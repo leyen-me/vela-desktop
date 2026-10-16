@@ -1,0 +1,200 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Windowed FIR Smoothing", shorttitle = "Windowed FIR Smoothing", overlay = true, format = format.price, max_bars_back = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+WIN_HANN        = "Hann"
+WIN_HAMMING     = "Hamming"
+WIN_TRIANGULAR  = "Triangular"
+WIN_RECTANGULAR = "Rectangular (SMA)"
+
+BULL_COLOR      = #089981
+BEAR_COLOR      = #f23645
+NEUTRAL_COLOR   = #787b86
+REFERENCE_COLOR = #787b86
+FILL_TRANSP     = 85 // transparency of the fill between the fast and slow averages
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+srcInput          = input.source(close, "Source", group = "Settings",
+     tooltip = "Price series smoothed by the windowed FIR average.")
+
+windowInput       = input.string(WIN_HANN, "Window", options = [WIN_HANN, WIN_HAMMING, WIN_TRIANGULAR, WIN_RECTANGULAR], group = "Settings",
+     tooltip = "Weight profile draped over the lookback. Hann is a raised cosine tapering to zero at both window edges; Hamming is the same cosine on a small pedestal, leaving the edge bars a little residual weight; Triangular rises to the middle and falls again; Rectangular weights every bar equally, which is exactly the simple moving average.")
+
+lengthInput       = input.int(21, "Length", minval = 3, maxval = 500, group = "Settings",
+     tooltip = "Number of bars N in the window. Symmetric FIR weights delay every frequency component equally, by (N - 1) / 2 bars, so pick the length with that delay in mind for the timeframe traded.")
+
+showSecondInput   = input.bool(false, "Show Second Average", group = "Second Average",
+     tooltip = "Plots a second windowed average built from the same window and source. Published designs read the difference of two windowed averages as a momentum gauge — the fill and the average cross alerts track which one is on top.")
+
+secondLengthInput = input.int(50, "Second Length", minval = 3, maxval = 500, group = "Second Average",
+     tooltip = "Window length N of the second average. Choose it longer than the primary length so the pair reads as fast versus slow.")
+
+showDashInput     = input.bool(true, "Show Dashboard", group = "Dashboard",
+     tooltip = "Displays the selected window, the window lengths, and the exact (N - 1) / 2 bar delay of each average — the fixed, known cost of symmetric FIR smoothing.")
+
+dashLocationInput = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = "Dashboard",
+     tooltip = "Chart corner where the dashboard is drawn.")
+
+dashSizeInput     = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = "Dashboard",
+     tooltip = "Text size of the dashboard.")
+
+trendColorInput   = input.bool(true, "Slope Trend Coloring", group = "Style",
+     tooltip = "Colors the average by its slope — bullish while the line is rising, bearish while it is falling — the slope-based trend read of a windowed smoother. Disable to draw the line in the neutral color.")
+
+bullColorInput    = input.color(BULL_COLOR, "Bullish", inline = "direction", group = "Style",
+     tooltip = "Bullish color, used while the average is rising and while the fast average holds above the slow one.")
+
+bearColorInput    = input.color(BEAR_COLOR, "Bearish", inline = "direction", group = "Style",
+     tooltip = "Bearish color, used while the average is falling and while the fast average holds below the slow one.")
+
+neutralColorInput = input.color(NEUTRAL_COLOR, "Neutral", group = "Style",
+     tooltip = "Line color used when slope trend coloring is disabled, or when the slope is flat.")
+
+secondColorInput  = input.color(REFERENCE_COLOR, "Second Average", group = "Style",
+     tooltip = "Color of the second windowed average.")
+
+showFillInput     = input.bool(true, "Fill Between Averages", group = "Style",
+     tooltip = "When the second average is shown, shades the gap between the two averages — bullish while the fast average is on top, bearish while it is below. The gap is the two-average momentum gauge made visible.")
+
+delayRefInput     = input.bool(false, "Delay-Aligned Reference", group = "Style",
+     tooltip = "Re-plots the primary average shifted back by its (N - 1) / 2 bar delay. Because symmetric FIR weights delay everything equally, the shifted line sits on top of the price movement it preserved — a clean benchmark against which faster filters can be judged.")
+
+delayColorInput   = input.color(REFERENCE_COLOR, "Delay Reference", group = "Style",
+     tooltip = "Color of the delay-aligned reference plot.")
+
+showSignalsInput  = input.bool(false, "Price Crossing Markers", group = "Style",
+     tooltip = "Displays small triangle markers when the source crosses over or under the primary average. Off by default to keep the chart clean — the crossing alerts work regardless.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Canonical published window coefficients for position k = 0..N-1 across the lookback (all four windows are
+// symmetric, so chart-time orientation does not matter):
+//   Rectangular : w(k) = 1                                        (equal weights — the SMA)
+//   Triangular  : w(k) = min(k + 1, N - k)                        (linear ramp to the middle and back)
+//   Hann        : w(k) = 0.5  - 0.5  * cos(2 * pi * k / (N - 1))  (raised cosine, zero at both edges)
+//   Hamming     : w(k) = 0.54 - 0.46 * cos(2 * pi * k / (N - 1))  (raised cosine on a 0.08 pedestal)
+windowWeight(int index, int length, string windowName) =>
+    float phase = length > 1 ? 2 * math.pi * index / (length - 1) : 0.0
+    switch windowName
+        WIN_RECTANGULAR => 1.0
+        WIN_TRIANGULAR  => 1.0 * math.min(index + 1, length - index)
+        WIN_HANN        => 0.5 - 0.5 * math.cos(phase)
+        WIN_HAMMING     => 0.54 - 0.46 * math.cos(phase)
+        => 1.0
+
+// Builds the N window weights once and normalizes them to sum to one
+buildWeights(simple int length, simple string windowName) =>
+    weightsArray = array.new_float(length, 0.0)
+    float weightSum = 0.0
+    for k = 0 to length - 1
+        float weight = windowWeight(k, length, windowName)
+        array.set(weightsArray, k, weight)
+        weightSum += weight
+    if weightSum > 0
+        for k = 0 to length - 1
+            array.set(weightsArray, k, array.get(weightsArray, k) / weightSum)
+    weightsArray
+
+// Weighted sum of the last N source values under the normalized window — na until a full window of data exists
+firAverage(float src, array<float> weightsArray) =>
+    int length  = array.size(weightsArray)
+    float value = na
+    if length > 0 and bar_index >= length - 1
+        float weightedSum = 0.0
+        bool  windowFull  = true
+        for k = 0 to length - 1
+            float sample = src[k]
+            if na(sample)
+                windowFull := false
+                break
+            weightedSum += sample * array.get(weightsArray, k)
+        value := windowFull ? weightedSum : na
+    value
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+// Weight profiles depend only on the inputs, so they are computed a single time
+var fastWeightsArray = buildWeights(lengthInput, windowInput)
+var slowWeightsArray = buildWeights(secondLengthInput, windowInput)
+
+fastAverage = firAverage(srcInput, fastWeightsArray)
+slowAverage = firAverage(srcInput, slowWeightsArray)
+
+// Exact group delay of a symmetric N-bar FIR window: (N - 1) / 2 bars
+delayOffsetBars = (lengthInput - 1) / 2
+
+// Slope of the primary average — the trend read of the smoother
+slope = fastAverage - nz(fastAverage[1], fastAverage)
+
+slopeTurnUp   = slope > 0 and nz(slope[1]) <= 0
+slopeTurnDown = slope < 0 and nz(slope[1]) >= 0
+
+// Price crossings — read exactly like a moving average
+priceCrossUp   = ta.crossover(srcInput, fastAverage)
+priceCrossDown = ta.crossunder(srcInput, fastAverage)
+
+// Fast / slow average crossings — sign changes of the two-average momentum gauge
+averageCrossUp   = ta.crossover(fastAverage, slowAverage)
+averageCrossDown = ta.crossunder(fastAverage, slowAverage)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+averageColor = trendColorInput ? (slope > 0 ? bullColorInput : slope < 0 ? bearColorInput : neutralColorInput) : neutralColorInput
+
+fillColor = showSecondInput and showFillInput and not na(fastAverage) and not na(slowAverage) ? (fastAverage > slowAverage ? color.new(bullColorInput, FILL_TRANSP) : color.new(bearColorInput, FILL_TRANSP)) : na
+
+fastPlotId = plot(fastAverage, "FIR Average", color = averageColor, linewidth = 2)
+slowPlotId = plot(showSecondInput ? slowAverage : na, "Second Average", color = secondColorInput, linewidth = 1)
+plot(delayRefInput ? fastAverage : na, "Delay-Aligned Reference", color = delayColorInput, linewidth = 1, style = plot.style_circles, offset = -delayOffsetBars)
+
+fill(fastPlotId, slowPlotId, color = fillColor, title = "Average Difference Fill")
+
+plotshape(showSignalsInput and priceCrossUp, "Bullish Cross", shape.triangleup, location.belowbar, color = bullColorInput, size = size.tiny)
+plotshape(showSignalsInput and priceCrossDown, "Bearish Cross", shape.triangledown, location.abovebar, color = bearColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+dashLocation = dashLocationInput == "Top Right" ? position.top_right : dashLocationInput == "Top Left" ? position.top_left : dashLocationInput == "Bottom Right" ? position.bottom_right : position.bottom_left
+dashTextSize = dashSizeInput == "Tiny" ? size.tiny : dashSizeInput == "Small" ? size.small : size.normal
+
+var table infoTable = showDashInput ? table.new(dashLocation, 2, 3, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1) : na
+
+if barstate.islast and not na(infoTable)
+    float fastDelay   = (lengthInput - 1) / 2.0
+    float slowDelay   = (secondLengthInput - 1) / 2.0
+    string lengthText = str.tostring(lengthInput) + (showSecondInput ? " / " + str.tostring(secondLengthInput) : "")
+    string delayText  = str.tostring(fastDelay, "#.#") + (showSecondInput ? " / " + str.tostring(slowDelay, "#.#") : "") + " bars"
+    labelColor        = DASH_HEADER
+    table.cell(infoTable, 0, 0, "Window", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(infoTable, 1, 0, windowInput, text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(infoTable, 0, 1, "Length", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(infoTable, 1, 1, lengthText, text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(infoTable, 0, 2, "Delay", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(infoTable, 1, 2, delayText, text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(slopeTurnUp, "Average Slope Up", "Windowed FIR average slope turned upward on {{ticker}} ({{interval}})")
+alertcondition(slopeTurnDown, "Average Slope Down", "Windowed FIR average slope turned downward on {{ticker}} ({{interval}})")
+alertcondition(priceCrossUp, "Bullish Price Cross", "Price crossed above the windowed FIR average on {{ticker}} ({{interval}})")
+alertcondition(priceCrossDown, "Bearish Price Cross", "Price crossed below the windowed FIR average on {{ticker}} ({{interval}})")
+alertcondition(showSecondInput and averageCrossUp, "Bullish Average Cross", "Fast windowed FIR average crossed above the slow average on {{ticker}} ({{interval}})")
+alertcondition(showSecondInput and averageCrossDown, "Bearish Average Cross", "Fast windowed FIR average crossed below the slow average on {{ticker}} ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

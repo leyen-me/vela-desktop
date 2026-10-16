@@ -1,0 +1,243 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Oscillator of Oscillator", shorttitle = "Oscillator of Oscillator", overlay = false, format = format.price, precision = 2)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+// Second-order construction template (Chande & Kroll, 1994): compute a first-layer oscillator as usual,
+// then locate it inside its own recent high-low range on a 0-100 scale and smooth the result (%K / %D).
+// The second layer reads the first layer's shape - its extremes describe the oscillator, not price.
+
+OSC_RSI   = "RSI"
+OSC_STOCH = "Stochastic %K"
+OSC_CCI   = "CCI"
+OSC_MFI   = "MFI"
+OSC_ROC   = "Rate of Change"
+
+TOP_RIGHT    = "Top Right"
+TOP_LEFT     = "Top Left"
+BOTTOM_RIGHT = "Bottom Right"
+BOTTOM_LEFT  = "Bottom Left"
+
+TINY_SIZE   = "Tiny"
+SMALL_SIZE  = "Small"
+NORMAL_SIZE = "Normal"
+
+MID = 50.
+
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+NEUTRAL_COLOR = #787b86
+LEVEL_COLOR   = #787b86
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+ZONE_TRANSP = 91           // transparency of the soft overbought / oversold zone shading
+
+FILL_VALUE_TRANSP = 50      // gradient transparency at the oscillator value
+FILL_MID_TRANSP   = 100     // gradient transparency at the 50 midline
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+baseInput = input.string(OSC_RSI, "Oscillator", options = [OSC_RSI, OSC_STOCH, OSC_CCI, OSC_MFI, OSC_ROC]
+  , group   = "First Layer"
+  , tooltip = "First-layer oscillator, computed from price as usual. The second layer is applied to this series rather than to price, so second-layer extremes say the oscillator is stretched relative to its own recent range - not that price itself is. Unbounded bases such as CCI and Rate of Change are normalized onto the 0-100 scale by the second layer.")
+
+firstLengthInput = input.int(14, "Length", minval = 1
+  , group   = "First Layer"
+  , tooltip = "First-layer lookback, e.g. a 14 period RSI of closing prices per the classic Stochastic RSI template.")
+
+sourceInput = input.source(close, "Source"
+  , group   = "First Layer"
+  , tooltip = "Price series feeding the RSI and Rate of Change bases. Stochastic %K always uses close/high/low, CCI its typical price (HLC3), and MFI typical price with volume, per their standard definitions.")
+
+preSmoothInput = input.int(1, "Pre-Smoothing", minval = 1
+  , group   = "First Layer"
+  , tooltip = "SMA length applied to the first layer before the second transformation (1 = none). Extra smoothing tames a jumpy first layer at the cost of additional lag, e.g. a stochastic of a smoothed RSI.")
+
+stochLengthInput = input.int(14, "Stochastic Window", minval = 1
+  , group   = "Second Layer"
+  , tooltip = "Second-layer lookback: the highest and lowest first-layer values over this window are recorded and the current value is located inside that range on a 0-100 scale. Shortening the window makes extremes more frequent and less meaningful; lengthening it makes the layer behave more like the raw oscillator it wraps.")
+
+kSmoothInput = input.int(3, "%K Smoothing", minval = 1
+  , group   = "Second Layer"
+  , tooltip = "SMA applied to the raw second-layer output, which is usually too jagged to read directly. The widespread default is 3.")
+
+dSmoothInput = input.int(3, "%D Smoothing", minval = 1
+  , group   = "Second Layer"
+  , tooltip = "SMA of %K forming the signal line used for crossover triggers. The widespread default is 3.")
+
+obInput = input.float(80, "Overbought", minval = 50, maxval = 100, step = 1
+  , group   = "Levels"
+  , tooltip = "Upper extreme of the second layer. Readings above it mean the first-layer oscillator is high relative to its own recent range - not that price itself is overbought. Price can keep grinding in one direction while the second layer cycles between extremes, so anchor these readings back to price structure.")
+
+osInput = input.float(20, "Oversold", minval = 0, maxval = 50, step = 1
+  , group   = "Levels"
+  , tooltip = "Lower extreme of the second layer. Readings below it mean the first-layer oscillator is low relative to its own recent range - not that price itself is oversold.")
+
+dashboardInput = input.bool(true, "Show Dashboard"
+  , group   = "Dashboard"
+  , tooltip = "On the chart a second-order oscillator looks like any bounded oscillator - the tell is in its construction. The dashboard spells out the two-pass pipeline (first layer, second transformation) and the current second-layer state.")
+
+dashboardPositionInput = input.string(TOP_RIGHT, "Location", options = [TOP_RIGHT, TOP_LEFT, BOTTOM_RIGHT, BOTTOM_LEFT]
+  , group   = "Dashboard"
+  , tooltip = "Position of the dashboard on the pane.")
+
+dashboardSizeInput = input.string(SMALL_SIZE, "Size", options = [TINY_SIZE, SMALL_SIZE, NORMAL_SIZE]
+  , group   = "Dashboard"
+  , tooltip = "Text size of the dashboard.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish Color"
+  , group   = "Style"
+  , tooltip = "%K line and gradient color while the second layer holds above the 50 midline.")
+
+bearColorInput = input.color(BEAR_COLOR, "Bearish Color"
+  , group   = "Style"
+  , tooltip = "%K line and gradient color while the second layer holds below the 50 midline.")
+
+signalColorInput = input.color(NEUTRAL_COLOR, "%D Color"
+  , group   = "Style"
+  , tooltip = "Color of the %D signal line.")
+
+levelColorInput = input.color(LEVEL_COLOR, "Levels Color"
+  , group   = "Style"
+  , tooltip = "Color of the dashed overbought/oversold extremes and the dotted 50 midline.")
+
+showCrossesInput = input.bool(false, "Show %K/%D Cross Markers"
+  , group   = "Style"
+  , tooltip = "Draw dots inside the pane where %K crosses %D. Off by default - the alert set already covers these discrete events and keeps the pane clean.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Dashboard position string to table position constant
+tableLocation(positionText) =>
+    switch positionText
+        TOP_RIGHT    => position.top_right
+        TOP_LEFT     => position.top_left
+        BOTTOM_RIGHT => position.bottom_right
+        => position.bottom_left
+
+// Dashboard size string to text size constant
+tableSize(sizeText) =>
+    switch sizeText
+        TINY_SIZE  => size.tiny
+        SMALL_SIZE => size.small
+        => size.normal
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+// First pass - every selectable base oscillator is computed on every bar, each per its standard definition
+rsiValue   = ta.rsi(sourceInput, firstLengthInput)
+stochValue = ta.stoch(close, high, low, firstLengthInput)
+cciValue   = ta.cci(hlc3, firstLengthInput)
+mfiValue   = ta.mfi(hlc3, firstLengthInput)
+rocValue   = ta.roc(sourceInput, firstLengthInput)
+
+baseOscillator = switch baseInput
+    OSC_RSI   => rsiValue
+    OSC_STOCH => stochValue
+    OSC_CCI   => cciValue
+    OSC_MFI   => mfiValue
+    => rocValue
+
+// Optional smoothing of the first layer before the second transformation
+firstLayer = ta.sma(baseOscillator, preSmoothInput)
+
+// Second pass - locate the first layer inside its own recent high-low range on a 0-100 scale
+highestFirst = ta.highest(firstLayer, stochLengthInput)
+lowestFirst  = ta.lowest(firstLayer, stochLengthInput)
+rangeSpan    = highestFirst - lowestFirst
+
+secondRaw = rangeSpan > 0 ? 100 * (firstLayer - lowestFirst) / rangeSpan : rangeSpan == 0 ? MID : na
+
+// Smooth the raw second layer the way the stochastic normally is (%K), then its signal average (%D)
+kValue = ta.sma(secondRaw, kSmoothInput)
+dValue = ta.sma(kValue, dSmoothInput)
+
+// Discrete second-layer events
+overboughtEntry = ta.crossover(kValue, obInput)
+overboughtExit  = ta.crossunder(kValue, obInput)
+oversoldEntry   = ta.crossunder(kValue, osInput)
+oversoldExit    = ta.crossover(kValue, osInput)
+bullMidCross    = ta.crossover(kValue, MID)
+bearMidCross    = ta.crossunder(kValue, MID)
+bullSignalCross = ta.crossover(kValue, dValue)
+bearSignalCross = ta.crossunder(kValue, dValue)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visualization
+//---------------------------------------------------------------------------------------------------------------------{
+kColor = kValue > MID ? bullColorInput : bearColorInput
+
+kPlotId   = plot(kValue, "%K", kColor, 1)
+dPlotId   = plot(dValue, "%D", signalColorInput, 1)
+midPlotId = plot(MID, "Midline Anchor", color = na, editable = false, display = display.none)
+
+fill(kPlotId, midPlotId, math.max(kValue, MID), math.min(kValue, MID)
+  , kValue > MID ? color.new(bullColorInput, FILL_VALUE_TRANSP) : color.new(bearColorInput, FILL_MID_TRANSP)
+  , kValue > MID ? color.new(bullColorInput, FILL_MID_TRANSP) : color.new(bearColorInput, FILL_VALUE_TRANSP)
+  , title = "Midline Gradient")
+
+plot(showCrossesInput and bullSignalCross ? kValue : na, "Bullish %K/%D Cross", color = bullColorInput, linewidth = 2, style = plot.style_circles)
+plot(showCrossesInput and bearSignalCross ? kValue : na, "Bearish %K/%D Cross", color = bearColorInput, linewidth = 2, style = plot.style_circles)
+
+hline(obInput, "Overbought", levelColorInput, hline.style_dashed)
+hline(osInput, "Oversold", levelColorInput, hline.style_dashed)
+hline(MID, "Midline", color.new(levelColorInput, 50), hline.style_dotted)
+
+// Soft zone shading - overbought band leans bearish, oversold band leans bullish
+obZoneId     = plot(obInput, "Overbought Zone Anchor", color = na, editable = false, display = display.none)
+osZoneId     = plot(osInput, "Oversold Zone Anchor", color = na, editable = false, display = display.none)
+topAnchorId  = plot(100, "Top Anchor", color = na, editable = false, display = display.none)
+botAnchorId  = plot(0, "Bottom Anchor", color = na, editable = false, display = display.none)
+
+fill(obZoneId, topAnchorId, color.new(bearColorInput, ZONE_TRANSP), title = "Overbought Zone")
+fill(osZoneId, botAnchorId, color.new(bullColorInput, ZONE_TRANSP), title = "Oversold Zone")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dashboardTable = na
+
+if dashboardInput and barstate.islast
+    if na(dashboardTable)
+        dashboardTable := table.new(tableLocation(dashboardPositionInput), 2, 3, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+    textSize   = tableSize(dashboardSizeInput)
+    labelColor = DASH_HEADER
+    firstText  = baseInput + " (" + str.tostring(firstLengthInput) + ")"
+      + (preSmoothInput > 1 ? " · SMA " + str.tostring(preSmoothInput) : "")
+      + (na(firstLayer) ? "" : " · " + str.tostring(firstLayer, "#.##"))
+    secondText = "Stochastic (" + str.tostring(stochLengthInput) + ") · %K " + str.tostring(kSmoothInput) + " · %D " + str.tostring(dSmoothInput)
+    stateText  = na(kValue) ? "Loading" : kValue >= obInput ? "Overbought" : kValue <= osInput ? "Oversold" : kValue > MID ? "Bullish" : "Bearish"
+    stateColor = na(kValue) ? DASH_TEXT : kValue > MID ? bullColorInput : bearColorInput
+
+    table.cell(dashboardTable, 0, 0, "First Layer", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 0, firstText, text_color = DASH_TEXT, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 1, "Second Layer", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 1, secondText, text_color = DASH_TEXT, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 2, "State", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 2, stateText, text_color = stateColor, text_size = textSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(overboughtEntry, "Overbought Entry", "Oscillator of Oscillator: %K crossed above the overbought level on {{ticker}} - the first-layer oscillator is stretched high within its own recent range ({{interval}})")
+alertcondition(overboughtExit, "Overbought Exit", "Oscillator of Oscillator: %K crossed back below the overbought level on {{ticker}} ({{interval}})")
+alertcondition(oversoldEntry, "Oversold Entry", "Oscillator of Oscillator: %K crossed below the oversold level on {{ticker}} - the first-layer oscillator is stretched low within its own recent range ({{interval}})")
+alertcondition(oversoldExit, "Oversold Exit", "Oscillator of Oscillator: %K crossed back above the oversold level on {{ticker}} ({{interval}})")
+alertcondition(bullMidCross, "Bullish Midline Cross", "Oscillator of Oscillator: %K crossed above the 50 midline on {{ticker}} ({{interval}})")
+alertcondition(bearMidCross, "Bearish Midline Cross", "Oscillator of Oscillator: %K crossed below the 50 midline on {{ticker}} ({{interval}})")
+alertcondition(bullSignalCross, "Bullish %K/%D Cross", "Oscillator of Oscillator: %K crossed above the %D signal line on {{ticker}} ({{interval}})")
+alertcondition(bearSignalCross, "Bearish %K/%D Cross", "Oscillator of Oscillator: %K crossed below the %D signal line on {{ticker}} ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

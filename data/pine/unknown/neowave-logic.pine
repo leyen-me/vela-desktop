@@ -1,0 +1,613 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("NeoWave Logic", shorttitle = "NeoWave Logic", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 100)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+NEUTRAL_COLOR = #787b86 // sideways structures and pending expectations - undecided until the logic resolves
+WARN_COLOR    = #ff9800 // the one accent - degree breaks
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+KIND_IMPULSE   = 1
+KIND_THREE     = 2
+KIND_TRIANGLE  = 3
+KIND_DIAMETRIC = 4
+
+TRI_CONTRACTING = 0
+TRI_EXPANDING   = 1
+TRI_NEUTRAL     = 2
+
+DIA_DIAMOND = 0
+DIA_BOWTIE  = 1
+
+STATUS_PENDING   = 0
+STATUS_CONFIRMED = 1
+STATUS_INVALID   = 2
+STATUS_STALE     = 3
+
+MAX_PIVOTS = 120
+
+GRP_WAVE   = "Wave Construction"
+GRP_LOGIC  = "NeoWave Rules"
+GRP_STRUCT = "Structures"
+GRP_STYLE  = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Inputs
+//---------------------------------------------------------------------------------------------------------------------{
+sourceModeInput = input.string("Close (wave chart)", "Data Points", options = ["Close (wave chart)", "High/Low"], group = GRP_WAVE, tooltip = "NeoWave builds waves from consistent data points plotted against elapsed time instead of eyeballed bar charts. 'Close (wave chart)' derives monowaves from closing prices - the closest standard-chart equivalent of Neely's charting prescription; 'High/Low' uses bar extremes for a conventional swing chart. Time is always measured in elapsed bars.")
+
+pivotLenInput = input.int(8, "Wave Pivot Length", minval = 2, maxval = 50, group = GRP_WAVE, tooltip = "Bars on each side required to confirm a turn of the selected data points. Each confirmed swing is treated as one wave of the working degree; larger values read the logic at a higher degree.")
+
+similarityInput = input.float(33, "Similarity & Balance Threshold %", minval = 1, maxval = 100, step = 1, group = GRP_LOGIC, tooltip = "Rule of similarity and balance: two adjacent waves belong to the same degree only when the smaller is at least this percentage of the larger in price or in time (Neely's one-third guideline). A wave failing BOTH comparisons is flagged as a degree break - the working comparison is discarded rather than rationalized.")
+
+retraceLimitInput = input.float(61.8, "Impulsive Retracement Limit %", minval = 10, maxval = 200, step = 0.1, group = GRP_LOGIC, tooltip = "Post-pattern extent test for impulsive (:5) structures: the reaction that follows must not retrace more than this percentage of the structure's net travel. A deeper retracement invalidates the impulsive label and the count must be abandoned. Full retracement within the structure's own formation time also denies it, whatever the limit.")
+
+timeFactorInput = input.float(1.0, "Time Allowance (x pattern time)", minval = 0.25, maxval = 5, step = 0.25, group = GRP_LOGIC, tooltip = "Post-pattern speed test: a corrective structure should be completely retraced within this multiple of the time it took to form. If the allowance expires first, the corrective label fails its logic test. Note the allowance runs from the structure's final pivot, so swing-confirmation lag counts against it; raise the factor to loosen the requirement.")
+
+detectTriangleInput = input.bool(true, "Detect Triangles (incl. Neutral)", group = GRP_STRUCT, tooltip = "Search for five-legged sideways structures and classify them as contracting, expanding, or Neely's neutral variant - the NeoWave addition whose longest leg sits in the middle.")
+
+detectDiametricInput = input.bool(true, "Detect Diametric Formations", group = GRP_STRUCT, tooltip = "Search for Neely's seven-legged corrective structure: legs similar in price and time, widest in the middle (diamond) or narrowest in the middle (bow-tie). Not part of the orthodox Elliott catalog.")
+
+showWaveInput = input.bool(true, "Show Wave Chart", group = GRP_STYLE, tooltip = "Draw the monowave zigzag built from the selected data points, plus a dotted in-progress leg.")
+
+showMeasureInput = input.bool(true, "Show Wave Measurements", group = GRP_STYLE, tooltip = "Label each confirmed wave with its price change, elapsed bars, and price/time similarity ratios versus the previous wave.")
+
+showExpectInput = input.bool(true, "Show Expectation Zones", group = GRP_STYLE, tooltip = "Draw each labeled structure's post-pattern expectation (level to hold or clear, and the time allowance) and mark its confirmation or invalidation.")
+
+showDashInput = input.bool(true, "Show Logic Dashboard", group = GRP_STYLE, tooltip = "Summary table of the latest wave ratios, degree verdict, structure label, expectation, and logic status.")
+
+dashPosInput = input.string("Top Right", "Dashboard Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = GRP_STYLE, tooltip = "Chart corner holding the logic dashboard.")
+
+dashSizeInput = input.string("Small", "Dashboard Size", options = ["Tiny", "Small", "Normal"], group = GRP_STYLE, tooltip = "Text size of the logic dashboard.")
+
+bullColorInput    = input.color(BULL_COLOR, "Bullish Waves / Confirmation", group = GRP_STYLE)
+bearColorInput    = input.color(BEAR_COLOR, "Bearish Waves / Invalidation", group = GRP_STYLE)
+neutralColorInput = input.color(NEUTRAL_COLOR, "NeoWave Structures & Expectations", group = GRP_STYLE)
+warnColorInput    = input.color(WARN_COLOR, "Degree Breaks", group = GRP_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Pivot State
+//---------------------------------------------------------------------------------------------------------------------{
+var pivotPricesArray = array.new<float>()
+var pivotBarsArray   = array.new<int>()
+var pivotDirsArray   = array.new<int>()
+
+// Last labeled structure (bar-anchored so array trimming never invalidates it)
+var int lastStructEndBar = -1
+var int lastStructKind   = 0
+var int lastStructDir    = 0
+
+// Active post-pattern expectation
+var int   actKind   = 0
+var int   actStatus = -1
+var int   actDir    = 0
+var float actStart  = na
+var float actEnd    = na
+var float actLimit  = na
+var float actTarget = na
+var float actViol   = na
+var int   actEndBar = 0
+var int   actDur    = 0
+var int   actWindow = 0
+var float postHigh  = na
+var float postLow   = na
+
+var box   actBox      = na
+var line  actLine     = na
+var label actLvlLabel = na
+var line  lastZigLine = na
+var line  liveLegLine = na
+
+// Dashboard snapshots
+var string dashWaveText   = "-"
+var string dashPriceText  = "-"
+var string dashTimeText   = "-"
+var string dashStructText = "-"
+var bool   dashHasRatio   = false
+var bool   dashBreak      = false
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+f_pivotPrice(idx) =>
+    array.get(pivotPricesArray, idx)
+
+f_pivotBar(idx) =>
+    array.get(pivotBarsArray, idx)
+
+f_labelStyle(idx) =>
+    array.get(pivotDirsArray, idx) == 1 ? label.style_label_down : label.style_label_up
+
+f_legRange(endIdx) =>
+    math.abs(f_pivotPrice(endIdx) - f_pivotPrice(endIdx - 1))
+
+f_legBars(endIdx) =>
+    f_pivotBar(endIdx) - f_pivotBar(endIdx - 1)
+
+f_legDir(endIdx) =>
+    f_pivotPrice(endIdx) > f_pivotPrice(endIdx - 1) ? 1 : -1
+
+// Smaller-over-larger ratio used by the rule of similarity and balance.
+f_ratioMinMax(valueA, valueB) =>
+    larger = math.max(valueA, valueB)
+    larger > 0 ? math.min(valueA, valueB) / larger : 1.0
+
+// Appends (or extends) a wave pivot, enforcing high/low alternation. Returns 0 none, 1 appended, 2 extended.
+f_addPivot(dir, price, barIdx) =>
+    evt = 0
+    pivotCount = array.size(pivotDirsArray)
+    if pivotCount == 0
+        array.push(pivotPricesArray, price)
+        array.push(pivotBarsArray, barIdx)
+        array.push(pivotDirsArray, dir)
+        evt := 1
+    else
+        lastDir = array.get(pivotDirsArray, pivotCount - 1)
+        if lastDir == dir
+            lastPrice = array.get(pivotPricesArray, pivotCount - 1)
+            if (dir == 1 and price >= lastPrice) or (dir == -1 and price <= lastPrice)
+                array.set(pivotPricesArray, pivotCount - 1, price)
+                array.set(pivotBarsArray, pivotCount - 1, barIdx)
+                evt := 2
+        else
+            array.push(pivotPricesArray, price)
+            array.push(pivotBarsArray, barIdx)
+            array.push(pivotDirsArray, dir)
+            evt := 1
+    evt
+
+// Five-legged trending (impulsive, :5) group spanning pivots endIdx-5..endIdx. Returns [valid, netDir].
+f_checkImpulse(endIdx) =>
+    sIdx = endIdx - 5
+    q0 = f_pivotPrice(sIdx)
+    q1 = f_pivotPrice(sIdx + 1)
+    q2 = f_pivotPrice(sIdx + 2)
+    q3 = f_pivotPrice(sIdx + 3)
+    q4 = f_pivotPrice(sIdx + 4)
+    q5 = f_pivotPrice(sIdx + 5)
+    upMove = q1 > q0
+    r1 = math.abs(q1 - q0)
+    r3 = math.abs(q3 - q2)
+    r5 = math.abs(q5 - q4)
+    thirdOk = not (r3 < r1 and r3 < r5)
+    structOk = upMove ? q2 > q0 and q3 > q1 and q4 > q1 and q5 > q3 : q2 < q0 and q3 < q1 and q4 < q1 and q5 < q3
+    [structOk and thirdOk, upMove ? 1 : -1]
+
+// Five-legged sideways triangle spanning pivots endIdx-5..endIdx. Returns [valid, variant].
+f_checkTriangle(endIdx) =>
+    sIdx = endIdx - 5
+    r1 = f_legRange(sIdx + 1)
+    r2 = f_legRange(sIdx + 2)
+    r3 = f_legRange(sIdx + 3)
+    r4 = f_legRange(sIdx + 4)
+    r5 = f_legRange(sIdx + 5)
+    maxLeg = math.max(r1, math.max(r2, math.max(r3, math.max(r4, r5))))
+    sideways = math.abs(f_pivotPrice(endIdx) - f_pivotPrice(sIdx)) < maxLeg
+    contracting = r2 < r1 and r3 < r2 and r4 < r3 and r5 < r4
+    expanding = r2 > r1 and r3 > r2 and r4 > r3 and r5 > r4
+    neutral = r3 > r1 and r3 > r2 and r3 > r4 and r3 > r5
+    variant = contracting ? TRI_CONTRACTING : expanding ? TRI_EXPANDING : neutral ? TRI_NEUTRAL : -1
+    [sideways and variant >= 0, variant]
+
+// Neely's seven-legged diametric spanning pivots endIdx-7..endIdx: sideways, legs similar in
+// price AND time, widest leg in the middle (diamond) or narrowest (bow-tie). Returns [valid, variant].
+f_checkDiametric(endIdx) =>
+    sIdx = endIdx - 7
+    float rMin = na
+    float rMax = na
+    float tMin = na
+    float tMax = na
+    for leg = 1 to 7
+        legRange = f_legRange(sIdx + leg)
+        legTime = f_legBars(sIdx + leg) * 1.0
+        rMin := na(rMin) ? legRange : math.min(rMin, legRange)
+        rMax := na(rMax) ? legRange : math.max(rMax, legRange)
+        tMin := na(tMin) ? legTime : math.min(tMin, legTime)
+        tMax := na(tMax) ? legTime : math.max(tMax, legTime)
+    midLeg = f_legRange(sIdx + 4)
+    isDiamond = true
+    isBowtie = true
+    for leg = 1 to 7
+        if leg != 4
+            legRange = f_legRange(sIdx + leg)
+            if legRange >= midLeg
+                isDiamond := false
+            if legRange <= midLeg
+                isBowtie := false
+    thr = similarityInput / 100
+    priceSimilar = rMax > 0 and rMin / rMax >= thr
+    timeSimilar = tMax > 0 and tMin / tMax >= thr
+    sideways = math.abs(f_pivotPrice(endIdx) - f_pivotPrice(sIdx)) < rMax
+    [sideways and priceSimilar and timeSimilar and (isDiamond or isBowtie), isDiamond ? DIA_DIAMOND : DIA_BOWTIE]
+
+// Three-legged reaction (:3) against the last labeled structure, spanning pivots endIdx-3..endIdx.
+// Returns [valid, netDir].
+f_checkReaction(endIdx) =>
+    sIdx = endIdx - 3
+    q0 = f_pivotPrice(sIdx)
+    q1 = f_pivotPrice(sIdx + 1)
+    q2 = f_pivotPrice(sIdx + 2)
+    q3 = f_pivotPrice(sIdx + 3)
+    reaDown = q1 < q0
+    shapeOk = reaDown ? q2 < q0 and q3 < q1 : q2 > q0 and q3 > q1
+    dirOk = (reaDown ? -1 : 1) == -lastStructDir
+    [shapeOk and dirOk, reaDown ? -1 : 1]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Wave Detection
+//---------------------------------------------------------------------------------------------------------------------{
+useHighLow = sourceModeInput == "High/Low"
+dataHigh = useHighLow ? high : close
+dataLow  = useHighLow ? low : close
+
+ph = ta.pivothigh(dataHigh, pivotLenInput, pivotLenInput)
+pl = ta.pivotlow(dataLow, pivotLenInput, pivotLenInput)
+
+// Extremes of the current confirmation window, used to seed post-pattern monitoring.
+winHigh = ta.highest(dataHigh, pivotLenInput + 1)
+winLow  = ta.lowest(dataLow, pivotLenInput + 1)
+
+pivotBarIdx = bar_index - pivotLenInput
+
+int appendCount = 0
+bool extendedFlag = false
+int evtFirst = 0
+int evtSecond = 0
+
+if not na(ph) and not na(pl)
+    // Outside bar produced both pivots: order them to preserve alternation with the previous pivot.
+    sizeNow = array.size(pivotDirsArray)
+    lastDirNow = sizeNow > 0 ? array.get(pivotDirsArray, sizeNow - 1) : 0
+    if lastDirNow == 1
+        evtFirst := f_addPivot(-1, pl, pivotBarIdx)
+        evtSecond := f_addPivot(1, ph, pivotBarIdx)
+    else
+        evtFirst := f_addPivot(1, ph, pivotBarIdx)
+        evtSecond := f_addPivot(-1, pl, pivotBarIdx)
+else if not na(ph)
+    evtFirst := f_addPivot(1, ph, pivotBarIdx)
+else if not na(pl)
+    evtFirst := f_addPivot(-1, pl, pivotBarIdx)
+
+appendCount += evtFirst == 1 ? 1 : 0
+appendCount += evtSecond == 1 ? 1 : 0
+extendedFlag := evtFirst == 2 or evtSecond == 2
+
+pivotCountNow = array.size(pivotDirsArray)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Wave Chart Drawing
+//---------------------------------------------------------------------------------------------------------------------{
+if showWaveInput and pivotCountNow >= 2
+    if extendedFlag and not na(lastZigLine)
+        extIdx = pivotCountNow - 1 - appendCount
+        if extIdx >= 1
+            line.set_xy2(lastZigLine, f_pivotBar(extIdx), f_pivotPrice(extIdx))
+    if appendCount >= 2 and pivotCountNow >= 3
+        legColorA = f_legDir(pivotCountNow - 2) == 1 ? color.new(bullColorInput, 35) : color.new(bearColorInput, 35)
+        lastZigLine := line.new(f_pivotBar(pivotCountNow - 3), f_pivotPrice(pivotCountNow - 3), f_pivotBar(pivotCountNow - 2), f_pivotPrice(pivotCountNow - 2), color = legColorA, width = 1)
+    if appendCount >= 1
+        legColorB = f_legDir(pivotCountNow - 1) == 1 ? color.new(bullColorInput, 35) : color.new(bearColorInput, 35)
+        lastZigLine := line.new(f_pivotBar(pivotCountNow - 2), f_pivotPrice(pivotCountNow - 2), f_pivotBar(pivotCountNow - 1), f_pivotPrice(pivotCountNow - 1), color = legColorB, width = 1)
+
+// In-progress leg from the newest pivot to the current data point (tentative, hence dotted).
+if showWaveInput and pivotCountNow > 0
+    lastIdx = pivotCountNow - 1
+    liveY = array.get(pivotDirsArray, lastIdx) == 1 ? dataLow : dataHigh
+    if na(liveLegLine)
+        liveLegLine := line.new(f_pivotBar(lastIdx), f_pivotPrice(lastIdx), bar_index, liveY, color = color.new(neutralColorInput, 30), style = line.style_dotted)
+    else
+        line.set_xy1(liveLegLine, f_pivotBar(lastIdx), f_pivotPrice(lastIdx))
+        line.set_xy2(liveLegLine, bar_index, liveY)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Wave Measurements & Rule Of Similarity And Balance
+//---------------------------------------------------------------------------------------------------------------------{
+bool degreeBreakAlert = false
+bool impulseAlert     = false
+bool threeAlert       = false
+bool triangleAlert    = false
+bool diametricAlert   = false
+bool logicConfirmAlert = false
+bool logicInvalidAlert = false
+
+endIdx = pivotCountNow - 2
+
+if appendCount > 0 and endIdx >= 1
+    firstStable = math.max(1, pivotCountNow - 1 - appendCount)
+    if firstStable <= endIdx
+        for stableIdx = firstStable to endIdx
+            legRange = f_legRange(stableIdx)
+            legTime = f_legBars(stableIdx)
+            basePrice = math.abs(f_pivotPrice(stableIdx - 1))
+            legPct = basePrice > 0 ? 100 * legRange / basePrice : 0.0
+            float priceRatio = na
+            float timeRatio = na
+            degreeBreak = false
+            if stableIdx >= 2
+                priceRatio := f_ratioMinMax(legRange, f_legRange(stableIdx - 1))
+                timeRatio := f_ratioMinMax(legTime * 1.0, f_legBars(stableIdx - 1) * 1.0)
+                degreeBreak := priceRatio < similarityInput / 100 and timeRatio < similarityInput / 100
+            dashWaveText := str.tostring(legPct, "#.##") + "% · " + str.tostring(legTime) + "b"
+            dashHasRatio := stableIdx >= 2
+            dashPriceText := dashHasRatio ? str.tostring(100 * priceRatio, "#") + "%" : "-"
+            dashTimeText := dashHasRatio ? str.tostring(100 * timeRatio, "#") + "%" : "-"
+            dashBreak := degreeBreak
+            if degreeBreak
+                degreeBreakAlert := true
+            if showMeasureInput
+                measureText = dashWaveText + (dashHasRatio ? "\nP " + str.tostring(100 * priceRatio, "#") + "% · T " + str.tostring(100 * timeRatio, "#") + "%" : "")
+                measureTip = degreeBreak ? "Degree break: this wave is below the similarity threshold versus the previous wave in BOTH price and time, so the two cannot belong to the same degree. Under NeoWave logic the working comparison is discarded rather than rationalized." : "Wave price change and elapsed bars, with price (P) and time (T) similarity ratios versus the previous wave. The rule of similarity and balance keeps adjacent waves of the same degree when at least one ratio meets the threshold."
+                label.new(f_pivotBar(stableIdx), f_pivotPrice(stableIdx), measureText, style = f_labelStyle(stableIdx), color = #00000000, textcolor = degreeBreak ? warnColorInput : neutralColorInput, size = size.tiny, tooltip = measureTip)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Structure Detection & Post-Pattern Expectations
+//---------------------------------------------------------------------------------------------------------------------{
+// Structures are recognized once the next swing away from them locks their final pivot, so
+// confirmed labels never repaint. Each new structure may start at the previous one's end pivot.
+if appendCount > 0 and endIdx >= 1
+    int foundKind = 0
+    int foundStart = -1
+    int foundVariant = -1
+    int foundDir = 0
+
+    if detectDiametricInput and endIdx >= 7 and f_pivotBar(endIdx - 7) >= lastStructEndBar
+        [diaOk, diaVariant] = f_checkDiametric(endIdx)
+        if diaOk
+            foundKind := KIND_DIAMETRIC
+            foundStart := endIdx - 7
+            foundVariant := diaVariant
+    if foundKind == 0 and detectTriangleInput and endIdx >= 5 and f_pivotBar(endIdx - 5) >= lastStructEndBar
+        [triOk, triVariant] = f_checkTriangle(endIdx)
+        if triOk
+            foundKind := KIND_TRIANGLE
+            foundStart := endIdx - 5
+            foundVariant := triVariant
+    if foundKind == 0 and endIdx >= 5 and f_pivotBar(endIdx - 5) >= lastStructEndBar
+        [impOk, impDir] = f_checkImpulse(endIdx)
+        if impOk
+            foundKind := KIND_IMPULSE
+            foundStart := endIdx - 5
+            foundDir := impDir
+    if foundKind == 0 and endIdx >= 3 and lastStructKind > 0 and f_pivotBar(endIdx - 3) == lastStructEndBar
+        [reaOk, reaDir] = f_checkReaction(endIdx)
+        if reaOk
+            foundKind := KIND_THREE
+            foundStart := endIdx - 3
+            foundDir := lastStructDir
+
+    if foundKind > 0
+        // Follow-through direction for sideways structures: the trend the pattern interrupted.
+        if foundKind == KIND_TRIANGLE or foundKind == KIND_DIAMETRIC
+            foundDir := foundStart >= 1 ? f_legDir(foundStart) : -f_legDir(foundStart + 1)
+
+        // Supersede any unresolved expectation: only the latest structure is monitored.
+        if actStatus == STATUS_PENDING
+            actStatus := STATUS_STALE
+            if not na(actBox)
+                box.set_border_color(actBox, color.new(neutralColorInput, 80))
+                box.set_bgcolor(actBox, color.new(neutralColorInput, 95))
+            if not na(actLine)
+                line.set_color(actLine, color.new(neutralColorInput, 60))
+            if not na(actLvlLabel)
+                label.set_textcolor(actLvlLabel, color.new(neutralColorInput, 50))
+
+        float structHigh = f_pivotPrice(foundStart)
+        float structLow = f_pivotPrice(foundStart)
+        for pivIdx = foundStart to endIdx
+            structHigh := math.max(structHigh, f_pivotPrice(pivIdx))
+            structLow := math.min(structLow, f_pivotPrice(pivIdx))
+
+        actKind := foundKind
+        actDir := foundDir
+        actStart := f_pivotPrice(foundStart)
+        actEnd := f_pivotPrice(endIdx)
+        actEndBar := f_pivotBar(endIdx)
+        actDur := actEndBar - f_pivotBar(foundStart)
+        actWindow := math.max(1, math.ceil(timeFactorInput * actDur))
+        actStatus := STATUS_PENDING
+        if foundKind == KIND_IMPULSE
+            actLimit := actEnd - foundDir * (retraceLimitInput / 100) * math.abs(actEnd - actStart)
+            actTarget := na
+            actViol := na
+        else
+            actTarget := foundDir == 1 ? structHigh : structLow
+            actViol := foundDir == 1 ? structLow : structHigh
+            actLimit := na
+
+        // Seed post-pattern extremes with everything seen since the structure's final pivot.
+        lastMutIdx = array.size(pivotPricesArray) - 1
+        postHigh := math.max(f_pivotPrice(lastMutIdx), winHigh)
+        postLow := math.min(f_pivotPrice(lastMutIdx), winLow)
+
+        netDir = actEnd > actStart ? 1 : -1
+        structColor = foundKind == KIND_IMPULSE or foundKind == KIND_THREE ? (netDir == 1 ? bullColorInput : bearColorInput) : neutralColorInput
+
+        legCount = endIdx - foundStart
+        for leg = 0 to legCount - 1
+            line.new(f_pivotBar(foundStart + leg), f_pivotPrice(foundStart + leg), f_pivotBar(foundStart + leg + 1), f_pivotPrice(foundStart + leg + 1), color = structColor, width = 2)
+
+        string structText = ""
+        string structTip = ""
+        if foundKind == KIND_IMPULSE
+            structText := ":5 impulsive"
+            structTip := "Five-legged trending group (:5). NeoWave post-pattern logic: the reaction that follows must not retrace more than the limit - a deeper retracement invalidates the impulsive label. Complete retracement within the structure's own formation time also denies it."
+            impulseAlert := true
+        else if foundKind == KIND_THREE
+            structText := ":3 corrective"
+            structTip := "Three-legged reaction (:3) against the prior structure. NeoWave post-pattern logic: a true correction is completely retraced within the time allowance; hesitation past the allowance, or a break of the reaction's own extreme, fails the logic test."
+            threeAlert := true
+        else if foundKind == KIND_TRIANGLE
+            variantText = foundVariant == TRI_CONTRACTING ? "contracting" : foundVariant == TRI_EXPANDING ? "expanding" : "neutral"
+            structText := "triangle · " + variantText
+            structTip := "Five-legged sideways structure. Contracting and expanding variants are orthodox; the neutral triangle - longest leg in the middle - is Neely's NeoWave addition for congestion the classic catalog cannot honestly describe. Expected to resolve through the pattern extreme in the follow-through direction within the time allowance."
+            triangleAlert := true
+        else
+            structText := "diametric · " + (foundVariant == DIA_DIAMOND ? "diamond" : "bow-tie")
+            structTip := "Neely's seven-legged corrective structure: legs similar in price and time, widest in the middle (diamond) or narrowest (bow-tie). Not part of the orthodox Elliott catalog. Expected to resolve through the pattern extreme in the follow-through direction within the time allowance."
+            diametricAlert := true
+
+        label.new(actEndBar, actEnd, structText, style = f_labelStyle(endIdx), color = #00000000, textcolor = structColor, size = size.small, tooltip = structTip)
+
+        if showExpectInput
+            zoneLvl = foundKind == KIND_IMPULSE ? actLimit : actTarget
+            zoneTop = math.max(actEnd, zoneLvl)
+            zoneBot = math.min(actEnd, zoneLvl)
+            rightX = math.min(actEndBar + actWindow, bar_index + 480)
+            lvlText = foundKind == KIND_IMPULSE ? str.tostring(retraceLimitInput, "#.#") + "% limit" : "retrace ≤ " + str.tostring(actWindow) + "b"
+            lvlTip = foundKind == KIND_IMPULSE ? "Post-pattern extent test: the reaction to this impulsive structure must hold this level. Trading through it means the structure was not impulsive - abandon the count." : "Post-pattern speed test: this corrective structure should be completely retraced (pattern extreme cleared in the follow-through direction) within the time allowance shown."
+            actBox := box.new(actEndBar, zoneTop, rightX, zoneBot, border_color = color.new(neutralColorInput, 60), border_style = line.style_dashed, border_width = 1, bgcolor = color.new(neutralColorInput, 92))
+            actLine := line.new(actEndBar, zoneLvl, rightX, zoneLvl, color = neutralColorInput, style = line.style_dashed)
+            actLvlLabel := label.new(rightX, zoneLvl, lvlText, style = label.style_label_left, color = #00000000, textcolor = neutralColorInput, size = size.tiny, tooltip = lvlTip)
+        else
+            actBox := na
+            actLine := na
+            actLvlLabel := na
+
+        dashStructText := structText + (netDir == 1 ? " ▲" : " ▼")
+        lastStructKind := foundKind
+        lastStructDir := foundDir
+        lastStructEndBar := actEndBar
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Post-Pattern Logic Monitoring
+//---------------------------------------------------------------------------------------------------------------------{
+if actStatus == STATUS_PENDING and actKind > 0
+    postHigh := math.max(postHigh, dataHigh)
+    postLow := math.min(postLow, dataLow)
+    barsElapsed = bar_index - actEndBar
+    int resolved = 0
+    float resolvedY = close
+    if actKind == KIND_IMPULSE
+        if actDir == 1
+            if postLow < actLimit
+                resolved := STATUS_INVALID
+                resolvedY := actLimit
+            else if postLow <= actStart and barsElapsed <= actWindow
+                resolved := STATUS_INVALID
+                resolvedY := actStart
+            else if postHigh > actEnd
+                resolved := STATUS_CONFIRMED
+                resolvedY := actEnd
+        else
+            if postHigh > actLimit
+                resolved := STATUS_INVALID
+                resolvedY := actLimit
+            else if postHigh >= actStart and barsElapsed <= actWindow
+                resolved := STATUS_INVALID
+                resolvedY := actStart
+            else if postLow < actEnd
+                resolved := STATUS_CONFIRMED
+                resolvedY := actEnd
+    else
+        if actDir == 1
+            if postLow < actViol
+                resolved := STATUS_INVALID
+                resolvedY := actViol
+            else if postHigh > actTarget
+                resolved := STATUS_CONFIRMED
+                resolvedY := actTarget
+            else if barsElapsed > actWindow
+                resolved := STATUS_INVALID
+                resolvedY := actTarget
+        else
+            if postHigh > actViol
+                resolved := STATUS_INVALID
+                resolvedY := actViol
+            else if postLow < actTarget
+                resolved := STATUS_CONFIRMED
+                resolvedY := actTarget
+            else if barsElapsed > actWindow
+                resolved := STATUS_INVALID
+                resolvedY := actTarget
+    if resolved > 0
+        actStatus := resolved
+        resColor = resolved == STATUS_CONFIRMED ? bullColorInput : bearColorInput
+        logicConfirmAlert := resolved == STATUS_CONFIRMED
+        logicInvalidAlert := resolved == STATUS_INVALID
+        if not na(actBox)
+            box.set_border_color(actBox, color.new(resColor, 50))
+            box.set_bgcolor(actBox, color.new(resColor, 90))
+        if not na(actLine)
+            line.set_color(actLine, resColor)
+        if showExpectInput
+            resText = resolved == STATUS_CONFIRMED ? "logic ✓" : "logic ✗"
+            resTip = resolved == STATUS_CONFIRMED ? "Post-pattern behavior matched the label's expectation in extent and speed: the structure label is confirmed." : "Post-pattern behavior failed the label's expectation: under NeoWave logic the label is wrong and the count must be abandoned - exit or re-analyze rather than relabel."
+            label.new(bar_index, resolvedY, resText, style = label.style_label_left, color = #00000000, textcolor = resColor, size = size.small, tooltip = resTip)
+
+// Cap stored pivots
+while array.size(pivotDirsArray) > MAX_PIVOTS
+    array.shift(pivotPricesArray)
+    array.shift(pivotBarsArray)
+    array.shift(pivotDirsArray)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+dashPosition = dashPosInput == "Top Right" ? position.top_right : dashPosInput == "Top Left" ? position.top_left : dashPosInput == "Bottom Right" ? position.bottom_right : position.bottom_left
+dashTextSize = dashSizeInput == "Tiny" ? size.tiny : dashSizeInput == "Small" ? size.small : size.normal
+
+var table dashTable = showDashInput ? table.new(dashPosition, 2, 8, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1) : na
+
+if barstate.islast and showDashInput
+    keyColor = DASH_HEADER
+    valColor = DASH_TEXT
+    string expText = "-"
+    string statusText = "-"
+    color statusColor = keyColor
+    if actKind > 0
+        if actKind == KIND_IMPULSE
+            expText := (actDir == 1 ? "hold ≥ " : "hold ≤ ") + str.tostring(actLimit, format.mintick)
+        else
+            expText := (actDir == 1 ? "clear " : "clear ") + str.tostring(actTarget, format.mintick) + " in ≤ " + str.tostring(actWindow) + "b"
+        if actStatus == STATUS_PENDING
+            barsLeft = math.max(actWindow - (bar_index - actEndBar), 0)
+            statusText := actKind == KIND_IMPULSE ? "pending" : "pending · " + str.tostring(barsLeft) + "b left"
+            statusColor := neutralColorInput
+        else if actStatus == STATUS_CONFIRMED
+            statusText := "confirmed"
+            statusColor := bullColorInput
+        else if actStatus == STATUS_INVALID
+            statusText := "invalidated"
+            statusColor := bearColorInput
+        else
+            statusText := "superseded"
+    table.cell(dashTable, 0, 0, "NeoWave logic", text_color = valColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 0, useHighLow ? "high/low" : "wave chart", text_color = keyColor, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 1, "Last wave", text_color = keyColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 1, dashWaveText, text_color = valColor, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 2, "Price ratio", text_color = keyColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 2, dashPriceText, text_color = valColor, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 3, "Time ratio", text_color = keyColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 3, dashTimeText, text_color = valColor, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 4, "Degree", text_color = keyColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 4, dashHasRatio ? (dashBreak ? "break" : "same") : "-", text_color = dashBreak ? warnColorInput : valColor, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 5, "Structure", text_color = keyColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 5, dashStructText, text_color = valColor, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 6, "Expectation", text_color = keyColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 6, expText, text_color = valColor, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 7, "Logic", text_color = keyColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 7, statusText, text_color = statusColor, text_size = dashTextSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(impulseAlert, "Impulsive Structure (:5) Labeled", "NeoWave logic: five-legged impulsive structure labeled on {{ticker}} {{interval}} - monitoring the post-pattern retracement limit")
+alertcondition(threeAlert, "Corrective Structure (:3) Labeled", "NeoWave logic: three-legged corrective reaction labeled on {{ticker}} {{interval}} - it should be completely retraced within the time allowance")
+alertcondition(triangleAlert, "Triangle Labeled", "NeoWave logic: five-legged triangle (contracting, expanding or neutral) labeled on {{ticker}} {{interval}}")
+alertcondition(diametricAlert, "Diametric Formation Labeled", "NeoWave logic: seven-legged diametric formation labeled on {{ticker}} {{interval}}")
+alertcondition(logicConfirmAlert, "Post-Pattern Logic Confirmed", "NeoWave logic: follow-through confirmed the last structure label on {{ticker}} {{interval}}")
+alertcondition(logicInvalidAlert, "Post-Pattern Logic Invalidated", "NeoWave logic: follow-through failed the last structure label on {{ticker}} {{interval}} - abandon the count and re-analyze")
+alertcondition(degreeBreakAlert, "Degree Break (Similarity Failure)", "NeoWave logic: adjacent waves on {{ticker}} {{interval}} fail the rule of similarity and balance in both price and time - not the same degree")
+
+//---------------------------------------------------------------------------------------------------------------------}

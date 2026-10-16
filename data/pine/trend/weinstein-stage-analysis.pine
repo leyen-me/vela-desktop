@@ -1,0 +1,447 @@
+// This work is licensed under Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Weinstein Stage Analysis", shorttitle = "Weinstein Stage Analysis", overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Stage identity hues: the two ranges (base, top) and the two trends (advance, decline)
+color S1_COLOR      = #ab47bc
+color S2_COLOR      = #089981
+color S3_COLOR      = #ff9800
+color S4_COLOR      = #f23645
+color NEUTRAL_COLOR = #787b86
+color HIDDEN_COLOR  = #00000000
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+int BOX_TRANSP    = 88
+int BORDER_TRANSP = 45
+int CELL_TRANSP   = 80
+
+string GRP_MA    = 'Moving Average'
+string GRP_STAGE = 'Stage Rules'
+string GRP_RS    = 'Mansfield Relative Strength'
+string GRP_TRADE = 'Trade Management'
+string GRP_DASH  = 'Dashboard'
+string GRP_STYLE = 'Style'
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+maWeeksInput = input.int(30, 'MA Length (weeks)', minval = 5, maxval = 100, group = GRP_MA, tooltip = 'Weinstein\'s 30-week moving average, the backbone of the method. The length is given in weeks and converted to chart bars: 30 bars on a weekly chart, 150 on a daily stock chart (5 sessions a week) and 210 on a 7-day market. The method is designed for weekly charts; daily charts give the same stages with earlier, noisier transitions.')
+
+maTypeInput = input.string('SMA', 'MA Type', options = ['SMA', 'EMA', 'WMA'], group = GRP_MA, tooltip = 'Weinstein used a simple moving average. EMA and WMA react faster to turns.')
+
+maColorInput = input.string('Stage', 'MA Color', options = ['Stage', 'Slope'], group = GRP_MA, tooltip = 'Color the MA by the current stage, or by its own slope (rising, flat, falling).')
+
+slopeWeeksInput = input.int(4, 'Slope Lookback (weeks)', minval = 1, maxval = 26, group = GRP_MA, tooltip = 'The MA slope is its percentage change over this many weeks. The stage machine reads the slope as rising, flat or falling.')
+
+flatBandInput = input.float(1.0, 'Flat Band %', minval = 0.1, maxval = 10, step = 0.1, group = GRP_MA, tooltip = 'A change inside plus or minus this percentage over the slope lookback reads as a flat MA, the signature of Stage 1 bases and Stage 3 tops. Above it the MA is rising, below it falling.')
+
+minBaseWeeksInput = input.int(4, 'Minimum Base (weeks)', minval = 1, maxval = 52, group = GRP_STAGE, tooltip = 'A Stage 1 base must last at least this long before a breakout above its resistance counts as Stage 2. Bases that are too short have not absorbed the supply left by the decline.')
+
+rangeWeeksInput = input.int(10, 'Range Lookback (weeks)', minval = 2, maxval = 52, group = GRP_STAGE, tooltip = 'When Stage 1 begins, the base is anchored on the lowest low of this many prior weeks (the decline low) and spans every high since; when Stage 3 begins, the top is anchored on the highest high (the Stage 2 peak) and spans every low since. The range then widens with every bar until price closes outside it: above resistance for Stage 2, below support for Stage 4.')
+
+slopeFilterInput = input.bool(true, 'MA Must Not Oppose the Break', group = GRP_STAGE, tooltip = 'Weinstein\'s core filter: a Stage 2 breakout is only accepted while the MA is not falling, and a Stage 4 breakdown only while it is not rising. Never buy below a declining 30-week MA, never short above a rising one.')
+
+volWeeksInput = input.int(4, 'Volume Average (weeks)', minval = 1, maxval = 52, group = GRP_STAGE, tooltip = 'Breakout volume is compared with the average volume of this many prior weeks.')
+
+volMultInput = input.float(2.0, 'Breakout Volume (x average)', minval = 1.0, maxval = 10, step = 0.1, group = GRP_STAGE, tooltip = 'Weinstein wants a Stage 2 breakout on volume at least twice the recent average. Every breakout reports its volume ratio; breakouts below this multiple are graded light.')
+
+volFilterInput = input.bool(false, 'Require Breakout Volume', group = GRP_STAGE, tooltip = 'Reject Stage 2 breakouts traded below the volume multiple instead of only grading them. Breakdowns are never volume filtered: Weinstein notes a stock can fall of its own weight. Ignored on symbols without volume.')
+
+benchInput = input.symbol('SP:SPX', 'Benchmark', group = GRP_RS, tooltip = 'Market index the chart symbol is measured against for the Mansfield Relative Strength line.')
+
+rsWeeksInput = input.int(52, 'Mansfield RS Length (weeks)', minval = 4, maxval = 104, group = GRP_RS, tooltip = 'Mansfield RS = (price / benchmark) divided by its own moving average over this many weeks, minus 1, in percent. Above zero the symbol is outperforming its usual relationship to the market, below zero it is lagging.')
+
+rsFilterInput = input.bool(false, 'Require Positive RS for Stage 2', group = GRP_RS, tooltip = 'Only accept Stage 2 breakouts while Mansfield RS is above zero, the way Weinstein screened for leaders. Ignored when the benchmark cannot be loaded.')
+
+retestInput = input.bool(true, 'Mark Retests of the Break Level', group = GRP_STAGE, tooltip = 'Weinstein\'s second entry: after a Stage 2 breakout, the first pullback that tests the old resistance and closes back above it; after a Stage 4 breakdown, the first rally that tests the old support and closes back below it.')
+
+retestWeeksInput = input.int(8, 'Retest Window (weeks)', minval = 1, maxval = 52, group = GRP_STAGE, tooltip = 'How long after the break a retest is still marked.')
+
+retestTolInput = input.float(2.0, 'Retest Tolerance %', minval = 0, maxval = 10, step = 0.25, group = GRP_STAGE, tooltip = 'How close to the break level a pullback must come to count as a test.')
+
+tradeInput = input.string('Long & Short', 'Trades', options = ['Long & Short', 'Long Only', 'Off'], group = GRP_TRADE, tooltip = 'Long entries on Stage 2 breakouts, short entries on Stage 4 breakdowns, each with a protective stop managed the way Weinstein describes.')
+
+stopWeeksInput = input.int(4, 'Initial Stop Lookback (weeks)', minval = 1, maxval = 26, group = GRP_TRADE, tooltip = 'The initial stop sits just beyond the most recent correction extreme: the lowest low of this many weeks before a long breakout, the highest high before a short breakdown.')
+
+trailInput = input.bool(true, 'Trail Behind Corrections', group = GRP_TRADE, tooltip = 'Raise a long stop to just below each confirmed correction low once the advance makes a new high above the peak that preceded it (mirror for shorts), and tighten it to the range edge when the next range stage begins: Stage 3 for longs, Stage 1 for shorts. Waiting for the new extreme keeps the stop under real corrections, not every pause.')
+
+swingWeeksInput = input.int(1, 'Correction Swing Length (weeks)', minval = 1, maxval = 8, group = GRP_TRADE, tooltip = 'Bars on each side a low (high) must dominate to count as a correction extreme for the trailing stop, in weeks. A swing is known only this long after it prints.')
+
+bufferInput = input.float(0.5, 'Stop Buffer %', minval = 0, maxval = 10, step = 0.1, group = GRP_TRADE, tooltip = 'Distance placed beyond each stop reference so the stop does not sit exactly on a round low or high.')
+
+showDashInput = input.bool(true, 'Show Dashboard', group = GRP_DASH)
+dashPosInput  = input.string('Bottom Right', 'Position', options = ['Top Right', 'Top Left', 'Bottom Right', 'Bottom Left'], inline = 'dash', group = GRP_DASH)
+dashSizeInput = input.string('Small', 'Size', options = ['Tiny', 'Small', 'Normal'], inline = 'dash', group = GRP_DASH)
+
+showBoxesInput  = input.bool(true, 'Range Boxes', group = GRP_STYLE, tooltip = 'Box each Stage 1 base and Stage 3 top from its seed to the bar that resolves it.')
+showLabelsInput = input.bool(true, 'Stage Labels', group = GRP_STYLE)
+showBgInput     = input.bool(false, 'Stage Background', group = GRP_STYLE, tooltip = 'Faint background tint in the current stage color.')
+bgTranspInput   = input.int(94, 'Background Transparency', minval = 80, maxval = 100, group = GRP_STYLE)
+s1ColorInput    = input.color(S1_COLOR, 'Stage 1', inline = 'c1', group = GRP_STYLE)
+s2ColorInput    = input.color(S2_COLOR, 'Stage 2', inline = 'c1', group = GRP_STYLE)
+s3ColorInput    = input.color(S3_COLOR, 'Stage 3', inline = 'c2', group = GRP_STYLE)
+s4ColorInput    = input.color(S4_COLOR, 'Stage 4', inline = 'c2', group = GRP_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+stageColor(int s) =>
+    switch s
+        1 => s1ColorInput
+        2 => s2ColorInput
+        3 => s3ColorInput
+        4 => s4ColorInput
+        => NEUTRAL_COLOR
+
+stageName(int s) =>
+    switch s
+        1 => 'Stage 1 · Basing'
+        2 => 'Stage 2 · Advancing'
+        3 => 'Stage 3 · Topping'
+        4 => 'Stage 4 · Declining'
+        => 'Undetermined'
+
+fmtPrice(float v) =>
+    na(v) ? '-' : str.tostring(v, format.mintick)
+
+fmtSigned(float v, string fmt) =>
+    na(v) ? 'n/a' : (v >= 0 ? '+' : '') + str.tostring(v, fmt)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Bars per week on the chart timeframe: weekly 1, daily 5 (7 on 7-day markets), intraday from the session length
+bool  sevenDay    = syminfo.type == 'crypto'
+float barsPerWeek = timeframe.isweekly ? 1.0 / timeframe.multiplier : timeframe.ismonthly ? 1.0 / (4.345 * timeframe.multiplier) : timeframe.isdaily ? (sevenDay ? 7.0 : 5.0) / timeframe.multiplier : (sevenDay ? 7.0 * 1440 : 5.0 * 390) / math.max(1.0, timeframe.in_seconds(timeframe.period) / 60.0)
+
+int maLen    = math.max(2, math.round(maWeeksInput * barsPerWeek))
+int slopeLen = math.max(1, math.round(slopeWeeksInput * barsPerWeek))
+int baseLen  = math.max(1, math.round(minBaseWeeksInput * barsPerWeek))
+int rangeLen = math.max(2, math.round(rangeWeeksInput * barsPerWeek))
+int volLen   = math.max(1, math.round(volWeeksInput * barsPerWeek))
+int rsLen    = math.max(2, math.round(rsWeeksInput * barsPerWeek))
+int stopLen  = math.max(1, math.round(stopWeeksInput * barsPerWeek))
+int swingLen = math.max(2, math.round(swingWeeksInput * barsPerWeek))
+int retestLen = math.max(1, math.round(retestWeeksInput * barsPerWeek))
+
+float maSma = ta.sma(close, maLen)
+float maEma = ta.ema(close, maLen)
+float maWma = ta.wma(close, maLen)
+float ma    = maTypeInput == 'EMA' ? maEma : maTypeInput == 'WMA' ? maWma : maSma
+
+float slopePct   = ma[slopeLen] > 0 ? (ma / ma[slopeLen] - 1) * 100 : na
+int   slopeState = na(slopePct) ? 0 : slopePct > flatBandInput ? 1 : slopePct < -flatBandInput ? -1 : 0
+
+// Mansfield relative strength against the benchmark (na when the benchmark cannot be loaded)
+float benchClose = request.security(benchInput, timeframe.period, close, ignore_invalid_symbol = true)
+float rsRatio    = benchClose > 0 ? close / benchClose : na
+float rsRatioMa  = ta.sma(rsRatio, rsLen)
+float mansfield  = rsRatioMa > 0 ? (rsRatio / rsRatioMa - 1) * 100 : na
+bool  rsKnown    = not na(mansfield)
+
+// Volume against the average of the prior weeks
+float volAvg   = ta.sma(nz(volume), volLen)[1]
+float volRatio = volAvg > 0 ? nz(volume) / volAvg : na
+
+// per-bar history indexed by bar_index, read when a range is seeded
+var array<float> highArr = array.new<float>()
+var array<float> lowArr  = array.new<float>()
+array.push(highArr, high)
+array.push(lowArr, low)
+
+float atrVal   = ta.atr(14)
+float stopLow  = ta.lowest(low, stopLen)
+float stopHigh = ta.highest(high, stopLen)
+float pivLow   = ta.pivotlow(low, swingLen, swingLen)
+float pivHigh  = ta.pivothigh(high, swingLen, swingLen)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Stage Machine
+//---------------------------------------------------------------------------------------------------------------------{
+
+var int   stage      = 0
+var int   stageStart = na
+var float rangeTop   = na
+var float rangeBot   = na
+var int   rangeLeft  = na
+var box   rangeBox   = na
+var float lastBreakVol = na
+var float breakLevel   = na
+var bool  retested     = true
+
+// trade state: 1 long, -1 short
+var int   pos      = 0
+var float stopLvl  = na
+var float entryPx  = na
+var int   entryBar = na
+var float tradeExt = na // best extreme since entry: highest high long, lowest low short
+var float candStop = na // pending correction extreme, promoted once the trend makes a new extreme
+var float candRef  = na
+
+bool toS1 = false
+bool toS2 = false
+bool toS3 = false
+bool toS4 = false
+bool longEntry  = false
+bool shortEntry = false
+bool retestUp   = false
+bool retestDown = false
+bool longExit   = false
+bool shortExit  = false
+string exitWhy  = ''
+bool initial    = false
+
+bool ready  = not na(ma) and not na(slopePct) and barstate.isconfirmed
+bool volOk  = not volFilterInput or na(volRatio) or nz(volume) == 0 or volRatio >= volMultInput
+bool rsOk   = not rsFilterInput or not rsKnown or mansfield > 0
+bool upOk   = not slopeFilterInput or slopeState >= 0
+bool downOk = not slopeFilterInput or slopeState <= 0
+
+if ready
+    int prevStage = stage
+    switch stage
+        0 =>
+            if close > ma and slopeState == 1
+                toS2 := true
+            else if close < ma and slopeState == -1
+                toS4 := true
+        1 =>
+            if bar_index - stageStart >= baseLen and close > rangeTop and close > ma and upOk and volOk and rsOk
+                toS2 := true
+            else if close < rangeBot and close < ma and downOk
+                toS4 := true
+        2 =>
+            if close < ma and slopeState <= 0
+                toS3 := true
+        3 =>
+            if close < rangeBot and close < ma and downOk
+                toS4 := true
+            else if close > rangeTop and close > ma and upOk and volOk and rsOk
+                toS2 := true
+        4 =>
+            if close > ma and slopeState >= 0
+                toS1 := true
+
+    int newStage = toS1 ? 1 : toS2 ? 2 : toS3 ? 3 : toS4 ? 4 : stage
+    initial := prevStage == 0
+
+    if newStage != stage
+        // close the range box of the stage being left
+        if not na(rangeBox)
+            box.set_right(rangeBox, bar_index)
+            rangeBox := na
+
+        // the level the break cleared: resistance for Stage 2, support for Stage 4
+        if newStage == 2 or newStage == 4
+            breakLevel := newStage == 2 ? rangeTop : rangeBot
+            retested   := na(breakLevel)
+
+        stage      := newStage
+        stageStart := bar_index
+
+        if newStage == 1 or newStage == 3
+            // anchor the range on the extreme that ended the prior trend: the decline low for a base,
+            // the advance high for a top, then span everything traded since
+            bool  isBase = newStage == 1
+            int   first  = math.max(0, bar_index - rangeLen + 1)
+            int   anchor = bar_index
+            float ext    = isBase ? low : high
+            for b = first to bar_index
+                float v = isBase ? array.get(lowArr, b) : array.get(highArr, b)
+                if (isBase and v < ext) or (not isBase and v > ext)
+                    ext    := v
+                    anchor := b
+            float opp = isBase ? high : low
+            for b = anchor to bar_index
+                opp := isBase ? math.max(opp, array.get(highArr, b)) : math.min(opp, array.get(lowArr, b))
+            rangeTop  := isBase ? opp : ext
+            rangeBot  := isBase ? ext : opp
+            rangeLeft := anchor
+            if showBoxesInput
+                color c = stageColor(newStage)
+                rangeBox := box.new(rangeLeft, rangeTop, bar_index, rangeBot, border_color = color.new(c, BORDER_TRANSP), bgcolor = color.new(c, BOX_TRANSP), text = newStage == 1 ? 'Stage 1 base' : 'Stage 3 top', text_size = size.small, text_color = c, text_halign = text.align_left, text_valign = newStage == 1 ? text.align_top : text.align_bottom)
+        else
+            rangeTop := na
+            rangeBot := na
+
+        if newStage == 2
+            lastBreakVol := volRatio
+
+        if showLabelsInput and (newStage == 2 or newStage == 4 or not showBoxesInput)
+            color  c      = stageColor(newStage)
+            // trend-stage labels sit beyond the break, over the space price is leaving behind
+            bool   below  = newStage == 1 or newStage == 4
+            string what   = prevStage == 0 ? 'Stage ' + str.tostring(newStage) : newStage == 2 ? (prevStage == 3 ? 'Stage 2 resumes' : 'Stage 2 breakout') : newStage == 4 ? (prevStage == 1 ? 'Stage 4 resumes' : 'Stage 4 breakdown') : newStage == 1 ? 'Stage 1' : 'Stage 3'
+            string volTxt = na(volRatio) or nz(volume) == 0 ? 'n/a' : str.tostring(volRatio, '0.0') + 'x average' + (newStage == 2 ? (volRatio >= volMultInput ? ' (strong)' : ' (light)') : '')
+            string tip    = stageName(newStage) + '\nMA slope ' + fmtSigned(slopePct, '#.##') + '% over ' + str.tostring(slopeWeeksInput) + ' weeks\nVolume ' + volTxt + '\nMansfield RS ' + fmtSigned(mansfield, '#.#')
+            float  y      = below ? math.min(low, low[1], low[2]) - 0.3 * atrVal : math.max(high, high[1], high[2]) + 0.3 * atrVal
+            label.new(bar_index, y, what, style = below ? label.style_label_up : label.style_label_down, color = newStage == 2 or newStage == 4 ? c : HIDDEN_COLOR, textcolor = newStage == 2 or newStage == 4 ? color.white : c, size = size.small, tooltip = tip)
+    else if (stage == 2 or stage == 4) and retestInput and not retested and bar_index - stageStart <= retestLen
+        float tol = retestTolInput / 100
+        if stage == 2 and low <= breakLevel * (1 + tol) and close > breakLevel and close > ma
+            retestUp := true
+            retested := true
+        else if stage == 4 and high >= breakLevel * (1 - tol) and close < breakLevel and close < ma
+            retestDown := true
+            retested   := true
+        if retestUp or retestDown
+            color c = stageColor(stage)
+            label.new(bar_index, retestUp ? low : high, 'Retest', style = retestUp ? label.style_label_up : label.style_label_down, color = HIDDEN_COLOR, textcolor = c, size = size.small, tooltip = (retestUp ? 'Pullback to the broken resistance ' : 'Rally to the broken support ') + fmtPrice(breakLevel) + (retestUp ? ' held: Weinstein\'s second chance to buy Stage 2' : ' failed: Weinstein\'s second chance to short Stage 4'))
+            line.new(stageStart, breakLevel, bar_index, breakLevel, color = color.new(c, 40), style = line.style_dotted)
+    else if stage == 1 or stage == 3
+        // the range widens until price closes outside it
+        rangeTop := math.max(rangeTop, high)
+        rangeBot := math.min(rangeBot, low)
+        if not na(rangeBox)
+            box.set_right(rangeBox, bar_index)
+            box.set_top(rangeBox, rangeTop)
+            box.set_bottom(rangeBox, rangeBot)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Trade Management
+//---------------------------------------------------------------------------------------------------------------------{
+
+float buf = bufferInput / 100
+
+if ready and tradeInput != 'Off'
+    // manage the open position first, on bars after the entry
+    if pos == 1 and bar_index > entryBar
+        // a correction low becomes the stop only after the advance clears the high that preceded it
+        if trailInput and not na(candStop) and close > candRef
+            stopLvl  := math.max(stopLvl, candStop * (1 - buf))
+            candStop := na
+        if trailInput and not na(pivLow) and pivLow * (1 - buf) > stopLvl
+            candStop := pivLow
+            candRef  := tradeExt
+        tradeExt := math.max(tradeExt, high)
+        if trailInput and toS3 and not na(rangeBot)
+            stopLvl := math.max(stopLvl, rangeBot * (1 - buf))
+        if close < stopLvl or toS4
+            longExit := true
+            exitWhy  := toS4 ? 'Stage 4 breakdown' : 'Stop'
+            pos      := 0
+    else if pos == -1 and bar_index > entryBar
+        // a rally high becomes the stop only after the decline breaks the low that preceded it
+        if trailInput and not na(candStop) and close < candRef
+            stopLvl  := math.min(stopLvl, candStop * (1 + buf))
+            candStop := na
+        if trailInput and not na(pivHigh) and pivHigh * (1 + buf) < stopLvl
+            candStop := pivHigh
+            candRef  := tradeExt
+        tradeExt := math.min(tradeExt, low)
+        if trailInput and toS1 and not na(rangeTop)
+            stopLvl := math.min(stopLvl, rangeTop * (1 + buf))
+        if close > stopLvl or toS2
+            shortExit := true
+            exitWhy   := toS2 ? 'Stage 2 breakout' : 'Stop'
+            pos       := 0
+
+    if longExit or shortExit
+        float pnl = (longExit ? close / entryPx - 1 : 1 - close / entryPx) * 100
+        string txt = (longExit ? 'Exit long ' : 'Cover short ') + fmtSigned(pnl, '#.#') + '%'
+        label.new(bar_index, longExit ? high : low, txt, style = longExit ? label.style_label_down : label.style_label_up, color = HIDDEN_COLOR, textcolor = NEUTRAL_COLOR, size = size.small, tooltip = exitWhy + ' at ' + fmtPrice(close) + ' after ' + str.tostring(bar_index - entryBar) + ' bars')
+
+    // new entries on the breakout bars (the first classification is a reading, not a break)
+    if toS2 and pos != 1 and not initial
+        pos       := 1
+        entryPx   := close
+        entryBar  := bar_index
+        stopLvl   := stopLow * (1 - buf)
+        tradeExt  := high
+        candStop  := na
+        longEntry := true
+    else if toS4 and pos != -1 and tradeInput == 'Long & Short' and not initial
+        pos        := -1
+        entryPx    := close
+        entryBar   := bar_index
+        stopLvl    := stopHigh * (1 + buf)
+        tradeExt   := low
+        candStop   := na
+        shortEntry := true
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+
+color slopeColor = slopeState == 1 ? s2ColorInput : slopeState == -1 ? s4ColorInput : NEUTRAL_COLOR
+color maColor    = maColorInput == 'Stage' ? stageColor(stage) : slopeColor
+plot(ma, 'Stage MA', color = maColor, linewidth = 2)
+
+plot(pos == 1 ? stopLvl : na, 'Long Stop', color = s2ColorInput, style = plot.style_steplinebr, linewidth = 1)
+plot(pos == -1 ? stopLvl : na, 'Short Stop', color = s4ColorInput, style = plot.style_steplinebr, linewidth = 1)
+
+plot(mansfield, 'Mansfield RS', color = na, display = display.data_window)
+plot(stage, 'Stage', color = na, display = display.data_window)
+
+bgcolor(showBgInput and stage > 0 ? color.new(stageColor(stage), bgTranspInput) : na, title = 'Stage Background')
+
+// dashboard
+var table dash = na
+
+if showDashInput and barstate.islast
+    string pos_ = switch dashPosInput
+        'Top Right'   => position.top_right
+        'Top Left'    => position.top_left
+        'Bottom Left' => position.bottom_left
+        => position.bottom_right
+
+    string sz = switch dashSizeInput
+        'Tiny'   => size.tiny
+        'Normal' => size.normal
+        => size.small
+
+    if na(dash)
+        dash := table.new(pos_, 2, 8, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+        table.merge_cells(dash, 0, 0, 1, 0)
+
+    color  sc       = stageColor(stage)
+    float  weeksIn  = na(stageStart) ? na : (bar_index - stageStart) / barsPerWeek
+    string slopeTxt = (slopeState == 1 ? 'Rising ' : slopeState == -1 ? 'Falling ' : 'Flat ') + fmtSigned(slopePct, '#.#') + '%'
+    float  distPct  = ma > 0 ? (close / ma - 1) * 100 : na
+    string warmTxt  = na(ma) ? 'Needs ' + str.tostring(maLen) + ' bars' : stageName(stage)
+    string rsTxt    = rsKnown ? fmtSigned(mansfield, '#.#') + (mansfield > nz(mansfield[slopeLen]) ? ' rising' : ' falling') : 'no benchmark data'
+    string posTxt   = pos == 1 ? 'Long · stop ' + fmtPrice(stopLvl) : pos == -1 ? 'Short · stop ' + fmtPrice(stopLvl) : 'Flat'
+
+    table.cell(dash, 0, 0, 'Weinstein Stage Analysis', text_color = DASH_TEXT, text_size = sz)
+    table.cell(dash, 0, 1, 'Stage', text_color = DASH_HEADER, text_size = sz, text_halign = text.align_left)
+    table.cell(dash, 1, 1, warmTxt, text_color = sc, bgcolor = color.new(sc, CELL_TRANSP), text_size = sz)
+    table.cell(dash, 0, 2, 'Weeks in stage', text_color = DASH_HEADER, text_size = sz, text_halign = text.align_left)
+    table.cell(dash, 1, 2, na(weeksIn) ? '-' : str.tostring(math.floor(weeksIn)), text_color = DASH_TEXT, text_size = sz)
+    table.cell(dash, 0, 3, str.tostring(maWeeksInput) + '-week MA', text_color = DASH_HEADER, text_size = sz, text_halign = text.align_left)
+    table.cell(dash, 1, 3, slopeTxt, text_color = slopeColor, text_size = sz)
+    table.cell(dash, 0, 4, 'Price vs MA', text_color = DASH_HEADER, text_size = sz, text_halign = text.align_left)
+    table.cell(dash, 1, 4, fmtSigned(distPct, '#.#') + '%', text_color = DASH_TEXT, text_size = sz)
+    table.cell(dash, 0, 5, 'Mansfield RS', text_color = DASH_HEADER, text_size = sz, text_halign = text.align_left)
+    table.cell(dash, 1, 5, rsTxt, text_color = rsKnown ? (mansfield > 0 ? s2ColorInput : s4ColorInput) : DASH_HEADER, text_size = sz)
+    table.cell(dash, 0, 6, 'Last breakout volume', text_color = DASH_HEADER, text_size = sz, text_halign = text.align_left)
+    table.cell(dash, 1, 6, na(lastBreakVol) ? '-' : str.tostring(lastBreakVol, '0.0') + 'x avg', text_color = DASH_TEXT, text_size = sz)
+    table.cell(dash, 0, 7, 'Position', text_color = DASH_HEADER, text_size = sz, text_halign = text.align_left)
+    table.cell(dash, 1, 7, posTxt, text_color = pos == 1 ? s2ColorInput : pos == -1 ? s4ColorInput : DASH_TEXT, text_size = sz)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(toS1, 'Stage 1 Base', 'Weinstein stage analysis: {{ticker}} entered Stage 1, the decline has stopped and a base is forming around a flattening MA.')
+alertcondition(toS2, 'Stage 2 Breakout', 'Weinstein stage analysis: {{ticker}} entered Stage 2 with a close above its range resistance and the MA.')
+alertcondition(toS3, 'Stage 3 Top', 'Weinstein stage analysis: {{ticker}} entered Stage 3, the advance has stalled below a flattening MA.')
+alertcondition(toS4, 'Stage 4 Breakdown', 'Weinstein stage analysis: {{ticker}} entered Stage 4 with a close below its range support and the MA.')
+alertcondition(retestUp, 'Stage 2 Retest', 'Weinstein stage analysis: {{ticker}} pulled back to its Stage 2 breakout level and closed back above it.')
+alertcondition(retestDown, 'Stage 4 Retest', 'Weinstein stage analysis: {{ticker}} rallied to its Stage 4 breakdown level and closed back below it.')
+alertcondition(longExit, 'Long Exit', 'Weinstein stage analysis: {{ticker}} long stop hit or Stage 4 breakdown.')
+alertcondition(shortExit, 'Short Cover', 'Weinstein stage analysis: {{ticker}} short stop hit or Stage 2 breakout.')
+
+//---------------------------------------------------------------------------------------------------------------------}

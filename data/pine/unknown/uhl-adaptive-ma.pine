@@ -1,0 +1,194 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("UHL Adaptive MA", shorttitle = "UHL Adaptive MA", overlay = true)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+HOLD_COLOR    = #787b86 // gate closed - the baseline holds flat
+NEUTRAL_COLOR = #787b86 // slope coloring disabled
+STEP_COLOR    = #ff9800 // the one accent - the fast trend-step line of the two-line form
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+FILL_STEP_TRANSP = 60  // gradient transparency at the trend-step end of the fill
+FILL_BASE_TRANSP = 100 // gradient transparency at the corrected-baseline end of the fill
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+srcInput = input.source(close, "Source", group = "Settings",
+     tooltip = "Series the variance-gated correction is applied to. The corrected average converges on this series' simple average while the trend-step line converges on the series itself — the gate works on any noisy input, not just price.")
+
+lengthInput = input.int(100, "Lookback Length", minval = 2, group = "Settings",
+     tooltip = "Single lookback driving both sides of the gate: the variance estimate (the noise band) and the SMA target. There is no universal setting — longer lookbacks widen the noise band, giving flatter lines with later, larger steps; shorter ones step more often. Match it to your holding period.")
+
+showStepInput = input.bool(true, "Show Trend-Step Line", group = "Settings",
+     tooltip = "Plots the fast corrected line, built by applying the same variance-gated correction directly to the raw source. Its crossings with the slow corrected baseline define the bullish and bearish states of the two-line form.")
+
+showDashboardInput = input.bool(true, "Show Dashboard", group = "Dashboard",
+     tooltip = "Displays a compact panel with the two-line trend state, whether the variance gate is holding or stepping, the current correction factor, and how long the baseline has held flat.")
+
+dashboardLocationInput = input.string("Top Right", "Location", options = ["Top Right", "Bottom Right", "Bottom Left", "Top Left"], group = "Dashboard",
+     tooltip = "Chart corner the dashboard is anchored to.")
+
+dashboardSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = "Dashboard",
+     tooltip = "Text size of the dashboard.")
+
+slopeColorInput = input.bool(true, "Slope Coloring", group = "Style",
+     tooltip = "Colors the corrected average by its behavior — bullish while stepping up, bearish while stepping down, and the holding color while the variance gate keeps it flat. Disable to draw the line in the neutral color.")
+
+adaptiveGradientInput = input.bool(true, "Adaptivity Gradient", group = "Style",
+     tooltip = "Blends the step colors toward the holding color according to the correction factor, so timid corrections stay pale and decisive jumps saturate. Also fades the trend-step line while its own gate is closed.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "state", group = "Style",
+     tooltip = "Bullish color, used for upward steps, the bullish side of the trend fill, and bullish crossover markers.")
+
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "state", group = "Style",
+     tooltip = "Bearish color, used for downward steps, the bearish side of the trend fill, and bearish crossover markers.")
+
+holdColorInput = input.color(HOLD_COLOR, "Holding", inline = "state", group = "Style",
+     tooltip = "Color of the corrected average while the correction factor sits at zero and the line holds its prior value.")
+
+neutralColorInput = input.color(NEUTRAL_COLOR, "Neutral", group = "Style",
+     tooltip = "Line color used when slope coloring is disabled.")
+
+stepColorInput = input.color(STEP_COLOR, "Trend-Step Line", group = "Style",
+     tooltip = "Color of the fast trend-step line.")
+
+lineWidthInput = input.int(2, "Line Width", minval = 1, maxval = 5, group = "Style",
+     tooltip = "Width of the corrected average. The trend-step line is drawn one step thinner.")
+
+showFillInput = input.bool(true, "Trend Gradient Fill", group = "Style",
+     tooltip = "Fills the area between the trend-step line and the corrected baseline with a vertical gradient — bullish while the fast line holds above the baseline, bearish while below — fading to fully transparent at the baseline. Requires the trend-step line.")
+
+showCrossesInput = input.bool(false, "Crossover Markers", group = "Style",
+     tooltip = "Displays small triangle markers where the trend-step line crosses the corrected baseline. Off by default to keep the chart clean — the crossover alerts work regardless.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// @function            Uhl's variance-gated correction — moves the previous value toward the target by a re-derived
+//                      fraction equal to 1 minus the ratio of lookback variance to the squared gap, floored at zero.
+//                      A gap inside the variance leaves the value untouched; a gap far beyond it converges rapidly.
+// @param previous      (float) Corrected value carried from the prior bar
+// @param target        (float) Value the correction converges on this bar
+// @param noiseVariance (float) Variance of the source over the lookback
+// @returns             [corrected value, correction factor]
+uhlCorrection(float previous, float target, float noiseVariance) =>
+    float sigmaSquared = math.max(noiseVariance, 0)
+    float prevValue    = nz(previous, target)
+    float gapSquared   = math.pow(prevValue - target, 2)
+    float factor       = not na(sigmaSquared) and gapSquared > sigmaSquared ? 1 - sigmaSquared / gapSquared : 0.0
+    float corrected    = na(target) or na(sigmaSquared) ? na : prevValue + factor * (target - prevValue)
+    [corrected, factor]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+// One lookback drives both sides of the gate — the noise band and the SMA target
+priceVariance = ta.variance(srcInput, lengthInput)
+smaTarget     = ta.sma(srcInput, lengthInput)
+
+// Corrected average — the variance-gated update applied toward the simple average (the slow baseline)
+float correctedMa = na
+[maValue, maFactor] = uhlCorrection(correctedMa[1], smaTarget, priceVariance)
+correctedMa := maValue
+
+// Trend-step line — the same correction applied toward the raw source (the fast line of the two-line form)
+float trendStep = na
+[stepValue, stepFactor] = uhlCorrection(trendStep[1], srcInput, priceVariance)
+trendStep := stepValue
+
+// Gate state — step direction, flat holds, and how long the baseline has held still
+maDelta   = correctedMa - correctedMa[1]
+isHolding = not na(maDelta) and maDelta == 0
+
+var int holdBars = 0
+holdBars := isHolding ? holdBars + 1 : 0
+
+// Events — slope turns out of a hold, the gate closing, and two-line crossings
+stepUp    = not na(maDelta) and maDelta > 0 and nz(maDelta[1]) <= 0
+stepDown  = not na(maDelta) and maDelta < 0 and nz(maDelta[1]) >= 0
+holdStart = isHolding and nz(maDelta[1]) != 0
+
+crossUp   = ta.crossover(trendStep, correctedMa)
+crossDown = ta.crossunder(trendStep, correctedMa)
+
+trendUp = trendStep > correctedMa
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+gradientFactor = math.min(nz(maFactor), 1)
+
+maColor = switch
+    not slopeColorInput => neutralColorInput
+    maDelta > 0         => adaptiveGradientInput ? color.from_gradient(gradientFactor, 0, 1, holdColorInput, bullColorInput) : bullColorInput
+    maDelta < 0         => adaptiveGradientInput ? color.from_gradient(gradientFactor, 0, 1, holdColorInput, bearColorInput) : bearColorInput
+    => holdColorInput
+
+stepGradient = math.min(nz(stepFactor), 1)
+stepColor    = adaptiveGradientInput ? color.from_gradient(stepGradient, 0, 1, color.new(stepColorInput, 60), stepColorInput) : stepColorInput
+
+stepPlotId = plot(showStepInput ? trendStep : na, "Trend-Step Line", color = stepColor, linewidth = math.max(lineWidthInput - 1, 1))
+maPlotId   = plot(correctedMa, "Corrected MA", color = maColor, linewidth = lineWidthInput)
+
+fillTopColor    = showFillInput ? (trendUp ? color.new(bullColorInput, FILL_STEP_TRANSP) : color.new(bearColorInput, FILL_BASE_TRANSP)) : na
+fillBottomColor = showFillInput ? (trendUp ? color.new(bullColorInput, FILL_BASE_TRANSP) : color.new(bearColorInput, FILL_STEP_TRANSP)) : na
+
+fill(stepPlotId, maPlotId, top_value = math.max(trendStep, correctedMa), bottom_value = math.min(trendStep, correctedMa), top_color = fillTopColor, bottom_color = fillBottomColor, title = "Trend Gradient Fill")
+
+plotshape(showCrossesInput and crossUp, "Bullish Crossover", shape.triangleup, location.belowbar, color = bullColorInput, size = size.tiny)
+plotshape(showCrossesInput and crossDown, "Bearish Crossunder", shape.triangledown, location.abovebar, color = bearColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+dashboardLocation = switch dashboardLocationInput
+    "Top Right"    => position.top_right
+    "Bottom Right" => position.bottom_right
+    "Bottom Left"  => position.bottom_left
+    => position.top_left
+
+dashboardTextSize = switch dashboardSizeInput
+    "Tiny"  => size.tiny
+    "Small" => size.small
+    => size.normal
+
+var table dashboardTable = table.new(dashboardLocation, 2, 4, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+if barstate.islast and showDashboardInput
+    naData     = na(trendStep) or na(correctedMa)
+    trendText  = naData ? "—" : trendUp ? "Bullish" : "Bearish"
+    trendColor = naData ? holdColorInput : trendUp ? bullColorInput : bearColorInput
+    stateText  = na(maDelta) ? "—" : maDelta > 0 ? "Stepping ▲" : maDelta < 0 ? "Stepping ▼" : "Holding"
+    stateColor = na(maDelta) or maDelta == 0 ? holdColorInput : maDelta > 0 ? bullColorInput : bearColorInput
+    factorText = naData ? "—" : str.tostring(nz(maFactor) * 100, "#.#") + "%"
+    heldText   = str.tostring(holdBars) + (holdBars == 1 ? " bar" : " bars")
+
+    table.cell(dashboardTable, 0, 0, "Trend",      text_color = DASH_HEADER, text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 0, trendText,    text_color = trendColor,     text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 1, "State",      text_color = DASH_HEADER, text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 1, stateText,    text_color = stateColor,     text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 2, "Correction", text_color = DASH_HEADER, text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 2, factorText,   text_color = DASH_TEXT, text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 3, "Held Flat",  text_color = DASH_HEADER, text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 3, heldText,     text_color = DASH_TEXT, text_size = dashboardTextSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(stepUp, "Bullish Step", "UHL Adaptive MA started stepping up on {{ticker}} ({{interval}}) — movement outran the recent noise band")
+alertcondition(stepDown, "Bearish Step", "UHL Adaptive MA started stepping down on {{ticker}} ({{interval}}) — movement outran the recent noise band")
+alertcondition(holdStart, "Hold Started", "UHL Adaptive MA went flat on {{ticker}} ({{interval}}) — price is back inside the recent noise band")
+alertcondition(crossUp, "Bullish Crossover", "Trend-step line crossed above the corrected baseline on {{ticker}} ({{interval}}) — bullish state of the two-line form")
+alertcondition(crossDown, "Bearish Crossunder", "Trend-step line crossed below the corrected baseline on {{ticker}} ({{interval}}) — bearish state of the two-line form")
+
+//---------------------------------------------------------------------------------------------------------------------}

@@ -1,0 +1,329 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Pennant", "Pennant", overlay = true, max_lines_count = 500, max_labels_count = 500, max_bars_back = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+int    POLE_MIN_SPAN = 2
+int    FILL_TRANSP   = 85
+color  BULL_COLOR    = #089981
+color  BEAR_COLOR    = #f23645
+color  HIDDEN_COLOR  = #00000000
+string POLE_GROUP    = 'Pole'
+string COIL_GROUP    = 'Pennant'
+string VOLUME_GROUP  = 'Volume'
+string STYLE_GROUP   = 'Style'
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+poleLenInput     = input.int(10, 'Pole Scan Window', minval = 3, maxval = 100, group = POLE_GROUP, tooltip = 'Maximum number of bars the pole may span. A pole is detected when the current bar sets a new window extreme after a steep run from the opposite extreme of the same window.')
+poleMultInput    = input.float(4.0, 'Pole Height (x ATR)', minval = 0.5, step = 0.5, group = POLE_GROUP, tooltip = 'Minimum height of the pole as a multiple of the baseline ATR, so only sharp moves that stand out from the surrounding price action qualify.')
+poleErInput      = input.float(0.5, 'Pole One-Sidedness', minval = 0.05, maxval = 1, step = 0.05, group = POLE_GROUP, tooltip = 'Minimum efficiency ratio of the pole (net change divided by the sum of absolute bar to bar changes). Higher values demand a near-vertical, one-sided impulse.')
+atrLenInput      = input.int(50, 'Volatility Baseline Length', minval = 5, group = POLE_GROUP, tooltip = 'ATR length used as the volatility baseline when testing the pole height and the coil tilt.')
+
+minCoilInput     = input.int(4, 'Minimum Pennant Bars', minval = 3, group = COIL_GROUP, tooltip = 'Minimum number of coil bars after the pole tip before a breakout can complete the pattern.')
+maxCoilInput     = input.int(15, 'Maximum Pennant Bars', minval = 4, group = COIL_GROUP, tooltip = 'Maximum coil duration. Classical guidance caps pennants at roughly three weeks on daily charts, longer consolidations are better classified as triangles or rectangles.')
+maxRetraceInput  = input.float(50, 'Maximum Pole Retracement %', minval = 10, maxval = 100, step = 5, group = COIL_GROUP, tooltip = 'Maximum fraction of the pole the coil may give back. A consolidation that grows to rival the pole in size invalidates the pattern.')
+convergeInput    = input.float(25, 'Minimum Convergence %', minval = 5, maxval = 90, step = 5, group = COIL_GROUP, tooltip = 'Minimum narrowing of the fitted boundary width from the start of the coil to its latest bar, distinguishing the converging pennant from a parallel flag.')
+tiltTolInput     = input.float(0.15, 'Maximum Coil Tilt (ATR/Bar)', minval = 0, step = 0.05, group = COIL_GROUP, tooltip = 'Maximum absolute slope of the coil midline in baseline ATRs per bar, keeping the pennant flat or only gently tilted against the pole.')
+
+volFilterInput   = input.bool(true, 'Volume Filter', group = VOLUME_GROUP, tooltip = 'Require quiet digestion, with average coil volume below average pole volume, and a volume expansion on the breakout bar. Ignored on symbols without volume data.')
+volExpandInput   = input.float(1.25, 'Breakout Volume (x Coil Average)', minval = 1, step = 0.05, group = VOLUME_GROUP, tooltip = 'Minimum breakout bar volume as a multiple of the average coil volume when the volume filter is enabled.')
+
+showFormingInput = input.bool(true, 'Show Forming Pennant', group = STYLE_GROUP, tooltip = 'Preview the converging boundaries of a live, not yet confirmed coil on the latest bar.')
+showTargetInput  = input.bool(true, 'Measured-Move Target', group = STYLE_GROUP, tooltip = 'Project the pole length from the breakout point, the flagpole version of the measure rule.')
+bullColorInput   = input.color(BULL_COLOR, 'Bullish', inline = 'colors', group = STYLE_GROUP)
+bearColorInput   = input.color(BEAR_COLOR, 'Bearish', inline = 'colors', group = STYLE_GROUP)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Least-squares line over an array of values (x = element index), shifted outward so every value
+// sits at or inside the returned boundary. Returns the slope and the shifted value at x = 0.
+fitBoundary(array<float> valuesArray, bool upperSide) =>
+    int n = array.size(valuesArray)
+    float outSlope = 0.0
+    float outBase  = 0.0
+    if n > 0
+        float sumX  = 0.0
+        float sumY  = 0.0
+        float sumXX = 0.0
+        float sumXY = 0.0
+        for i = 0 to n - 1
+            float value = array.get(valuesArray, i)
+            sumX  += i
+            sumY  += value
+            sumXX += i * i
+            sumXY += i * value
+        float denom     = n * sumXX - sumX * sumX
+        float slope     = denom == 0 ? 0.0 : (n * sumXY - sumX * sumY) / denom
+        float intercept = (sumY - slope * sumX) / n
+        float offset    = 0.0
+        for i = 0 to n - 1
+            float residual = array.get(valuesArray, i) - (intercept + slope * i)
+            offset := upperSide ? math.max(offset, residual) : math.min(offset, residual)
+        outSlope := slope
+        outBase  := intercept + offset
+    [outSlope, outBase]
+
+// Average of the array elements from startIndex to the end, na when the span is empty
+arrayMean(array<float> valuesArray, int startIndex) =>
+    int n = array.size(valuesArray)
+    float total = 0.0
+    int   count = 0
+    if startIndex <= n - 1
+        for i = startIndex to n - 1
+            total += array.get(valuesArray, i)
+            count += 1
+    count > 0 ? total / count : na
+
+// Draw a completed pennant: pole, converging boundaries, fill, name label and optional measured-move target
+drawPennant(bool bullish, int poleStartBar, float poleStartPrice, int poleTipBar, float poleTipPrice, int coilLength, float upperSlope, float upperBase, float lowerSlope, float lowerBase, float targetPrice) =>
+    color dirColor = bullish ? bullColorInput : bearColorInput
+    int   breakBar = poleTipBar + coilLength
+    line.new(poleStartBar, poleStartPrice, poleTipBar, poleTipPrice, color = dirColor, width = 2)
+    line upperLine = line.new(poleTipBar, upperBase, breakBar, upperBase + upperSlope * coilLength, color = dirColor)
+    line lowerLine = line.new(poleTipBar, lowerBase, breakBar, lowerBase + lowerSlope * coilLength, color = dirColor)
+    linefill.new(upperLine, lowerLine, color.new(dirColor, FILL_TRANSP))
+    label.new(breakBar, bullish ? low : high, bullish ? 'Bull Pennant' : 'Bear Pennant', style = bullish ? label.style_label_up : label.style_label_down, color = HIDDEN_COLOR, textcolor = dirColor, size = size.small)
+    if showTargetInput
+        int extendBars = math.max(5, coilLength)
+        line.new(breakBar, targetPrice, breakBar + extendBars, targetPrice, color = dirColor, style = line.style_dotted)
+        label.new(breakBar + extendBars, targetPrice, 'Target', style = label.style_label_left, color = HIDDEN_COLOR, textcolor = dirColor, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+float atrBase       = ta.atr(atrLenInput)
+float windowHighest = ta.highest(high, poleLenInput)
+float windowLowest  = ta.lowest(low, poleLenInput)
+
+int maxCoilBars = math.max(maxCoilInput, minCoilInput)
+
+// State: 0 = scanning for a pole, 1 = tracking a bullish coil, -1 = tracking a bearish coil
+var int   dirState   = 0
+var int   tipBar     = na
+var float tipPrice   = na
+var int   poleBar    = na
+var float polePrice  = na
+var float poleHeight = na
+var float atrAtTip   = na
+var float poleVolAvg = na
+var bool  coilValid  = false
+
+// Coil points since the pole tip (index 0 = tip bar)
+var array<float> coilHighArray = array.new<float>()
+var array<float> coilLowArray  = array.new<float>()
+var array<float> coilVolArray  = array.new<float>()
+
+bool bullForming  = false
+bool bearForming  = false
+bool bullBreakout = false
+bool bearBreakout = false
+bool bullFailed   = false
+bool bearFailed   = false
+
+// Manage an active bullish coil
+if dirState == 1
+    int pointsCount = array.size(coilHighArray)
+    // Test the current close against the boundaries fitted on the bars stored so far
+    if coilValid
+        [upSlope, upBase] = fitBoundary(coilHighArray, true)
+        [dnSlope, dnBase] = fitBoundary(coilLowArray, false)
+        float upperY     = upBase + upSlope * pointsCount
+        float lowerY     = dnBase + dnSlope * pointsCount
+        float coilVolAvg = arrayMean(coilVolArray, 1)
+        bool  volBreakOk = not volFilterInput or na(volume) or na(coilVolAvg) or volume >= volExpandInput * coilVolAvg
+        if close > upperY and volBreakOk
+            bullBreakout := true
+            drawPennant(true, poleBar, polePrice, tipBar, tipPrice, pointsCount, upSlope, upBase, dnSlope, dnBase, close + poleHeight)
+            dirState  := 0
+            coilValid := false
+        else if close < lowerY
+            bullFailed := true
+            dirState   := 0
+            coilValid  := false
+    if dirState == 1
+        if high > tipPrice
+            // The impulse resumed beyond the tip without a valid breakout, rescan for a fresh pole
+            dirState  := 0
+            coilValid := false
+        else
+            array.push(coilHighArray, high)
+            array.push(coilLowArray, low)
+            array.push(coilVolArray, nz(volume))
+            int   coilBars   = array.size(coilHighArray) - 1
+            float deepestLow = array.min(coilLowArray)
+            if coilBars > maxCoilBars or tipPrice - deepestLow > maxRetraceInput / 100 * poleHeight
+                bullFailed := coilValid
+                dirState   := 0
+                coilValid  := false
+            else
+                bool validNow = false
+                if coilBars >= minCoilInput
+                    [uS, uB] = fitBoundary(coilHighArray, true)
+                    [lS, lB] = fitBoundary(coilLowArray, false)
+                    float widthStart = uB - lB
+                    float widthEnd   = uB + uS * coilBars - (lB + lS * coilBars)
+                    float midSlope   = (uS + lS) / 2
+                    float coilVolAvg = arrayMean(coilVolArray, 1)
+                    bool  convergeOk = widthStart > 0 and widthEnd > 0 and widthEnd <= widthStart * (1 - convergeInput / 100)
+                    bool  tiltOk     = math.abs(midSlope) <= tiltTolInput * atrAtTip
+                    bool  volQuietOk = not volFilterInput or na(volume) or na(coilVolAvg) or coilVolAvg < poleVolAvg
+                    validNow := convergeOk and tiltOk and volQuietOk
+                bullForming := validNow and not coilValid
+                coilValid   := validNow
+
+// Manage an active bearish coil
+else if dirState == -1
+    int pointsCount = array.size(coilHighArray)
+    if coilValid
+        [upSlope, upBase] = fitBoundary(coilHighArray, true)
+        [dnSlope, dnBase] = fitBoundary(coilLowArray, false)
+        float upperY     = upBase + upSlope * pointsCount
+        float lowerY     = dnBase + dnSlope * pointsCount
+        float coilVolAvg = arrayMean(coilVolArray, 1)
+        bool  volBreakOk = not volFilterInput or na(volume) or na(coilVolAvg) or volume >= volExpandInput * coilVolAvg
+        if close < lowerY and volBreakOk
+            bearBreakout := true
+            drawPennant(false, poleBar, polePrice, tipBar, tipPrice, pointsCount, upSlope, upBase, dnSlope, dnBase, close - poleHeight)
+            dirState  := 0
+            coilValid := false
+        else if close > upperY
+            bearFailed := true
+            dirState   := 0
+            coilValid  := false
+    if dirState == -1
+        if low < tipPrice
+            dirState  := 0
+            coilValid := false
+        else
+            array.push(coilHighArray, high)
+            array.push(coilLowArray, low)
+            array.push(coilVolArray, nz(volume))
+            int   coilBars    = array.size(coilHighArray) - 1
+            float highestHigh = array.max(coilHighArray)
+            if coilBars > maxCoilBars or highestHigh - tipPrice > maxRetraceInput / 100 * poleHeight
+                bearFailed := coilValid
+                dirState   := 0
+                coilValid  := false
+            else
+                bool validNow = false
+                if coilBars >= minCoilInput
+                    [uS, uB] = fitBoundary(coilHighArray, true)
+                    [lS, lB] = fitBoundary(coilLowArray, false)
+                    float widthStart = uB - lB
+                    float widthEnd   = uB + uS * coilBars - (lB + lS * coilBars)
+                    float midSlope   = (uS + lS) / 2
+                    float coilVolAvg = arrayMean(coilVolArray, 1)
+                    bool  convergeOk = widthStart > 0 and widthEnd > 0 and widthEnd <= widthStart * (1 - convergeInput / 100)
+                    bool  tiltOk     = math.abs(midSlope) <= tiltTolInput * atrAtTip
+                    bool  volQuietOk = not volFilterInput or na(volume) or na(coilVolAvg) or coilVolAvg < poleVolAvg
+                    validNow := convergeOk and tiltOk and volQuietOk
+                bearForming := validNow and not coilValid
+                coilValid   := validNow
+
+// Scan for a new pole (also runs on the bar a coil was resolved, so an extending impulse re-anchors)
+if dirState == 0
+    bool bullTipSet = high >= windowHighest
+    bool bearTipSet = low <= windowLowest
+    if bullTipSet or bearTipSet
+        float scanLow    = low
+        int   lowOffset  = 0
+        float scanHigh   = high
+        int   highOffset = 0
+        for i = 1 to poleLenInput - 1
+            if low[i] < scanLow
+                scanLow   := low[i]
+                lowOffset := i
+            if high[i] > scanHigh
+                scanHigh   := high[i]
+                highOffset := i
+        if bullTipSet and lowOffset >= POLE_MIN_SPAN
+            float poleTravel = 0.0
+            for i = 0 to lowOffset - 1
+                poleTravel += math.abs(close[i] - close[i + 1])
+            float efficiency = poleTravel > 0 ? math.abs(close - close[lowOffset]) / poleTravel : 0.0
+            float height     = high - scanLow
+            if not na(atrBase) and height >= poleMultInput * atrBase and efficiency >= poleErInput
+                dirState   := 1
+                tipBar     := bar_index
+                tipPrice   := high
+                poleBar    := bar_index - lowOffset
+                polePrice  := scanLow
+                poleHeight := height
+                atrAtTip   := atrBase
+                float volTotal = 0.0
+                for i = 0 to lowOffset
+                    volTotal += nz(volume[i])
+                poleVolAvg := volTotal / (lowOffset + 1)
+                coilValid  := false
+                array.clear(coilHighArray)
+                array.clear(coilLowArray)
+                array.clear(coilVolArray)
+                array.push(coilHighArray, high)
+                array.push(coilLowArray, low)
+                array.push(coilVolArray, nz(volume))
+        if dirState == 0 and bearTipSet and highOffset >= POLE_MIN_SPAN
+            float poleTravel = 0.0
+            for i = 0 to highOffset - 1
+                poleTravel += math.abs(close[i] - close[i + 1])
+            float efficiency = poleTravel > 0 ? math.abs(close - close[highOffset]) / poleTravel : 0.0
+            float height     = scanHigh - low
+            if not na(atrBase) and height >= poleMultInput * atrBase and efficiency >= poleErInput
+                dirState   := -1
+                tipBar     := bar_index
+                tipPrice   := low
+                poleBar    := bar_index - highOffset
+                polePrice  := scanHigh
+                poleHeight := height
+                atrAtTip   := atrBase
+                float volTotal = 0.0
+                for i = 0 to highOffset
+                    volTotal += nz(volume[i])
+                poleVolAvg := volTotal / (highOffset + 1)
+                coilValid  := false
+                array.clear(coilHighArray)
+                array.clear(coilLowArray)
+                array.clear(coilVolArray)
+                array.push(coilHighArray, high)
+                array.push(coilLowArray, low)
+                array.push(coilVolArray, nz(volume))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+// Dotted preview of the boundaries of a valid coil that has not broken out yet
+var line liveUpperLine = na
+var line liveLowerLine = na
+
+if barstate.islast
+    if not na(liveUpperLine)
+        line.delete(liveUpperLine)
+        liveUpperLine := na
+    if not na(liveLowerLine)
+        line.delete(liveLowerLine)
+        liveLowerLine := na
+    if showFormingInput and dirState != 0 and coilValid
+        int lastX = array.size(coilHighArray) - 1
+        [uS, uB] = fitBoundary(coilHighArray, true)
+        [lS, lB] = fitBoundary(coilLowArray, false)
+        color dirColor = dirState == 1 ? bullColorInput : bearColorInput
+        liveUpperLine := line.new(tipBar, uB, tipBar + lastX, uB + uS * lastX, color = dirColor, style = line.style_dotted)
+        liveLowerLine := line.new(tipBar, lB, tipBar + lastX, lB + lS * lastX, color = dirColor, style = line.style_dotted)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(bullForming,  'Bullish Pennant Forming',     'A bullish pennant is forming: converging coil after a sharp advance, awaiting an upside breakout')
+alertcondition(bearForming,  'Bearish Pennant Forming',     'A bearish pennant is forming: converging coil after a sharp decline, awaiting a downside breakout')
+alertcondition(bullBreakout, 'Bullish Pennant Breakout',    'Bullish pennant completed: decisive close above the coil boundary in the direction of the pole')
+alertcondition(bearBreakout, 'Bearish Pennant Breakout',    'Bearish pennant completed: decisive close below the coil boundary in the direction of the pole')
+alertcondition(bullFailed,   'Bullish Pennant Invalidated', 'Bullish pennant invalidated: the coil broke against the pole or grew out of proportion')
+alertcondition(bearFailed,   'Bearish Pennant Invalidated', 'Bearish pennant invalidated: the coil broke against the pole or grew out of proportion')
+
+//---------------------------------------------------------------------------------------------------------------------}

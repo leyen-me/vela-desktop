@@ -1,0 +1,453 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Gap Rules Interaction", shorttitle = "Gap Rules Interaction", overlay = true, format = format.price, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+color NEUTRAL_COLOR = #787b86
+color RANGE_COLOR   = #787b86   // prior-day map and opening range are structure - grey
+color ACCENT_COLOR  = #ff9800   // the one accent - the prior close, the gap fill level
+color BULL_COLOR    = #089981
+color BEAR_COLOR    = #f23645
+color LABEL_BG      = #00000000
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+int MS_PER_MINUTE = 60000
+
+string SESSION_GROUP = "Session"
+string GAP_GROUP     = "Gap Classification"
+string OR_GROUP      = "Opening Range"
+string STYLE_GROUP   = "Style"
+
+string POS_TOP_RIGHT    = "Top Right"
+string POS_TOP_LEFT     = "Top Left"
+string POS_BOTTOM_RIGHT = "Bottom Right"
+string POS_BOTTOM_LEFT  = "Bottom Left"
+
+// Gap location classes (read step 2)
+int CLASS_NONE    = 0
+int CLASS_INSIDE  = 1
+int CLASS_OUTSIDE = 2
+
+// Opening range read against the gap (read step 3)
+int OR_FORMING = 0
+int OR_ACCEPT  = 1
+int OR_REJECT  = 2
+
+// Day read: the combined interaction verdict
+int READ_WARMUP  = 0
+int READ_NOGAP   = 1
+int READ_CONT    = 2
+int READ_FADE    = 3
+int READ_MIXED   = 4
+int READ_NEGATED = 5
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+useCustomSessionInput = input.bool(false, "Custom Session", inline = "sess", group = SESSION_GROUP, tooltip = "Measure the prior-day map, the gap and the opening range inside a session window (exchange timezone) instead of the chart's full trading day. Recommended on futures, where the rules read best against the regular-hours open and the prior settlement-area close, and on stocks charted with extended hours visible.")
+
+sessionWindowInput = input.session("0930-1600", "", inline = "sess", group = SESSION_GROUP, tooltip = "Session window applied when 'Custom Session' is enabled. The prior day's high, low and close, the opening gap and the opening range are all measured inside this window.")
+
+daysInput = input.int(5, "Sessions Shown", minval = 1, maxval = 30, group = SESSION_GROUP, tooltip = "Number of recent sessions that keep their prior-day levels, gap zone, opening range and classification label drawn on the chart.")
+
+adrLenInput = input.int(10, "Average Daily Range Length", minval = 1, maxval = 60, group = GAP_GROUP, tooltip = "Completed sessions averaged into the average daily range (ADR). The gap's size is judged relative to this range: the same point gap can be negligible on a volatile symbol and out of balance on a quiet one.")
+
+negligibleInput = input.float(0.1, "Negligible Gap Threshold", minval = 0, maxval = 2, step = 0.05, group = GAP_GROUP, tooltip = "Gaps smaller than this fraction of the average daily range are classified as negligible: no gap playbook applies and the interaction read stays flat for the session. 0.1 = 10% of the ADR.")
+
+orMinutesInput = input.int(30, "Opening Range Duration (Minutes)", minval = 1, maxval = 480, group = OR_GROUP, tooltip = "Minutes after the session open that define the opening range. Where this range forms relative to the gapped-over level and the prior-day map drives the acceptance / rejection read. Use a chart timeframe at or below this duration.")
+
+showLevelsInput = input.bool(true, "Prior High / Low", inline = "phl", group = STYLE_GROUP)
+rangeColorInput = input.color(RANGE_COLOR, "", inline = "phl", group = STYLE_GROUP)
+
+showCloseInput  = input.bool(true, "Prior Close (Gap Fill Level)", inline = "pc", group = STYLE_GROUP)
+closeColorInput = input.color(ACCENT_COLOR, "", inline = "pc", group = STYLE_GROUP)
+
+showGapBoxInput = input.bool(true, "Gap Zone", group = STYLE_GROUP)
+
+showOrInput  = input.bool(true, "Opening Range", inline = "or", group = STYLE_GROUP)
+orColorInput = input.color(RANGE_COLOR, "", inline = "or", group = STYLE_GROUP)
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "dir", group = STYLE_GROUP)
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "dir", group = STYLE_GROUP)
+
+showOpenLabelInput = input.bool(true, "Gap Classification Label", group = STYLE_GROUP, tooltip = "One label per session at the open with the gap direction, its size versus the average daily range and its location class against the prior day's range.")
+
+showMarkersInput = input.bool(false, "Event Markers", group = STYLE_GROUP, tooltip = "Small marks for the interaction events: failure back through the gapped-over level, full gap fill and negation of the gap. Off by default - the alerts cover the same events.")
+
+showTableInput     = input.bool(true, "Dashboard", inline = "tbl", group = STYLE_GROUP)
+tablePositionInput = input.string(POS_TOP_RIGHT, "", options = [POS_TOP_RIGHT, POS_TOP_LEFT, POS_BOTTOM_RIGHT, POS_BOTTOM_LEFT], inline = "tbl", group = STYLE_GROUP)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// User-Defined Types & Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Drawings belonging to one session, kept together so expired sessions can be removed as a unit
+type SessionDraw
+    line  phLine
+    line  plLine
+    line  pcLine
+    line  orMidLine
+    box   gapBox
+    box   orBox
+    label openLabel
+
+// Delete every drawing of an expired session
+deleteSessionDraw(SessionDraw sessionDraw) =>
+    if not na(sessionDraw)
+        if not na(sessionDraw.phLine)
+            line.delete(sessionDraw.phLine)
+        if not na(sessionDraw.plLine)
+            line.delete(sessionDraw.plLine)
+        if not na(sessionDraw.pcLine)
+            line.delete(sessionDraw.pcLine)
+        if not na(sessionDraw.orMidLine)
+            line.delete(sessionDraw.orMidLine)
+        if not na(sessionDraw.gapBox)
+            box.delete(sessionDraw.gapBox)
+        if not na(sessionDraw.orBox)
+            box.delete(sessionDraw.orBox)
+        if not na(sessionDraw.openLabel)
+            label.delete(sessionDraw.openLabel)
+
+// Table position constant from the style option
+getTablePosition(string positionName) =>
+    switch positionName
+        POS_TOP_LEFT     => position.top_left
+        POS_BOTTOM_RIGHT => position.bottom_right
+        POS_BOTTOM_LEFT  => position.bottom_left
+        => position.top_right
+
+// Price text for the dashboard
+formatPrice(float priceValue) =>
+    na(priceValue) ? "n/a" : str.tostring(priceValue, format.mintick)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Session Tracking, Prior-Day Map & Gap Classification
+//---------------------------------------------------------------------------------------------------------------------{
+
+bool intradayOk = timeframe.isintraday
+bool inSession  = not useCustomSessionInput or not na(time(timeframe.period, sessionWindowInput))
+bool dayChange  = timeframe.change("D")
+
+var int dayCounter = 0
+if dayChange
+    dayCounter += 1
+
+// A session starts on the first in-scope bar of each trading day
+var int lastSessionDay = na
+bool newSession = intradayOk and inSession and (na(lastSessionDay) or dayCounter != lastSessionDay)
+
+// Running session trackers
+var float curOpen  = na
+var float curHigh  = na
+var float curLow   = na
+var float curClose = na
+
+// Prior day's reference map
+var float priorHigh   = na
+var float priorLow    = na
+var float priorClose  = na
+var bool  priorsValid = false
+
+// Average daily range over completed sessions
+var array<float> rangesArray = array.new<float>()
+var float adr = na
+
+// Gap metrics, set once per session at the open
+var float gapSize  = na
+var int   gapDir   = 0
+var float gapRatio = na
+var int   gapClass = CLASS_NONE
+var float keyLevel = na
+
+// Opening range state
+var int   sessStartBar = na
+var int   orEndTime    = na
+var float orHigh       = na
+var float orLow        = na
+var bool  orLocked     = false
+var int   orRead       = OR_FORMING
+
+// Interaction state (read steps 4 and 5)
+var bool  keyTested    = false
+var bool  hasReEntered = false
+var bool  fullFilled   = false
+var bool  negated      = false
+var float runExtreme   = na
+var bool  contFired    = false
+var bool  fadeFired    = false
+
+// Session drawings
+var SessionDraw curDraw = na
+var array<SessionDraw> drawsArray = array.new<SessionDraw>()
+var array<label> eventLabelsArray = array.new<label>()
+
+if newSession
+    lastSessionDay := dayCounter
+
+    // The session that just completed becomes today's prior-day map and feeds the average daily range
+    if not na(curOpen)
+        priorHigh  := curHigh
+        priorLow   := curLow
+        priorClose := curClose
+        array.push(rangesArray, curHigh - curLow)
+        if array.size(rangesArray) > adrLenInput
+            array.shift(rangesArray)
+        adr := array.avg(rangesArray)
+
+    priorsValid := not na(priorHigh) and not na(priorLow) and not na(priorClose)
+
+    // Reset the running session trackers
+    curOpen  := open
+    curHigh  := high
+    curLow   := low
+    curClose := close
+
+    // Classify the gap: beyond the prior range entirely, beyond the prior close but inside the range,
+    // or negligible relative to the recent average daily range
+    gapSize  := priorsValid ? curOpen - priorClose : na
+    gapDir   := priorsValid ? (gapSize > 0 ? 1 : gapSize < 0 ? -1 : 0) : 0
+    gapRatio := priorsValid and not na(adr) and adr > 0 ? math.abs(gapSize) / adr : na
+    bool negligible = not priorsValid or gapDir == 0 or (not na(gapRatio) and gapRatio < negligibleInput)
+    gapClass := negligible ? CLASS_NONE : curOpen > priorHigh or curOpen < priorLow ? CLASS_OUTSIDE : CLASS_INSIDE
+
+    // The gapped-over level: the nearest prior-day level behind price at the open. Beyond the prior range it is the
+    // prior high / low; inside the range the prior close is the only level behind price and the line that negates the gap
+    keyLevel := gapClass == CLASS_OUTSIDE ? (gapDir > 0 ? priorHigh : priorLow) : gapClass == CLASS_INSIDE ? priorClose : na
+
+    // Opening range reset
+    sessStartBar := bar_index
+    orEndTime    := time + orMinutesInput * MS_PER_MINUTE
+    orHigh       := high
+    orLow        := low
+    orLocked     := false
+    orRead       := OR_FORMING
+
+    // Interaction state reset
+    keyTested    := false
+    hasReEntered := false
+    fullFilled   := false
+    negated      := false
+    runExtreme   := gapClass == CLASS_NONE ? na : gapDir > 0 ? low : high
+    contFired    := false
+    fadeFired    := false
+
+    // Session drawings: prior-day map, gap zone, opening range and the open classification label
+    curDraw := SessionDraw.new()
+    array.push(drawsArray, curDraw)
+    while array.size(drawsArray) > daysInput
+        deleteSessionDraw(array.shift(drawsArray))
+    while array.size(eventLabelsArray) > daysInput * 3
+        label.delete(array.shift(eventLabelsArray))
+
+    if priorsValid
+        if showLevelsInput
+            curDraw.phLine := line.new(bar_index, priorHigh, bar_index, priorHigh, color = color.new(rangeColorInput, 25), style = line.style_dashed)
+            curDraw.plLine := line.new(bar_index, priorLow, bar_index, priorLow, color = color.new(rangeColorInput, 25), style = line.style_dashed)
+        if showCloseInput
+            curDraw.pcLine := line.new(bar_index, priorClose, bar_index, priorClose, color = closeColorInput)
+    if showGapBoxInput and gapClass != CLASS_NONE
+        color gapColor = gapDir > 0 ? bullColorInput : bearColorInput
+        curDraw.gapBox := box.new(bar_index, math.max(curOpen, priorClose), bar_index, math.min(curOpen, priorClose), border_color = color.new(gapColor, 60), border_style = line.style_dotted, bgcolor = color.new(gapColor, 85))
+    if showOrInput
+        curDraw.orBox := box.new(bar_index, high, bar_index, low, border_color = color.new(orColorInput, 40), border_style = line.style_dashed, bgcolor = color.new(orColorInput, 92))
+    if showOpenLabelInput and gapClass != CLASS_NONE
+        string classText = gapClass == CLASS_OUTSIDE ? "beyond prior range" : "inside prior range"
+        string ratioText = na(gapRatio) ? "" : str.format(" {0,number,#.##}× ADR", gapRatio)
+        curDraw.openLabel := label.new(bar_index, curOpen, (gapDir > 0 ? "▲ Gap up" : "▼ Gap down") + ratioText + " - " + classText, style = label.style_label_left, color = LABEL_BG, textcolor = gapDir > 0 ? bullColorInput : bearColorInput, size = size.small, tooltip = "Open classified against the prior day's map (high, low, close) and the recent average daily range")
+
+bool sessionLive = intradayOk and inSession and not na(curOpen)
+
+// Extend the running session trackers past the opening bar
+if sessionLive and not newSession
+    curHigh  := math.max(curHigh, high)
+    curLow   := math.min(curLow, low)
+    curClose := close
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Opening Range
+//---------------------------------------------------------------------------------------------------------------------{
+
+bool orJustLocked = false
+
+if sessionLive and not newSession and not orLocked
+    if time < orEndTime
+        orHigh := math.max(orHigh, high)
+        orLow  := math.min(orLow, low)
+    else
+        orLocked     := true
+        orJustLocked := true
+        // The opening range read: building entirely beyond the gapped-over level is acceptance of the gap,
+        // forming back through it into prior territory signals the gap is being rejected
+        if gapClass != CLASS_NONE and not na(keyLevel)
+            orRead := gapDir > 0 ? (orLow >= keyLevel ? OR_ACCEPT : OR_REJECT) : orHigh <= keyLevel ? OR_ACCEPT : OR_REJECT
+
+float orMid = orLocked ? math.avg(orHigh, orLow) : na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Level Interaction & Gap Fill
+//---------------------------------------------------------------------------------------------------------------------{
+
+if sessionLive and gapClass != CLASS_NONE
+    // Deepest retrace toward the prior close since the open, driving the fill percentage
+    runExtreme := gapDir > 0 ? math.min(nz(runExtreme, low), low) : math.max(nz(runExtreme, high), high)
+
+    // First test and failure of the gapped-over level: a touch that holds is the continuation cue,
+    // a close back through it opens the path toward the unfilled gap and the prior close
+    if not na(keyLevel)
+        keyTested    := keyTested or (gapDir > 0 ? low <= keyLevel : high >= keyLevel)
+        hasReEntered := hasReEntered or (gapDir > 0 ? close < keyLevel : close > keyLevel)
+
+    // Gap-fill level: touching the prior close is a full fill, a close through it negates the gap's structure
+    fullFilled := fullFilled or (gapDir > 0 ? low <= priorClose : high >= priorClose)
+    negated    := negated or (gapDir > 0 ? close < priorClose : close > priorClose)
+
+float fillFrac = gapClass != CLASS_NONE and not na(runExtreme) and not na(gapSize) and gapSize != 0 ? math.min(1.0, math.max(0.0, (gapDir > 0 ? curOpen - runExtreme : runExtreme - curOpen) / math.abs(gapSize))) : na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Day Read & Events
+//---------------------------------------------------------------------------------------------------------------------{
+
+bool onGapDay = sessionLive and gapClass != CLASS_NONE
+
+// Continuation alignment: gap beyond the prior range, opening range holding its gap-side half,
+// and no re-entry through the gapped-over level
+bool continuationAlignedNow = onGapDay and gapClass == CLASS_OUTSIDE and orLocked and not na(orMid) and (gapDir > 0 ? close >= orMid : close <= orMid) and not hasReEntered and not fullFilled
+
+// Fade alignment: price back inside accepted territory after the gap, rotating toward the prior close
+bool fadeAlignedNow = onGapDay and orLocked and not na(orMid) and not fullFilled and (gapClass == CLASS_INSIDE ? (gapDir > 0 ? close < orMid : close > orMid) : hasReEntered and (gapDir > 0 ? close < keyLevel : close > keyLevel))
+
+var int dayRead = READ_WARMUP
+if sessionLive
+    dayRead := not priorsValid ? READ_WARMUP : gapClass == CLASS_NONE ? READ_NOGAP : negated ? READ_NEGATED : continuationAlignedNow ? READ_CONT : fadeAlignedNow ? READ_FADE : READ_MIXED
+
+// Per-session one-shot events feeding the markers and alerts
+bool gapOutsideBullEvent = newSession and gapClass == CLASS_OUTSIDE and gapDir > 0
+bool gapOutsideBearEvent = newSession and gapClass == CLASS_OUTSIDE and gapDir < 0
+bool gapInsideBullEvent  = newSession and gapClass == CLASS_INSIDE and gapDir > 0
+bool gapInsideBearEvent  = newSession and gapClass == CLASS_INSIDE and gapDir < 0
+bool orAcceptEvent       = orJustLocked and gapClass != CLASS_NONE and orRead == OR_ACCEPT
+bool orRejectEvent       = orJustLocked and gapClass != CLASS_NONE and orRead == OR_REJECT
+bool reEntryEvent        = hasReEntered and (newSession or not hasReEntered[1])
+bool fullFillEvent       = fullFilled and (newSession or not fullFilled[1])
+bool negatedEvent        = negated and (newSession or not negated[1])
+bool contAlignEvent      = continuationAlignedNow and not contFired
+bool fadeAlignEvent      = fadeAlignedNow and not fadeFired
+
+if contAlignEvent
+    contFired := true
+if fadeAlignEvent
+    fadeFired := true
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Extend the current session's drawings across the session
+if sessionLive and not na(curDraw)
+    if not na(curDraw.phLine)
+        line.set_x2(curDraw.phLine, bar_index)
+    if not na(curDraw.plLine)
+        line.set_x2(curDraw.plLine, bar_index)
+    if not na(curDraw.pcLine)
+        line.set_x2(curDraw.pcLine, bar_index)
+    if not na(curDraw.orMidLine)
+        line.set_x2(curDraw.orMidLine, bar_index)
+    if not na(curDraw.gapBox)
+        box.set_right(curDraw.gapBox, bar_index)
+    if not na(curDraw.orBox)
+        box.set_right(curDraw.orBox, bar_index)
+        if not orLocked
+            box.set_top(curDraw.orBox, orHigh)
+            box.set_bottom(curDraw.orBox, orLow)
+
+// Once the opening range locks, color it by its read and draw its midpoint, the alignment trigger line
+if orJustLocked and not na(curDraw)
+    if not na(curDraw.orBox)
+        box.set_top(curDraw.orBox, orHigh)
+        box.set_bottom(curDraw.orBox, orLow)
+        if gapClass != CLASS_NONE and orRead != OR_FORMING
+            color readColor = orRead == OR_ACCEPT ? (gapDir > 0 ? bullColorInput : bearColorInput) : gapDir > 0 ? bearColorInput : bullColorInput
+            box.set_border_color(curDraw.orBox, color.new(readColor, 40))
+            box.set_bgcolor(curDraw.orBox, color.new(readColor, 90))
+    if showOrInput and not na(sessStartBar) and not na(orMid)
+        curDraw.orMidLine := line.new(sessStartBar, orMid, bar_index, orMid, color = color.new(orColorInput, 55), style = line.style_dotted)
+
+// Optional event marks: the gapped-over level failing, the full fill and the negation of the gap
+if showMarkersInput and onGapDay
+    color counterColor = gapDir > 0 ? bearColorInput : bullColorInput
+    if reEntryEvent and not na(keyLevel)
+        array.push(eventLabelsArray, label.new(bar_index, keyLevel, "✕", style = label.style_label_center, color = LABEL_BG, textcolor = counterColor, size = size.small, tooltip = "Failure back through the gapped-over level - the path opens toward the unfilled gap and the prior close"))
+    if fullFillEvent
+        array.push(eventLabelsArray, label.new(bar_index, priorClose, "◆", style = label.style_label_center, color = LABEL_BG, textcolor = counterColor, size = size.small, tooltip = "Full gap fill - price traded back to the prior close"))
+    if negatedEvent
+        array.push(eventLabelsArray, label.new(bar_index, priorClose, "✕", style = gapDir > 0 ? label.style_label_up : label.style_label_down, color = LABEL_BG, textcolor = counterColor, size = size.small, tooltip = "Close through the prior close - the gap's structure is negated, imbalance back to balance"))
+
+// Dashboard: the layered read of the session
+var table dashTable = table.new(getTablePosition(tablePositionInput), 2, 7, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+if barstate.islast
+    if not intradayOk
+        table.cell(dashTable, 0, 0, "gap rules interaction runs on intraday charts only - the opening gap, the prior-day map and the opening range need intraday data", text_color = BEAR_COLOR, text_size = size.small)
+    else if showTableInput
+        color dirColor     = gapDir > 0 ? bullColorInput : gapDir < 0 ? bearColorInput : DASH_TEXT
+        color counterColor = gapDir > 0 ? bearColorInput : gapDir < 0 ? bullColorInput : DASH_TEXT
+
+        string gapText   = not priorsValid ? "n/a" : (gapDir > 0 ? "▲ +" : gapDir < 0 ? "▼ " : "") + str.tostring(gapSize, format.mintick) + (na(gapRatio) ? "" : str.format(" ({0,number,#.##}× ADR)", gapRatio))
+        string classText = not priorsValid ? "waiting for a prior session" : gapClass == CLASS_OUTSIDE ? "beyond prior range" : gapClass == CLASS_INSIDE ? "inside prior range" : "negligible / no gap"
+        string orText    = not orLocked ? (na(curOpen) ? "n/a" : "forming") : gapClass == CLASS_NONE ? "set - no gap to read" : orRead == OR_ACCEPT ? "accepting the gap" : "rejecting the gap"
+        string keyName   = gapClass == CLASS_OUTSIDE ? (gapDir > 0 ? "Prior high" : "Prior low") : "Prior close"
+        string keyText   = gapClass == CLASS_NONE ? "n/a" : keyName + " - " + (hasReEntered ? "failed" : keyTested ? "held on test" : "untested")
+        string fillText  = gapClass == CLASS_NONE ? "n/a" : negated ? "full - negated" : fullFilled ? "full" : na(fillFrac) ? "n/a" : fillFrac < 0.005 ? "unfilled" : str.tostring(math.round(fillFrac * 100)) + "% filled"
+        string readText  = dayRead == READ_WARMUP ? "waiting for a prior session" : dayRead == READ_NOGAP ? "no gap playbook" : dayRead == READ_CONT ? "continuation aligned" : dayRead == READ_FADE ? "fade aligned" : dayRead == READ_NEGATED ? "negated - back in balance" : "mixed - no alignment"
+        color readColor  = dayRead == READ_CONT ? dirColor : dayRead == READ_FADE or dayRead == READ_NEGATED ? counterColor : DASH_TEXT
+
+        table.cell(dashTable, 0, 0, "Gap", text_color = DASH_HEADER, text_size = size.small, text_halign = text.align_left)
+        table.cell(dashTable, 1, 0, gapText, text_color = dirColor, text_size = size.small, text_halign = text.align_right)
+        table.cell(dashTable, 0, 1, "Location", text_color = DASH_HEADER, text_size = size.small, text_halign = text.align_left)
+        table.cell(dashTable, 1, 1, classText, text_color = DASH_TEXT, text_size = size.small, text_halign = text.align_right)
+        table.cell(dashTable, 0, 2, str.format("ADR ({0})", adrLenInput), text_color = DASH_HEADER, text_size = size.small, text_halign = text.align_left)
+        table.cell(dashTable, 1, 2, formatPrice(adr), text_color = DASH_TEXT, text_size = size.small, text_halign = text.align_right)
+        table.cell(dashTable, 0, 3, "Opening range", text_color = DASH_HEADER, text_size = size.small, text_halign = text.align_left)
+        table.cell(dashTable, 1, 3, orText, text_color = orLocked and gapClass != CLASS_NONE ? (orRead == OR_ACCEPT ? dirColor : counterColor) : DASH_TEXT, text_size = size.small, text_halign = text.align_right)
+        table.cell(dashTable, 0, 4, "Gapped-over level", text_color = DASH_HEADER, text_size = size.small, text_halign = text.align_left)
+        table.cell(dashTable, 1, 4, keyText, text_color = gapClass != CLASS_NONE and hasReEntered ? counterColor : DASH_TEXT, text_size = size.small, text_halign = text.align_right)
+        table.cell(dashTable, 0, 5, "Gap fill", text_color = DASH_HEADER, text_size = size.small, text_halign = text.align_left)
+        table.cell(dashTable, 1, 5, fillText, text_color = DASH_TEXT, text_size = size.small, text_halign = text.align_right)
+        table.cell(dashTable, 0, 6, "Day read", text_color = DASH_HEADER, text_size = size.small, text_halign = text.align_left)
+        table.cell(dashTable, 1, 6, readText, text_color = readColor, text_size = size.small, text_halign = text.align_right)
+
+// Data window readout of the layered levels
+plot(priorHigh, "Prior High", rangeColorInput, display = display.data_window)
+plot(priorLow, "Prior Low", rangeColorInput, display = display.data_window)
+plot(priorClose, "Prior Close (Gap Fill Level)", closeColorInput, display = display.data_window)
+plot(orLocked ? orHigh : na, "Opening Range High", orColorInput, display = display.data_window)
+plot(orLocked ? orLow : na, "Opening Range Low", orColorInput, display = display.data_window)
+plot(fillFrac * 100, "Gap Fill %", ACCENT_COLOR, display = display.data_window)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(gapOutsideBullEvent, "Bullish Gap Beyond Prior Range", "Gap rules interaction: {{ticker}} {{interval}} opened above the prior day's entire range - out of balance; days that hold outside tend to trend, watching the opening range against the prior high")
+alertcondition(gapOutsideBearEvent, "Bearish Gap Beyond Prior Range", "Gap rules interaction: {{ticker}} {{interval}} opened below the prior day's entire range - out of balance; days that hold outside tend to trend, watching the opening range against the prior low")
+alertcondition(gapInsideBullEvent, "Bullish Gap Inside Prior Range", "Gap rules interaction: {{ticker}} {{interval}} gapped up but opened inside the prior day's range - structurally weaker; a fill back to the prior close is a routine outcome")
+alertcondition(gapInsideBearEvent, "Bearish Gap Inside Prior Range", "Gap rules interaction: {{ticker}} {{interval}} gapped down but opened inside the prior day's range - structurally weaker; a fill back to the prior close is a routine outcome")
+alertcondition(orAcceptEvent, "Opening Range Accepting The Gap", "Gap rules interaction: the opening range on {{ticker}} {{interval}} formed entirely beyond the gapped-over level - early trade is accepting the gap")
+alertcondition(orRejectEvent, "Opening Range Rejecting The Gap", "Gap rules interaction: the opening range on {{ticker}} {{interval}} traded back through the gapped-over level - early trade is rejecting the gap")
+alertcondition(reEntryEvent, "Gapped-Over Level Failed", "Gap rules interaction: {{ticker}} {{interval}} closed back through the gapped-over level - the path opens toward the unfilled gap and the prior close")
+alertcondition(contAlignEvent, "Continuation Alignment", "Gap rules interaction on {{ticker}} {{interval}}: gap beyond the prior range, opening range holding its gap-side half and no re-entry through the gapped-over level - gap-and-go continuation conditions aligned")
+alertcondition(fadeAlignEvent, "Fade Alignment", "Gap rules interaction on {{ticker}} {{interval}}: price back inside accepted territory with the opening range read against the gap - rotation toward the prior close, risk framed at the opening-range extreme")
+alertcondition(fullFillEvent, "Full Gap Fill", "Gap rules interaction: {{ticker}} {{interval}} traded back to the prior close - gap fully filled; holding here preserves the gap-side structure, continuing through negates it")
+alertcondition(negatedEvent, "Gap Negated", "Gap rules interaction: {{ticker}} {{interval}} closed through the prior close - the full fill kept going and the gap's structure is negated, imbalance converted back to balance")
+
+//---------------------------------------------------------------------------------------------------------------------}

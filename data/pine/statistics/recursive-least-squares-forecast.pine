@@ -1,0 +1,146 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+//@version=6
+indicator("Recursive Least Squares Forecast", "RLS Forecast", overlay = true, max_labels_count = 500, max_polylines_count = 100)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+color GREEN      = #089981
+color RED        = #f23645
+color NEUTRAL    = #787b86
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Inputs
+//---------------------------------------------------------------------------------------------------------------------{
+float lambdaInput   = input.float(0.98, "Forgetting Factor (λ)", minval = 0.8, maxval = 1.0, step = 0.01, tooltip = "Controls how quickly the model forgets old data. Lower values make the forecast more adaptive to recent price changes.")
+float multInput     = input.float(2.0, "Band Multiplier", minval = 0.1, step = 0.1, tooltip = "Standard deviation multiplier for the forecast bands.")
+int lengthInput     = input.int(50, "Forecast Horizon", minval = 5, maxval = 100, tooltip = "Number of bars to project the 'Ghost Line' into the future.")
+bool showGhostInput = input.bool(true, "Show Ghost Line & Bands", tooltip = "Display the future projection and uncertainty bands.")
+bool showSignalsInput = input.bool(true, "Show Mean Reversion Signals", tooltip = "Enable buy/sell signals based on mean reversion logic.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// RLS Logic
+//---------------------------------------------------------------------------------------------------------------------{
+// State variables for RLS (Recursive Least Squares)
+// Model: y = w1 + w2 * t
+var float w1 = 0.0 // Intercept
+var float w2 = 0.0 // Slope
+var float p11 = 1000.0 // P matrix components (Symmetric)
+var float p12 = 0.0
+var float p22 = 1000.0
+var float msqe = 0.0 // Mean Squared Error for volatility estimation
+
+// Time variable (using a shifted bar_index to avoid precision issues)
+float t = bar_index
+
+// Initialization
+if bar_index == 0
+    w1 := close
+    w2 := 0.0
+
+// RLS Update Steps
+// 1. Calculate Error (Innovation)
+float y = close
+float yHat = w1 + w2 * t
+float error = y - yHat
+
+// 2. Update MSQE (for bands)
+msqe := math.max(0, lambdaInput * msqe + (1 - lambdaInput) * math.pow(error, 2))
+float rlsStd = math.sqrt(msqe)
+
+// 3. Gain Vector k = Px / (lambda + x'Px)
+// x = [1, t]'
+float p11_t_p12 = p11 + t * p12
+float p12_t_p22 = p12 + t * p22
+float denom = lambdaInput + (p11_t_p12 + t * p12_t_p22)
+float k1 = p11_t_p12 / denom
+float k2 = p12_t_p22 / denom
+
+// 4. Update Weights w = w + k*e
+w1 := w1 + k1 * error
+w2 := w2 + k2 * error
+
+// 5. Update Matrix P = (P - kx'P) / lambda
+p11 := (p11 - k1 * p11_t_p12) / lambdaInput
+p12 := (p12 - k1 * p12_t_p22) / lambdaInput
+p22 := (p22 - k2 * p12_t_p22) / lambdaInput
+
+// Current Mean and Bands
+float rlsMean = w1 + w2 * t
+float upperBand = rlsMean + rlsStd * multInput
+float lowerBand = rlsMean - rlsStd * multInput
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Signals Logic
+//---------------------------------------------------------------------------------------------------------------------{
+var bool isOverbought = false
+var bool isOversold = false
+
+bool crossUpBand = ta.crossover(high, upperBand)
+bool crossDnBand = ta.crossunder(low, lowerBand)
+
+if crossUpBand
+    isOverbought := true
+if crossDnBand
+    isOversold := true
+
+bool sellSignalCross = ta.crossunder(close, upperBand)
+bool buySignalCross = ta.crossover(close, lowerBand)
+
+bool sellSignal = isOverbought and sellSignalCross
+bool buySignal = isOversold and buySignalCross
+
+if sellSignal
+    isOverbought := false
+if buySignal
+    isOversold := false
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visuals
+//---------------------------------------------------------------------------------------------------------------------{
+// Plotting historical mean and bands
+pMean  = plot(rlsMean, "RLS Mean", color = color.new(NEUTRAL, 50))
+pUpper = plot(upperBand, "Upper Band", color = RED)
+pLower = plot(lowerBand, "Lower Band", color = GREEN)
+fill(pUpper, pMean, upperBand, rlsMean, color.new(RED, 80),   color.new(RED, 100),   "Upper Band Fill")
+fill(pLower, pMean, rlsMean, lowerBand, color.new(GREEN, 100), color.new(GREEN, 80), "Lower Band Fill")
+
+
+
+// Ghost Line & Forecast Bands (Future Projection)
+var polyline ghostLine = na
+var polyline ghostUpper = na
+var polyline ghostLower = na
+
+if showGhostInput and barstate.islast
+    polyline.delete(ghostLine)
+    polyline.delete(ghostUpper)
+    polyline.delete(ghostLower)
+    
+    array<chart.point> meanPoints = array.new<chart.point>()
+    array<chart.point> upperPoints = array.new<chart.point>()
+    array<chart.point> lowerPoints = array.new<chart.point>()
+    
+    for i = 0 to lengthInput
+        int futureT = bar_index + i
+        float futureMean = w1 + w2 * futureT
+        float futureUpper = futureMean + rlsStd * multInput
+        float futureLower = futureMean - rlsStd * multInput
+        
+        meanPoints.push(chart.point.from_index(futureT, futureMean))
+        upperPoints.push(chart.point.from_index(futureT, futureUpper))
+        lowerPoints.push(chart.point.from_index(futureT, futureLower))
+        
+    ghostLine  := polyline.new(meanPoints,  line_color = NEUTRAL, line_style = line.style_dashed)
+    ghostUpper := polyline.new(upperPoints, line_color = RED,     line_style = line.style_dotted)
+    ghostLower := polyline.new(lowerPoints, line_color = GREEN,   line_style = line.style_dotted)
+
+// Signal Labels
+if showSignalsInput
+    if buySignal
+        label.new(bar_index, low, "BUY", color = #00000000, textcolor = GREEN, style = label.style_label_up, size = size.small)
+    if sellSignal
+        label.new(bar_index, high, "SELL", color = #00000000, textcolor = RED, style = label.style_label_down, size = size.small)
+
+//---------------------------------------------------------------------------------------------------------------------}

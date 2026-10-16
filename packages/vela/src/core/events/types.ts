@@ -1,0 +1,175 @@
+import type { EngineAlert, EngineWarning } from "../ports/ScriptingEngine";
+import type { ScriptRun } from "../script-run";
+import type { OHLCV } from "../model/ohlcv";
+import type { DrawingTypeKey, SerializedDrawing } from "../drawings/Drawing";
+import type { VelaTheme } from "../options";
+import type { SnapMode } from "../drawings/geometry";
+import type { DrawingMode } from "../drawings/port";
+import type { MarkClickEvent } from "../marks/types";
+import type { ReplayEndReason } from "../ReplayControl";
+
+/** Chart-level events emitted on `chart.on(...)`. */
+export interface VelaEventMap extends Record<string, unknown> {
+  ready: undefined;
+  /**
+   * The chart's market switched IN PLACE via `setMarket` — symbol, provider, timeframe,
+   * or offline data changed (a depth-only reload does not fire). Fires after the new
+   * market's history is painted and every consumer restarted. `prev` carries the
+   * previous identity so hosts can re-key per-symbol state (e.g. swap user-drawing
+   * documents between symbols).
+   */
+  "market:changed": {
+    symbol: string;
+    timeframe: string;
+    prev: { symbol: string; timeframe: string };
+  };
+  /**
+   * A bar load began with nothing painted: the FIRST load (fires during construction —
+   * subscribers attached later see only its `load:end`), or an identity switch
+   * (symbol/provider/timeframe), which blanks the old series in the same breath. Fires
+   * before the first fetch — plugins, extensions and custom indicators hide or reset
+   * their own visuals here. Exactly one `load:end` follows. A depth-only reload
+   * (`bars`) keeps the chart painted and fires neither.
+   */
+  "load:start": { symbol: string; timeframe: string; firstLoad: boolean };
+  /**
+   * The load ended: its first bars painted (`bars` > 0 — on deep histories the quick
+   * preview, before the full depth), or it ended with none (`bars` = 0 — a failed
+   * fetch, an empty market, or a parked symbol nothing serves). Counterpart of
+   * `load:start`; plugins restore or rebuild their visuals here.
+   */
+  "load:end": { symbol: string; timeframe: string; bars: number };
+  "indicator:added": { id: string };
+  "indicator:removed": { id: string };
+  /** An indicator's stored input/prop VALUES changed (settings dialog, `setInputs`) — what state persistence listens to. */
+  "indicator:inputs": { id: string };
+  "indicator:error": { id: string; error: Error };
+  /** No registered provider can serve the chart symbol — the load is PARKED, not failed:
+   *  it resumes by itself if a capable provider registers later. */
+  "data:unresolved": { symbol: string; providers: string[] };
+  /** An indicator was moved/merged to another pane (`chart.panes` / legend / object tree). */
+  "indicator:moved": { id: string; paneId: string };
+  /** An indicator was shown/hidden (legend eye, `handle.setVisible`, or object tree). */
+  "indicator:visibility": { id: string; visible: boolean };
+  /** A pane's layout changed: order, collapse/maximize, creation or removal. */
+  "pane:changed": undefined;
+  /**
+   * The app theme changed — `chart.setTheme(...)` or the in-chart settings dialog's
+   * Canvas → Theme row. Payload is the RESOLVED theme; host chrome around the chart
+   * (toolbars, panels, page shells) re-skins from it. Not fired for plot-only
+   * cosmetic edits (`layout.background` through the config), which deliberately
+   * leave the app theme alone.
+   */
+  "theme:changed": VelaTheme;
+  /**
+   * The base price style is switching `from` → `to` (candles, line, area, a chart-type
+   * id, …). Fires synchronously BEFORE the chart repaints in the new style, whatever
+   * the path: the topbar style menu, `ctx.setPriceStyle`,
+   * `chart.renderer.set('priceStyle', …)`, the settings dialog, `applyConfig` and
+   * config templates, or a state restore. Never fires for the style the chart was
+   * created with, nor for a set to the style already shown. While it runs the chart
+   * still shows `from`, so a listener can capture the outgoing frame
+   * (`chart.renderer.screenshotCanvas()`) to animate the switch. Listeners must not
+   * change the price style again from inside it.
+   */
+  "priceStyle:change": { from: string; to: string };
+  /** A study pane was reordered one slot (`dir`) — carries enough to invert for undo/redo. */
+  "pane:moved": { paneId: string; dir: "up" | "down" };
+  /** A user drawing was created (interactively or via `chart.drawings.add`). */
+  "drawing:created": { id: string };
+  /** An interactive placement is in progress — the ghost's current shape after each
+   *  anchor click / cursor move, `null` when placement ends (finalized or
+   *  cancelled). Transient: nothing is in the store yet. Multi-chart hosts mirror
+   *  it on linked charts via `drawings.setExternalGhost`. */
+  "drawing:draft": { doc: SerializedDrawing | null };
+  /** A user drawing's anchors/style/text changed. */
+  "drawing:edited": { id: string };
+  /** Selection changed. `ids` is every selected drawing in selection order; `id` is the
+   *  primary (`ids[0]`, the one a settings popup edits), null when nothing is selected. */
+  "drawing:selected": { id: string | null; ids: string[] };
+  /** The favorite-tool set changed (star toggles or a bulk restore). */
+  "drawing:favorites": { favorites: string[] };
+  /** A tool's remembered settings changed — the ones its next drawing starts from (the last
+   *  drawing of that type the user styled, a bulk restore, or a reset). Read them back with
+   *  `drawings.toolDefaults()`. */
+  "drawing:defaults": { type: DrawingTypeKey };
+  /** A tool's saved looks changed (saved, deleted, or a bulk restore) — read them back with
+   *  `drawings.toolTemplates()`. */
+  "drawing:templates": { type: DrawingTypeKey };
+  /** The armed drawing tool changed — toolbar click, one-shot tool finishing (back to
+   *  the pointer, `null`), or a programmatic `drawings.setTool`. */
+  "drawing:tool": { type: DrawingTypeKey | null };
+  /** The magnet snap mode changed (in-chart toolbar or `drawings.setSnapMode`). */
+  "drawing:snap": { mode: SnapMode };
+  /** Stay-in-drawing-mode changed (in-chart toolbar or `drawings.setStayMode`) — when
+   *  on, finishing a drawing leaves the tool armed. */
+  "drawing:stay": { on: boolean };
+  /** The renderer-local mode changed: measure ruler, eraser, or none — including the
+   *  mutual-exclusion exits (arming a tool leaves measure/eraser). */
+  "drawing:mode": { mode: DrawingMode };
+  /** A user drawing was removed. */
+  "drawing:removed": { id: string };
+  /** The user requested a drawing's settings popup. */
+  "drawing:settings": { id: string };
+  /** A timeline-mark glyph was clicked — `ids` lists every mark under it (a cluster). Fires
+   *  before the popup opens; a mark without content opens none, so this is the host's hook. */
+  "mark:click": MarkClickEvent;
+  /**
+   * A SCRIPT computed — the first run over the history, a live tick, a new bar, an input
+   * edit, a viewport move, a market switch. The payload carries the run itself (title,
+   * cause, the plots/variables/broker state at the computed bar), so a listener reads it
+   * directly instead of resolving a handle and pulling a snapshot. Throttled to ~1/s per
+   * indicator while streaming, and only emitted for engines that expose an execution
+   * context. Native (core-computed) indicators never fire it — they run no script.
+   */
+  "script:run": ScriptRun;
+  /** An indicator's execution context advanced (run finished, or throttled during
+   *  streaming) — re-pull `handle.context()` if you consume it. Prefer `script:run`,
+   *  which delivers the data rather than a signal to go fetch it. */
+  "context:changed": { id: string };
+  /** A live tick: the forming bar was updated or a new bar appended (a bar revealed by replay included). */
+  bar: OHLCV;
+  /**
+   * The visible time range moved (pan/zoom/fit — fires per applied change, NOT
+   * debounced; the engine re-run debounce is separate). Payload = `{from, to}` in
+   * epoch-ms. The seam viewport-sync links between charts build on.
+   */
+  "viewport:changed": { from: number; to: number };
+  /** A deep-history backfill chunk landed (`loaded` of `target` bars are on the chart). */
+  "history:progress": { loaded: number; target: number };
+  /**
+   * The history load finished: `'depth'` = the requested bar count is loaded, `'genesis'` =
+   * the source has nothing older (full available history), `'aborted'` = a fetch failed or
+   * the data was non-monotonic — the chart keeps what loaded. Fires exactly once, including
+   * for small/offline charts (immediately after their single load).
+   */
+  "history:complete": {
+    reason: "depth" | "genesis" | "aborted";
+    oldestTime: number;
+    barsLoaded: number;
+  };
+  /** Replay mode began (or seeked): the chart shows history up to `cursorTime`, `remaining` bars are hidden. */
+  "replay:start": { cursorTime: number; remaining: number };
+  /** One hidden bar was revealed (it also fires `bar`, like a live bar). A bar played tick
+   *  by tick steps once, when its last tick settles it. */
+  "replay:step": { cursorTime: number; remaining: number };
+  /** An intrabar update of the bar forming at `cursorTime` (`chart.replay.setTicks`):
+   *  tick `index` of `count` is applied (batched updates report the last one). */
+  "replay:tick": { cursorTime: number; index: number; count: number };
+  /** Timed reveal started, or its pace changed. */
+  "replay:play": { intervalMs: number };
+  /** Timed reveal paused — `pause()`, or a seek (`start()` while playing). */
+  "replay:pause": undefined;
+  /**
+   * Replay mode ended: `'stopped'` = `chart.replay.stop()`, `'finished'` = the last hidden
+   * bar was revealed, `'market'` = a symbol switch replaced the history (a timeframe or
+   * session switch carries the replay over instead). The full history
+   * is back and live updates resumed.
+   */
+  "replay:end": { reason: ReplayEndReason };
+  /** An indicator's script raised an alert. `indicator` names the source — the
+   *  indicator's display title (what its legend row shows). Never fires for bars a
+   *  replay reveals (`chart.replay`). */
+  alert: EngineAlert & { indicator?: string };
+  warning: EngineWarning;
+}

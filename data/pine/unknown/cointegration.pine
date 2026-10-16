@@ -1,0 +1,338 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Cointegration", shorttitle = "Cointegration", overlay = false, format = format.price, precision = 2)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+NEUTRAL_COLOR = #787b86 // structure - thresholds, mean, spread while not cointegrated
+ACCENT_COLOR  = #ff9800 // the one accent - the optional Dickey-Fuller statistic
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+ZONE_TRANSP = 91 // transparency of the soft entry-zone shading
+ZONE_DEPTH  = 1  // z-score depth of the shaded band beyond each entry level
+
+FILL_VALUE_TRANSP = 50  // gradient transparency at the z-score value
+FILL_MEAN_TRANSP  = 100 // gradient transparency at the spread mean
+
+// MacKinnon asymptotic critical values for the Engle-Granger cointegration test
+// (two variables, constant, no trend in the cointegrating regression)
+CV_1PCT  = -3.90
+CV_5PCT  = -3.34
+CV_10PCT = -3.04
+
+SIG_1PCT  = "1%"
+SIG_5PCT  = "5%"
+SIG_10PCT = "10%"
+
+MAX_WINDOW = 500
+EPSILON    = 1e-12
+
+TOP_RIGHT    = "Top Right"
+TOP_LEFT     = "Top Left"
+BOTTOM_RIGHT = "Bottom Right"
+BOTTOM_LEFT  = "Bottom Left"
+
+TINY_SIZE   = "Tiny"
+SMALL_SIZE  = "Small"
+NORMAL_SIZE = "Normal"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+symbolInput     = input.symbol("SP:SPX", "Comparison Symbol", group = "Pair",
+     tooltip = "Second leg of the pair. Pick an economically linked instrument (shared sector, index or input costs) - statistical screens without a linkage story breed false positives. The chart symbol's levels are regressed on this leg's levels to obtain the hedge ratio.")
+
+srcInput        = input.source(close, "Source", group = "Pair",
+     tooltip = "Price series used for both legs. Cointegration works on price levels, not returns - the regression and the residual spread are computed from these levels.")
+
+logInput        = input.bool(true, "Use Log Prices", group = "Pair",
+     tooltip = "Run the hedge-ratio regression and the spread on log prices, the usual choice in pairs work so the hedge ratio reads as a relative weight. Disable to use raw price levels.")
+
+lengthInput     = input.int(252, "Formation Window", minval = 30, maxval = MAX_WINDOW, group = "Cointegration Test",
+     tooltip = "Bars used to estimate the hedge-ratio regression, test the residual spread and z-score it - 252 approximates the classic one-year formation window on daily charts. Longer windows are statistically steadier, shorter ones notice a break faster but false-alarm more.")
+
+sigInput        = input.string(SIG_5PCT, "Significance Level", options = [SIG_1PCT, SIG_5PCT, SIG_10PCT], group = "Cointegration Test",
+     tooltip = "Significance of the Engle-Granger step: the Dickey-Fuller statistic of the residual spread must fall below the MacKinnon critical value (-3.90 / -3.34 / -3.04) for the pair to test cointegrated. Stricter levels admit fewer, more reliable relationships.")
+
+showStatInput   = input.bool(false, "Plot Test Statistic", group = "Cointegration Test",
+     tooltip = "Plot the rolling Dickey-Fuller statistic together with its critical value next to the z-score, so the health of the relationship can be monitored bar by bar as it is re-tested on each new window.")
+
+entryInput      = input.float(2, "Entry Threshold", minval = 0.5, step = 0.25, group = "Spread Trading",
+     tooltip = "Spread z-score beyond which entry events fire: short the spread when it crosses above the upper level, long the spread when it crosses below the lower level. Two standard deviations is the classic setting.")
+
+exitInput       = input.float(0, "Exit Threshold", minval = 0, step = 0.25, group = "Spread Trading",
+     tooltip = "Z-score level at which mean-reversion exit events fire on the way back. 0 waits for a full return to the spread mean; higher values take the exit earlier.")
+
+gateInput       = input.bool(true, "Signals Require Cointegration", group = "Spread Trading",
+     tooltip = "Only fire entry events while the residual spread currently tests stationary, standing down when the relationship stops passing - deviations of a broken pair have no statistical reason to revert.")
+
+markersInput    = input.bool(false, "Show Signal Markers", group = "Spread Trading",
+     tooltip = "Draw triangles on the z-score when entry events fire. Off by default to keep the pane clean - the alert conditions cover the same events regardless of this setting.")
+
+showDashInput   = input.bool(true, "Show Dashboard", group = "Dashboard",
+     tooltip = "Displays the pair diagnostics panel: the legs, the window, the hedge ratio, the spread z-score, the Dickey-Fuller statistic against its critical value, the half-life of reversion and the cointegration status.")
+
+dashLocInput    = input.string(TOP_RIGHT, "Location", options = [TOP_RIGHT, TOP_LEFT, BOTTOM_RIGHT, BOTTOM_LEFT], inline = "dash", group = "Dashboard",
+     tooltip = "Position of the dashboard on the pane.")
+
+dashSizeInput   = input.string(SMALL_SIZE, "Size", options = [TINY_SIZE, SMALL_SIZE, NORMAL_SIZE], inline = "dash", group = "Dashboard",
+     tooltip = "Text size of the dashboard.")
+
+bullColorInput  = input.color(BULL_COLOR, "Bullish", inline = "direction", group = "Style",
+     tooltip = "Color of the z-score line and gradient above the spread mean, and of long-spread markers.")
+
+bearColorInput  = input.color(BEAR_COLOR, "Bearish", inline = "direction", group = "Style",
+     tooltip = "Color of the z-score line and gradient below the spread mean, and of short-spread markers.")
+
+neutralColorInput = input.color(NEUTRAL_COLOR, "Neutral", group = "Style",
+     tooltip = "Color of the entry and exit threshold levels and, when dimming is enabled, of the spread while the pair does not test cointegrated.")
+
+statColorInput  = input.color(ACCENT_COLOR, "Test Statistic", group = "Style",
+     tooltip = "Color of the optional Dickey-Fuller statistic plot; its critical value line uses a faded shade of the same color.")
+
+meanColorInput  = input.color(color.new(NEUTRAL_COLOR, 50), "Mean Line", group = "Style",
+     tooltip = "Color of the dotted line at zero, the mean of the z-scored spread that deviations are expected to revert toward.")
+
+dimInput        = input.bool(true, "Dim Spread When Not Cointegrated", group = "Style",
+     tooltip = "Use the neutral color for the z-score line and its gradient while the pair does not test cointegrated, so stretches where fading the spread lacks statistical backing stand out at a glance.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Table corner from the dashboard position option
+tableLocation(string positionText) =>
+    switch
+        positionText == TOP_RIGHT    => position.top_right
+        positionText == TOP_LEFT     => position.top_left
+        positionText == BOTTOM_RIGHT => position.bottom_right
+        => position.bottom_left
+
+// Table text size from the dashboard size option
+tableTextSize(string sizeText) =>
+    switch
+        sizeText == TINY_SIZE  => size.tiny
+        sizeText == SMALL_SIZE => size.small
+        => size.normal
+
+// Price level fed to the cointegrating regression - log levels by default, guarded
+// against non-positive prices
+legLevel(float price) =>
+    logInput ? (price > 0 ? math.log(price) : na) : price
+
+// Fixed-precision display string, "n/a" while the statistic is not yet defined
+formatStat(float value, string formatPattern) =>
+    na(value) ? "n/a" : str.tostring(value, formatPattern)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+// Comparison leg aligned to the chart's bars - the source expression is evaluated in the
+// comparison symbol's own context
+float comparisonPrice = request.security(symbolInput, timeframe.period, srcInput, ignore_invalid_symbol = true)
+
+float chartLeg = legLevel(srcInput)
+float compLeg  = legLevel(comparisonPrice)
+
+max_bars_back(chartLeg, MAX_WINDOW)
+max_bars_back(compLeg, MAX_WINDOW)
+
+// Latches true once the comparison symbol has returned any data - drives the no-data notice
+var bool comparisonSeen = false
+if not na(comparisonPrice)
+    comparisonSeen := true
+
+float hedgeRatio          = na
+float regressionIntercept = na
+float spread              = na
+float spreadZ             = na
+float dfStat              = na
+float halfLife            = na
+
+bool windowOk = bar_index >= lengthInput and not na(chartLeg) and not na(compLeg) and not na(chartLeg[lengthInput - 1]) and not na(compLeg[lengthInput - 1])
+
+if windowOk
+    // Step 1 - hedge ratio: OLS regression of the chart leg's levels on the comparison
+    // leg's levels over the formation window
+    float sumComp   = 0.0
+    float sumChart  = 0.0
+    float sumCross  = 0.0
+    float sumCompSq = 0.0
+
+    for i = 0 to lengthInput - 1
+        float compValue  = compLeg[i]
+        float chartValue = chartLeg[i]
+        sumComp   += compValue
+        sumChart  += chartValue
+        sumCross  += compValue * chartValue
+        sumCompSq += compValue * compValue
+
+    float slopeDenominator = lengthInput * sumCompSq - sumComp * sumComp
+
+    if not na(slopeDenominator) and math.abs(slopeDenominator) > EPSILON
+        hedgeRatio          := (lengthInput * sumCross - sumComp * sumChart) / slopeDenominator
+        regressionIntercept := (sumChart - hedgeRatio * sumComp) / lengthInput
+
+        // Step 2 - residual spread over the window, rebuilt each bar with the current
+        // regression so the relationship is re-tested on every rolling window
+        array<float> residualArray = array.new<float>(lengthInput)
+
+        for i = 0 to lengthInput - 1
+            residualArray.set(i, chartLeg[i] - regressionIntercept - hedgeRatio * compLeg[i])
+
+        spread := residualArray.get(0)
+
+        // Step 3 - z-score of the spread against its own window history, so entry and
+        // exit thresholds are comparable across pairs
+        float residualMean  = residualArray.avg()
+        float residualStdev = residualArray.stdev(false)
+
+        if not na(residualStdev) and residualStdev > EPSILON
+            spreadZ := (spread - residualMean) / residualStdev
+
+        // Step 4 - Engle-Granger step: Dickey-Fuller regression on the residual,
+        // change on lagged level with no constant (OLS residuals are mean zero)
+        float lagSquaredSum = 0.0
+        float diffLagSum    = 0.0
+
+        for i = 0 to lengthInput - 2
+            float lagResidual    = residualArray.get(i + 1)
+            float residualChange = residualArray.get(i) - lagResidual
+            lagSquaredSum += lagResidual * lagResidual
+            diffLagSum    += residualChange * lagResidual
+
+        if not na(lagSquaredSum) and lagSquaredSum > EPSILON
+            float reversionRate = diffLagSum / lagSquaredSum
+            float residualSumSq = 0.0
+
+            for i = 0 to lengthInput - 2
+                float lagResidual    = residualArray.get(i + 1)
+                float residualChange = residualArray.get(i) - lagResidual
+                residualSumSq += math.pow(residualChange - reversionRate * lagResidual, 2)
+
+            float sigmaSquared  = residualSumSq / (lengthInput - 2)
+            float slopeStdError = math.sqrt(sigmaSquared / lagSquaredSum)
+
+            if not na(slopeStdError) and slopeStdError > EPSILON
+                dfStat := reversionRate / slopeStdError
+
+            // Step 5 - half-life of reversion from the same fit: -ln(2) / reversion rate,
+            // the typical bars a deviation takes to decay halfway back to the mean
+            if reversionRate < 0
+                halfLife := -math.log(2) / reversionRate
+
+float criticalValue = sigInput == SIG_1PCT ? CV_1PCT : sigInput == SIG_10PCT ? CV_10PCT : CV_5PCT
+bool  cointegrated  = not na(dfStat) and dfStat < criticalValue
+
+// Relationship transitions, tracked as an int state so history is nz-safe
+int  cointState       = cointegrated ? 1 : 0
+bool cointEstablished = cointState == 1 and nz(cointState[1]) == 0 and comparisonSeen
+bool cointLost        = cointState == 0 and nz(cointState[1]) == 1
+
+// Spread trading events: fade z-score extremes back toward the mean, optionally only
+// while the relationship still tests intact
+bool allowSignals = not gateInput or cointegrated
+
+bool longSpread  = ta.crossunder(spreadZ, -entryInput) and allowSignals
+bool shortSpread = ta.crossover(spreadZ, entryInput) and allowSignals
+
+bool exitFromLong  = ta.crossover(spreadZ, -exitInput)
+bool exitFromShort = ta.crossunder(spreadZ, exitInput)
+bool spreadExit    = exitFromLong or exitFromShort
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+bool  spreadAbove    = nz(spreadZ) >= 0
+color directionColor = spreadAbove ? bullColorInput : bearColorInput
+color spreadColor    = cointegrated or not dimInput ? directionColor : neutralColorInput
+
+zScorePlotId = plot(spreadZ, "Spread Z-Score", color = spreadColor, linewidth = 2, style = plot.style_linebr)
+meanAnchorId = plot(0, "Mean Anchor", editable = false, display = display.none)
+
+fill(zScorePlotId, meanAnchorId, top_value = math.max(nz(spreadZ), 0), bottom_value = math.min(nz(spreadZ), 0), top_color = spreadAbove ? color.new(spreadColor, FILL_VALUE_TRANSP) : color.new(spreadColor, FILL_MEAN_TRANSP), bottom_color = spreadAbove ? color.new(spreadColor, FILL_MEAN_TRANSP) : color.new(spreadColor, FILL_VALUE_TRANSP), title = "Spread Gradient Fill")
+
+hline(0, "Spread Mean", color = meanColorInput, linestyle = hline.style_dotted)
+
+plot(entryInput, "Upper Entry Level", color = color.new(neutralColorInput, 50), linewidth = 1, style = plot.style_circles)
+plot(-entryInput, "Lower Entry Level", color = color.new(neutralColorInput, 50), linewidth = 1, style = plot.style_circles)
+plot(exitInput > 0 ? exitInput : na, "Upper Exit Level", color = color.new(neutralColorInput, 70), linewidth = 1, style = plot.style_circles)
+plot(exitInput > 0 ? -exitInput : na, "Lower Exit Level", color = color.new(neutralColorInput, 70), linewidth = 1, style = plot.style_circles)
+
+// Soft entry-zone shading beyond each entry level - short-spread zone above, long-spread zone below
+upperEntryAnchorId = plot(entryInput, "Upper Entry Anchor", editable = false, display = display.none)
+upperZoneAnchorId  = plot(entryInput + ZONE_DEPTH, "Upper Zone Anchor", editable = false, display = display.none)
+lowerEntryAnchorId = plot(-entryInput, "Lower Entry Anchor", editable = false, display = display.none)
+lowerZoneAnchorId  = plot(-entryInput - ZONE_DEPTH, "Lower Zone Anchor", editable = false, display = display.none)
+
+fill(upperEntryAnchorId, upperZoneAnchorId, color.new(bearColorInput, ZONE_TRANSP), title = "Short Spread Zone")
+fill(lowerEntryAnchorId, lowerZoneAnchorId, color.new(bullColorInput, ZONE_TRANSP), title = "Long Spread Zone")
+
+plot(showStatInput ? dfStat : na, "Dickey-Fuller Statistic", color = statColorInput, linewidth = 1, style = plot.style_linebr)
+plot(showStatInput ? criticalValue : na, "Critical Value", color = color.new(statColorInput, 50), linewidth = 1, style = plot.style_linebr)
+
+plotshape(markersInput and longSpread ? spreadZ : na, "Long Spread Signal", style = shape.triangleup, location = location.absolute, color = bullColorInput, size = size.tiny)
+plotshape(markersInput and shortSpread ? spreadZ : na, "Short Spread Signal", style = shape.triangledown, location = location.absolute, color = bearColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dashboardTable = na
+
+if barstate.islast and (showDashInput or not comparisonSeen)
+    if na(dashboardTable)
+        dashboardTable := table.new(tableLocation(dashLocInput), 2, comparisonSeen ? 8 : 1, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+    string textSize  = tableTextSize(dashSizeInput)
+    color labelColor = DASH_HEADER
+    color valueColor = DASH_TEXT
+
+    // comparison leg shown without its exchange prefix
+    string comparisonName = symbolInput
+    array<string> symbolParts = str.split(symbolInput, ":")
+    if symbolParts.size() > 0
+        comparisonName := symbolParts.get(symbolParts.size() - 1)
+
+    if not comparisonSeen
+        // graceful notice when the comparison symbol returns no data
+        table.cell(dashboardTable, 0, 0, "Cointegration", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+        table.cell(dashboardTable, 1, 0, "No data for " + comparisonName, text_color = bearColorInput, text_size = textSize, text_halign = text.align_right)
+    else
+        string halfLifeText = na(halfLife) ? "n/a" : str.tostring(halfLife, "0.0") + " bars"
+        string statusText   = cointegrated ? "Cointegrated" : "Not Cointegrated"
+        color  statusColor  = cointegrated ? bullColorInput : bearColorInput
+
+        table.cell(dashboardTable, 0, 0, "Pair", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+        table.cell(dashboardTable, 1, 0, syminfo.ticker + " / " + comparisonName, text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+        table.cell(dashboardTable, 0, 1, "Window", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+        table.cell(dashboardTable, 1, 1, str.tostring(lengthInput) + " bars", text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+        table.cell(dashboardTable, 0, 2, "Hedge Ratio", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+        table.cell(dashboardTable, 1, 2, formatStat(hedgeRatio, "0.000"), text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+        table.cell(dashboardTable, 0, 3, "Spread Z-Score", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+        table.cell(dashboardTable, 1, 3, formatStat(spreadZ, "0.00"), text_color = na(spreadZ) ? labelColor : directionColor, text_size = textSize, text_halign = text.align_right)
+        table.cell(dashboardTable, 0, 4, "DF Statistic", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+        table.cell(dashboardTable, 1, 4, formatStat(dfStat, "0.00"), text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+        table.cell(dashboardTable, 0, 5, "Critical (" + sigInput + ")", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+        table.cell(dashboardTable, 1, 5, str.tostring(criticalValue, "0.00"), text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+        table.cell(dashboardTable, 0, 6, "Half-Life", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+        table.cell(dashboardTable, 1, 6, halfLifeText, text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+        table.cell(dashboardTable, 0, 7, "Status", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+        table.cell(dashboardTable, 1, 7, statusText, text_color = statusColor, text_size = textSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(longSpread, "Long Spread Entry", "Cointegration on {{ticker}}: spread z-score crossed below the lower entry threshold - long-spread setup, buy the chart symbol against the comparison leg at the hedge ratio ({{interval}})")
+alertcondition(shortSpread, "Short Spread Entry", "Cointegration on {{ticker}}: spread z-score crossed above the upper entry threshold - short-spread setup, sell the chart symbol against the comparison leg at the hedge ratio ({{interval}})")
+alertcondition(spreadExit, "Spread Mean Reversion Exit", "Cointegration on {{ticker}}: spread z-score crossed its exit threshold back toward the mean - reversion target reached ({{interval}})")
+alertcondition(cointEstablished, "Cointegration Established", "Cointegration on {{ticker}}: the residual spread now tests stationary at the selected significance level - relationship established ({{interval}})")
+alertcondition(cointLost, "Cointegration Lost", "Cointegration on {{ticker}}: the residual spread no longer tests stationary at the selected significance level - stand down on new entries ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

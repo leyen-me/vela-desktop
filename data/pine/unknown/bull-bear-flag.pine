@@ -1,0 +1,371 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Bull/bear Flag", "Bull/bear Flag", overlay = true, max_lines_count = 500, max_labels_count = 500, max_bars_back = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+//Pattern machine states, one independent machine per direction
+ST_IDLE   = 0
+ST_BUILD  = 1
+ST_ACTIVE = 2
+
+//A pole is a sequence, not a single bar
+MIN_POLE_BARS = 2
+
+FILL_TRANSPARENCY = 85
+LABEL_BG          = #00000000
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+atrLengthInput = input.int(14, "ATR Length", minval = 1, group = "Pole",
+  tooltip = "Average True Range length used to normalize the pole's height, so impulse detection adapts to each symbol's volatility.")
+
+poleWindowInput = input.int(10, "Maximum Pole Duration", minval = 3, maxval = 50, group = "Pole",
+  tooltip = "Longest span, in bars, the impulse leg may take from its origin to its tip. A qualifying pole is a near-vertical move completing within this window - the pole qualifies the pattern; without an impulsive pole there is no flag.")
+
+poleHeightInput = input.float(3.0, "Minimum Pole Height (ATR)", minval = 0.5, step = 0.5, group = "Pole",
+  tooltip = "Smallest pole height, as a multiple of the ATR, for the impulse leg to qualify. Higher values demand a sharper move that stands out from the surrounding action.")
+
+strongClosesInput = input.float(60, "Strong Closes (%)", minval = 0, maxval = 100, step = 5, group = "Pole",
+  tooltip = "Minimum share of pole bars that must close in the impulsive half of their range, enforcing the near-vertical sequence of strong closes that defines a pole rather than a loose drift.")
+
+flagMinBarsInput = input.int(4, "Flag Duration", minval = 2, maxval = 50, inline = "span", group = "Flag",
+  tooltip = "Fewest pause bars before the drift can qualify as a flag. A flag is the multi-bar version of a one-bar pause - classically a handful of overlapping bars.")
+
+flagMaxBarsInput = input.int(15, "to", minval = 3, maxval = 100, inline = "span", group = "Flag",
+  tooltip = "Most pause bars the flag may last. Classical guidance keeps flags brief - days to a few weeks on daily charts; prolonged or spreading consolidation is a different structure and the candidate is discarded.")
+
+flagDepthInput = input.float(50, "Maximum Flag Depth (% of Pole)", minval = 10, maxval = 100, step = 5, group = "Flag",
+  tooltip = "Deepest countertrend retracement allowed, as a percentage of the pole's height. Common guidance keeps a flag well under half of its pole, ideally holding the pole's upper third for bull flags (lower third for bear flags). Deeper drifts read as ordinary pullbacks and are rejected.")
+
+flagTiltInput = input.float(10, "Maximum With-Trend Tilt (% of Pole)", minval = 0, maxval = 50, step = 5, group = "Flag",
+  tooltip = "Largest net drift of the flag channel in the pole's direction, as a percentage of the pole's height. Flags tilt against the pole or sideways; a steep drift continuing the pole's direction is not a flag - after an up pole that shape reads closer to a rising wedge.")
+
+contractionInput = input.bool(true, "Require Bar-Range Contraction", group = "Flag",
+  tooltip = "Require the average flag bar range to be smaller than the average pole bar range. Poles print consecutive wide-range bars; healthy flags print small, overlapping bars - evidence that countertrend pressure is passive profit-taking.")
+
+volumeFilterInput = input.bool(false, "Volume Filter", group = "Flag",
+  tooltip = "Enforce the classical volume signature: contraction through the flag (flag average below pole average) and expansion at the break (breakout bar volume above the flag average). Automatically bypassed when the symbol reports no volume data.")
+
+bullColorInput = input.color(#089981, "Bullish Patterns", group = "Style",
+  tooltip = "Color of bull flag drawings, labels, markers and measured targets.")
+
+bearColorInput = input.color(#f23645, "Bearish Patterns", group = "Style",
+  tooltip = "Color of bear flag drawings, labels, markers and measured targets.")
+
+showPoleInput = input.bool(true, "Show Pole", group = "Style",
+  tooltip = "Draw the impulse leg from its origin to the pole tip.")
+
+showFillInput = input.bool(true, "Channel Fill", group = "Style",
+  tooltip = "Shade the interior of the flag channel between its two parallel boundaries.")
+
+showLabelsInput = input.bool(true, "Pattern Labels", group = "Style",
+  tooltip = "Label each qualified flag at its pole tip.")
+
+showTargetInput = input.bool(true, "Show Measured Target", group = "Style",
+  tooltip = "After a breakout, project the pole's height from the breakout point as a dotted objective line - the classical measure rule for flags. A planning device rather than a promise; most pair it with a trailing method.")
+
+showMarkersInput = input.bool(true, "Event Markers", group = "Style",
+  tooltip = "Plot chart markers on breakouts, measured-target hits and pattern failures.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types & State
+//---------------------------------------------------------------------------------------------------------------------{
+type FlagPattern
+    int      state          = 0
+    int      poleStartBar   = 0
+    float    poleStartPrice = na
+    int      poleEndBar     = 0
+    float    poleEndPrice   = na
+    float    poleHeight     = na
+    float    poleAvgRange   = na
+    float    poleAvgVolume  = na
+    float    flagExtreme    = na
+    float    flagRangeSum   = 0
+    float    flagVolumeSum  = 0
+    float    fitBase        = na
+    float    fitSlope       = na
+    float    fitUp          = na
+    float    fitDn          = na
+    int      fitBars        = 0
+    line     poleLine       = na
+    line     nearLine       = na
+    line     farLine        = na
+    linefill channelFill    = na
+    label    patternLabel   = na
+    bool     trackerOn      = false
+    float    trackerTarget  = na
+    float    trackerStop    = na
+    line     targetLine     = na
+
+var FlagPattern bullPattern = FlagPattern.new()
+var FlagPattern bearPattern = FlagPattern.new()
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+//Share (%) of the last (length + 1) bars closing in the impulsive half of their range for the given direction
+strongCloseShare(int length, int dirSign) =>
+    int strongCount = 0
+    for offset = 0 to length
+        float barRange = high[offset] - low[offset]
+        float closePos = barRange > 0 ? (close[offset] - low[offset]) / barRange : 0.5
+        if (dirSign > 0 ? closePos : 1 - closePos) >= 0.5
+            strongCount += 1
+    100. * strongCount / (length + 1)
+
+//Least-squares midline over the last n bars plus the parallel offsets reaching the extreme high/low deviations,
+//so both boundaries are parallel by construction and fitted on the pullback itself
+fitChannel(int n) =>
+    float sumX  = 0.
+    float sumY  = 0.
+    float sumXY = 0.
+    float sumXX = 0.
+    for offset = 0 to n - 1
+        int   x = n - 1 - offset
+        float y = hl2[offset]
+        sumX  += x
+        sumY  += y
+        sumXY += x * y
+        sumXX += x * x
+    float denom = n * sumXX - sumX * sumX
+    float slope = denom != 0 ? (n * sumXY - sumX * sumY) / denom : 0.
+    float base  = (sumY - slope * sumX) / n
+    float upOffset = 0.
+    float dnOffset = 0.
+    for offset = 0 to n - 1
+        float fitted = base + slope * (n - 1 - offset)
+        upOffset := math.max(upOffset, high[offset] - fitted)
+        dnOffset := math.max(dnOffset, fitted - low[offset])
+    [base, slope, upOffset, dnOffset]
+
+//Register a fresh pole candidate ending at the current bar
+setCandidate(FlagPattern p, int poleDuration, float poleFrom, float poleTo) =>
+    p.state          := ST_BUILD
+    p.poleStartBar   := bar_index - poleDuration
+    p.poleStartPrice := poleFrom
+    p.poleEndBar     := bar_index
+    p.poleEndPrice   := poleTo
+    p.poleHeight     := math.abs(poleTo - poleFrom)
+    float rangeSum  = 0.
+    float volumeSum = 0.
+    for offset = 0 to poleDuration
+        rangeSum  += high[offset] - low[offset]
+        volumeSum += nz(volume[offset])
+    p.poleAvgRange   := rangeSum / (poleDuration + 1)
+    p.poleAvgVolume  := volumeSum / (poleDuration + 1)
+    p.flagExtreme    := na
+    p.flagRangeSum   := 0
+    p.flagVolumeSum  := 0
+    p.fitBars        := 0
+
+//Drop references to the current pattern drawings, keeping them on the chart as history
+releaseDrawings(FlagPattern p) =>
+    p.poleLine     := line(na)
+    p.nearLine     := line(na)
+    p.farLine      := line(na)
+    p.channelFill  := linefill(na)
+    p.patternLabel := label(na)
+
+//Remove the current pattern drawings from the chart (candidate degraded into a non-flag)
+deleteDrawings(FlagPattern p) =>
+    line.delete(p.poleLine)
+    line.delete(p.nearLine)
+    line.delete(p.farLine)
+    linefill.delete(p.channelFill)
+    label.delete(p.patternLabel)
+    releaseDrawings(p)
+
+//Advance one direction's pattern machine by one confirmed bar and return the bar's events
+updatePattern(FlagPattern p, int dirSign, bool poleSignal, int poleDuration, float poleFrom, float poleTo, color dirColor) =>
+    bool formedEvent   = false
+    bool breakoutEvent = false
+    bool targetEvent   = false
+    bool failureEvent  = false
+    //Measured-move tracker for the most recent breakout in this direction
+    if p.trackerOn
+        if not na(p.targetLine)
+            line.set_x2(p.targetLine, bar_index)
+        float trackerTip = dirSign > 0 ? high : low
+        if dirSign * (trackerTip - p.trackerTarget) >= 0
+            targetEvent := true
+            p.trackerOn := false
+        else if dirSign * (p.trackerStop - close) > 0
+            failureEvent := true
+            p.trackerOn  := false
+            if not na(p.targetLine)
+                line.delete(p.targetLine)
+                p.targetLine := line(na)
+    //Pattern state machine
+    bool absorbBar = false
+    if p.state == ST_BUILD
+        float poleTip = dirSign > 0 ? high : low
+        if dirSign * (poleTip - p.poleEndPrice) > 0
+            //Impulse resumed beyond the tip: refresh the candidate while it still qualifies, drop it otherwise
+            if poleSignal
+                setCandidate(p, poleDuration, poleFrom, poleTo)
+            else
+                p.state := ST_IDLE
+        else
+            absorbBar := true
+    else if p.state == ST_ACTIVE
+        int   xNow     = bar_index - (p.poleEndBar + 1)
+        float projMid  = p.fitBase + p.fitSlope * xNow
+        float projNear = projMid + (dirSign > 0 ? p.fitUp : -p.fitDn)
+        float projFar  = projMid + (dirSign > 0 ? -p.fitDn : p.fitUp)
+        if dirSign * (close - projNear) > 0
+            //Decisive close through the flag boundary in the pole's direction
+            line.set_xy2(p.nearLine, bar_index, projNear)
+            line.set_xy2(p.farLine, bar_index, projFar)
+            bool breakVolumeOk = not volumeFilterInput or na(volume) or nz(volume) > p.flagVolumeSum / math.max(p.fitBars, 1)
+            if breakVolumeOk
+                breakoutEvent := true
+                float target = projNear + dirSign * p.poleHeight
+                p.trackerTarget := target
+                p.trackerStop   := p.flagExtreme
+                p.trackerOn     := true
+                p.targetLine    := showTargetInput ? line.new(bar_index, target, bar_index, target, color = dirColor, style = line.style_dotted) : line(na)
+                if dirSign * ((dirSign > 0 ? high : low) - target) >= 0
+                    targetEvent := true
+                    p.trackerOn := false
+                releaseDrawings(p)
+            else
+                deleteDrawings(p)
+            p.state := ST_IDLE
+        else if dirSign * (projFar - close) > 0
+            //Close beyond the far flag edge - the stop side - invalidates the pattern
+            failureEvent := true
+            line.set_xy2(p.nearLine, bar_index, projNear)
+            line.set_xy2(p.farLine, bar_index, projFar)
+            releaseDrawings(p)
+            p.state := ST_IDLE
+        else
+            absorbBar := true
+    //Absorb the bar into the flag, re-check the qualification rules, then form or keep drifting
+    if absorbBar
+        int   flagBars   = bar_index - p.poleEndBar
+        float extremeNow = dirSign > 0 ? low : high
+        p.flagExtreme   := na(p.flagExtreme) or dirSign * extremeNow < dirSign * p.flagExtreme ? extremeNow : p.flagExtreme
+        p.flagRangeSum  += high - low
+        p.flagVolumeSum += nz(volume)
+        float flagDepth = dirSign * (p.poleEndPrice - p.flagExtreme)
+        if flagBars > flagMaxBarsInput or flagDepth > flagDepthInput / 100 * p.poleHeight
+            //Too long or too deep: an ordinary pullback or a developing range, not a flag
+            deleteDrawings(p)
+            p.state := ST_IDLE
+        else if flagBars >= flagMinBarsInput
+            [base, slope, upOffset, dnOffset] = fitChannel(flagBars)
+            bool  driftOk    = dirSign * slope * (flagBars - 1) <= flagTiltInput / 100 * p.poleHeight
+            float nearOffset = dirSign > 0 ? upOffset : -dnOffset
+            float farOffset  = dirSign > 0 ? -dnOffset : upOffset
+            int   flagStart  = p.poleEndBar + 1
+            float nearY1     = base + nearOffset
+            float nearY2     = base + slope * (flagBars - 1) + nearOffset
+            float farY1      = base + farOffset
+            float farY2      = base + slope * (flagBars - 1) + farOffset
+            if p.state == ST_ACTIVE
+                if driftOk
+                    line.set_xy1(p.nearLine, flagStart, nearY1)
+                    line.set_xy2(p.nearLine, bar_index, nearY2)
+                    line.set_xy1(p.farLine, flagStart, farY1)
+                    line.set_xy2(p.farLine, bar_index, farY2)
+                    p.fitBase  := base
+                    p.fitSlope := slope
+                    p.fitUp    := upOffset
+                    p.fitDn    := dnOffset
+                    p.fitBars  := flagBars
+                else
+                    deleteDrawings(p)
+                    p.state := ST_IDLE
+            else
+                bool contractionOk = not contractionInput or p.flagRangeSum / flagBars < p.poleAvgRange
+                bool volumeOk      = not volumeFilterInput or na(volume) or p.flagVolumeSum / flagBars < p.poleAvgVolume
+                if driftOk and contractionOk and volumeOk
+                    formedEvent := true
+                    p.state    := ST_ACTIVE
+                    p.fitBase  := base
+                    p.fitSlope := slope
+                    p.fitUp    := upOffset
+                    p.fitDn    := dnOffset
+                    p.fitBars  := flagBars
+                    if showPoleInput
+                        p.poleLine := line.new(p.poleStartBar, p.poleStartPrice, p.poleEndBar, p.poleEndPrice, color = dirColor, width = 2)
+                    p.nearLine := line.new(flagStart, nearY1, bar_index, nearY2, color = dirColor)
+                    p.farLine  := line.new(flagStart, farY1, bar_index, farY2, color = dirColor)
+                    if showFillInput
+                        p.channelFill := linefill.new(p.nearLine, p.farLine, color.new(dirColor, FILL_TRANSPARENCY))
+                    if showLabelsInput
+                        p.patternLabel := label.new(p.poleEndBar, p.poleEndPrice, dirSign > 0 ? "Bull Flag" : "Bear Flag"
+                          , color = LABEL_BG, textcolor = dirColor, size = size.small
+                          , style = dirSign > 0 ? label.style_label_down : label.style_label_up)
+    //Start a fresh candidate once idle
+    if p.state == ST_IDLE and poleSignal
+        setCandidate(p, poleDuration, poleFrom, poleTo)
+    [formedEvent, breakoutEvent, targetEvent, failureEvent]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Pole Detection
+//---------------------------------------------------------------------------------------------------------------------{
+float atrValue   = ta.atr(atrLengthInput)
+float windowHigh = ta.highest(high, poleWindowInput)
+float windowLow  = ta.lowest(low, poleWindowInput)
+int   highOffset = -nz(ta.highestbars(high, poleWindowInput), 0)
+int   lowOffset  = -nz(ta.lowestbars(low, poleWindowInput), 0)
+
+//A bull pole ends at a fresh window high standing a full multiple of ATR above the window low it rose from,
+//printed as a near-vertical sequence of strong closes - the bear pole mirrors it
+bool bullPoleSignal = not na(atrValue) and highOffset == 0 and lowOffset >= MIN_POLE_BARS - 1 and
+  high - windowLow >= poleHeightInput * atrValue and strongCloseShare(lowOffset, 1) >= strongClosesInput
+bool bearPoleSignal = not na(atrValue) and lowOffset == 0 and highOffset >= MIN_POLE_BARS - 1 and
+  windowHigh - low >= poleHeightInput * atrValue and strongCloseShare(highOffset, -1) >= strongClosesInput
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Pattern Logic
+//---------------------------------------------------------------------------------------------------------------------{
+bool bullFormedEvent   = false
+bool bullBreakoutEvent = false
+bool bullTargetEvent   = false
+bool bullFailureEvent  = false
+bool bearFormedEvent   = false
+bool bearBreakoutEvent = false
+bool bearTargetEvent   = false
+bool bearFailureEvent  = false
+
+if barstate.isconfirmed
+    [bullFormed, bullBreak, bullTarget, bullFail] = updatePattern(bullPattern, 1, bullPoleSignal, lowOffset, windowLow, high, bullColorInput)
+    bullFormedEvent   := bullFormed
+    bullBreakoutEvent := bullBreak
+    bullTargetEvent   := bullTarget
+    bullFailureEvent  := bullFail
+    [bearFormed, bearBreak, bearTarget, bearFail] = updatePattern(bearPattern, -1, bearPoleSignal, highOffset, windowHigh, low, bearColorInput)
+    bearFormedEvent   := bearFormed
+    bearBreakoutEvent := bearBreak
+    bearTargetEvent   := bearTarget
+    bearFailureEvent  := bearFail
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Event Markers
+//---------------------------------------------------------------------------------------------------------------------{
+plotshape(showMarkersInput and bullBreakoutEvent, "Bull Flag Breakout", shape.triangleup, location.belowbar, bullColorInput, size = size.tiny)
+plotshape(showMarkersInput and bullTargetEvent, "Bull Flag Target Reached", shape.diamond, location.abovebar, bullColorInput, size = size.tiny)
+plotshape(showMarkersInput and bullFailureEvent, "Bull Flag Failure", shape.xcross, location.belowbar, bullColorInput, size = size.tiny)
+plotshape(showMarkersInput and bearBreakoutEvent, "Bear Flag Breakout", shape.triangledown, location.abovebar, bearColorInput, size = size.tiny)
+plotshape(showMarkersInput and bearTargetEvent, "Bear Flag Target Reached", shape.diamond, location.belowbar, bearColorInput, size = size.tiny)
+plotshape(showMarkersInput and bearFailureEvent, "Bear Flag Failure", shape.xcross, location.abovebar, bearColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(bullFormedEvent, "Bull Flag Formed", "Bull flag formed on {{ticker}} ({{interval}}): sharp up pole followed by a shallow counter-drift channel. Watch for a decisive close above the upper flag boundary.")
+alertcondition(bullBreakoutEvent, "Bull Flag Breakout", "Bull flag breakout on {{ticker}} ({{interval}}): decisive close above the flag channel in the pole's direction. Measured target projected at breakout point plus pole height.")
+alertcondition(bullTargetEvent, "Bull Flag Target Reached", "Bull flag measured target reached on {{ticker}} ({{interval}}): the pole's height projected from the breakout point has been met.")
+alertcondition(bullFailureEvent, "Bull Flag Failure", "Bull flag failed on {{ticker}} ({{interval}}): close beyond the far flag edge (stop side).")
+alertcondition(bearFormedEvent, "Bear Flag Formed", "Bear flag formed on {{ticker}} ({{interval}}): sharp down pole followed by a shallow counter-drift channel. Watch for a decisive close below the lower flag boundary.")
+alertcondition(bearBreakoutEvent, "Bear Flag Breakout", "Bear flag breakout on {{ticker}} ({{interval}}): decisive close below the flag channel in the pole's direction. Measured target projected at breakout point minus pole height.")
+alertcondition(bearTargetEvent, "Bear Flag Target Reached", "Bear flag measured target reached on {{ticker}} ({{interval}}): the pole's height projected from the breakout point has been met.")
+alertcondition(bearFailureEvent, "Bear Flag Failure", "Bear flag failed on {{ticker}} ({{interval}}): close beyond the far flag edge (stop side).")
+
+//---------------------------------------------------------------------------------------------------------------------}

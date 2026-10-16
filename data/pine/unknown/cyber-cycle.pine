@@ -1,0 +1,112 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Cyber Cycle", shorttitle = "Cyber Cycle", overlay = false, format = format.price, precision = 4)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+MODE_RAW   = "Cyber Cycle"
+MODE_STOCH = "Stochastic Cyber Cycle"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+srcInput = input.source(hl2, "Source", group = "Settings", tooltip = "Price series fed to the filter. Ehlers' published code uses the bar midpoint (high + low) / 2.")
+
+alphaInput = input.float(0.07, "Alpha", minval = 0.01, maxval = 0.99, step = 0.01, group = "Settings", tooltip = "Smoothing constant of the recursive filter, 0.07 in Ehlers' published code. Higher values react faster to swings but pass more noise, lower values are smoother but lag more.")
+
+modeInput = input.string(MODE_RAW, "Display", options = [MODE_RAW, MODE_STOCH], group = "Settings", tooltip = "The raw Cyber Cycle is unbounded, its amplitude is whatever the market currently offers. The Stochastic Cyber Cycle ranks the raw cycle within its recent range and rescales it between -1 and +1, restoring fixed extreme levels that are comparable across time.")
+
+stochLengthInput = input.int(8, "Stochastic Length", minval = 2, group = "Stochastic Variant", tooltip = "Lookback used to rank the raw cycle within its recent highest-lowest range for the stochastic variant. 8 is the published default.")
+
+showLevelsInput = input.bool(true, "Extreme Levels", inline = "levels", group = "Stochastic Variant", tooltip = "Show overbought/oversold guides on the Stochastic Cyber Cycle display. They are hidden on the raw display, where the cycle is unbounded and extremes are judged against recent swing amplitude instead.")
+obLevelInput = input.float(0.5, "", minval = 0, maxval = 1, step = 0.05, inline = "levels", group = "Stochastic Variant", tooltip = "Overbought level of the stochastic display (bounded -1 to +1).")
+osLevelInput = input.float(-0.5, "", minval = -1, maxval = 0, step = 0.05, inline = "levels", group = "Stochastic Variant", tooltip = "Oversold level of the stochastic display (bounded -1 to +1).")
+
+showMarkersInput = input.bool(false, "Crossover Markers", group = "Signals", tooltip = "Draw a dot on the oscillator at each cycle/trigger crossing. Off by default to keep the pane clean, the alerts cover the same events.")
+
+bullColorInput = input.color(#089981, "Bullish", inline = "direction", group = "Style", tooltip = "Cycle line and gradient color above the zero line.")
+bearColorInput = input.color(#f23645, "Bearish", inline = "direction", group = "Style", tooltip = "Cycle line and gradient color below the zero line.")
+triggerColorInput = input.color(#ff9800, "Trigger", group = "Style", tooltip = "Color of the trigger line, the cycle delayed one bar. Crossings between the two lines supply the timing signals near cycle troughs and crests.")
+levelsColorInput = input.color(#787b86, "Levels", group = "Style", tooltip = "Color of the zero line and of the stochastic extreme levels.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Cyber Cycle
+//---------------------------------------------------------------------------------------------------------------------{
+// Ehlers, "Cybernetic Analysis for Stocks and Futures" (2004). A short 4-bar weighted average first
+// damps bar-to-bar noise, then a recursive filter rejects the slow trend component, leaving the
+// mid-frequency cycle oscillating around zero. The first bars are seeded with the book's simple
+// second-difference warm-up, and the trigger is the cycle delayed one bar.
+float inputCoef = math.pow(1 - 0.5 * alphaInput, 2)
+float feedbackCoef1 = 2 * (1 - alphaInput)
+float feedbackCoef2 = math.pow(1 - alphaInput, 2)
+
+float smooth = (srcInput + 2 * srcInput[1] + 2 * srcInput[2] + srcInput[3]) / 6
+
+float cycle = na
+cycle := bar_index < 6 or na(smooth[2]) ?
+  (srcInput - 2 * nz(srcInput[1], srcInput) + nz(srcInput[2], srcInput)) / 4 :
+  inputCoef * (smooth - 2 * smooth[1] + smooth[2]) + feedbackCoef1 * nz(cycle[1]) - feedbackCoef2 * nz(cycle[2])
+
+float trigger = cycle[1]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Stochastic Cyber Cycle
+//---------------------------------------------------------------------------------------------------------------------{
+// Published stochastic variant from the same book: rank the raw cycle within its recent range,
+// smooth with the 4/3/2/1 weighted average, rescale to the -1/+1 interval, and lead-compensate
+// the trigger with the book's 0.96 / 0.02 constants.
+float highestCycle = ta.highest(cycle, stochLengthInput)
+float lowestCycle = ta.lowest(cycle, stochLengthInput)
+float cycleSpan = highestCycle - lowestCycle
+
+float stochRatio = na
+stochRatio := not na(cycleSpan) and cycleSpan != 0 ? (cycle - lowestCycle) / cycleSpan : nz(stochRatio[1])
+
+float stochSmooth = (4 * stochRatio + 3 * nz(stochRatio[1]) + 2 * nz(stochRatio[2]) + nz(stochRatio[3])) / 10
+float stochCycle = 2 * (stochSmooth - 0.5)
+float stochTrigger = 0.96 * (nz(stochCycle[1]) + 0.02)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Display Series & Signals
+//---------------------------------------------------------------------------------------------------------------------{
+bool stochMode = modeInput == MODE_STOCH
+
+float osc = stochMode ? stochCycle : cycle
+float trig = stochMode ? stochTrigger : trigger
+
+bool bullCross = ta.crossover(osc, trig)
+bool bearCross = ta.crossunder(osc, trig)
+bool overboughtCross = ta.crossover(stochCycle, obLevelInput)
+bool oversoldCross = ta.crossunder(stochCycle, osLevelInput)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visualization
+//---------------------------------------------------------------------------------------------------------------------{
+color oscColor = osc > 0 ? bullColorInput : bearColorInput
+bool showLevels = stochMode and showLevelsInput
+
+oscPlotId = plot(osc, "Cycle", oscColor)
+trigPlotId = plot(trig, "Trigger", triggerColorInput)
+zeroPlotId = plot(0, "Zero Anchor", color = na, editable = false)
+
+fill(oscPlotId, zeroPlotId, math.max(osc, 0), math.min(osc, 0), osc > 0 ? color.new(bullColorInput, 50) : color.new(bearColorInput, 100), osc > 0 ? color.new(bullColorInput, 100) : color.new(bearColorInput, 50), title = "Cycle Gradient")
+
+hline(0, "Zero Line", color.new(#787b86, 50), hline.style_dotted)
+
+plot(showLevels ? obLevelInput : na, "Overbought Level", levelsColorInput, 1, plot.style_circles)
+plot(showLevels ? osLevelInput : na, "Oversold Level", levelsColorInput, 1, plot.style_circles)
+
+plotshape(showMarkersInput and bullCross ? osc : na, "Bullish Crossover Marker", shape.circle, location.absolute, bullColorInput, size = size.tiny)
+plotshape(showMarkersInput and bearCross ? osc : na, "Bearish Crossover Marker", shape.circle, location.absolute, bearColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(bullCross, "Bullish Crossover", "Cyber Cycle crossed above its trigger line (potential cycle trough) on {{ticker}}, {{interval}}")
+alertcondition(bearCross, "Bearish Crossunder", "Cyber Cycle crossed below its trigger line (potential cycle crest) on {{ticker}}, {{interval}}")
+alertcondition(overboughtCross, "Stochastic Cycle Overbought", "Stochastic Cyber Cycle entered its overbought zone on {{ticker}}, {{interval}}")
+alertcondition(oversoldCross, "Stochastic Cycle Oversold", "Stochastic Cyber Cycle entered its oversold zone on {{ticker}}, {{interval}}")
+
+//---------------------------------------------------------------------------------------------------------------------}

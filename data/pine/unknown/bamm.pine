@@ -1,0 +1,372 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("BAMM", shorttitle = "BAMM", overlay = true, max_lines_count = 500, max_labels_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+color BULL_COLOR    = #089981
+color BEAR_COLOR    = #f23645
+color NEUTRAL_COLOR = #787b86
+color TRANSPARENT   = #00000000
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+int ST_IDLE      = 0
+int ST_ARMED     = 1
+int ST_TRIGGERED = 2
+
+int MAX_PIVOTS = 12
+int FILL_TRANSP = 85
+
+string DETECTION_GROUP = 'Detection'
+string DASHBOARD_GROUP = 'Dashboard'
+string STYLE_GROUP     = 'Style'
+
+string CLOSE_TRIGGER = 'Close beyond B'
+string WICK_TRIGGER  = 'Wick beyond B'
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+swingLengthInput = input.int(10, 'Swing Length', minval = 2, maxval = 200, group = DETECTION_GROUP, tooltip = 'Pivot half-length used to detect the swing highs and lows forming the X, A, B and C points of the candidate Bat. Larger values return larger structures and fewer setups.')
+
+bMinRetracementInput = input.float(0.382, 'Min B Retracement', minval = 0.01, maxval = 0.99, step = 0.01, group = DETECTION_GROUP, tooltip = 'Lower bound for the B retracement of the XA leg. 0.382 is the standard lower bound of the Bat structure; shallower B points are rejected.')
+
+bMaxRetracementInput = input.float(0.5, 'Max B Retracement', minval = 0.01, maxval = 0.99, step = 0.01, group = DETECTION_GROUP, tooltip = 'Upper bound for the B retracement of the XA leg. The Bat requires B to hold at or under 0.50 of XA — a deeper B disqualifies the front half.')
+
+targetRatioInput = input.float(0.886, 'Completion Retracement', minval = 0.5, maxval = 2, step = 0.001, group = DETECTION_GROUP, tooltip = 'XA retracement projected as the magnet destination (D) once B breaks. 0.886 is the Bat completion level the BAMM move is drawn toward.')
+
+triggerModeInput = input.string(CLOSE_TRIGGER, 'Trigger Mode', options = [CLOSE_TRIGGER, WICK_TRIGGER], group = DETECTION_GROUP, tooltip = 'Defines the decisive break of the B level that starts the magnet move. "Close beyond B" requires a bar close through the trigger line, "Wick beyond B" accepts any trade through it. Events are evaluated on confirmed bars.')
+
+showDashboardInput = input.bool(true, 'Show Dashboard', group = DASHBOARD_GROUP, tooltip = 'Displays a summary panel with the setup state, magnet leg direction, B trigger level, projected 0.886 target, and the progress of the leg from B toward the completion.')
+
+dashboardPositionInput = input.string('Top Right', 'Position', options = ['Top Right', 'Top Left', 'Bottom Right', 'Bottom Left'], group = DASHBOARD_GROUP, tooltip = 'Dashboard placement on the chart.')
+
+dashboardSizeInput = input.string('Small', 'Size', options = ['Tiny', 'Small', 'Normal'], group = DASHBOARD_GROUP, tooltip = 'Dashboard text size.')
+
+bullColorInput = input.color(BULL_COLOR, 'Bullish Magnet Leg', group = STYLE_GROUP)
+
+bearColorInput = input.color(BEAR_COLOR, 'Bearish Magnet Leg', group = STYLE_GROUP)
+
+structureColorInput = input.color(NEUTRAL_COLOR, 'Structure', group = STYLE_GROUP)
+
+showPointLabelsInput = input.bool(true, 'Point Labels', group = STYLE_GROUP)
+
+showLegFillInput = input.bool(true, 'Magnet Leg Fill', group = STYLE_GROUP)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Variables
+//---------------------------------------------------------------------------------------------------------------------{
+
+var array<int>   pivotDirArray   = array.new<int>()
+var array<float> pivotPriceArray = array.new<float>()
+var array<int>   pivotBarArray   = array.new<int>()
+
+var int   setupState = ST_IDLE
+var int   legDir     = 0
+var float xPrice     = na
+var int   xBar       = na
+var float aPrice     = na
+var int   aBar       = na
+var float bPrice     = na
+var int   bBar       = na
+var float cPrice     = na
+var int   cBar       = na
+var float dPrice     = na
+var int   triggerBar = na
+
+var string lastOutcomeText = '—'
+
+var line xaLineId = na
+var line abLineId = na
+var line bcLineId = na
+var line bLineId  = na
+var line dLineId  = na
+
+var label xLabelId = na
+var label aLabelId = na
+var label bLabelId = na
+var label cLabelId = na
+var label bTagId   = na
+var label dTagId   = na
+
+var linefill legFillId = na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Append a pivot to the alternating zigzag arrays; same-direction pivots keep the more extreme value
+addPivot(int pivotDir, float pivotPrice, int pivotBar) =>
+    bool changed = false
+    int n = array.size(pivotDirArray)
+    if n == 0
+        array.push(pivotDirArray, pivotDir)
+        array.push(pivotPriceArray, pivotPrice)
+        array.push(pivotBarArray, pivotBar)
+        changed := true
+    else
+        int lastDir     = array.get(pivotDirArray, n - 1)
+        float lastPrice = array.get(pivotPriceArray, n - 1)
+        if lastDir == pivotDir
+            if (pivotDir == 1 and pivotPrice > lastPrice) or (pivotDir == -1 and pivotPrice < lastPrice)
+                array.set(pivotPriceArray, n - 1, pivotPrice)
+                array.set(pivotBarArray, n - 1, pivotBar)
+                changed := true
+        else
+            array.push(pivotDirArray, pivotDir)
+            array.push(pivotPriceArray, pivotPrice)
+            array.push(pivotBarArray, pivotBar)
+            changed := true
+    if array.size(pivotDirArray) > MAX_PIVOTS
+        array.shift(pivotDirArray)
+        array.shift(pivotPriceArray)
+        array.shift(pivotBarArray)
+    changed
+
+// Test the last four pivots for a valid Bat front half: XA leg, B at or under the max retracement, C inside the AB range
+detectCandidate() =>
+    bool candidateOk  = false
+    int candidateDir  = 0
+    float xP = na
+    int   xB = na
+    float aP = na
+    int   aB = na
+    float bP = na
+    int   bB = na
+    float cP = na
+    int   cB = na
+    int n = array.size(pivotDirArray)
+    if n >= 4
+        xP := array.get(pivotPriceArray, n - 4)
+        xB := array.get(pivotBarArray, n - 4)
+        aP := array.get(pivotPriceArray, n - 3)
+        aB := array.get(pivotBarArray, n - 3)
+        bP := array.get(pivotPriceArray, n - 2)
+        bB := array.get(pivotBarArray, n - 2)
+        cP := array.get(pivotPriceArray, n - 1)
+        cB := array.get(pivotBarArray, n - 1)
+        int aDir = array.get(pivotDirArray, n - 3)
+        // Signed XA impulse: gaps can produce a pivot high below the prior pivot low, so the range is verified, not assumed
+        float xaRange = aDir == 1 ? aP - xP : xP - aP
+        if xaRange > 0
+            float bRetracement = (aDir == 1 ? aP - bP : bP - aP) / xaRange
+            bool cInsideAb = aDir == 1 ? cP < aP and cP > bP : cP > aP and cP < bP
+            float bLo = math.min(bMinRetracementInput, bMaxRetracementInput)
+            float bHi = math.max(bMinRetracementInput, bMaxRetracementInput)
+            // B must also sit shallower than the completion ratio so the projected D lies beyond the trigger
+            if bRetracement >= bLo and bRetracement <= bHi and bRetracement < targetRatioInput and cInsideAb
+                candidateOk  := true
+                candidateDir := -aDir
+    [candidateOk, candidateDir, xP, xB, aP, aB, bP, bB, cP, cB]
+
+// Remove the drawings of the active setup (no-op for ids already deleted or released to history)
+clearSetupDrawings() =>
+    line.delete(xaLineId)
+    line.delete(abLineId)
+    line.delete(bcLineId)
+    line.delete(bLineId)
+    line.delete(dLineId)
+    label.delete(xLabelId)
+    label.delete(aLabelId)
+    label.delete(bLabelId)
+    label.delete(cLabelId)
+    label.delete(bTagId)
+    label.delete(dTagId)
+    linefill.delete(legFillId)
+
+getDashboardPosition() =>
+    switch dashboardPositionInput
+        'Top Right'    => position.top_right
+        'Top Left'     => position.top_left
+        'Bottom Right' => position.bottom_right
+        => position.bottom_left
+
+getDashboardSize() =>
+    switch dashboardSizeInput
+        'Tiny'   => size.tiny
+        'Normal' => size.normal
+        => size.small
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+
+float pivotHighPrice = ta.pivothigh(swingLengthInput, swingLengthInput)
+float pivotLowPrice  = ta.pivotlow(swingLengthInput, swingLengthInput)
+
+bool armedBullEvent   = false
+bool armedBearEvent   = false
+bool triggerBullEvent = false
+bool triggerBearEvent = false
+bool targetEvent      = false
+bool failEvent        = false
+bool overrunEvent     = false
+
+if barstate.isconfirmed
+    // Zigzag bookkeeping
+    bool pivotUpdated = false
+    if not na(pivotLowPrice)
+        if addPivot(-1, pivotLowPrice, bar_index - swingLengthInput)
+            pivotUpdated := true
+    if not na(pivotHighPrice)
+        if addPivot(1, pivotHighPrice, bar_index - swingLengthInput)
+            pivotUpdated := true
+
+    // Arm a fresh candidate (or replace an armed, untriggered one) whenever the pivot structure changes
+    if pivotUpdated and setupState != ST_TRIGGERED
+        [candidateOk, candidateDir, xP, xB, aP, aB, bP, bB, cP, cB] = detectCandidate()
+        if candidateOk
+            clearSetupDrawings()
+            setupState := ST_ARMED
+            legDir     := candidateDir
+            xPrice     := xP
+            xBar       := xB
+            aPrice     := aP
+            aBar       := aB
+            bPrice     := bP
+            bBar       := bB
+            cPrice     := cP
+            cBar       := cB
+            dPrice     := aP + candidateDir * targetRatioInput * math.abs(aP - xP)
+            triggerBar := na
+            color legCol = candidateDir == 1 ? bullColorInput : bearColorInput
+            xaLineId := line.new(xB, xP, aB, aP, color = structureColorInput)
+            abLineId := line.new(aB, aP, bB, bP, color = structureColorInput)
+            bcLineId := line.new(bB, bP, cB, cP, color = structureColorInput)
+            bLineId  := line.new(cB, bP, bar_index, bP, color = legCol, style = line.style_dashed)
+            dLineId  := line.new(cB, dPrice, bar_index, dPrice, color = legCol, style = line.style_dotted)
+            bTagId   := label.new(bar_index, bP, 'B Trigger', style = label.style_label_left, color = TRANSPARENT, textcolor = legCol, size = size.small)
+            dTagId   := label.new(bar_index, dPrice, str.tostring(targetRatioInput), style = label.style_label_left, color = TRANSPARENT, textcolor = legCol, size = size.small)
+            if showPointLabelsInput
+                xLabelId := label.new(xB, xP, 'X', style = candidateDir == -1 ? label.style_label_up : label.style_label_down, color = TRANSPARENT, textcolor = structureColorInput, size = size.small)
+                aLabelId := label.new(aB, aP, 'A', style = candidateDir == -1 ? label.style_label_down : label.style_label_up, color = TRANSPARENT, textcolor = structureColorInput, size = size.small)
+                bLabelId := label.new(bB, bP, 'B', style = candidateDir == -1 ? label.style_label_up : label.style_label_down, color = TRANSPARENT, textcolor = structureColorInput, size = size.small)
+                cLabelId := label.new(cB, cP, 'C', style = candidateDir == -1 ? label.style_label_down : label.style_label_up, color = TRANSPARENT, textcolor = structureColorInput, size = size.small)
+            if candidateDir == 1
+                armedBullEvent := true
+            else
+                armedBearEvent := true
+
+    // Structure invalidation before the trigger: price violating the A extreme voids the front half
+    if setupState == ST_ARMED
+        bool structureBroken = legDir == -1 ? high > aPrice : low < aPrice
+        if structureBroken
+            clearSetupDrawings()
+            setupState := ST_IDLE
+            legDir     := 0
+
+    // The BAMM event: a decisive break of B in the direction of D starts the magnet move
+    if setupState == ST_ARMED
+        float triggerSource = triggerModeInput == CLOSE_TRIGGER ? close : legDir == 1 ? high : low
+        bool bBroken = legDir == 1 ? triggerSource > bPrice : triggerSource < bPrice
+        if bBroken
+            setupState := ST_TRIGGERED
+            triggerBar := bar_index
+            color legCol = legDir == 1 ? bullColorInput : bearColorInput
+            label.new(bar_index, bPrice, 'BAMM', style = legDir == 1 ? label.style_label_up : label.style_label_down, color = legCol, textcolor = chart.bg_color, size = size.small)
+            if showLegFillInput
+                legFillId := linefill.new(bLineId, dLineId, color.new(legCol, FILL_TRANSP))
+            if legDir == 1
+                triggerBullEvent := true
+            else
+                triggerBearEvent := true
+
+    // Resolution of the magnet move: arrival at the completion, overrun through it, or a reclaim of B against the trade
+    if setupState == ST_TRIGGERED
+        bool touchedTarget       = legDir == 1 ? high >= dPrice : low <= dPrice
+        bool closedThroughTarget = legDir == 1 ? close > dPrice : close < dPrice
+        bool reclaimedTrigger    = legDir == 1 ? close < bPrice : close > bPrice
+        if touchedTarget or reclaimedTrigger
+            color legCol = legDir == 1 ? bullColorInput : bearColorInput
+            if touchedTarget
+                targetEvent  := true
+                overrunEvent := closedThroughTarget
+                int legBars = bar_index - triggerBar
+                string arrivalText = (closedThroughTarget ? '' : '✓ ') + str.tostring(targetRatioInput) + (closedThroughTarget ? ' overrun' : '') + ' · ' + str.tostring(legBars) + (legBars == 1 ? ' bar' : ' bars')
+                label.new(bar_index, dPrice, arrivalText, style = legDir == 1 ? label.style_label_down : label.style_label_up, color = TRANSPARENT, textcolor = legCol, size = size.small)
+                lastOutcomeText := closedThroughTarget ? 'Overrun (Alt Bat?)' : 'Target reached'
+            else
+                failEvent := true
+                label.new(bar_index, bPrice, '✕ B reclaimed', style = legDir == 1 ? label.style_label_down : label.style_label_up, color = TRANSPARENT, textcolor = legCol, size = size.small)
+                lastOutcomeText := 'Invalidated'
+            // Freeze the trigger/target lines at the resolution bar and release the ids so history is preserved
+            line.set_x2(bLineId, bar_index)
+            line.set_x2(dLineId, bar_index)
+            label.set_x(bTagId, bar_index)
+            label.set_x(dTagId, bar_index)
+            xaLineId  := line(na)
+            abLineId  := line(na)
+            bcLineId  := line(na)
+            bLineId   := line(na)
+            dLineId   := line(na)
+            xLabelId  := label(na)
+            aLabelId  := label(na)
+            bLabelId  := label(na)
+            cLabelId  := label(na)
+            bTagId    := label(na)
+            dTagId    := label(na)
+            legFillId := linefill(na)
+            setupState := ST_IDLE
+            legDir     := 0
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Extend the trigger and destination lines while the setup is live
+if setupState != ST_IDLE and not na(bLineId)
+    line.set_x2(bLineId, bar_index)
+    line.set_x2(dLineId, bar_index)
+    label.set_x(bTagId, bar_index)
+    label.set_x(dTagId, bar_index)
+
+var table dashboardTable = showDashboardInput ? table.new(getDashboardPosition(), 2, 6, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1) : table(na)
+
+if showDashboardInput and barstate.islast
+    string dashSize = getDashboardSize()
+    color labelCol  = DASH_HEADER
+    color legCol    = legDir == 1 ? bullColorInput : legDir == -1 ? bearColorInput : DASH_TEXT
+    string stateText   = setupState == ST_IDLE ? 'Idle' : setupState == ST_ARMED ? 'Armed' : 'Magnet move'
+    string legText     = setupState == ST_IDLE ? '—' : legDir == 1 ? '▲ Bullish' : '▼ Bearish'
+    string triggerText = setupState == ST_IDLE ? '—' : str.tostring(bPrice, format.mintick)
+    string targetText  = setupState == ST_IDLE ? '—' : str.tostring(dPrice, format.mintick)
+    string progressText = '—'
+    if setupState == ST_TRIGGERED and not na(close)
+        float span = math.abs(bPrice - dPrice)
+        if span > 0
+            float traveled = legDir == 1 ? close - bPrice : bPrice - close
+            progressText := str.tostring(math.min(math.max(traveled / span, 0), 1) * 100, '#.#') + '%'
+    table.cell(dashboardTable, 0, 0, 'State', text_color = labelCol, text_size = dashSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 0, stateText, text_color = DASH_TEXT, text_size = dashSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 1, 'Magnet Leg', text_color = labelCol, text_size = dashSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 1, legText, text_color = legCol, text_size = dashSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 2, 'Trigger (B)', text_color = labelCol, text_size = dashSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 2, triggerText, text_color = DASH_TEXT, text_size = dashSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 3, 'Target (' + str.tostring(targetRatioInput) + ')', text_color = labelCol, text_size = dashSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 3, targetText, text_color = DASH_TEXT, text_size = dashSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 4, 'Progress', text_color = labelCol, text_size = dashSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 4, progressText, text_color = legCol, text_size = dashSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 5, 'Last', text_color = labelCol, text_size = dashSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 5, lastOutcomeText, text_color = DASH_TEXT, text_size = dashSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(armedBullEvent, 'Bullish BAMM Setup Armed', 'Bullish BAMM setup armed — bearish Bat front half confirmed; a break above B projects a magnet move toward the 0.886 XA retracement')
+alertcondition(armedBearEvent, 'Bearish BAMM Setup Armed', 'Bearish BAMM setup armed — bullish Bat front half confirmed; a break below B projects a magnet move toward the 0.886 XA retracement')
+alertcondition(triggerBullEvent, 'Bullish BAMM Trigger', 'Bullish BAMM — price broke decisively above the B level; magnet move toward the 0.886 completion in progress')
+alertcondition(triggerBearEvent, 'Bearish BAMM Trigger', 'Bearish BAMM — price broke decisively below the B level; magnet move toward the 0.886 completion in progress')
+alertcondition(targetEvent, 'BAMM Target Reached', 'BAMM magnet move reached the 0.886 completion — the magnet trade is over and completion-zone assessment begins')
+alertcondition(failEvent, 'BAMM Invalidated', 'BAMM invalidated — price reclaimed the B level against the magnet move')
+alertcondition(overrunEvent, 'BAMM Target Overrun', 'BAMM target overrun — decisive close through the 0.886 level; possible Alt Bat scenario extending toward a 1.13 completion')
+
+//---------------------------------------------------------------------------------------------------------------------}

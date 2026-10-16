@@ -1,0 +1,298 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Speed Resistance Lines", "Speed Resistance Lines", overlay = true, format = format.price, max_lines_count = 25, max_labels_count = 25)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+// Gould speed fractions - the full trendline slope and its two-thirds and one-third speedlines
+FULL_SPEED = 1.0
+TWO_THIRDS = 2.0 / 3.0
+ONE_THIRD  = 1.0 / 3.0
+
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+NEUTRAL_COLOR = #787b86 // data-window readouts
+
+AUTO_MODE   = "Auto (Swings)"
+MANUAL_MODE = "Manual"
+
+DIR_LATEST  = "Latest Swing"
+DIR_RISING  = "Rising Only"
+DIR_FALLING = "Falling Only"
+
+FILL_STRONG_TRANSP = 85
+FILL_SOFT_TRANSP   = 93
+DRAW_LOOKBACK      = 9000
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+anchorModeInput = input.string(AUTO_MODE, "Anchor Mode", options = [AUTO_MODE, MANUAL_MODE], group = "Anchors"
+  , tooltip = "Where the measured swing comes from. Auto (Swings) fans the speedlines from the latest completed swing leg detected from confirmed pivots. Manual measures the swing between Point A and Point B set below.")
+
+swingLengthInput = input.int(25, "Swing Length", minval = 2, group = "Anchors"
+  , tooltip = "Bars required on each side of a pivot to confirm it in Auto mode. Larger values anchor the fan to more significant swings and update it less often; a new leg is only adopted once its end pivot confirms, Swing Length bars after the extreme.")
+
+autoDirInput = input.string(DIR_LATEST, "Fan Direction", options = [DIR_LATEST, DIR_RISING, DIR_FALLING], group = "Anchors"
+  , tooltip = "Auto mode filter. Latest Swing redraws the fan on every completed leg in either direction. Rising Only keeps only fans measured from a swing low up to a swing high; Falling Only keeps only fans measured from a swing high down to a swing low.")
+
+manualTimeAInput = input.time(timestamp("01 Jan 2024 00:00 +0000"), "Point A Time", group = "Manual Anchors", confirm = true
+  , tooltip = "Origin of the manual swing - the significant low a rising move starts from, or the significant high a falling move starts from. Set by clicking the chart when the indicator is added; edit here to move it.")
+
+manualPriceAInput = input.price(0.0, "Point A Price", group = "Manual Anchors", confirm = true
+  , tooltip = "Price coordinate of Point A. Used as-is when Snap to High/Low is disabled; with snapping enabled the fan uses the wick of the Point A bar instead.")
+
+manualTimeBInput = input.time(timestamp("01 Mar 2024 00:00 +0000"), "Point B Time", group = "Manual Anchors", confirm = true
+  , tooltip = "End of the manual swing - the swing high of a rising move, or the swing low of a falling move. Must be later than Point A.")
+
+manualPriceBInput = input.price(0.0, "Point B Price", group = "Manual Anchors", confirm = true
+  , tooltip = "Price coordinate of Point B. Used as-is when Snap to High/Low is disabled; with snapping enabled the fan uses the wick of the Point B bar instead.")
+
+snapAnchorsInput = input.bool(true, "Snap to High/Low", group = "Manual Anchors"
+  , tooltip = "Snaps the manual points to bar wicks: the low of the Point A bar and the high of the Point B bar for a rising swing, mirrored for a falling one. Disable to use the exact selected prices.")
+
+bullColorInput = input.color(BULL_COLOR, "Rising", inline = "fan", group = "Style"
+  , tooltip = "Fan color when the measured swing rises from a low.")
+
+bearColorInput = input.color(BEAR_COLOR, "Falling", inline = "fan", group = "Style"
+  , tooltip = "Fan color when the measured swing falls from a high. The full-speed line draws solid, the 2/3 speedline dashed and the 1/3 speedline dotted.")
+
+lineWidthInput = input.int(1, "Line Width", minval = 1, maxval = 5, group = "Style"
+  , tooltip = "Width of the three fan lines.")
+
+showLabelsInput = input.bool(true, "Speed Labels", group = "Style"
+  , tooltip = "Labels each ray with its speed fraction - 1, 2/3 and 1/3 - just right of the most recent bar.")
+
+fillFanInput = input.bool(true, "Fan Fill", group = "Style"
+  , tooltip = "Tints the wedges between the rays: stronger between the full line and the 2/3 speedline, lighter between the 2/3 and 1/3 speedlines.")
+
+showAnchorsInput = input.bool(true, "Anchor Markers", group = "Style"
+  , tooltip = "Marks the swing origin and the swing end the vertical rise is measured between.")
+
+showMarkersInput = input.bool(false, "Break Markers", group = "Style"
+  , tooltip = "Plots a small cross whenever price closes across a fan line against the fan direction. The corresponding alerts remain available even when markers are hidden.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Value at bar `x` of the ray from (oBar, oPrice) whose slope is `fraction` of the primary swing slope,
+// i.e. the ray through the `fraction` level of the vertical rise measured at the swing end's position
+speedLineValueAt(int oBar, float oPrice, int aBar, float aPrice, float fraction, int x) =>
+    oPrice + (aPrice - oPrice) / (aBar - oBar) * fraction * (x - oBar)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Swing Detection
+//---------------------------------------------------------------------------------------------------------------------{
+float pivotHigh = ta.pivothigh(swingLengthInput, swingLengthInput)
+float pivotLow  = ta.pivotlow(swingLengthInput, swingLengthInput)
+int   pivotBar  = bar_index - swingLengthInput
+
+// Alternating swing state - a same-direction pivot only replaces the running extreme when more extreme
+var int   lastPivotDir   = 0
+var int   swingHighBar   = na
+var float swingHighPrice = na
+var int   swingLowBar    = na
+var float swingLowPrice  = na
+
+if not na(pivotHigh)
+    if lastPivotDir == 1
+        if pivotHigh >= swingHighPrice
+            swingHighPrice := pivotHigh
+            swingHighBar   := pivotBar
+    else
+        swingHighPrice := pivotHigh
+        swingHighBar   := pivotBar
+        lastPivotDir   := 1
+
+if not na(pivotLow)
+    if lastPivotDir == -1
+        if pivotLow <= swingLowPrice
+            swingLowPrice := pivotLow
+            swingLowBar   := pivotBar
+    else
+        swingLowPrice := pivotLow
+        swingLowBar   := pivotBar
+        lastPivotDir  := -1
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Fan Anchors
+//---------------------------------------------------------------------------------------------------------------------{
+// Adopted swing: origin (fan vertex) and apex (swing end the vertical rise is measured at)
+var int   fanDir      = 0
+var int   originBar   = na
+var float originPrice = na
+var int   apexBar     = na
+var float apexPrice   = na
+
+// Manual points - captured on the first bar at or after each selected time
+var int   manualABar  = na
+var float manualAHigh = na
+var float manualALow  = na
+var int   manualBBar  = na
+var float manualBHigh = na
+var float manualBLow  = na
+
+if na(manualABar) and time >= manualTimeAInput
+    manualABar  := bar_index
+    manualAHigh := high
+    manualALow  := low
+
+if na(manualBBar) and time >= manualTimeBInput
+    manualBBar  := bar_index
+    manualBHigh := high
+    manualBLow  := low
+
+if anchorModeInput == AUTO_MODE
+    bool risingLeg  = lastPivotDir == 1  and not na(swingLowBar)  and not na(swingHighBar) and swingHighBar > swingLowBar
+    bool fallingLeg = lastPivotDir == -1 and not na(swingHighBar) and not na(swingLowBar)  and swingLowBar  > swingHighBar
+    if risingLeg and autoDirInput != DIR_FALLING
+        fanDir      := 1
+        originBar   := swingLowBar
+        originPrice := swingLowPrice
+        apexBar     := swingHighBar
+        apexPrice   := swingHighPrice
+    if fallingLeg and autoDirInput != DIR_RISING
+        fanDir      := -1
+        originBar   := swingHighBar
+        originPrice := swingHighPrice
+        apexBar     := swingLowBar
+        apexPrice   := swingLowPrice
+else if not na(manualABar) and not na(manualBBar) and manualBBar > manualABar
+    int manualDir = manualPriceBInput > manualPriceAInput ? 1 : manualPriceBInput < manualPriceAInput ? -1 : 0
+    if manualDir == 0
+        float startMid = math.avg(manualAHigh, manualALow)
+        float endMid   = math.avg(manualBHigh, manualBLow)
+        manualDir := endMid > startMid ? 1 : endMid < startMid ? -1 : 0
+    float yStart = snapAnchorsInput ? (manualDir == 1 ? manualALow  : manualAHigh) : manualPriceAInput
+    float yEnd   = snapAnchorsInput ? (manualDir == 1 ? manualBHigh : manualBLow)  : manualPriceBInput
+    if manualDir == 1 and yEnd > yStart or manualDir == -1 and yEnd < yStart
+        fanDir      := manualDir
+        originBar   := manualABar
+        originPrice := yStart
+        apexBar     := manualBBar
+        apexPrice   := yEnd
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Speed Line Values & Events
+//---------------------------------------------------------------------------------------------------------------------{
+float fullLineVal = fanDir != 0 ? speedLineValueAt(originBar, originPrice, apexBar, apexPrice, FULL_SPEED, bar_index) : na
+float twoThirdVal = fanDir != 0 ? speedLineValueAt(originBar, originPrice, apexBar, apexPrice, TWO_THIRDS, bar_index) : na
+float oneThirdVal = fanDir != 0 ? speedLineValueAt(originBar, originPrice, apexBar, apexPrice, ONE_THIRD,  bar_index) : na
+
+// Events are only evaluated while the fan geometry is unchanged from the previous bar
+bool anchorsChanged = fanDir != nz(fanDir[1]) or nz(originBar, -1) != nz(originBar[1], -1) or nz(apexBar, -1) != nz(apexBar[1], -1) or nz(originPrice) != nz(originPrice[1]) or nz(apexPrice) != nz(apexPrice[1])
+bool valsOk = not na(fullLineVal) and not na(fullLineVal[1]) and not na(twoThirdVal) and not na(twoThirdVal[1]) and not na(oneThirdVal) and not na(oneThirdVal[1])
+bool risingSteady  = fanDir == 1  and not anchorsChanged and valsOk
+bool fallingSteady = fanDir == -1 and not anchorsChanged and valsOk
+
+// Cascade breaks - each closing loss downgrades the trend's rate to the next slower line
+bool riseFullBreak = risingSteady and close < fullLineVal and close[1] >= fullLineVal[1]
+bool rise23Break   = risingSteady and close < twoThirdVal and close[1] >= twoThirdVal[1]
+bool rise13Break   = risingSteady and close < oneThirdVal and close[1] >= oneThirdVal[1]
+bool fallFullBreak = fallingSteady and close > fullLineVal and close[1] <= fullLineVal[1]
+bool fall23Break   = fallingSteady and close > twoThirdVal and close[1] <= twoThirdVal[1]
+bool fall13Break   = fallingSteady and close > oneThirdVal and close[1] <= oneThirdVal[1]
+
+// Speedline holds - the correction reaches a speedline intrabar and closes back on the trend side
+bool riseHold = risingSteady and ((low <= twoThirdVal and close > twoThirdVal and low[1] > twoThirdVal[1]) or (low <= oneThirdVal and close > oneThirdVal and low[1] > oneThirdVal[1]))
+bool fallHold = fallingSteady and ((high >= twoThirdVal and close < twoThirdVal and high[1] < twoThirdVal[1]) or (high >= oneThirdVal and close < oneThirdVal and high[1] < oneThirdVal[1]))
+
+// Role reversal - price returns to a fan line from its broken side and is rejected at the close
+bool riseRetest = risingSteady and ((high >= fullLineVal and close < fullLineVal and high[1] < fullLineVal[1]) or (high >= twoThirdVal and close < twoThirdVal and high[1] < twoThirdVal[1]) or (high >= oneThirdVal and close < oneThirdVal and high[1] < oneThirdVal[1]))
+bool fallRetest = fallingSteady and ((low <= fullLineVal and close > fullLineVal and low[1] > fullLineVal[1]) or (low <= twoThirdVal and close > twoThirdVal and low[1] > twoThirdVal[1]) or (low <= oneThirdVal and close > oneThirdVal and low[1] > oneThirdVal[1]))
+
+bool riseAnyBreak = riseFullBreak or rise23Break or rise13Break
+bool fallAnyBreak = fallFullBreak or fall23Break or fall13Break
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Fan Drawing
+//---------------------------------------------------------------------------------------------------------------------{
+var line  fullLineId     = na
+var line  twoThirdLineId = na
+var line  oneThirdLineId = na
+var label fullLabelId     = na
+var label twoThirdLabelId = na
+var label oneThirdLabelId = na
+var label originMarkerId  = na
+var label apexMarkerId    = na
+var linefill upperFillId = na
+var linefill lowerFillId = na
+
+if barstate.isfirst
+    fullLineId      := line.new(bar_index, close, bar_index + 1, close, xloc.bar_index, extend.right, color(na), line.style_solid,  lineWidthInput)
+    twoThirdLineId  := line.new(bar_index, close, bar_index + 1, close, xloc.bar_index, extend.right, color(na), line.style_dashed, lineWidthInput)
+    oneThirdLineId  := line.new(bar_index, close, bar_index + 1, close, xloc.bar_index, extend.right, color(na), line.style_dotted, lineWidthInput)
+    fullLabelId     := label.new(bar_index, close, "1",   xloc.bar_index, yloc.price, #00000000, label.style_label_left, color(na), size.small)
+    twoThirdLabelId := label.new(bar_index, close, "2/3", xloc.bar_index, yloc.price, #00000000, label.style_label_left, color(na), size.small)
+    oneThirdLabelId := label.new(bar_index, close, "1/3", xloc.bar_index, yloc.price, #00000000, label.style_label_left, color(na), size.small)
+    originMarkerId  := label.new(bar_index, close, "●", xloc.bar_index, yloc.price, #00000000, label.style_label_up,   color(na), size.tiny, tooltip = "Swing origin - fan vertex")
+    apexMarkerId    := label.new(bar_index, close, "●", xloc.bar_index, yloc.price, #00000000, label.style_label_down, color(na), size.tiny, tooltip = "Swing end - the vertical rise is measured here")
+    upperFillId     := linefill.new(fullLineId, twoThirdLineId, color(na))
+    lowerFillId     := linefill.new(twoThirdLineId, oneThirdLineId, color(na))
+
+if barstate.islast
+    if fanDir != 0
+        color fanColor = fanDir == 1 ? bullColorInput : bearColorInput
+        int   x1 = math.max(originBar, bar_index - DRAW_LOOKBACK)
+        int   x2 = math.max(apexBar, x1 + 1)
+        line.set_xy1(fullLineId, x1, speedLineValueAt(originBar, originPrice, apexBar, apexPrice, FULL_SPEED, x1))
+        line.set_xy2(fullLineId, x2, speedLineValueAt(originBar, originPrice, apexBar, apexPrice, FULL_SPEED, x2))
+        line.set_xy1(twoThirdLineId, x1, speedLineValueAt(originBar, originPrice, apexBar, apexPrice, TWO_THIRDS, x1))
+        line.set_xy2(twoThirdLineId, x2, speedLineValueAt(originBar, originPrice, apexBar, apexPrice, TWO_THIRDS, x2))
+        line.set_xy1(oneThirdLineId, x1, speedLineValueAt(originBar, originPrice, apexBar, apexPrice, ONE_THIRD, x1))
+        line.set_xy2(oneThirdLineId, x2, speedLineValueAt(originBar, originPrice, apexBar, apexPrice, ONE_THIRD, x2))
+        line.set_color(fullLineId, fanColor)
+        line.set_color(twoThirdLineId, fanColor)
+        line.set_color(oneThirdLineId, fanColor)
+        color labelColor = showLabelsInput ? fanColor : color(na)
+        label.set_xy(fullLabelId, bar_index, fullLineVal)
+        label.set_xy(twoThirdLabelId, bar_index, twoThirdVal)
+        label.set_xy(oneThirdLabelId, bar_index, oneThirdVal)
+        label.set_textcolor(fullLabelId, labelColor)
+        label.set_textcolor(twoThirdLabelId, labelColor)
+        label.set_textcolor(oneThirdLabelId, labelColor)
+        color markerColor = showAnchorsInput ? fanColor : color(na)
+        label.set_xy(originMarkerId, x1, speedLineValueAt(originBar, originPrice, apexBar, apexPrice, FULL_SPEED, x1))
+        label.set_xy(apexMarkerId, x2, speedLineValueAt(originBar, originPrice, apexBar, apexPrice, FULL_SPEED, x2))
+        label.set_style(originMarkerId, fanDir == 1 ? label.style_label_up : label.style_label_down)
+        label.set_style(apexMarkerId, fanDir == 1 ? label.style_label_down : label.style_label_up)
+        label.set_textcolor(originMarkerId, markerColor)
+        label.set_textcolor(apexMarkerId, markerColor)
+        linefill.set_color(upperFillId, fillFanInput ? color.new(fanColor, FILL_STRONG_TRANSP) : color(na))
+        linefill.set_color(lowerFillId, fillFanInput ? color.new(fanColor, FILL_SOFT_TRANSP) : color(na))
+    else
+        line.set_color(fullLineId, color(na))
+        line.set_color(twoThirdLineId, color(na))
+        line.set_color(oneThirdLineId, color(na))
+        label.set_textcolor(fullLabelId, color(na))
+        label.set_textcolor(twoThirdLabelId, color(na))
+        label.set_textcolor(oneThirdLabelId, color(na))
+        label.set_textcolor(originMarkerId, color(na))
+        label.set_textcolor(apexMarkerId, color(na))
+        linefill.set_color(upperFillId, color(na))
+        linefill.set_color(lowerFillId, color(na))
+
+plotshape(showMarkersInput and riseAnyBreak, "Rising Fan Line Break", shape.xcross, location.abovebar, bearColorInput, size = size.tiny)
+plotshape(showMarkersInput and fallAnyBreak, "Falling Fan Line Break", shape.xcross, location.belowbar, bullColorInput, size = size.tiny)
+
+plot(fullLineVal, "Full Speed Line", NEUTRAL_COLOR, 1, display = display.data_window)
+plot(twoThirdVal, "2/3 Speedline", NEUTRAL_COLOR, 1, display = display.data_window)
+plot(oneThirdVal, "1/3 Speedline", NEUTRAL_COLOR, 1, display = display.data_window)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(riseFullBreak, "Full Line Break (Rising Fan)", "Speed Resistance Lines: price closed below the full speed line of the rising fan — the advance is running below its original pace")
+alertcondition(rise23Break, "2/3 Speedline Break (Rising Fan)", "Speed Resistance Lines: price closed below the 2/3 speedline of the rising fan — first pullback defense lost, attention shifts to the 1/3 line")
+alertcondition(rise13Break, "1/3 Speedline Break (Rising Fan)", "Speed Resistance Lines: price closed below the 1/3 speedline of the rising fan — the advance's rate has failed even if the swing low still holds")
+alertcondition(riseHold, "Speedline Held (Rising Fan)", "Speed Resistance Lines: a rising-fan speedline was tested intrabar and held into the close — the correction is respecting the fan")
+alertcondition(riseRetest, "Broken Line Retest (Rising Fan)", "Speed Resistance Lines: price retested a rising-fan line from below and was rejected — broken support acting as resistance")
+alertcondition(fallFullBreak, "Full Line Break (Falling Fan)", "Speed Resistance Lines: price closed above the full speed line of the falling fan — the decline is running below its original pace")
+alertcondition(fall23Break, "2/3 Speedline Break (Falling Fan)", "Speed Resistance Lines: price closed above the 2/3 speedline of the falling fan — first bounce defense lost, attention shifts to the 1/3 line")
+alertcondition(fall13Break, "1/3 Speedline Break (Falling Fan)", "Speed Resistance Lines: price closed above the 1/3 speedline of the falling fan — the decline's rate has failed even if the swing high still holds")
+alertcondition(fallHold, "Speedline Held (Falling Fan)", "Speed Resistance Lines: a falling-fan speedline was tested intrabar and held into the close — the bounce is respecting the fan")
+alertcondition(fallRetest, "Broken Line Retest (Falling Fan)", "Speed Resistance Lines: price retested a falling-fan line from above and was rejected — broken resistance acting as support")
+
+//---------------------------------------------------------------------------------------------------------------------}

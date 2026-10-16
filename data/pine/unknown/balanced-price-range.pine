@@ -1,0 +1,215 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Balanced Price Range"
+  , shorttitle      = "Balanced Price Range"
+  , overlay         = true
+  , max_boxes_count = 500
+  , max_lines_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR     = #089981
+BEAR_COLOR     = #f23645
+VIOLATED_COLOR = #787b86
+
+TRIGGER_CLOSE = "Close"
+TRIGGER_WICK  = "Wick"
+
+ZONE_FILL_TRANSPARENCY   = 85
+ZONE_BORDER_TRANSPARENCY = 60
+MIDLINE_TRANSPARENCY     = 30
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+BPR_GROUP   = "Balanced Price Range"
+STYLE_GROUP = "Style"
+
+pairingWindowInput = input.int(10, "Pairing Window (Bars)", minval = 1, maxval = 100, group = BPR_GROUP
+  , tooltip = "Maximum number of bars between the two opposing fair value gaps. Overlapping gaps only form a balanced price range when the second gap prints within this many bars of the first, keeping the two displacements in quick succession.")
+
+violationTriggerInput = input.string(TRIGGER_CLOSE, "Violation Trigger", options = [TRIGGER_CLOSE, TRIGGER_WICK], group = BPR_GROUP
+  , tooltip = "Price event that violates a zone through its far side. 'Close' requires a candle close beyond the overlap's far edge - the break-and-hold read; 'Wick' treats any trade beyond it as a violation.")
+
+showLastInput = input.int(20, "Show Last", minval = 1, maxval = 100, group = BPR_GROUP
+  , tooltip = "Maximum number of balanced price ranges kept on the chart, counting both active and violated zones. Older zones are removed first.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "direction", group = STYLE_GROUP
+  , tooltip = "Color of bullish balanced price ranges: a bearish gap overrun by a bullish one, watched as support.")
+
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "direction", group = STYLE_GROUP
+  , tooltip = "Color of bearish balanced price ranges: a bullish gap overrun by a bearish one, watched as resistance. The newer gap carries the bias in both cases.")
+
+showMidlineInput = input.bool(true, "Zone Midline", inline = "midline", group = STYLE_GROUP)
+
+midlineStyleInput = input.string("Dotted", "", options = ["Solid", "Dashed", "Dotted"], inline = "midline", group = STYLE_GROUP
+  , tooltip = "Display the midpoint of each overlap and set its line style. The midpoint and the near edge are common locations to stage entries within the zone, with invalidation beyond its far side.")
+
+showViolatedInput = input.bool(true, "Show Violated Zones", inline = "violated", group = STYLE_GROUP)
+
+violatedColorInput = input.color(VIOLATED_COLOR, "", inline = "violated", group = STYLE_GROUP
+  , tooltip = "Keep violated zones on the chart, recolored and frozen where the break occurred. Price slicing through a balanced price range and holding beyond it suggests the earlier rejection has been absorbed.")
+
+//Midline style option to drawing constant
+midlineStyle = switch midlineStyleInput
+    "Solid"  => line.style_solid
+    "Dashed" => line.style_dashed
+    => line.style_dotted
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types & Variables
+//---------------------------------------------------------------------------------------------------------------------{
+//One confirmed three-candle fair value gap awaiting an opposing overlap
+type Fvg
+    float top
+    float bottom
+    int   confirmIndex
+
+//One balanced price range: the tracked overlap of two opposing gaps
+type Bpr
+    box   zoneBox
+    line  midLine
+    float top
+    float bottom
+    bool  isBull
+    int   formIndex
+    bool  touched
+    bool  violated
+
+var array<Fvg> bullFvgArray = array.new<Fvg>()
+var array<Fvg> bearFvgArray = array.new<Fvg>()
+var array<Bpr> bprArray     = array.new<Bpr>()
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+//Drop stored gaps that have aged beyond the pairing window
+pruneFvgs(array<Fvg> fvgArray) =>
+    while fvgArray.size() > 0 and fvgArray.first().confirmIndex < bar_index - pairingWindowInput
+        fvgArray.shift()
+
+//Index of the most recent stored opposing gap whose span overlaps the new gap, -1 when none
+findOverlap(array<Fvg> opposingArray, float newTop, float newBottom) =>
+    int matchIndex = -1
+    int arraySize  = opposingArray.size()
+    if arraySize > 0
+        for i = 0 to arraySize - 1
+            Fvg olderFvg = opposingArray.get(i)
+            if math.min(olderFvg.top, newTop) > math.max(olderFvg.bottom, newBottom)
+                matchIndex := i
+    matchIndex
+
+//Draw the overlap of the two opposing gaps from the older gap's middle candle and register it for tracking
+createBpr(Fvg olderFvg, float newTop, float newBottom, bool isBull) =>
+    float zoneTop    = math.min(olderFvg.top, newTop)
+    float zoneBottom = math.max(olderFvg.bottom, newBottom)
+    float zoneMid    = math.avg(zoneTop, zoneBottom)
+    color baseColor  = isBull ? bullColorInput : bearColorInput
+    int   leftIndex  = olderFvg.confirmIndex - 1
+    box zoneBox = box.new(leftIndex, zoneTop, bar_index, zoneBottom
+      , border_color = color.new(baseColor, ZONE_BORDER_TRANSPARENCY)
+      , bgcolor      = color.new(baseColor, ZONE_FILL_TRANSPARENCY))
+    line midLine = line.new(leftIndex, zoneMid, bar_index, zoneMid
+      , color = showMidlineInput ? color.new(baseColor, MIDLINE_TRANSPARENCY) : color(na)
+      , style = midlineStyle)
+    bprArray.push(Bpr.new(zoneBox, midLine, zoneTop, zoneBottom, isBull, bar_index, false, false))
+    if bprArray.size() > showLastInput
+        Bpr oldest = bprArray.shift()
+        oldest.zoneBox.delete()
+        oldest.midLine.delete()
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Balanced Price Range Detection
+//---------------------------------------------------------------------------------------------------------------------{
+bool bullFormedEvent   = false
+bool bearFormedEvent   = false
+bool bullRetestEvent   = false
+bool bearRetestEvent   = false
+bool bullViolatedEvent = false
+bool bearViolatedEvent = false
+
+//Standard three-candle fair value gaps: an imbalance left between the 1st candle's extreme and the 3rd candle's
+bool bullFvg = not na(high[2]) and low > high[2]
+bool bearFvg = not na(low[2]) and high < low[2]
+
+if barstate.isconfirmed
+    pruneFvgs(bullFvgArray)
+    pruneFvgs(bearFvgArray)
+
+    //A bearish gap cutting back through a recent bullish gap leaves a bearish BPR, watched as resistance
+    if bearFvg
+        int matchIndex = findOverlap(bullFvgArray, low[2], high)
+        if matchIndex >= 0
+            createBpr(bullFvgArray.get(matchIndex), low[2], high, false)
+            bullFvgArray.remove(matchIndex)
+            bearFormedEvent := true
+        bearFvgArray.push(Fvg.new(low[2], high, bar_index))
+
+    //A bullish gap cutting back through a recent bearish gap leaves a bullish BPR, watched as support
+    if bullFvg
+        int matchIndex = findOverlap(bearFvgArray, low, high[2])
+        if matchIndex >= 0
+            createBpr(bearFvgArray.get(matchIndex), low, high[2], true)
+            bearFvgArray.remove(matchIndex)
+            bullFormedEvent := true
+        bullFvgArray.push(Fvg.new(low, high[2], bar_index))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Zone Tracking
+//---------------------------------------------------------------------------------------------------------------------{
+int zoneIndex = 0
+while zoneIndex < bprArray.size()
+    Bpr zone = bprArray.get(zoneIndex)
+    bool removeZone = false
+
+    if not zone.violated
+        //Active overlaps keep extending as the zone to trade back to
+        zone.zoneBox.set_right(bar_index)
+        zone.midLine.set_x2(bar_index)
+
+        if barstate.isconfirmed and bar_index > zone.formIndex
+            float violationPrice = violationTriggerInput == TRIGGER_WICK ? (zone.isBull ? low : high) : close
+            bool  zoneViolated   = zone.isBull ? violationPrice < zone.bottom : violationPrice > zone.top
+
+            if zoneViolated
+                //A break through the far side reads as the balance resolving the other way
+                zone.violated := true
+                if showViolatedInput
+                    zone.zoneBox.set_bgcolor(color.new(violatedColorInput, ZONE_FILL_TRANSPARENCY))
+                    zone.zoneBox.set_border_color(color.new(violatedColorInput, ZONE_BORDER_TRANSPARENCY))
+                    zone.midLine.set_color(showMidlineInput ? color.new(violatedColorInput, MIDLINE_TRANSPARENCY) : color(na))
+                else
+                    zone.zoneBox.delete()
+                    zone.midLine.delete()
+                    removeZone := true
+                if zone.isBull
+                    bullViolatedEvent := true
+                else
+                    bearViolatedEvent := true
+            else if not zone.touched and high >= zone.bottom and low <= zone.top
+                //First return into the overlap since formation, watched for continuation with the newer gap
+                zone.touched := true
+                if zone.isBull
+                    bullRetestEvent := true
+                else
+                    bearRetestEvent := true
+
+    if removeZone
+        bprArray.remove(zoneIndex)
+    else
+        zoneIndex += 1
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(bullFormedEvent, "Bullish BPR Formed", "A bullish fair value gap displaced back through a recent bearish one - the overlap is a bullish Balanced Price Range, watched as support.")
+alertcondition(bearFormedEvent, "Bearish BPR Formed", "A bearish fair value gap displaced back through a recent bullish one - the overlap is a bearish Balanced Price Range, watched as resistance.")
+alertcondition(bullRetestEvent, "Bullish BPR Retest", "Price returned to a bullish Balanced Price Range for the first time since it formed - watched for continuation higher, in the direction of the newer gap.")
+alertcondition(bearRetestEvent, "Bearish BPR Retest", "Price returned to a bearish Balanced Price Range for the first time since it formed - watched for continuation lower, in the direction of the newer gap.")
+alertcondition(bullViolatedEvent, "Bullish BPR Violated", "Price broke through the far side of a bullish Balanced Price Range - the earlier rejection reads as absorbed and the balance as resolving the other way.")
+alertcondition(bearViolatedEvent, "Bearish BPR Violated", "Price broke through the far side of a bearish Balanced Price Range - the earlier rejection reads as absorbed and the balance as resolving the other way.")
+
+//---------------------------------------------------------------------------------------------------------------------}

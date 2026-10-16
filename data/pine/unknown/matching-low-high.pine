@@ -1,0 +1,395 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Matching Low/high"
+  , shorttitle       = "Matching Low/high"
+  , overlay          = true
+  , format           = format.price
+  , max_lines_count  = 500
+  , max_labels_count = 500
+  , max_boxes_count  = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+//Default palette
+color BULL_COLOR    = #089981
+color BEAR_COLOR    = #f23645
+color NEUTRAL_COLOR = #787b86
+color LABEL_BG      = #00000000
+
+//Dashboard palette
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+//Transparency applied to a matched-close level once price has closed through it (the continuation outcome)
+int DEAD_LEVEL_TRANSP = 60
+
+//Transparency of the tolerance band drawn around the matched close
+int ZONE_TRANSP = 85
+
+//Trend context methods
+string TREND_MA  = "Moving Average"
+string TREND_NET = "Net Price Change"
+
+//Close match tolerance modes
+string TOL_ATR   = "% of ATR"
+string TOL_TICKS = "Ticks"
+string TOL_PCT   = "% of Price"
+
+//Dashboard locations
+string POS_TR = "Top Right"
+string POS_TL = "Top Left"
+string POS_BR = "Bottom Right"
+string POS_BL = "Bottom Left"
+
+//Dashboard sizes
+string SIZE_TINY   = "Tiny"
+string SIZE_SMALL  = "Small"
+string SIZE_NORMAL = "Normal"
+
+//Input groups
+string GROUP_DETECTION = "Matching Close Detection"
+string GROUP_FORM      = "Pattern Form"
+string GROUP_LEVELS    = "Level Tracking & Resolution"
+string GROUP_DASH      = "Dashboard"
+string GROUP_STYLE     = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+trendMethodInput = input.string(TREND_MA, "Trend Context", options = [TREND_MA, TREND_NET]
+  , group   = GROUP_DETECTION
+  , tooltip = "How the preceding trend is established on the bar just before the pair. Moving Average: that close must sit below its average for a decline, above it for an advance. Net Price Change: it must be lower/higher than the close Trend Length bars earlier. A matching low needs a preceding decline and a matching high a preceding advance - two equal closes inside a range are just range noise, so no pattern is marked without this context.")
+
+trendLengthInput = input.int(14, "Trend Length"
+  , minval  = 2
+  , maxval  = 200
+  , group   = GROUP_DETECTION
+  , tooltip = "Bars used by the trend context measure: the moving average length, or the lookback of the net price change.")
+
+tolModeInput = input.string(TOL_ATR, "Close Match Tolerance", options = [TOL_ATR, TOL_TICKS, TOL_PCT]
+  , inline  = "tolerance"
+  , group   = GROUP_DETECTION
+  , tooltip = "Unit of the close match tolerance.")
+
+tolValueInput = input.float(5, ""
+  , minval  = 0
+  , step    = 0.5
+  , inline  = "tolerance"
+  , group   = GROUP_DETECTION
+  , tooltip = "Maximum distance between the two closes for them to count as matching, with the amount read in the selected unit: a percentage of the ATR (5 = 0.05 x ATR), a number of ticks, or a percentage of price. Exact equality is rare in decimalized markets, so scanners accept a small tolerance - but the wider it is, the weaker the level logic. Results are sensitive to this choice.")
+
+volatilityLengthInput = input.int(14, "Volatility Length"
+  , minval  = 1
+  , maxval  = 200
+  , group   = GROUP_DETECTION
+  , tooltip = "Length of the ATR behind the % of ATR tolerance, and of the average real body used by the long first candle body filter.")
+
+pullAwayInput = input.bool(true, "Second Candle Pulls Away From Level"
+  , group   = GROUP_FORM
+  , tooltip = "Prefers the textbook second candle: it must open or trade beyond the matched level by more than the tolerance - above it for a matching low, below it for a matching high - before finishing back on it, showing an intrabar attempt that failed at the same price.")
+
+longBodyInput = input.bool(false, "Long First Candle Body"
+  , group   = GROUP_FORM
+  , tooltip = "Restricts detection to the classic form where the first candle prints a long real body, measured against the average body of the candles preceding the pair.")
+
+longBodyMultInput = input.float(1.2, "Long Body Multiplier"
+  , minval  = 0.1
+  , maxval  = 5
+  , step    = 0.1
+  , group   = GROUP_FORM
+  , tooltip = "Minimum real body of the first candle as a multiple of the recent average body, applied when the long first candle body filter is enabled.")
+
+resolveWindowInput = input.int(10, "Resolution Window"
+  , minval  = 1
+  , maxval  = 200
+  , group   = GROUP_LEVELS
+  , tooltip = "Bars the matched close is tracked while waiting for resolution. The first close beyond the tolerance band decides it: a confirming close on the reversal side supports the classical reading and turns the level solid, while a close through the matched level argues for continuation and retires it dotted and dimmed - effectively a breakout of the freshly defined level. Levels still undecided after this many bars stop extending.")
+
+showStatsInput = input.bool(true, "Resolution Statistics"
+  , group   = GROUP_DASH
+  , tooltip = "Tallies how detected patterns resolved on the loaded history: held (confirming close on the reversal side) versus broken (close through the matched level). The classical label is reversal, but large-sample tests often find continuation more common - this dashboard shows the split on the chart at hand.")
+
+statsPositionInput = input.string(POS_TR, "Dashboard Location", options = [POS_TR, POS_TL, POS_BR, POS_BL]
+  , group   = GROUP_DASH
+  , tooltip = "Chart corner holding the dashboard.")
+
+statsSizeInput = input.string(SIZE_SMALL, "Dashboard Size", options = [SIZE_TINY, SIZE_SMALL, SIZE_NORMAL]
+  , group   = GROUP_DASH
+  , tooltip = "Dashboard text size.")
+
+showLabelsInput = input.bool(true, "Pattern Labels"
+  , group   = GROUP_STYLE
+  , tooltip = "Labels each matching low/high on the second candle of the pair.")
+
+showZoneInput = input.bool(true, "Tolerance Band"
+  , group   = GROUP_STYLE
+  , tooltip = "Draws the tolerance band around the matched close; the first close beyond it resolves the pattern.")
+
+showResolutionInput = input.bool(true, "Resolution Marks"
+  , group   = GROUP_STYLE
+  , tooltip = "Marks the candle whose close resolves a level as held or broken.")
+
+highlightInput = input.bool(false, "Highlight Pattern Candles"
+  , group   = GROUP_STYLE
+  , tooltip = "Colors the two candles forming the pattern.")
+
+showBasisInput = input.bool(false, "Show Trend Basis"
+  , group   = GROUP_STYLE
+  , tooltip = "Plots the moving average acting as the preceding-trend filter (Moving Average context only).")
+
+bullColorInput = input.color(BULL_COLOR, "Matching Low", inline = "patternColors", group = GROUP_STYLE)
+
+bearColorInput = input.color(BEAR_COLOR, "Matching High", inline = "patternColors", group = GROUP_STYLE)
+
+basisColorInput = input.color(NEUTRAL_COLOR, "Trend Basis", group = GROUP_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types & Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+//A tracked matched-close level: the price two adjacent closes agreed on, extended forward until the first
+//decisive close beyond its tolerance band resolves it as held (reversal side) or broken (continuation)
+type MatchLevel
+    line  levelLine
+    box   toleranceZone
+    float price
+    float tolerance
+    bool  isLow
+    int   startBar
+
+//Maps the dashboard location input to a table position
+dashLocation(string locationStr) =>
+    switch locationStr
+        POS_TR => position.top_right
+        POS_TL => position.top_left
+        POS_BR => position.bottom_right
+        => position.bottom_left
+
+//Maps the dashboard size input to a text size
+dashTextSize(string sizeStr) =>
+    switch sizeStr
+        SIZE_TINY  => size.tiny
+        SIZE_SMALL => size.small
+        => size.normal
+
+//Formats a resolved share as a whole percentage
+formatShare(int part, int total) =>
+    total > 0 ? str.tostring(math.round(100.0 * part / total)) + "%" : "-"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+
+float bodySize   = math.abs(close - open)
+float bodyAvg    = ta.sma(bodySize, volatilityLengthInput)
+float atrValue   = ta.atr(volatilityLengthInput)
+float trendBasis = ta.sma(close, trendLengthInput)
+float trendRef   = close[trendLengthInput + 2]
+
+//Tolerance between the two closes, in price units
+float tolValue = switch tolModeInput
+    TOL_ATR   => nz(atrValue) * tolValueInput / 100
+    TOL_TICKS => tolValueInput * syminfo.mintick
+    => close * tolValueInput / 100
+
+bool tolReady = tolModeInput != TOL_ATR or not na(atrValue)
+
+//Trend context measured on the bar preceding the pair: a matching low needs a decline into it,
+//a matching high an advance
+bool declineBefore = false
+bool advanceBefore = false
+
+if trendMethodInput == TREND_MA
+    declineBefore := not na(trendBasis[2]) and close[2] < trendBasis[2]
+    advanceBefore := not na(trendBasis[2]) and close[2] > trendBasis[2]
+else
+    declineBefore := not na(trendRef) and close[2] < trendRef
+    advanceBefore := not na(trendRef) and close[2] > trendRef
+
+//The defining feature: two adjacent closes matching exactly or within tolerance. The matched level is the
+//midpoint of the two nearly identical closes
+bool  closesMatch  = tolReady and math.abs(close - close[1]) <= tolValue
+float matchedClose = math.avg(close, close[1])
+
+//Candle direction: both candles bearish for a matching low, both bullish for a matching high
+bool bothBearish = close < open and close[1] < open[1]
+bool bothBullish = close > open and close[1] > open[1]
+
+//Textbook second candle: it pulled away from the matched level intrabar and finished back on it
+bool pullAwayLow  = not pullAwayInput or high > matchedClose + tolValue
+bool pullAwayHigh = not pullAwayInput or low < matchedClose - tolValue
+
+//Optional long first body, measured against the average body of the candles preceding the pair
+bool longFirstBody = not longBodyInput or (not na(bodyAvg[2]) and bodySize[1] > bodyAvg[2] * longBodyMultInput)
+
+bool matchingLow  = declineBefore and bothBearish and closesMatch and pullAwayLow and longFirstBody
+bool matchingHigh = advanceBefore and bothBullish and closesMatch and pullAwayHigh and longFirstBody
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Pattern Marks & Level Tracking
+//---------------------------------------------------------------------------------------------------------------------{
+
+var array<MatchLevel> levelsArray = array.new<MatchLevel>()
+
+var int lowCount   = 0
+var int lowHeld    = 0
+var int lowBroken  = 0
+var int highCount  = 0
+var int highHeld   = 0
+var int highBroken = 0
+
+bool lowHeldEvent    = false
+bool lowBrokenEvent  = false
+bool highHeldEvent   = false
+bool highBrokenEvent = false
+
+//Extend the tracked levels and resolve each on the first decisive close beyond its tolerance band:
+//a hold promotes the level to a solid line, a break retires it dotted and dimmed
+if array.size(levelsArray) > 0
+    array<MatchLevel> keepArray = array.new<MatchLevel>()
+    for i = 0 to array.size(levelsArray) - 1
+        MatchLevel refLevel = array.get(levelsArray, i)
+        line.set_x2(refLevel.levelLine, bar_index)
+        if not na(refLevel.toleranceZone)
+            box.set_right(refLevel.toleranceZone, bar_index)
+        bool heldNow   = refLevel.isLow ? close > refLevel.price + refLevel.tolerance : close < refLevel.price - refLevel.tolerance
+        bool brokenNow = refLevel.isLow ? close < refLevel.price - refLevel.tolerance : close > refLevel.price + refLevel.tolerance
+        if heldNow or brokenNow
+            color levelColor = refLevel.isLow ? bullColorInput : bearColorInput
+            if heldNow
+                line.set_style(refLevel.levelLine, line.style_solid)
+            else
+                line.set_style(refLevel.levelLine, line.style_dotted)
+                line.set_color(refLevel.levelLine, color.new(levelColor, DEAD_LEVEL_TRANSP))
+            if refLevel.isLow
+                lowHeld        += heldNow ? 1 : 0
+                lowBroken      += brokenNow ? 1 : 0
+                lowHeldEvent   := lowHeldEvent or heldNow
+                lowBrokenEvent := lowBrokenEvent or brokenNow
+            else
+                highHeld        += heldNow ? 1 : 0
+                highBroken      += brokenNow ? 1 : 0
+                highHeldEvent   := highHeldEvent or heldNow
+                highBrokenEvent := highBrokenEvent or brokenNow
+            if showResolutionInput
+                bool upResolve = refLevel.isLow ? heldNow : brokenNow
+                string resolveText    = heldNow ? "held" : "broken"
+                string resolveTooltip = heldNow ? "Confirming close on the reversal side of the matched close at " + str.tostring(refLevel.price, format.mintick) + " - the classical reading holds." : "Close through the matched close at " + str.tostring(refLevel.price, format.mintick) + " - the pattern resolved as continuation, a breakout of the freshly defined level."
+                if upResolve
+                    label.new(bar_index, low, resolveText
+                      , style     = label.style_label_up
+                      , color     = LABEL_BG
+                      , textcolor = bullColorInput
+                      , size      = size.tiny
+                      , tooltip   = resolveTooltip)
+                else
+                    label.new(bar_index, high, resolveText
+                      , style     = label.style_label_down
+                      , color     = LABEL_BG
+                      , textcolor = bearColorInput
+                      , size      = size.tiny
+                      , tooltip   = resolveTooltip)
+        else if bar_index - refLevel.startBar < resolveWindowInput
+            array.push(keepArray, refLevel)
+    levelsArray := keepArray
+
+//Register a new matching low: label the pair, draw the matched close with its tolerance band, start tracking
+if matchingLow
+    lowCount += 1
+    box lowZone = na
+    if showZoneInput
+        lowZone := box.new(bar_index - 1, matchedClose + tolValue, bar_index, matchedClose - tolValue
+          , border_color = color.new(bullColorInput, 100)
+          , bgcolor      = color.new(bullColorInput, ZONE_TRANSP))
+    line lowLine = line.new(bar_index - 1, matchedClose, bar_index, matchedClose, color = bullColorInput, style = line.style_dashed, width = 1)
+    array.push(levelsArray, MatchLevel.new(lowLine, lowZone, matchedClose, tolValue, true, bar_index))
+    if showLabelsInput
+        label.new(bar_index, low, "Matching Low"
+          , style     = label.style_label_up
+          , color     = LABEL_BG
+          , textcolor = bullColorInput
+          , size      = size.small
+          , tooltip   = "Matching low: after a decline, two bearish candles closed at " + str.tostring(matchedClose, format.mintick) + " - a price the market tested twice and could not push through. Classical reading: bullish reversal off the twice-tested close; tested behavior is frequently continuation instead. Wait for a decisive close beyond the tolerance band.")
+
+//Mirror at the top of an advance: two bullish candles closing at the same price
+if matchingHigh
+    highCount += 1
+    box highZone = na
+    if showZoneInput
+        highZone := box.new(bar_index - 1, matchedClose + tolValue, bar_index, matchedClose - tolValue
+          , border_color = color.new(bearColorInput, 100)
+          , bgcolor      = color.new(bearColorInput, ZONE_TRANSP))
+    line highLine = line.new(bar_index - 1, matchedClose, bar_index, matchedClose, color = bearColorInput, style = line.style_dashed, width = 1)
+    array.push(levelsArray, MatchLevel.new(highLine, highZone, matchedClose, tolValue, false, bar_index))
+    if showLabelsInput
+        label.new(bar_index, high, "Matching High"
+          , style     = label.style_label_down
+          , color     = LABEL_BG
+          , textcolor = bearColorInput
+          , size      = size.small
+          , tooltip   = "Matching high: after an advance, two bullish candles closed at " + str.tostring(matchedClose, format.mintick) + " - a price the market tested twice and could not push through. Classical reading: bearish reversal off the twice-tested close; a decisive close above the band converts it into a resistance breakout instead.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+
+var table statsTable = table(na)
+
+//The split between the classical reversal reading and the tested tendency toward continuation, on this chart
+if showStatsInput and barstate.islast
+    if na(statsTable)
+        statsTable := table.new(dashLocation(statsPositionInput), 4, 3
+          , bgcolor      = DASH_BG
+          , border_width = 0
+          , frame_color  = DASH_FRAME
+          , frame_width  = 1)
+    string txtSize   = dashTextSize(statsSizeInput)
+    int lowResolved  = lowHeld + lowBroken
+    int highResolved = highHeld + highBroken
+    table.cell(statsTable, 0, 0, "", text_size = txtSize)
+    table.cell(statsTable, 1, 0, "Count", text_color = DASH_HEADER, text_size = txtSize, tooltip = "Patterns detected over the loaded chart history")
+    table.cell(statsTable, 2, 0, "Held", text_color = DASH_HEADER, text_size = txtSize, tooltip = "Resolved with a confirming close on the reversal side of the matched close - the classical reading")
+    table.cell(statsTable, 3, 0, "Broken", text_color = DASH_HEADER, text_size = txtSize, tooltip = "Resolved with a close through the matched close - the continuation outcome")
+    table.cell(statsTable, 0, 1, "Matching Low", text_color = bullColorInput, text_size = txtSize, text_halign = text.align_left)
+    table.cell(statsTable, 1, 1, str.tostring(lowCount), text_color = DASH_TEXT, text_size = txtSize)
+    table.cell(statsTable, 2, 1, str.tostring(lowHeld) + " (" + formatShare(lowHeld, lowResolved) + ")", text_color = DASH_TEXT, text_size = txtSize)
+    table.cell(statsTable, 3, 1, str.tostring(lowBroken) + " (" + formatShare(lowBroken, lowResolved) + ")", text_color = DASH_TEXT, text_size = txtSize)
+    table.cell(statsTable, 0, 2, "Matching High", text_color = bearColorInput, text_size = txtSize, text_halign = text.align_left)
+    table.cell(statsTable, 1, 2, str.tostring(highCount), text_color = DASH_TEXT, text_size = txtSize)
+    table.cell(statsTable, 2, 2, str.tostring(highHeld) + " (" + formatShare(highHeld, highResolved) + ")", text_color = DASH_TEXT, text_size = txtSize)
+    table.cell(statsTable, 3, 2, str.tostring(highBroken) + " (" + formatShare(highBroken, highResolved) + ")", text_color = DASH_TEXT, text_size = txtSize)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+
+plot(trendBasis, "Trend Basis", showBasisInput and trendMethodInput == TREND_MA ? basisColorInput : color(na), 1)
+
+barcolor(highlightInput and (matchingLow or matchingHigh) ? (matchingLow ? bullColorInput : bearColorInput) : color(na), title = "Pattern Candles")
+
+barcolor(highlightInput and (matchingLow or matchingHigh) ? (matchingLow ? bullColorInput : bearColorInput) : color(na), offset = -1, title = "Pattern Candles (first of the pair)")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(matchingLow, "Matching Low", "Matching low on {{ticker}} ({{interval}}) - after a decline, two bearish candles closed at the same level near {{close}}. Classical reading is bullish reversal, tested behavior is frequently continuation: wait for a decisive close beyond the matched level")
+
+alertcondition(matchingHigh, "Matching High", "Matching high on {{ticker}} ({{interval}}) - after an advance, two bullish candles closed at the same level near {{close}}. Classical reading is bearish reversal: wait for a decisive close beyond the matched level")
+
+alertcondition(lowHeldEvent, "Matching Low Held (Reversal Confirmed)", "A matching low on {{ticker}} ({{interval}}) printed a confirming close above its matched level - the classical bullish reversal reading holds, with the natural stop just beyond the matched closes")
+
+alertcondition(lowBrokenEvent, "Matching Low Broken (Continuation)", "Price on {{ticker}} ({{interval}}) closed below a matching low's matched level - the pattern resolved as continuation, a breakout of the freshly defined support")
+
+alertcondition(highHeldEvent, "Matching High Held (Reversal Confirmed)", "A matching high on {{ticker}} ({{interval}}) printed a confirming close below its matched level - the classical bearish reversal reading holds, with the natural stop just beyond the matched closes")
+
+alertcondition(highBrokenEvent, "Matching High Broken (Continuation)", "Price on {{ticker}} ({{interval}}) closed above a matching high's matched level - the pattern resolved as continuation, a breakout of the freshly defined resistance")
+
+//---------------------------------------------------------------------------------------------------------------------}

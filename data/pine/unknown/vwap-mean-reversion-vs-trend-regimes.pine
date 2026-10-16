@@ -1,0 +1,395 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("VWAP Mean-reversion vs Trend Regimes", shorttitle = "VWAP Mean-reversion vs Trend Regimes", overlay = true, format = format.price, max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+REGIME_TREND  =  1 // one-sided day - VWAP / first band act as dynamic support or resistance
+REGIME_REVERT = -1 // rotational day - outer-band stretches rotate back to the average
+REGIME_NONE   =  0 // developing - not enough session evidence to commit either way
+
+BULL_COLOR       = #089981 // up-trend day - price holding above the average
+BEAR_COLOR       = #f23645 // down-trend day - price holding below the average
+REVERSION_COLOR  = #ff9800 // the one accent - rotational day, fade the bands
+DEVELOPING_COLOR = #787b86 // not enough evidence yet - structure grey
+LABEL_BG_COLOR   = #00000000
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+TOP_RIGHT    = "Top Right"
+TOP_LEFT     = "Top Left"
+BOTTOM_RIGHT = "Bottom Right"
+BOTTOM_LEFT  = "Bottom Left"
+
+TINY_SIZE   = "Tiny"
+SMALL_SIZE  = "Small"
+NORMAL_SIZE = "Normal"
+
+SESSION_ANCHOR = "D" // the session VWAP and its bands reset on each new daily session
+
+FILL_EDGE_TRANSP   = 80  // band gradient transparency at the outer band
+FILL_CENTER_TRANSP = 100 // band gradient transparency at the average
+INNER_LINE_TRANSP  = 55  // first band line transparency
+OUTER_LINE_TRANSP  = 30  // outer band line transparency
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+srcInput = input.source(hlc3, "Source"
+  , group   = "Session VWAP & Bands"
+  , tooltip = "Price series fed into the volume weighting. HLC3 (typical price) is the standard session VWAP source. The average, its deviation bands and every regime statistic reset at the start of each new daily session.")
+
+band1MultInput = input.float(1.0, "First Band Multiplier", minval = 0.1, step = 0.25
+  , group   = "Session VWAP & Bands"
+  , tooltip = "Volume-weighted standard deviations for the first band pair. On trend days this band and VWAP itself are the dynamic support or resistance that pullbacks are joined at. 1 is the standard first deviation band.")
+
+band2MultInput = input.float(2.0, "Outer Band Multiplier", minval = 0.1, step = 0.25
+  , group   = "Session VWAP & Bands"
+  , tooltip = "Volume-weighted standard deviations for the outer band pair - the stretch edge of the session. On rotational days tags of this band are faded back toward the average with the stop beyond the band; on trend days the same tags keep stretching further.")
+
+windowInput = input.int(48, "Evidence Window", minval = 10, maxval = 500
+  , group   = "Regime Classification"
+  , tooltip = "Recent in-session bars the classifier reads. Crossings, side hold, slope and stretch are all measured over this window, so it sets how quickly a day that stops crossing VWAP and starts holding one side gets reclassified. The window never reaches back into the prior session.")
+
+minEvidenceInput = input.int(12, "Minimum Evidence", minval = 1, maxval = 500
+  , group   = "Regime Classification"
+  , tooltip = "In-session bars required before the first classification commits. Classification is probabilistic and provisional, so the day stays Developing until this much evidence exists - 12 bars is about the first hour on a 5-minute chart. Capped at the evidence window.")
+
+trendThresholdInput = input.int(65, "Trend Threshold", minval = 50, maxval = 100
+  , group   = "Regime Classification"
+  , tooltip = "Composite score (0-100) at or above which the day is classified as trending. The gap between the two thresholds is a hold zone: inside it the previous classification stands, so borderline evidence does not flip the playbook back and forth.")
+
+revertThresholdInput = input.int(35, "Mean-Reversion Threshold", minval = 0, maxval = 50
+  , group   = "Regime Classification"
+  , tooltip = "Composite score at or below which the day is classified as rotational / mean-reverting - balanced two-sided trade around an accepted average.")
+
+crossingsPivotInput = input.int(4, "Rotation Crossings", minval = 1
+  , group   = "Regime Classification"
+  , tooltip = "VWAP crossings within the window that read as fully rotational. Zero crossings is maximum trend evidence, half this count is neutral. Trend days stop crossing the average; balanced days cross it repeatedly in both directions.")
+
+sideHoldPivotInput = input.int(75, "Side-Hold Pivot %", minval = 55, maxval = 95
+  , group   = "Regime Classification"
+  , tooltip = "Share of window closes on the dominant side of VWAP that reads as neutral. A more one-sided hold argues for a trend day, a share near 50/50 argues for rotation.")
+
+slopePivotInput = input.float(0.5, "Slope Pivot", minval = 0.05, step = 0.05
+  , group   = "Regime Classification"
+  , tooltip = "VWAP travel across the evidence window, in deviations (σ), that reads as neutral. A flat average argues for rotation; a persistent slope argues for a trend day. Twice the pivot is maximum trend evidence.")
+
+stretchPivotInput = input.float(0.5, "Stretch Pivot", minval = 0.05, step = 0.05
+  , group   = "Regime Classification"
+  , tooltip = "Average z-score magnitude - the mean signed distance from VWAP in deviations over the window - that reads as neutral. Rotational days oscillate around zero; band-riding trend days keep price accepted well away from the average on one side.")
+
+showDashboardInput = input.bool(true, "Show Dashboard"
+  , group   = "Dashboard"
+  , tooltip = "Classification panel: the active regime, its composite score, the four tells it is built from (crossings, side hold, VWAP slope, stretch), the live z-score of distance from the average, and the playbook that fits the current read.")
+
+dashboardPositionInput = input.string(TOP_RIGHT, "Position", options = [TOP_RIGHT, TOP_LEFT, BOTTOM_RIGHT, BOTTOM_LEFT], inline = "dash"
+  , group   = "Dashboard"
+  , tooltip = "Chart corner the dashboard is anchored to.")
+
+dashboardSizeInput = input.string(SMALL_SIZE, "Size", options = [TINY_SIZE, SMALL_SIZE, NORMAL_SIZE], inline = "dash"
+  , group   = "Dashboard"
+  , tooltip = "Dashboard text size.")
+
+bullColorInput = input.color(BULL_COLOR, "Trend Up", inline = "trend"
+  , group   = "Style"
+  , tooltip = "Color of VWAP, bands and gradient while the day is classified as an up-trend - price holding above the average.")
+
+bearColorInput = input.color(BEAR_COLOR, "Trend Down", inline = "trend"
+  , group   = "Style"
+  , tooltip = "Color of VWAP, bands and gradient while the day is classified as a down-trend - price holding below the average.")
+
+revertColorInput = input.color(REVERSION_COLOR, "Mean Reversion", inline = "state"
+  , group   = "Style"
+  , tooltip = "Color while the day is classified as rotational - stretches toward the outer bands are expected to rotate back to VWAP.")
+
+developingColorInput = input.color(DEVELOPING_COLOR, "Developing", inline = "state"
+  , group   = "Style"
+  , tooltip = "Color while the session has not yet produced enough evidence to commit to either playbook.")
+
+gradientFillInput = input.bool(true, "Band Gradient Fill"
+  , group   = "Style"
+  , tooltip = "Vertical gradient between the average and each outer band, colored by the active regime - fully transparent at VWAP, strongest at the band edge. Purely visual; the classification is unaffected.")
+
+showInnerBandInput = input.bool(true, "Show First Band"
+  , group   = "Style"
+  , tooltip = "Displays the first deviation band pair - the trend playbook's pullback zone boundary.")
+
+showOuterBandInput = input.bool(true, "Show Outer Band"
+  , group   = "Style"
+  , tooltip = "Displays the outer deviation band pair - the reversion playbook's fade edge.")
+
+showSetupMarkersInput = input.bool(false, "Setup Markers"
+  , group   = "Style"
+  , tooltip = "Small markers on playbook events: diamonds where an outer-band tag occurs in the mean-reversion regime, triangles where a pullback reaches the VWAP / first-band zone in the trend regime. Off by default to keep the chart clean - the alerts cover the same events regardless.")
+
+showFlipLabelsInput = input.bool(false, "Regime Flip Labels"
+  , group   = "Style"
+  , tooltip = "Text label on the bar a session is first classified or reclassified. Off by default - the regime coloring and the dashboard already carry the state.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Dashboard anchor from the position option
+tableLocation(string positionText) =>
+    switch
+        positionText == TOP_RIGHT    => position.top_right
+        positionText == TOP_LEFT     => position.top_left
+        positionText == BOTTOM_RIGHT => position.bottom_right
+        => position.bottom_left
+
+// Dashboard text size from the size option
+tableTextSize(string sizeText) =>
+    switch
+        sizeText == TINY_SIZE  => size.tiny
+        sizeText == SMALL_SIZE => size.small
+        => size.normal
+
+// Bounded value - every classification component is clamped to a fixed range before averaging
+clampValue(float value, float lowLimit, float highLimit) =>
+    math.max(lowLimit, math.min(highLimit, value))
+
+// Signed deviation readout for the dashboard
+formatSigma(float value) =>
+    na(value) ? "n/a" : (value >= 0 ? "+" : "") + str.tostring(value, "0.00") + "σ"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Session VWAP & Bands
+//---------------------------------------------------------------------------------------------------------------------{
+bool newSession    = timeframe.change(SESSION_ANCHOR)
+bool intradayChart = timeframe.isintraday
+
+// Volume-weighted running sums, reset at each new session - the standard session VWAP construction with
+// volume-weighted standard deviation bands around it
+var float sumPriceVolume   = 0.0
+var float sumVolume        = 0.0
+var float sumPriceSqVolume = 0.0
+
+if newSession
+    sumPriceVolume   := 0.0
+    sumVolume        := 0.0
+    sumPriceSqVolume := 0.0
+
+float barVolume = nz(volume)
+sumPriceVolume   += srcInput * barVolume
+sumVolume        += barVolume
+sumPriceSqVolume += srcInput * srcInput * barVolume
+
+float vwapValue     = sumVolume > 0 ? sumPriceVolume / sumVolume : na
+float vwapVariance  = sumVolume > 0 ? math.max(sumPriceSqVolume / sumVolume - vwapValue * vwapValue, 0) : na
+float vwapDeviation = math.sqrt(vwapVariance)
+
+// Keeping the multipliers ordered protects the band roles if the inputs are ever inverted
+float innerMult = math.min(band1MultInput, band2MultInput)
+float outerMult = math.max(band1MultInput, band2MultInput)
+
+float upperInnerBand = vwapValue + innerMult * vwapDeviation
+float lowerInnerBand = vwapValue - innerMult * vwapDeviation
+float upperOuterBand = vwapValue + outerMult * vwapDeviation
+float lowerOuterBand = vwapValue - outerMult * vwapDeviation
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Regime Engine
+//---------------------------------------------------------------------------------------------------------------------{
+// Per-bar evidence: crossings of the average, which side the close holds, and the z-score of distance from it.
+// The session-open jump of the freshly reset VWAP is never counted as a rotation.
+bool crossUpVwap   = ta.crossover(close, vwapValue)
+bool crossDownVwap = ta.crossunder(close, vwapValue)
+bool vwapCross     = not newSession and (crossUpVwap or crossDownVwap)
+bool closeAbove    = not na(vwapValue) and close > vwapValue
+float closeZScore  = not na(vwapDeviation) and vwapDeviation > 0 ? (close - vwapValue) / vwapDeviation : 0.0
+
+// Rolling evidence arrays - cleared at the session open so no read ever mixes two days, trimmed to the window
+// so a day that changes character mid-session gets reclassified from recent behavior
+var array<float> crossArray  = array.new<float>()
+var array<float> sideArray   = array.new<float>()
+var array<float> zScoreArray = array.new<float>()
+var array<float> vwapArray   = array.new<float>()
+
+if newSession
+    array.clear(crossArray)
+    array.clear(sideArray)
+    array.clear(zScoreArray)
+    array.clear(vwapArray)
+
+if intradayChart and not na(vwapValue)
+    array.push(crossArray, vwapCross ? 1.0 : 0.0)
+    array.push(sideArray, closeAbove ? 1.0 : 0.0)
+    array.push(zScoreArray, closeZScore)
+    array.push(vwapArray, vwapValue)
+    if array.size(crossArray) > windowInput
+        array.shift(crossArray)
+        array.shift(sideArray)
+        array.shift(zScoreArray)
+        array.shift(vwapArray)
+
+int evidenceBars      = array.size(zScoreArray)
+int minEvidenceBars   = math.min(minEvidenceInput, windowInput)
+float crossingCount   = evidenceBars > 0 ? array.sum(crossArray) : 0.0
+float aboveShare      = evidenceBars > 0 ? array.sum(sideArray) / evidenceBars : 0.5
+float sideShare       = math.max(aboveShare, 1 - aboveShare)
+float meanZScore      = evidenceBars > 0 ? array.avg(zScoreArray) : 0.0
+float windowStartVwap = evidenceBars > 0 ? array.get(vwapArray, 0) : vwapValue
+float slopeSigma      = not na(vwapValue) and not na(vwapDeviation) and vwapDeviation > 0 ? (vwapValue - windowStartVwap) / vwapDeviation : 0.0
+
+// The four tells, each scored on -1 (rotational) to +1 (trending) around its pivot, then averaged into a
+// 0-100 composite - no single classifier is definitive, so they vote
+float sidePivot    = sideHoldPivotInput / 100.0
+float sideScore    = clampValue((sideShare - sidePivot) / math.min(1.0 - sidePivot, sidePivot - 0.5), -1.0, 1.0)
+float crossScore   = clampValue(1.0 - 2.0 * crossingCount / crossingsPivotInput, -1.0, 1.0)
+float slopeScore   = clampValue(math.abs(slopeSigma) / slopePivotInput - 1.0, -1.0, 1.0)
+float stretchScore = clampValue(math.abs(meanZScore) / stretchPivotInput - 1.0, -1.0, 1.0)
+float regimeScore  = clampValue(50.0 + 50.0 * (sideScore + crossScore + slopeScore + stretchScore) / 4.0, 0.0, 100.0)
+
+// Classification is provisional: it commits only after minimum evidence, holds through the zone between the
+// thresholds, and resets to Developing at every session open
+int revertLevel = math.min(revertThresholdInput, trendThresholdInput)
+bool evidenceReady = intradayChart and evidenceBars >= minEvidenceBars and not na(vwapDeviation) and vwapDeviation > 0
+
+var int regime         = REGIME_NONE
+var int trendDirection = 0
+
+if newSession
+    regime         := REGIME_NONE
+    trendDirection := 0
+
+if evidenceReady
+    if regimeScore >= trendThresholdInput
+        regime := REGIME_TREND
+    else if regimeScore <= revertLevel
+        regime := REGIME_REVERT
+
+trendDirection := regime == REGIME_TREND ? (aboveShare >= 0.5 ? 1 : -1) : 0
+
+bool trendUpFlip   = regime == REGIME_TREND and trendDirection == 1 and (nz(regime[1]) != REGIME_TREND or nz(trendDirection[1]) != 1)
+bool trendDownFlip = regime == REGIME_TREND and trendDirection == -1 and (nz(regime[1]) != REGIME_TREND or nz(trendDirection[1]) != -1)
+bool revertFlip    = regime == REGIME_REVERT and nz(regime[1]) != REGIME_REVERT
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Playbook Setups
+//---------------------------------------------------------------------------------------------------------------------{
+// Reversion playbook: in the rotational regime, a tag of the outer band is the fade setup back toward the average.
+// Trend playbook: in the trend regime, price re-entering the VWAP / first-band zone while still holding the
+// average's side is the pullback to join.
+bool upperOuterTag  = ta.crossover(high, upperOuterBand)
+bool lowerOuterTag  = ta.crossunder(low, lowerOuterBand)
+bool upperZoneEntry = ta.crossunder(low, upperInnerBand)
+bool lowerZoneEntry = ta.crossover(high, lowerInnerBand)
+
+bool fadeShortSetup     = regime == REGIME_REVERT and upperOuterTag
+bool fadeLongSetup      = regime == REGIME_REVERT and lowerOuterTag
+bool trendPullbackLong  = regime == REGIME_TREND and trendDirection == 1 and upperZoneEntry and close > vwapValue
+bool trendPullbackShort = regime == REGIME_TREND and trendDirection == -1 and lowerZoneEntry and close < vwapValue
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+color regimeColor = regime == REGIME_TREND ? (trendDirection == 1 ? bullColorInput : bearColorInput) : regime == REGIME_REVERT ? revertColorInput : developingColorInput
+
+// Session VWAP needs an intraday chart - on higher timeframes everything hides and the dashboard says so
+float vwapDisplay       = intradayChart ? vwapValue : na
+float upperInnerDisplay = intradayChart ? upperInnerBand : na
+float lowerInnerDisplay = intradayChart ? lowerInnerBand : na
+float upperOuterDisplay = intradayChart ? upperOuterBand : na
+float lowerOuterDisplay = intradayChart ? lowerOuterBand : na
+
+// Line colors break at the session open so the reset never draws as a jump
+color vwapLineColor  = newSession ? na : regimeColor
+color innerLineColor = newSession or not showInnerBandInput ? na : color.new(regimeColor, INNER_LINE_TRANSP)
+color outerLineColor = newSession or not showOuterBandInput ? na : color.new(regimeColor, OUTER_LINE_TRANSP)
+
+vwapPlotId       = plot(vwapDisplay, "Session VWAP", vwapLineColor, 2)
+upperInnerPlotId = plot(upperInnerDisplay, "Upper First Band", innerLineColor, 1)
+lowerInnerPlotId = plot(lowerInnerDisplay, "Lower First Band", innerLineColor, 1)
+upperOuterPlotId = plot(upperOuterDisplay, "Upper Outer Band", outerLineColor, 1)
+lowerOuterPlotId = plot(lowerOuterDisplay, "Lower Outer Band", outerLineColor, 1)
+
+color fillCenterColor = gradientFillInput and intradayChart and not newSession ? color.new(regimeColor, FILL_CENTER_TRANSP) : na
+color fillEdgeColor   = gradientFillInput and intradayChart and not newSession ? color.new(regimeColor, FILL_EDGE_TRANSP) : na
+
+fill(vwapPlotId, upperOuterPlotId
+  , top_value    = upperOuterDisplay
+  , bottom_value = vwapDisplay
+  , top_color    = fillEdgeColor
+  , bottom_color = fillCenterColor
+  , title        = "Upper Band Gradient")
+
+fill(vwapPlotId, lowerOuterPlotId
+  , top_value    = vwapDisplay
+  , bottom_value = lowerOuterDisplay
+  , top_color    = fillCenterColor
+  , bottom_color = fillEdgeColor
+  , title        = "Lower Band Gradient")
+
+plotshape(showSetupMarkersInput and fadeLongSetup, "Fade Long Setup", shape.diamond, location.belowbar, color = bullColorInput, size = size.tiny)
+plotshape(showSetupMarkersInput and fadeShortSetup, "Fade Short Setup", shape.diamond, location.abovebar, color = bearColorInput, size = size.tiny)
+plotshape(showSetupMarkersInput and trendPullbackLong, "Trend Pullback Long", shape.triangleup, location.belowbar, color = bullColorInput, size = size.tiny)
+plotshape(showSetupMarkersInput and trendPullbackShort, "Trend Pullback Short", shape.triangledown, location.abovebar, color = bearColorInput, size = size.tiny)
+
+if showFlipLabelsInput
+    if trendUpFlip
+        label.new(bar_index, low, "Trend ▲", style = label.style_label_up, color = LABEL_BG_COLOR, textcolor = bullColorInput, size = size.small)
+    if trendDownFlip
+        label.new(bar_index, high, "Trend ▼", style = label.style_label_down, color = LABEL_BG_COLOR, textcolor = bearColorInput, size = size.small)
+    if revertFlip
+        label.new(bar_index, high, "Rotation", style = label.style_label_down, color = LABEL_BG_COLOR, textcolor = revertColorInput, size = size.small)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dashboardTable = na
+
+if barstate.islast and showDashboardInput
+    if na(dashboardTable)
+        dashboardTable := table.new(tableLocation(dashboardPositionInput), intradayChart ? 2 : 1, intradayChart ? 8 : 1, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+    string textSize = tableTextSize(dashboardSizeInput)
+
+    if not intradayChart
+        table.cell(dashboardTable, 0, 0, "Session VWAP regimes need an intraday chart", text_color = DASH_TEXT, text_size = textSize)
+    else
+        color labelColor = DASH_HEADER
+        color valueColor = DASH_TEXT
+        color sideColor  = aboveShare >= 0.5 ? bullColorInput : bearColorInput
+
+        string regimeText = regime == REGIME_TREND ? (trendDirection == 1 ? "Trend ▲" : "Trend ▼") : regime == REGIME_REVERT ? "Mean Reversion" : "Developing"
+        string scoreText  = evidenceReady ? str.tostring(regimeScore, "#") + " / 100" : "evidence " + str.tostring(evidenceBars) + " / " + str.tostring(minEvidenceBars) + " bars"
+        string crossText  = str.tostring(crossingCount, "#") + " in " + str.tostring(evidenceBars) + " bars"
+        string sideText   = str.tostring(sideShare * 100, "#") + "% " + (aboveShare >= 0.5 ? "above" : "below")
+        string playbookText = regime == REGIME_TREND ? (trendDirection == 1 ? "Buy pullbacks at VWAP / band 1" : "Sell pullbacks at VWAP / band 1") : regime == REGIME_REVERT ? "Fade band tags back to VWAP" : "Wait - evidence building"
+
+        table.cell(dashboardTable, 0, 0, "Regime", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+        table.cell(dashboardTable, 1, 0, regimeText, text_color = regimeColor, text_size = textSize, text_halign = text.align_right)
+        table.cell(dashboardTable, 0, 1, "Score", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+        table.cell(dashboardTable, 1, 1, scoreText, text_color = regimeColor, text_size = textSize, text_halign = text.align_right)
+        table.cell(dashboardTable, 0, 2, "Crossings", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+        table.cell(dashboardTable, 1, 2, crossText, text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+        table.cell(dashboardTable, 0, 3, "Side Hold", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+        table.cell(dashboardTable, 1, 3, sideText, text_color = sideColor, text_size = textSize, text_halign = text.align_right)
+        table.cell(dashboardTable, 0, 4, "VWAP Slope", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+        table.cell(dashboardTable, 1, 4, formatSigma(slopeSigma), text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+        table.cell(dashboardTable, 0, 5, "Avg Stretch", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+        table.cell(dashboardTable, 1, 5, formatSigma(meanZScore), text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+        table.cell(dashboardTable, 0, 6, "Close z", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+        table.cell(dashboardTable, 1, 6, formatSigma(closeZScore), text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+        table.cell(dashboardTable, 0, 7, "Playbook", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+        table.cell(dashboardTable, 1, 7, playbookText, text_color = regimeColor, text_size = textSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(trendUpFlip, "Trend Regime (Up)", "VWAP Mean-reversion vs Trend Regimes: {{ticker}} classified as an up-trend day - price is holding above session VWAP with a persistent slope and few crossings; join pullbacks at VWAP or the first band and skip counter-trend fades ({{interval}})")
+alertcondition(trendDownFlip, "Trend Regime (Down)", "VWAP Mean-reversion vs Trend Regimes: {{ticker}} classified as a down-trend day - price is holding below session VWAP with a persistent slope and few crossings; sell pullbacks at VWAP or the first band and skip counter-trend fades ({{interval}})")
+alertcondition(revertFlip, "Mean-Reversion Regime", "VWAP Mean-reversion vs Trend Regimes: {{ticker}} classified as a rotational day - price is crossing a flat VWAP repeatedly in both directions; fade outer-band tags back toward the average with stops beyond the band ({{interval}})")
+alertcondition(fadeShortSetup, "Fade Setup at Upper Outer Band", "VWAP Mean-reversion vs Trend Regimes: {{ticker}} tagged the upper outer band in the mean-reversion regime - reversion playbook fade back toward VWAP, stop beyond the band, the average as primary target ({{interval}})")
+alertcondition(fadeLongSetup, "Fade Setup at Lower Outer Band", "VWAP Mean-reversion vs Trend Regimes: {{ticker}} tagged the lower outer band in the mean-reversion regime - reversion playbook fade back toward VWAP, stop beyond the band, the average as primary target ({{interval}})")
+alertcondition(trendPullbackLong, "Trend Pullback into VWAP Support", "VWAP Mean-reversion vs Trend Regimes: {{ticker}} pulled back into the VWAP / first-band support zone on an up-trend day - trend playbook join in the direction of the hold ({{interval}})")
+alertcondition(trendPullbackShort, "Trend Pullback into VWAP Resistance", "VWAP Mean-reversion vs Trend Regimes: {{ticker}} pulled back into the VWAP / first-band resistance zone on a down-trend day - trend playbook join in the direction of the hold ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

@@ -1,0 +1,281 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Gann Box", shorttitle = "Gann Box", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 100)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+AUTO_MODE    = "Auto (Swings)"
+MANUAL_MODE  = "Manual (Range)"
+WICKS_SOURCE = "Wicks"
+CLOSE_SOURCE = "Closes"
+EIGHTHS      = "Eighths"
+QUARTERS     = "Quarters"
+THIRDS       = "Thirds"
+HALVES       = "Halves"
+FIBONACCI    = "Fibonacci"
+SIZE_TINY    = "Tiny"
+SIZE_SMALL   = "Small"
+SIZE_NORMAL  = "Normal"
+
+COLOR_GRAY   = #787b86   // structure: box frame and grid
+COLOR_ORANGE = #ff9800   // the midpoint, the division that draws the most attention
+COLOR_GOLD   = #ffd700   // the anchor swing diagonals, kept apart from the grid
+COLOR_NONE   = #00000000
+
+ANCHORS_GROUP = "Anchors"
+GRID_GROUP    = "Box Grid"
+STYLE_GROUP   = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+anchorModeInput = input.string(AUTO_MODE, "Anchor Mode", options = [AUTO_MODE, MANUAL_MODE], group = ANCHORS_GROUP, tooltip = "Auto (Swings) anchors the box to the most recent confirmed swing high and swing low. Manual (Range) snaps the box corners to the extreme prices printed between the two dates below.")
+
+swingLengthInput = input.int(20, "Swing Length", minval = 2, maxval = 200, group = ANCHORS_GROUP, tooltip = "Bars to the left and right that a point must dominate to confirm as a swing. Larger values anchor the box on more significant swings. Used by Auto (Swings) mode only.")
+
+anchorSourceInput = input.string(WICKS_SOURCE, "Anchor Source", options = [WICKS_SOURCE, CLOSE_SOURCE], group = ANCHORS_GROUP, tooltip = "Anchor the box corners to candle wicks (highs/lows) or to closing prices. Keep a single convention so boxes stay reproducible.")
+
+rangeStartInput = input.time(timestamp("1 Jan 2026 00:00 +0000"), "Range Start", group = ANCHORS_GROUP, tooltip = "Start of the window scanned in Manual (Range) mode. The box snaps to the highest and lowest prices found inside the window, so the window only needs to bracket the swing.")
+
+rangeEndInput = input.time(timestamp("1 Mar 2026 00:00 +0000"), "Range End", group = ANCHORS_GROUP, tooltip = "End of the window scanned in Manual (Range) mode. Set it in the past to freeze the box, or beyond the last bar to keep tracking new extremes as they print.")
+
+divisionsInput = input.string(EIGHTHS, "Divisions", options = [EIGHTHS, QUARTERS, THIRDS, HALVES, FIBONACCI], group = GRID_GROUP, tooltip = "Fractions subdividing the box in BOTH price and time, measured from the box bottom (0%) to top (100%) and from left to right. Eighths is the traditional Gann scheme and includes the quarters and the 50% midpoint; Quarters, Thirds and Halves are coarser classics; Fibonacci uses 23.6/38.2/50/61.8/78.6%.")
+
+showDiagonalsInput = input.bool(true, "Corner Diagonals", group = GRID_GROUP, tooltip = "Draw the corner-to-corner diagonals: solid along the anchor swing, dotted for the counter diagonal. Diagonals are computed in linear price, so keep the chart scale convention (linear vs logarithmic) constant for reproducible geometry.")
+
+showIntersectionsInput = input.bool(true, "Diagonal Intersections", group = GRID_GROUP, tooltip = "Mark the squaring points where the diagonals cross the grid, i.e. where the elapsed-time fraction matches the price fraction. Gann-oriented traders watch these crossings as higher-interest spots.")
+
+extendLevelsInput = input.bool(false, "Extend Price Levels Right", group = GRID_GROUP, tooltip = "Extend the horizontal price divisions and the box edges to the right of the box, so they can serve as support/resistance and breakout/retest references on current bars.")
+
+projectTimeInput = input.bool(false, "Project Time Grid Forward", group = GRID_GROUP, tooltip = "Repeat the time divisions over one extra box width past the right edge, projecting the swing's time rhythm forward as future timing windows.")
+
+showPriceLabelsInput = input.bool(true, "Price Labels", inline = "labels", group = GRID_GROUP, tooltip = "Show the fraction and price of each horizontal division.")
+
+showTimeLabelsInput = input.bool(true, "Time Labels", inline = "labels", group = GRID_GROUP, tooltip = "Show the fraction of each vertical time division below the box.")
+
+borderColorInput = input.color(COLOR_GRAY, "Box Border", inline = "box", group = STYLE_GROUP, tooltip = "Color of the box outline and of the 0%/100% price labels.")
+
+fillColorInput = input.color(color.new(COLOR_GRAY, 92), "Fill", inline = "box", group = STYLE_GROUP, tooltip = "Background fill of the box.")
+
+gridColorInput = input.color(color.new(COLOR_GRAY, 45), "Grid Lines", group = STYLE_GROUP, tooltip = "Color of the internal price and time division lines.")
+
+midColorInput = input.color(COLOR_ORANGE, "Midpoint (50%)", group = STYLE_GROUP, tooltip = "Color highlighting the 50% price and time midlines, the divisions that typically draw the most attention.")
+
+diagonalColorInput = input.color(color.new(COLOR_GOLD, 25), "Diagonals", group = STYLE_GROUP, tooltip = "Color of the corner diagonals and of their squaring points on the grid.")
+
+labelSizeInput = input.string(SIZE_SMALL, "Label Size", options = [SIZE_TINY, SIZE_SMALL, SIZE_NORMAL], group = STYLE_GROUP, tooltip = "Text size of the price labels.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Internal division fractions of the selected scheme (box edges 0 and 1 excluded)
+buildFractions(string scheme) =>
+    switch scheme
+        EIGHTHS  => array.from(0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875)
+        QUARTERS => array.from(0.25, 0.5, 0.75)
+        THIRDS   => array.from(1.0 / 3, 2.0 / 3)
+        HALVES   => array.from(0.5)
+        =>          array.from(0.236, 0.382, 0.5, 0.618, 0.786)
+
+// Format a fraction as a percentage string
+formatPct(float fraction) =>
+    str.tostring(fraction * 100, "#.##") + "%"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Swing Anchors
+//---------------------------------------------------------------------------------------------------------------------{
+float srcHigh = anchorSourceInput == WICKS_SOURCE ? high : close
+float srcLow  = anchorSourceInput == WICKS_SOURCE ? low  : close
+
+float pivotHigh = ta.pivothigh(srcHigh, swingLengthInput, swingLengthInput)
+float pivotLow  = ta.pivotlow(srcLow, swingLengthInput, swingLengthInput)
+
+var float autoHighPrice = na
+var int   autoHighBar   = na
+var float autoLowPrice  = na
+var int   autoLowBar    = na
+
+if not na(pivotHigh)
+    autoHighPrice := pivotHigh
+    autoHighBar   := bar_index - swingLengthInput
+
+if not na(pivotLow)
+    autoLowPrice := pivotLow
+    autoLowBar   := bar_index - swingLengthInput
+
+var float manualHighPrice = na
+var int   manualHighBar   = na
+var float manualLowPrice  = na
+var int   manualLowBar    = na
+
+if anchorModeInput == MANUAL_MODE and time >= rangeStartInput and time <= rangeEndInput
+    if na(manualHighPrice) or srcHigh > manualHighPrice
+        manualHighPrice := srcHigh
+        manualHighBar   := bar_index
+    if na(manualLowPrice) or srcLow < manualLowPrice
+        manualLowPrice := srcLow
+        manualLowBar   := bar_index
+
+bool useManual = anchorModeInput == MANUAL_MODE
+
+float swingHighPrice = useManual ? manualHighPrice : autoHighPrice
+int   swingHighBar   = useManual ? manualHighBar   : autoHighBar
+float swingLowPrice  = useManual ? manualLowPrice  : autoLowPrice
+int   swingLowBar    = useManual ? manualLowBar    : autoLowBar
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Box Geometry & Events
+//---------------------------------------------------------------------------------------------------------------------{
+var float[] fractionArray = buildFractions(divisionsInput)
+
+bool boxValid = not na(swingHighPrice) and not na(swingLowPrice) and not na(swingHighBar) and not na(swingLowBar) and swingHighBar != swingLowBar and swingHighPrice != swingLowPrice
+
+int   leftBar    = na
+int   rightBar   = na
+float startPrice = na
+float endPrice   = na
+
+if boxValid
+    if swingLowBar < swingHighBar
+        leftBar    := swingLowBar
+        startPrice := swingLowPrice
+        rightBar   := swingHighBar
+        endPrice   := swingHighPrice
+    else
+        leftBar    := swingHighBar
+        startPrice := swingHighPrice
+        rightBar   := swingLowBar
+        endPrice   := swingLowPrice
+
+float boxTop     = boxValid ? math.max(startPrice, endPrice) : na
+float boxBottom  = boxValid ? math.min(startPrice, endPrice) : na
+float boxMid     = boxValid ? math.avg(boxTop, boxBottom) : na
+float priceRange = boxValid ? boxTop - boxBottom : na
+int   timeSpan   = boxValid ? rightBar - leftBar : na
+
+// Anchors unchanged since the previous bar — avoids spurious events on re-anchoring
+bool anchorsStable = boxValid and not na(leftBar[1]) and leftBar == leftBar[1] and rightBar == rightBar[1] and startPrice == startPrice[1] and endPrice == endPrice[1]
+
+bool crossedInternal = false
+
+if anchorsStable
+    for fraction in fractionArray
+        float levelPrice = boxBottom + fraction * priceRange
+        bool crossedUp   = close > levelPrice and close[1] <= levelPrice
+        bool crossedDown = close < levelPrice and close[1] >= levelPrice
+        if crossedUp or crossedDown
+            crossedInternal := true
+
+bool crossedMidpoint = anchorsStable and ((close > boxMid and close[1] <= boxMid) or (close < boxMid and close[1] >= boxMid))
+
+bool brokeAboveBox = anchorsStable and close > boxTop    and close[1] <= boxTop
+bool brokeBelowBox = anchorsStable and close < boxBottom and close[1] >= boxBottom
+
+// Forward timing windows: the box time rhythm continued past the right edge
+bool timeDivisionReached = false
+
+if anchorsStable
+    for fraction in fractionArray
+        if bar_index == rightBar + math.round(fraction * timeSpan)
+            timeDivisionReached := true
+    if bar_index == rightBar + timeSpan
+        timeDivisionReached := true
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Drawing
+//---------------------------------------------------------------------------------------------------------------------{
+var line[]  lineArray  = array.new<line>()
+var label[] labelArray = array.new<label>()
+var box[]   boxArray   = array.new<box>()
+
+string labelSize = labelSizeInput == SIZE_TINY ? size.tiny : labelSizeInput == SIZE_NORMAL ? size.normal : size.small
+
+if barstate.islast
+    if lineArray.size() > 0
+        for eachLine in lineArray
+            eachLine.delete()
+        lineArray.clear()
+    if labelArray.size() > 0
+        for eachLabel in labelArray
+            eachLabel.delete()
+        labelArray.clear()
+    if boxArray.size() > 0
+        for eachBox in boxArray
+            eachBox.delete()
+        boxArray.clear()
+
+    if boxValid
+        // box frame
+        boxArray.push(box.new(leftBar, boxTop, rightBar, boxBottom, border_color = borderColorInput, border_width = 1, border_style = line.style_solid, bgcolor = fillColorInput))
+
+        int labelX = extendLevelsInput ? bar_index + 3 : rightBar
+
+        // horizontal price divisions
+        for fraction in fractionArray
+            float levelPrice = boxBottom + fraction * priceRange
+            bool  isMidLevel = fraction == 0.5
+            color levelColor = isMidLevel ? midColorInput : gridColorInput
+            lineArray.push(line.new(leftBar, levelPrice, rightBar, levelPrice, extend = extendLevelsInput ? extend.right : extend.none, color = levelColor, style = isMidLevel ? line.style_dashed : line.style_dotted))
+            if showPriceLabelsInput
+                labelArray.push(label.new(labelX, levelPrice, formatPct(fraction) + " · " + str.tostring(levelPrice, format.mintick), color = COLOR_NONE, style = label.style_label_left, textcolor = levelColor, size = labelSize))
+
+        // box edges extended right as breakout/retest references
+        if extendLevelsInput
+            lineArray.push(line.new(rightBar, boxTop, rightBar + 1, boxTop, extend = extend.right, color = borderColorInput, style = line.style_dotted))
+            lineArray.push(line.new(rightBar, boxBottom, rightBar + 1, boxBottom, extend = extend.right, color = borderColorInput, style = line.style_dotted))
+
+        if showPriceLabelsInput
+            labelArray.push(label.new(labelX, boxTop, "100% · " + str.tostring(boxTop, format.mintick), color = COLOR_NONE, style = label.style_label_left, textcolor = borderColorInput, size = labelSize))
+            labelArray.push(label.new(labelX, boxBottom, "0% · " + str.tostring(boxBottom, format.mintick), color = COLOR_NONE, style = label.style_label_left, textcolor = borderColorInput, size = labelSize))
+
+        // vertical time divisions
+        int previousDivisionX = na
+        for fraction in fractionArray
+            int divisionX = leftBar + math.round(fraction * timeSpan)
+            if divisionX > leftBar and divisionX < rightBar and (na(previousDivisionX) or divisionX != previousDivisionX)
+                bool  isMidLevel = fraction == 0.5
+                color levelColor = isMidLevel ? midColorInput : gridColorInput
+                lineArray.push(line.new(divisionX, boxBottom, divisionX, boxTop, color = levelColor, style = isMidLevel ? line.style_dashed : line.style_dotted))
+                if showTimeLabelsInput
+                    labelArray.push(label.new(divisionX, boxBottom, formatPct(fraction), color = COLOR_NONE, style = label.style_label_up, textcolor = levelColor, size = size.tiny))
+            previousDivisionX := divisionX
+
+        // corner diagonals: solid along the anchor swing, dotted counter diagonal
+        if showDiagonalsInput
+            lineArray.push(line.new(leftBar, startPrice, rightBar, endPrice, color = diagonalColorInput, style = line.style_solid))
+            lineArray.push(line.new(leftBar, endPrice, rightBar, startPrice, color = diagonalColorInput, style = line.style_dotted))
+
+        // squaring points: grid crossings where the time fraction equals the price fraction
+        if showIntersectionsInput
+            color dotColor = color.new(diagonalColorInput, 30)
+            for fraction in fractionArray
+                int crossX = leftBar + math.round(fraction * timeSpan)
+                if crossX > leftBar and crossX < rightBar
+                    float moveY = startPrice + fraction * (endPrice - startPrice)
+                    labelArray.push(label.new(crossX, moveY, "", color = dotColor, style = label.style_circle, size = size.tiny))
+                    if fraction != 0.5
+                        float counterY = endPrice - fraction * (endPrice - startPrice)
+                        labelArray.push(label.new(crossX, counterY, "", color = dotColor, style = label.style_circle, size = size.tiny))
+
+        // time rhythm projected one box width past the right edge
+        if projectTimeInput
+            for fraction in fractionArray
+                int projectedX = rightBar + math.round(fraction * timeSpan)
+                if projectedX > rightBar and projectedX < rightBar + timeSpan and projectedX <= bar_index + 480
+                    lineArray.push(line.new(projectedX, boxBottom, projectedX, boxTop, color = gridColorInput, style = line.style_dotted))
+            if rightBar + timeSpan <= bar_index + 480
+                lineArray.push(line.new(rightBar + timeSpan, boxBottom, rightBar + timeSpan, boxTop, color = borderColorInput, style = line.style_dotted))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(crossedInternal,     "Price Crossed Internal Level", "Price crossed an internal Gann Box price division")
+alertcondition(crossedMidpoint,     "Price Crossed Midpoint",       "Price crossed the Gann Box 50% midpoint")
+alertcondition(brokeAboveBox,       "Price Broke Above Box",        "Price closed above the Gann Box top edge")
+alertcondition(brokeBelowBox,       "Price Broke Below Box",        "Price closed below the Gann Box bottom edge")
+alertcondition(timeDivisionReached, "Time Division Reached",        "Time reached a projected Gann Box time division")
+
+//---------------------------------------------------------------------------------------------------------------------}

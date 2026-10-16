@@ -1,0 +1,270 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/ MPL-2.0
+//@version=6
+indicator("Valid BOS Pullback", "Valid BOS Pullback", overlay = true, max_lines_count = 500, max_labels_count = 500)
+
+// --- Inputs ---
+leftBarsInput = input.int(3, "Swing left bars", minval = 1, group = "Structure", tooltip = "Number of preceding bars a structural swing must exceed.")
+rightBarsInput = input.int(3, "Swing right bars", minval = 1, group = "Structure", tooltip = "Bars required to confirm a swing; the new high or low must be confirmed before a pullback can count.")
+swingLookbackInput = input.int(48, "Structure lookback (bars)", minval = 6, maxval = 500, group = "Structure", tooltip = "Choose the highest confirmed previous high and lowest confirmed previous low within this window. 48 bars is 4 hours on a 5-minute chart.")
+touchTicksInput = input.int(4, "Close invalidation tolerance (ticks)", minval = 0, group = "Structure", tooltip = "A close more than this far back through the old structure level invalidates the setup. A qualifying retest always requires the candle's actual high-low range to cross the exact line.")
+minUntouchedBarsInput = input.int(5, "Minimum bars without a retest", minval = 0, maxval = 100, group = "Structure", tooltip = "After the initial break, require this many consecutive completed bars whose wicks do not touch the old level (at the exact line). An early touch resets the count; only a subsequent retest qualifies.")
+minExtensionTicksInput = input.int(1, "Minimum initial break (ticks)", minval = 1, group = "Structure", tooltip = "Minimum closing distance beyond the old swing level to begin a setup.")
+maxWaitInput = input.int(120, "Maximum setup age (bars)", minval = 5, maxval = 1000, group = "Structure", tooltip = "Discard unfinished setups after this many bars; confirmed historical setups remain visible.")
+showDevelopingInput = input.bool(true, "Show developing levels", group = "Style", tooltip = "Show old swing and new extreme levels while waiting for a valid retest and final break.")
+showPullbackTextInput = input.bool(true, "Show valid-pullback text", group = "Style", tooltip = "Show the pullback label as soon as an actual touch of the old structure line is confirmed.")
+showTouchCircleInput = input.bool(true, "Mark retest touches", group = "Style", tooltip = "Draw a small circle on the old structure line at the candle that actually touched it.")
+referenceColorInput = input.color(#EAEAEA, "Previous high / low", group = "Style", tooltip = "Color of the old structural swing that must be retested.")
+bullColorInput = input.color(#7CFC00, "Bullish BOS / check", group = "Style", tooltip = "Color of bullish levels and confirmed annotations.")
+bearColorInput = input.color(#f23645, "Bearish BOS / check", group = "Style", tooltip = "Color of bearish levels and confirmed annotations.")
+
+// --- Setup data: each initial break runs independently, so newer breaks do not erase older ones ---
+type BosSetup
+    int direction
+    int stage
+    int startBar
+    int referenceTime
+    int extremeTime
+    int retestTime
+    float reference
+    float target
+    bool extremeConfirmed
+    line referenceLine
+    line targetLine
+    label pullbackLabel = na
+    label touchCircleLabel = na
+    int cleanBars = 0
+    int extremeBar = na
+
+var array<BosSetup> activeSetupsArray = array.new<BosSetup>()
+var array<float> highValuesArray = array.new<float>()
+var array<int> highBarsArray = array.new<int>()
+var array<int> highTimesArray = array.new<int>()
+var array<float> lowValuesArray = array.new<float>()
+var array<int> lowBarsArray = array.new<int>()
+var array<int> lowTimesArray = array.new<int>()
+// Confirmed BOS extremes are retired: the same swing can never become a new pullback reference.
+var array<int> retiredHighTimesArray = array.new<int>()
+var array<int> retiredLowTimesArray = array.new<int>()
+var array<float> retiredHighLevelsArray = array.new<float>()
+var array<float> retiredLowLevelsArray = array.new<float>()
+var array<int> retiredHighBarsArray = array.new<int>()
+var array<int> retiredLowBarsArray = array.new<int>()
+
+float highPivot = ta.pivothigh(high, leftBarsInput, rightBarsInput)
+float lowPivot = ta.pivotlow(low, leftBarsInput, rightBarsInput)
+float touchAllowance = touchTicksInput * syminfo.mintick
+float minExtension = minExtensionTicksInput * syminfo.mintick
+bool bullBos = false
+bool bearBos = false
+
+if barstate.isconfirmed
+    if not na(highPivot)
+        array.push(highValuesArray, highPivot)
+        array.push(highBarsArray, bar_index - rightBarsInput)
+        array.push(highTimesArray, time[rightBarsInput])
+    if not na(lowPivot)
+        array.push(lowValuesArray, lowPivot)
+        array.push(lowBarsArray, bar_index - rightBarsInput)
+        array.push(lowTimesArray, time[rightBarsInput])
+    while array.size(highBarsArray) > 0 and bar_index - array.get(highBarsArray, 0) > swingLookbackInput
+        array.shift(highValuesArray)
+        array.shift(highBarsArray)
+        array.shift(highTimesArray)
+    while array.size(lowBarsArray) > 0 and bar_index - array.get(lowBarsArray, 0) > swingLookbackInput
+        array.shift(lowValuesArray)
+        array.shift(lowBarsArray)
+        array.shift(lowTimesArray)
+    // Retire a completed level only while its original swing could still be in the structure window.
+    while array.size(retiredHighBarsArray) > 0 and bar_index - array.get(retiredHighBarsArray, 0) > swingLookbackInput + rightBarsInput
+        array.shift(retiredHighBarsArray)
+        array.shift(retiredHighTimesArray)
+        array.shift(retiredHighLevelsArray)
+    while array.size(retiredLowBarsArray) > 0 and bar_index - array.get(retiredLowBarsArray, 0) > swingLookbackInput + rightBarsInput
+        array.shift(retiredLowBarsArray)
+        array.shift(retiredLowTimesArray)
+        array.shift(retiredLowLevelsArray)
+
+    // --- Advance EVERY candidate; preserve confirmed lines instead of deleting them ---
+    int activeCount = array.size(activeSetupsArray)
+    if activeCount > 0
+        for step = 0 to activeCount - 1
+            int index = activeCount - 1 - step
+            BosSetup setup = array.get(activeSetupsArray, index)
+            bool invalid = bar_index - setup.startBar > maxWaitInput
+            bool completed = false
+            if setup.direction == 1
+                invalid := invalid or close < setup.reference - touchAllowance
+                if not invalid
+                    if setup.stage == 1
+                        if na(setup.extremeBar)
+                            setup.extremeBar := setup.startBar
+                        if high > setup.target
+                            setup.target := high
+                            setup.extremeTime := time
+                            setup.extremeBar := bar_index
+                            setup.extremeConfirmed := false
+                            if showDevelopingInput
+                                line.set_x1(setup.targetLine, time)
+                                line.set_y1(setup.targetLine, high)
+                                line.set_y2(setup.targetLine, high)
+                        // The new extreme is established once it survives the swing confirmation window.
+                        if bar_index - setup.extremeBar >= rightBarsInput
+                            setup.extremeConfirmed := true
+                        bool touchedOldLevel = low <= setup.reference and high >= setup.reference
+                        if touchedOldLevel and setup.extremeConfirmed and setup.cleanBars >= minUntouchedBarsInput
+                            setup.stage := 2
+                            setup.retestTime := time
+                            if showPullbackTextInput
+                                setup.pullbackLabel := label.new(setup.referenceTime, setup.reference, "Valid Pullback", xloc = xloc.bar_time, yloc = yloc.price, style = label.style_label_right, color = #00000000, textcolor = bullColorInput, size = size.small)
+                            if showTouchCircleInput
+                                setup.touchCircleLabel := label.new(time, setup.reference, "○", xloc = xloc.bar_time, yloc = yloc.price, style = label.style_circle, color = color.new(bullColorInput, 65), textcolor = bullColorInput, size = size.large)
+                            if showDevelopingInput
+                                line.set_x2(setup.referenceLine, time)
+                                line.set_color(setup.referenceLine, bullColorInput)
+                                line.set_style(setup.referenceLine, line.style_dashed)
+                        setup.cleanBars := touchedOldLevel ? 0 : setup.cleanBars + 1
+                    else if close > setup.target
+                        completed := true
+                        bullBos := true
+            else
+                invalid := invalid or close > setup.reference + touchAllowance
+                if not invalid
+                    if setup.stage == 1
+                        if na(setup.extremeBar)
+                            setup.extremeBar := setup.startBar
+                        if low < setup.target
+                            setup.target := low
+                            setup.extremeTime := time
+                            setup.extremeBar := bar_index
+                            setup.extremeConfirmed := false
+                            if showDevelopingInput
+                                line.set_x1(setup.targetLine, time)
+                                line.set_y1(setup.targetLine, low)
+                                line.set_y2(setup.targetLine, low)
+                        if bar_index - setup.extremeBar >= rightBarsInput
+                            setup.extremeConfirmed := true
+                        bool touchedOldLevel = high >= setup.reference and low <= setup.reference
+                        if touchedOldLevel and setup.extremeConfirmed and setup.cleanBars >= minUntouchedBarsInput
+                            setup.stage := 2
+                            setup.retestTime := time
+                            if showPullbackTextInput
+                                setup.pullbackLabel := label.new(setup.referenceTime, setup.reference, "Valid Pullback", xloc = xloc.bar_time, yloc = yloc.price, style = label.style_label_right, color = #00000000, textcolor = bearColorInput, size = size.small)
+                            if showTouchCircleInput
+                                setup.touchCircleLabel := label.new(time, setup.reference, "○", xloc = xloc.bar_time, yloc = yloc.price, style = label.style_circle, color = color.new(bearColorInput, 65), textcolor = bearColorInput, size = size.large)
+                            if showDevelopingInput
+                                line.set_x2(setup.referenceLine, time)
+                                line.set_color(setup.referenceLine, bearColorInput)
+                                line.set_style(setup.referenceLine, line.style_dashed)
+                        setup.cleanBars := touchedOldLevel ? 0 : setup.cleanBars + 1
+                    else if close < setup.target
+                        completed := true
+                        bearBos := true
+            if invalid
+                if not na(setup.pullbackLabel)
+                    label.delete(setup.pullbackLabel)
+                if not na(setup.touchCircleLabel)
+                    label.delete(setup.touchCircleLabel)
+                if showDevelopingInput
+                    line.delete(setup.referenceLine)
+                    line.delete(setup.targetLine)
+                array.remove(activeSetupsArray, index)
+            else if completed
+                color signalColor = setup.direction == 1 ? bullColorInput : bearColorInput
+                if setup.direction == 1
+                    array.push(retiredHighTimesArray, setup.extremeTime)
+                    array.push(retiredHighLevelsArray, setup.target)
+                    array.push(retiredHighBarsArray, bar_index)
+                else
+                    array.push(retiredLowTimesArray, setup.extremeTime)
+                    array.push(retiredLowLevelsArray, setup.target)
+                    array.push(retiredLowBarsArray, bar_index)
+                if not showDevelopingInput
+                    setup.referenceLine := line.new(setup.referenceTime, setup.reference, setup.retestTime, setup.reference, xloc = xloc.bar_time, color = signalColor, style = line.style_dashed, width = 2)
+                    setup.targetLine := line.new(setup.extremeTime, setup.target, time, setup.target, xloc = xloc.bar_time, color = signalColor, width = 2)
+                else
+                    line.set_x2(setup.targetLine, time)
+                    line.set_style(setup.targetLine, line.style_solid)
+                label.new(setup.extremeTime, setup.target, "✓", xloc = xloc.bar_time, yloc = yloc.price, style = setup.direction == 1 ? label.style_label_down : label.style_label_up, color = signalColor, textcolor = chart.bg_color, size = size.small)
+                // The pullback label was already drawn when the retest occurred; keep it with this completed setup.
+                array.remove(activeSetupsArray, index)
+            else
+                if showDevelopingInput
+                    if setup.stage == 1
+                        line.set_x2(setup.referenceLine, time)
+                    line.set_x2(setup.targetLine, time)
+                array.set(activeSetupsArray, index, setup)
+
+    // A level just confirmed as a BOS cannot remain the white reference of another live setup.
+    int remainingCount = array.size(activeSetupsArray)
+    if remainingCount > 0
+        for step = 0 to remainingCount - 1
+            int index = remainingCount - 1 - step
+            BosSetup pending = array.get(activeSetupsArray, index)
+            bool retiredReference = pending.direction == 1 ? array.includes(retiredHighLevelsArray, pending.reference) : array.includes(retiredLowLevelsArray, pending.reference)
+            if retiredReference
+                if not na(pending.pullbackLabel)
+                    label.delete(pending.pullbackLabel)
+                if not na(pending.touchCircleLabel)
+                    label.delete(pending.touchCircleLabel)
+                if showDevelopingInput
+                    line.delete(pending.referenceLine)
+                    line.delete(pending.targetLine)
+                array.remove(activeSetupsArray, index)
+
+    // --- Choose dominant confirmed swings for fresh initial breaks ---
+    float previousHigh = na
+    float previousLow = na
+    int previousHighTime = na
+    int previousLowTime = na
+    if array.size(highValuesArray) > 0
+        for index = 0 to array.size(highValuesArray) - 1
+            float candidate = array.get(highValuesArray, index)
+            int candidateTime = array.get(highTimesArray, index)
+            if not array.includes(retiredHighTimesArray, candidateTime) and not array.includes(retiredHighLevelsArray, candidate) and (na(previousHigh) or candidate > previousHigh)
+                previousHigh := candidate
+                previousHighTime := candidateTime
+    if array.size(lowValuesArray) > 0
+        for index = 0 to array.size(lowValuesArray) - 1
+            float candidate = array.get(lowValuesArray, index)
+            int candidateTime = array.get(lowTimesArray, index)
+            if not array.includes(retiredLowTimesArray, candidateTime) and not array.includes(retiredLowLevelsArray, candidate) and (na(previousLow) or candidate < previousLow)
+                previousLow := candidate
+                previousLowTime := candidateTime
+    bool newBullSetup = not bullBos and not na(previousHigh) and time > previousHighTime and close > previousHigh + minExtension and close[1] <= previousHigh
+    bool newBearSetup = not bearBos and not na(previousLow) and time > previousLowTime and close < previousLow - minExtension and close[1] >= previousLow
+    // A prior setup's breakout level must not also become a new white reference line.
+    if array.size(activeSetupsArray) > 0
+        for index = 0 to array.size(activeSetupsArray) - 1
+            BosSetup pending = array.get(activeSetupsArray, index)
+            if pending.stage == 2 and pending.direction == 1 and not na(previousHigh) and math.abs(previousHigh - pending.target) <= syminfo.mintick
+                newBullSetup := false
+            if pending.stage == 2 and pending.direction == -1 and not na(previousLow) and math.abs(previousLow - pending.target) <= syminfo.mintick
+                newBearSetup := false
+    // A fresh structural break in the opposite direction cancels ALL unfinished setups
+    // from the prior trend, including levels still waiting for their first retest.
+    int pendingCount = array.size(activeSetupsArray)
+    if (newBullSetup or newBearSetup) and pendingCount > 0
+        for step = 0 to pendingCount - 1
+            int index = pendingCount - 1 - step
+            BosSetup pending = array.get(activeSetupsArray, index)
+            if (newBullSetup and pending.direction == -1) or (newBearSetup and pending.direction == 1)
+                if not na(pending.pullbackLabel)
+                    label.delete(pending.pullbackLabel)
+                if not na(pending.touchCircleLabel)
+                    label.delete(pending.touchCircleLabel)
+                if showDevelopingInput
+                    line.delete(pending.referenceLine)
+                    line.delete(pending.targetLine)
+                array.remove(activeSetupsArray, index)
+    if newBullSetup
+        line refLine = showDevelopingInput ? line.new(previousHighTime, previousHigh, time, previousHigh, xloc = xloc.bar_time, color = referenceColorInput, width = 2) : na
+        line highLine = showDevelopingInput ? line.new(time, high, time, high, xloc = xloc.bar_time, color = bullColorInput, width = 2) : na
+        array.push(activeSetupsArray, BosSetup.new(1, 1, bar_index, previousHighTime, time, na, previousHigh, high, false, refLine, highLine))
+    if newBearSetup
+        line refLine = showDevelopingInput ? line.new(previousLowTime, previousLow, time, previousLow, xloc = xloc.bar_time, color = referenceColorInput, width = 2) : na
+        line lowLine = showDevelopingInput ? line.new(time, low, time, low, xloc = xloc.bar_time, color = bearColorInput, width = 2) : na
+        array.push(activeSetupsArray, BosSetup.new(-1, 1, bar_index, previousLowTime, time, na, previousLow, low, false, refLine, lowLine))
+
+// --- Alerts: trigger on the close of the final break, never retroactively ---
+alertcondition(bullBos, "Bullish retest-confirmed BOS", "Bullish BOS: old high retested, then the new high was broken on a confirmed close.")
+alertcondition(bearBos, "Bearish retest-confirmed BOS", "Bearish BOS: old low retested, then the new low was broken on a confirmed close.")

@@ -1,0 +1,191 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Parkinson Estimator", shorttitle = "Parkinson Estimator", overlay = false, format = format.percent, precision = 2)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+VOL_COLOR         = #787b86 // mid-range volatility color, blended toward the compression / expansion colors by percentile rank
+COMPRESS_COLOR    = #089981 // compressed volatility - the quiet stretches that precede expansion
+EXPAND_COLOR      = #f23645 // expanded volatility - the danger reading
+CC_COLOR          = #787b86 // close-to-close comparison line
+LEVEL_COLOR       = #787b86 // dotted percentile reference levels
+ZERO_COLOR        = color.new(#787b86, 70)
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+FILL_VALUE_TRANSP = 50      // gradient transparency at the volatility value
+FILL_ZERO_TRANSP  = 100     // gradient transparency at zero
+
+PARKINSON_COEF = 1.0 / (4.0 * math.log(2)) // Parkinson range scaling, 1 / (4 ln 2) ~ 1 / 2.773
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+lengthInput = input.int(20, "Window Length", minval = 2, group = "Calculation",
+     tooltip = "Number of bars the per-bar range variance is averaged over. A bar's extremes sample the whole path traveled rather than one endpoint, so under idealized assumptions (zero drift, continuous trading) the estimator is roughly five times more efficient than close-to-close volatility - a much shorter window achieves the same precision, which is why it suits bands, stop distances and sizing when the lookback must stay short. Keep the window fixed when comparing instruments, since length changes level and responsiveness together.")
+
+annualizeInput = input.bool(true, "Annualize", group = "Calculation",
+     tooltip = "Scales the reading to annualized volatility - average per-bar variance times bars per year, square-rooted - so it can be compared across instruments and against options-market figures. Disable to read the raw per-bar volatility of the window instead.")
+
+barsPerYearInput = input.int(252, "Bars Per Year", minval = 1, group = "Calculation",
+     tooltip = "Annualization constant. Daily equity data conventionally uses 252; some futures and forex tools use 260 or 365. Intraday charts must count bars per year - bars per session times trading days. Annualization constants are a leading cause of cross-platform disagreements, so match this setting when reconciling readings.")
+
+showCcInput = input.bool(true, "Close-to-Close Comparison", group = "Gap Diagnostic",
+     tooltip = "Overlays close-to-close historical volatility - the standard deviation of log close-to-close returns - on the same window and annualization. The level says how volatile; the gap between the two lines says where movement happens. Parkinson persistently below close-to-close points to overnight gaps doing the moving, since gaps land between bars where the high-low span never sees them; Parkinson persistently above it points to wide intraday travel the closes keep hiding.")
+
+percentileLengthInput = input.int(100, "Percentile Lookback", minval = 10, group = "Percentile Thresholds",
+     tooltip = "Bars used to rank the current reading against its own history. The percentile rank drives the expansion and compression alerts without an absolute cutoff, so band widths and sizing respond to regime rather than raw level and screening stays comparable across instruments and annualization settings.")
+
+highPercentileInput = input.float(80, "High Percentile", minval = 50, maxval = 100, step = 1, inline = "percentile", group = "Percentile Thresholds",
+     tooltip = "Percentile rank above which volatility counts as expanded; crossing it fires the 'Volatility Expansion' alert.")
+
+lowPercentileInput = input.float(20, "Low Percentile", minval = 0, maxval = 50, step = 1, inline = "percentile", group = "Percentile Thresholds",
+     tooltip = "Percentile rank below which volatility counts as compressed - the quiet stretches that often precede range expansion. Because the estimator stabilizes on short windows it flags compression promptly; crossing under this rank fires the 'Volatility Compression' alert.")
+
+showLevelsInput = input.bool(false, "Show Percentile Levels", group = "Percentile Thresholds",
+     tooltip = "Plots the volatility values sitting at the high and low percentiles of the lookback as dotted reference levels, making threshold crossings visible in the pane. Off by default to keep the pane clean; the alerts fire either way.")
+
+showDashInput = input.bool(true, "Show Dashboard", group = "Dashboard",
+     tooltip = "Displays the current Parkinson reading, close-to-close volatility on the same settings, the range/close ratio - the gap diagnostic in numbers - and the percentile rank of the reading.")
+
+dashPosInput = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], inline = "dash", group = "Dashboard",
+     tooltip = "Corner of the pane the dashboard is anchored to.")
+
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], inline = "dash", group = "Dashboard",
+     tooltip = "Dashboard text size.")
+
+volColorInput = input.color(VOL_COLOR, "Parkinson Volatility", group = "Style",
+     tooltip = "Color of the Parkinson volatility line and its gradient fill while the reading sits mid-range of its percentile lookback. Toward the low and high percentiles the color blends into the compression and expansion colors. The estimate measures movement size only and carries no directional information.")
+
+compressColorInput = input.color(COMPRESS_COLOR, "Compressed", inline = "regime", group = "Style",
+     tooltip = "Line and fill color at and below the low percentile - compressed volatility.")
+
+expandColorInput = input.color(EXPAND_COLOR, "Expanded", inline = "regime", group = "Style",
+     tooltip = "Line and fill color at and above the high percentile - expanded volatility.")
+
+ccColorInput = input.color(CC_COLOR, "Close-to-Close", group = "Style",
+     tooltip = "Color of the close-to-close comparison line.")
+
+levelColorInput = input.color(LEVEL_COLOR, "Percentile Levels", group = "Style",
+     tooltip = "Color of the dotted high and low percentile reference levels.")
+
+gradientInput = input.bool(true, "Gradient Fill", group = "Style",
+     tooltip = "Fills the area between zero and the volatility line with a vertical gradient - fully transparent at zero, strongest at the current value.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+getTablePosition(positionText) =>
+    switch positionText
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        => position.bottom_left
+
+getTextSize(sizeText) =>
+    switch sizeText
+        "Tiny"  => size.tiny
+        "Small" => size.small
+        => size.normal
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+// Per-bar Parkinson variance - the squared natural log of high over low, divided by 4 ln 2. For a
+// driftless geometric Brownian motion the expected squared log range equals 4 ln 2 times the true
+// variance, so the scaling makes the term unbiased under those assumptions (Parkinson, 1980). The
+// guard keeps degenerate bars (missing or non-positive prices) from contaminating the window
+logRange          = high > 0 and low > 0 ? math.log(high / low) : na
+parkinsonVariance = logRange * logRange * PARKINSON_COEF
+
+// Close-to-close log return - the one-endpoint measure the range improves on, and the second leg
+// of the gap diagnostic: overnight gaps land between bars where only this series sees them, while
+// wide intraday travel lands inside bars where only the range sees it
+logReturn = close > 0 and not na(close[1]) and close[1] > 0 ? math.log(close / close[1]) : na
+
+// Window mean -> volatility: average the per-bar variance across the window, multiply by bars per
+// year, take the square root. The comparison line is the standard deviation of log returns on the
+// same window and annualization, so the two series are directly comparable
+parkinsonMeanVariance = ta.sma(parkinsonVariance, lengthInput)
+ccDeviation           = ta.stdev(logReturn, lengthInput)
+
+annualFactor = annualizeInput ? barsPerYearInput : 1
+parkinsonVol = na(parkinsonMeanVariance) ? na : math.sqrt(math.max(parkinsonMeanVariance, 0) * annualFactor) * 100
+ccVol        = na(ccDeviation)           ? na : ccDeviation * math.sqrt(annualFactor) * 100
+
+// Range/close ratio - the gap diagnostic in one number. Persistently below 1 the closes move more
+// than the bars span, so movement arrives between sessions where the range never sees it and the
+// estimator understates risk; persistently above 1 the sessions are churny and wide-ranged even
+// when the closes land quietly
+volRatio = not na(parkinsonVol) and not na(ccVol) and ccVol > 0 ? parkinsonVol / ccVol : na
+
+// Percentile rank of the reading against its own history - compression screening and expansion
+// flagging without an absolute cutoff. The interpolated percentile values double as plottable levels
+volPercentile = ta.percentrank(parkinsonVol, percentileLengthInput)
+highLevel     = ta.percentile_linear_interpolation(parkinsonVol, percentileLengthInput, highPercentileInput)
+lowLevel      = ta.percentile_linear_interpolation(parkinsonVol, percentileLengthInput, lowPercentileInput)
+
+// Threshold and divergence events
+expansionEvent   = ta.crossover(volPercentile, highPercentileInput)
+compressionEvent = ta.crossunder(volPercentile, lowPercentileInput)
+aboveCcEvent     = ta.crossover(parkinsonVol, ccVol)
+belowCcEvent     = ta.crossunder(parkinsonVol, ccVol)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+// Regime coloring by percentile rank - compressed below the low percentile, neutral midway, expanded above the high percentile
+midPercentile = (highPercentileInput + lowPercentileInput) / 2
+volColor      = na(volPercentile) ? volColorInput : volPercentile <= midPercentile ? color.from_gradient(volPercentile, lowPercentileInput, midPercentile, compressColorInput, volColorInput) : color.from_gradient(volPercentile, midPercentile, highPercentileInput, volColorInput, expandColorInput)
+
+fillTopColor    = gradientInput ? color.new(volColor, FILL_VALUE_TRANSP) : na
+fillBottomColor = gradientInput ? color.new(volColor, FILL_ZERO_TRANSP) : na
+
+parkinsonPlotId = plot(parkinsonVol, "Parkinson Volatility", color = volColor, linewidth = 2)
+zeroPlotId      = plot(0, "Zero Line", color = ZERO_COLOR, linewidth = 1)
+
+fill(parkinsonPlotId, zeroPlotId, top_value = math.max(nz(parkinsonVol), 0), bottom_value = 0, top_color = fillTopColor, bottom_color = fillBottomColor, title = "Volatility Gradient Fill")
+
+plot(showCcInput ? ccVol : na, "Close-to-Close Comparison", color = ccColorInput, linewidth = 1)
+
+plot(showLevelsInput ? highLevel : na, "High Percentile Level", color = color.new(levelColorInput, 30), linewidth = 1, style = plot.style_circles)
+plot(showLevelsInput ? lowLevel : na, "Low Percentile Level", color = color.new(levelColorInput, 30), linewidth = 1, style = plot.style_circles)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dashTable = na
+
+if barstate.isfirst and showDashInput
+    dashTable := table.new(getTablePosition(dashPosInput), 2, 4, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+if barstate.islast and showDashInput and not na(dashTable)
+    parkinsonText = na(parkinsonVol) ? "-" : str.tostring(parkinsonVol, "#.##") + "%"
+    ccText        = na(ccVol) ? "-" : str.tostring(ccVol, "#.##") + "%"
+    ratioText     = na(volRatio) ? "-" : str.tostring(volRatio, "#.##") + "x"
+    rankText      = na(volPercentile) ? "-" : str.tostring(volPercentile, "#")
+    labelColor    = DASH_HEADER
+    rankColor     = na(volPercentile) ? DASH_TEXT : volPercentile >= highPercentileInput ? expandColorInput : volPercentile <= lowPercentileInput ? compressColorInput : DASH_TEXT
+    dashTextSize  = getTextSize(dashSizeInput)
+    table.cell(dashTable, 0, 0, "Parkinson", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 0, parkinsonText, text_color = volColor, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 1, "Close-to-Close", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 1, ccText, text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 2, "Range/Close Ratio", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 2, ratioText, text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 3, "Percentile Rank", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 3, rankText, text_color = rankColor, text_size = dashTextSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(expansionEvent, "Volatility Expansion", "Parkinson Estimator on {{ticker}} - annualized range-based volatility crossed above its high percentile threshold, volatility expansion under way ({{interval}})")
+alertcondition(compressionEvent, "Volatility Compression", "Parkinson Estimator on {{ticker}} - annualized range-based volatility fell below its low percentile threshold, a quiet stretch that often precedes range expansion ({{interval}})")
+alertcondition(aboveCcEvent, "Parkinson Above Close-to-Close", "Parkinson Estimator on {{ticker}} - range-based volatility crossed above close-to-close volatility, sessions are churny and wide-ranged even where closes land quietly ({{interval}})")
+alertcondition(belowCcEvent, "Parkinson Below Close-to-Close", "Parkinson Estimator on {{ticker}} - range-based volatility crossed below close-to-close volatility, movement is arriving between sessions where the high-low range never sees it ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

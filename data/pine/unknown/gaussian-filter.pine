@@ -1,0 +1,115 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Gaussian Filter", shorttitle = "Gaussian Filter", overlay = true, format = format.price)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+MAX_POLES         = 4     // cap on the cascade length in John Ehlers' original design
+BULL_COLOR        = #089981
+BEAR_COLOR        = #f23645
+NEUTRAL_COLOR     = #787b86
+FILL_PRICE_TRANSP = 60    // gradient transparency at the price end of the fill
+FILL_FILT_TRANSP  = 100   // gradient transparency at the filter end of the fill
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+srcInput    = input.source(close, "Source", group = "Settings",
+     tooltip = "Price series the filter smooths. The close is the common choice; feeding another series here also covers the pre-smoother use, running an indicator input through a Gaussian stage before further calculations.")
+
+periodInput = input.int(14, "Period", minval = 2, group = "Settings",
+     tooltip = "Filter period P in bars — the cutoff the per-stage smoothing coefficient is derived from. Longer periods give a rounder, slower line; shorter periods track price more closely but let more noise through. 14 is the common default.")
+
+polesInput  = input.int(4, "Poles", minval = 1, maxval = MAX_POLES, group = "Settings",
+     tooltip = "Number of poles N — the count of identical one-pole stages price is passed through in series. Each extra pole pushes the combined response closer to the Gaussian bell and adds smoothness and lag at the same period. 4 is the cap in Ehlers' original; a single pole behaves much like an EMA.")
+
+trendColorInput   = input.bool(true, "Slope Trend Coloring", group = "Style",
+     tooltip = "Colors the Gaussian filter by its slope — bullish while the filter is rising, bearish while it is falling. Disable to draw the line in the neutral color.")
+
+bullColorInput    = input.color(BULL_COLOR, "Bullish", inline = "direction", group = "Style",
+     tooltip = "Bullish color, used while the filter slope is rising and for bullish crossings/fill.")
+
+bearColorInput    = input.color(BEAR_COLOR, "Bearish", inline = "direction", group = "Style",
+     tooltip = "Bearish color, used while the filter slope is falling and for bearish crossings/fill.")
+
+neutralColorInput = input.color(NEUTRAL_COLOR, "Neutral", group = "Style",
+     tooltip = "Line color used when slope trend coloring is disabled, or when the slope is flat.")
+
+showFillInput     = input.bool(true, "Price / Filter Gradient Fill", group = "Style",
+     tooltip = "Fills the area between the source and the filter with a vertical gradient — bullish while price holds above the Gaussian filter, bearish while below — fading to fully transparent at the filter line.")
+
+showSignalsInput  = input.bool(false, "Price Crossing Markers", group = "Style",
+     tooltip = "Displays small triangle markers when the source crosses over or under the Gaussian filter. Off by default to keep the chart clean — the crossing alerts work regardless.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// N-pole recursive Gaussian filter — John Ehlers' published recipe:
+//   beta  = (1 - cos(2*pi/P)) / (2^(1/N) - 1)
+//   alpha = -beta + sqrt(beta^2 + 2*beta)
+//   y_0 = price ; y_k = alpha*y_{k-1} + (1 - alpha)*y_k[1] for k = 1..N ; GF = y_N
+// Cascading N identical one-pole stages drives the combined impulse response toward the Gaussian bell (central
+// limit theorem); expanding the cascade reproduces the published binomial forms, e.g. for 2 poles
+// GF = alpha^2*price + 2*(1 - alpha)*GF[1] - (1 - alpha)^2*GF[2]. Every stage runs on every bar so the recursive
+// histories stay consistent whichever pole count is selected; each stage is na-seeded with its own input.
+gaussianFilter(float src, simple int period, simple int poles) =>
+    beta  = (1 - math.cos(2 * math.pi / period)) / (math.pow(2, 1.0 / poles) - 1)
+    alpha = -beta + math.sqrt(beta * beta + 2 * beta)
+    float stage1 = na
+    float stage2 = na
+    float stage3 = na
+    float stage4 = na
+    stage1 := alpha * src    + (1 - alpha) * nz(stage1[1], src)
+    stage2 := alpha * stage1 + (1 - alpha) * nz(stage2[1], stage1)
+    stage3 := alpha * stage2 + (1 - alpha) * nz(stage3[1], stage2)
+    stage4 := alpha * stage3 + (1 - alpha) * nz(stage4[1], stage3)
+    switch poles
+        1 => stage1
+        2 => stage2
+        3 => stage3
+        => stage4
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+gf = gaussianFilter(srcInput, periodInput, polesInput)
+
+// Slope of the filter — the trend-baseline read of the smoother
+slope = gf - nz(gf[1], gf)
+
+// Slope reversals of the filter
+slopeTurnUp   = slope > 0 and nz(slope[1]) <= 0
+slopeTurnDown = slope < 0 and nz(slope[1]) >= 0
+
+// Price crossings — the standard moving average crossover grammar with a smoother line
+crossUp   = ta.crossover(srcInput, gf)
+crossDown = ta.crossunder(srcInput, gf)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+gfColor = trendColorInput ? (slope > 0 ? bullColorInput : slope < 0 ? bearColorInput : neutralColorInput) : neutralColorInput
+
+priceAbove      = srcInput > gf
+fillTopColor    = showFillInput ? (priceAbove ? color.new(bullColorInput, FILL_PRICE_TRANSP) : color.new(bearColorInput, FILL_FILT_TRANSP)) : na
+fillBottomColor = showFillInput ? (priceAbove ? color.new(bullColorInput, FILL_FILT_TRANSP) : color.new(bearColorInput, FILL_PRICE_TRANSP)) : na
+
+srcPlotId = plot(srcInput, "Source", color = na, editable = false, display = display.none)
+gfPlotId  = plot(gf, "Gaussian Filter", color = gfColor, linewidth = 2)
+
+fill(srcPlotId, gfPlotId, top_value = math.max(srcInput, gf), bottom_value = math.min(srcInput, gf), top_color = fillTopColor, bottom_color = fillBottomColor, title = "Price / Filter Gradient Fill")
+
+plotshape(showSignalsInput and crossUp, "Bullish Cross", shape.triangleup, location.belowbar, color = bullColorInput, size = size.tiny)
+plotshape(showSignalsInput and crossDown, "Bearish Cross", shape.triangledown, location.abovebar, color = bearColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(crossUp, "Bullish Price Cross", "Price crossed above the Gaussian Filter on {{ticker}} ({{interval}})")
+alertcondition(crossDown, "Bearish Price Cross", "Price crossed below the Gaussian Filter on {{ticker}} ({{interval}})")
+alertcondition(slopeTurnUp, "Gaussian Filter Slope Up", "Gaussian Filter slope turned upward on {{ticker}} ({{interval}})")
+alertcondition(slopeTurnDown, "Gaussian Filter Slope Down", "Gaussian Filter slope turned downward on {{ticker}} ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

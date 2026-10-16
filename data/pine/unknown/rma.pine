@@ -1,0 +1,197 @@
+//@version=6
+indicator("RMA", shorttitle = "RMA", overlay = true)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR      = #089981
+BEAR_COLOR      = #f23645
+NEUTRAL_COLOR   = #787b86
+SLOW_COLOR      = #ff9800               // the one accent - the slow line of the optional crossover pair
+EMA_REF_COLOR   = #787b86               // comparison lines are structure - grey
+SMA_REF_COLOR   = color.new(#787b86, 40)
+EQUIV_REF_COLOR = #ab47bc               // the exact-alpha twin hugs the RMA, so it needs its own hue to be told apart
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+FILL_PRICE_TRANSP = 60  // gradient transparency at the price end of the fill
+FILL_LINE_TRANSP  = 100 // gradient transparency at the RMA end of the fill
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+srcInput    = input.source(close, "Source", group = "Settings",
+     tooltip = "Price series the average smooths. Wilder computed his 1978 indicators on the close, but the recursion accepts any source.")
+
+lengthInput = input.int(14, "RMA Length", minval = 1, group = "Settings",
+     tooltip = "Number of bars N in Wilder's smoothing. Each bar the line keeps (N - 1)/N of its previous value and blends in 1/N of the new price, so the smoothing factor is alpha = 1/N — 14 is Wilder's classic setting. Because that alpha is smaller than an EMA's 2/(N + 1), an N-period RMA responds like a (2N - 1)-period EMA and is markedly slower than an EMA of the same stated length.")
+
+pairInput       = input.bool(false, "Second RMA", group = "Crossover Pair",
+     tooltip = "Adds a second, slower RMA to form a crossover pair built for patience — pairs of RMAs flip far less often than same-length EMA pairs, trading responsiveness for fewer whipsaws. Crossings between the two lines are covered by the pair alerts.")
+
+pairLengthInput = input.int(50, "Second RMA Length", minval = 1, group = "Crossover Pair",
+     tooltip = "Length of the second RMA. Set it slower than the main line so the pair reads fast against slow — e.g. 14 against 50.")
+
+showEmaInput   = input.bool(false, "EMA — Same Length", group = "Comparison",
+     tooltip = "Overlays an EMA of the same stated length. At equal periods the EMA weighs the newest bar by 2/(N + 1) against the RMA's 1/N, so it hugs price visibly tighter — the side-by-side measure of the RMA's extra calm and extra lag.")
+
+showSmaInput   = input.bool(false, "SMA — Same Length", group = "Comparison",
+     tooltip = "Overlays a simple moving average of the same length. The SMA forgets each bar completely once it exits its window, while the RMA never fully forgets and discounts the past exponentially — its effective memory stretches well beyond the nominal period.")
+
+showEquivInput = input.bool(false, "Equivalent EMA (2N - 1)", group = "Comparison",
+     tooltip = "Overlays the EMA whose smoothing factor matches the RMA's exactly: length 2N - 1 gives alpha = 2/(2N) = 1/N — 27 for the default 14. Apart from seeding differences on the earliest bars it should track the RMA almost perfectly; the textbook sanity check of the recursion.")
+
+showDashboardInput     = input.bool(true, "Show Dashboard", group = "Dashboard",
+     tooltip = "Displays a compact panel with the RMA's smoothing factor (1/N), its EMA-equivalent length (2N - 1), the slope read, and price's position against the line.")
+
+dashboardLocationInput = input.string("Top Right", "Location", options = ["Top Right", "Bottom Right", "Bottom Left", "Top Left"], group = "Dashboard",
+     tooltip = "Chart corner the dashboard is anchored to.")
+
+dashboardSizeInput     = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = "Dashboard",
+     tooltip = "Text size of the dashboard.")
+
+trendColorInput   = input.bool(true, "Slope Trend Coloring", group = "Style",
+     tooltip = "Colors the RMA by its slope — bullish while the line rises, bearish while it falls. The calm, rarely-flipping slope of the smoothed line is one of the two classic bias reads; disable to draw the line in the neutral color.")
+
+bullColorInput    = input.color(BULL_COLOR, "Bullish", inline = "direction", group = "Style",
+     tooltip = "Bullish color, used while the RMA slopes upward and for bullish crossings/fill.")
+
+bearColorInput    = input.color(BEAR_COLOR, "Bearish", inline = "direction", group = "Style",
+     tooltip = "Bearish color, used while the RMA slopes downward and for bearish crossings/fill.")
+
+neutralColorInput = input.color(NEUTRAL_COLOR, "Neutral", group = "Style",
+     tooltip = "Line color used when slope trend coloring is disabled, or when the slope is flat.")
+
+slowColorInput    = input.color(SLOW_COLOR, "Second RMA", group = "Style",
+     tooltip = "Color of the second, slower RMA of the crossover pair.")
+
+emaColorInput     = input.color(EMA_REF_COLOR, "EMA", inline = "reference", group = "Style",
+     tooltip = "Color of the same-length EMA comparison line.")
+
+smaColorInput     = input.color(SMA_REF_COLOR, "SMA", inline = "reference", group = "Style",
+     tooltip = "Color of the same-length SMA comparison line.")
+
+equivColorInput   = input.color(EQUIV_REF_COLOR, "2N - 1", inline = "reference", group = "Style",
+     tooltip = "Color of the equivalent (2N - 1)-period EMA comparison line.")
+
+lineWidthInput    = input.int(2, "Line Width", minval = 1, maxval = 5, group = "Style",
+     tooltip = "Width of the RMA lines.")
+
+showFillInput     = input.bool(true, "Price / RMA Gradient Fill", group = "Style",
+     tooltip = "Fills the area between the source and the RMA with a vertical gradient — bullish while price holds above the line, bearish while below — fading to fully transparent at the RMA. Price's side of the slow baseline is the other classic bias read.")
+
+showMarkersInput  = input.bool(false, "Price Crossing Markers", group = "Style",
+     tooltip = "Displays small triangle markers when the source crosses over or under the RMA. Off by default to keep the chart clean — the crossing alerts work regardless.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Wilder's smoothing (RMA / SMMA) — the recursion from New Concepts in Technical Trading Systems (1978):
+// seed with the simple average of the first N values, then each bar
+// RMA = (previous RMA * (N - 1) + price) / N  —  equivalently previous + (price - previous) / N, an EMA with alpha = 1/N
+wilderMa(float src, simple int len, float seed) =>
+    var float value = na
+    value := na(value) ? seed : na(src) ? value : (value * (len - 1) + src) / len
+    value
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+// Simple averages of the first N values — Wilder's seeds, the main one doubling as the SMA comparison line
+smaValue = ta.sma(srcInput, lengthInput)
+slowSeed = ta.sma(srcInput, pairLengthInput)
+
+// Both RMAs run on every bar so their recursive histories stay consistent even while hidden
+rmaValue  = wilderMa(srcInput, lengthInput, smaValue)
+slowValue = wilderMa(srcInput, pairLengthInput, slowSeed)
+
+// Comparison EMAs — the same stated length, and the exact-alpha twin at 2N - 1 (alpha = 2/(2N) = 1/N)
+emaValue   = ta.ema(srcInput, lengthInput)
+equivValue = ta.ema(srcInput, 2 * lengthInput - 1)
+
+// Slope of the RMA — the trend read of the smoother
+slope = rmaValue - nz(rmaValue[1], rmaValue)
+
+// Price crossings and slope reversals of the main line
+crossUp       = ta.crossover(srcInput, rmaValue)
+crossDown     = ta.crossunder(srcInput, rmaValue)
+slopeTurnUp   = slope > 0 and nz(slope[1]) <= 0
+slopeTurnDown = slope < 0 and nz(slope[1]) >= 0
+
+// Crossings of the pair — the main (fast) RMA against the second (slow) RMA
+pairCrossUp   = ta.crossover(rmaValue, slowValue)
+pairCrossDown = ta.crossunder(rmaValue, slowValue)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+rmaColor = trendColorInput ? (slope > 0 ? bullColorInput : slope < 0 ? bearColorInput : neutralColorInput) : neutralColorInput
+
+priceAbove      = srcInput > rmaValue
+fillTopColor    = showFillInput ? (priceAbove ? color.new(bullColorInput, FILL_PRICE_TRANSP) : color.new(bearColorInput, FILL_LINE_TRANSP)) : na
+fillBottomColor = showFillInput ? (priceAbove ? color.new(bullColorInput, FILL_LINE_TRANSP) : color.new(bearColorInput, FILL_PRICE_TRANSP)) : na
+
+srcPlotId = plot(srcInput, "Source", color = na, editable = false, display = display.none)
+rmaPlotId = plot(rmaValue, "RMA", color = rmaColor, linewidth = lineWidthInput)
+
+plot(pairInput ? slowValue : na, "Second RMA", color = slowColorInput, linewidth = lineWidthInput)
+plot(showEmaInput ? emaValue : na, "EMA (Same Length)", color = emaColorInput)
+plot(showSmaInput ? smaValue : na, "SMA (Same Length)", color = smaColorInput)
+plot(showEquivInput ? equivValue : na, "Equivalent EMA (2N - 1)", color = equivColorInput)
+
+fill(srcPlotId, rmaPlotId, top_value = math.max(srcInput, rmaValue), bottom_value = math.min(srcInput, rmaValue), top_color = fillTopColor, bottom_color = fillBottomColor, title = "Price / RMA Gradient Fill")
+
+plotshape(showMarkersInput and crossUp, "Bullish Price Cross", shape.triangleup, location.belowbar, color = bullColorInput, size = size.tiny)
+plotshape(showMarkersInput and crossDown, "Bearish Price Cross", shape.triangledown, location.abovebar, color = bearColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+dashboardLocation = switch dashboardLocationInput
+    "Top Right"    => position.top_right
+    "Bottom Right" => position.bottom_right
+    "Bottom Left"  => position.bottom_left
+    => position.top_left
+
+dashboardTextSize = switch dashboardSizeInput
+    "Tiny"  => size.tiny
+    "Small" => size.small
+    => size.normal
+
+var table dashboardTable = table.new(dashboardLocation, 2, 4, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+if barstate.islast and showDashboardInput
+    // Wilder's smoothing factor and the EMA length it is equivalent to — the porting read of the panel
+    alphaText = "1/" + str.tostring(lengthInput) + " = " + str.tostring(1.0 / lengthInput, "#.####")
+    equivText = str.tostring(2 * lengthInput - 1) + " bars"
+
+    slopeNow   = nz(slope)
+    slopeText  = slopeNow > 0 ? "Rising" : slopeNow < 0 ? "Falling" : "Flat"
+    slopeColor = slopeNow > 0 ? bullColorInput : slopeNow < 0 ? bearColorInput : neutralColorInput
+
+    aboveNow  = not na(rmaValue) and srcInput > rmaValue
+    biasText  = na(rmaValue) ? "—" : aboveNow ? "Above RMA" : "Below RMA"
+    biasColor = na(rmaValue) ? neutralColorInput : aboveNow ? bullColorInput : bearColorInput
+
+    table.cell(dashboardTable, 0, 0, "Alpha (1/N)",    text_color = DASH_HEADER, text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 0, alphaText,        text_color = DASH_TEXT, text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 1, "EMA Equivalent", text_color = DASH_HEADER, text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 1, equivText,        text_color = DASH_TEXT, text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 2, "Slope",          text_color = DASH_HEADER, text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 2, slopeText,        text_color = slopeColor,     text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 3, "Price",          text_color = DASH_HEADER, text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 3, biasText,         text_color = biasColor,      text_size = dashboardTextSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(crossUp, "Bullish Price Cross", "Price crossed above the RMA on {{ticker}} ({{interval}})")
+alertcondition(crossDown, "Bearish Price Cross", "Price crossed below the RMA on {{ticker}} ({{interval}})")
+alertcondition(slopeTurnUp, "RMA Slope Up", "RMA slope turned upward on {{ticker}} ({{interval}})")
+alertcondition(slopeTurnDown, "RMA Slope Down", "RMA slope turned downward on {{ticker}} ({{interval}})")
+alertcondition(pairInput and pairCrossUp, "Pair Bullish Cross", "Fast RMA crossed above the slow RMA on {{ticker}} ({{interval}})")
+alertcondition(pairInput and pairCrossDown, "Pair Bearish Cross", "Fast RMA crossed below the slow RMA on {{ticker}} ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

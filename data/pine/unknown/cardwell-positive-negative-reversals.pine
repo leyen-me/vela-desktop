@@ -1,0 +1,464 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Cardwell Positive/negative Reversals"
+  , shorttitle       = "Cardwell Positive/negative Reversals"
+  , overlay          = false
+  , format           = format.price
+  , precision        = 2
+  , max_lines_count  = 500
+  , max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+string BOTH_OPTION = "Both"
+string POS_OPTION  = "Positive Only"
+string NEG_OPTION  = "Negative Only"
+
+string TOP_RIGHT_OPTION    = "Top Right"
+string TOP_LEFT_OPTION     = "Top Left"
+string BOTTOM_RIGHT_OPTION = "Bottom Right"
+string BOTTOM_LEFT_OPTION  = "Bottom Left"
+
+string TINY_OPTION   = "Tiny"
+string SMALL_OPTION  = "Small"
+string NORMAL_OPTION = "Normal"
+
+//RSI midpoint - the anchor of the gradient fill and of the bullish/bearish coloring of the oscillator
+float CENTER_LEVEL = 50.0
+
+//Sides carried by the measured-objective bookkeeping arrays
+int POS_SIDE = 1
+int NEG_SIDE = -1
+
+int FULL_TRANSP = 100
+int HALF_TRANSP = 50
+
+//Objectives kept under live management at any time - older unreached lines simply stop extending
+int MAX_TRACKED_TARGETS = 12
+
+color TRANSP_COLOR = #00000000
+
+color BULL_COLOR    = #089981
+color BEAR_COLOR    = #f23645
+color NEUTRAL_COLOR = #787b86
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+string GROUP_RSI    = "RSI"
+string GROUP_DETECT = "Reversal Detection"
+string GROUP_FILTER = "Filters"
+string GROUP_TARGET = "Price Targets"
+string GROUP_DASH   = "Dashboard"
+string GROUP_STYLE  = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+rsiLengthInput = input.int(14, "RSI Length"
+  , minval  = 2
+  , group   = GROUP_RSI
+  , tooltip = "Lookback of the RSI the patterns are read on. Cardwell's reversal work is built on Wilder's 14-period RSI.")
+
+sourceInput = input.source(close, "Source"
+  , group   = GROUP_RSI
+  , tooltip = "Price series fed to the RSI.")
+
+pivotLenInput = input.int(5, "Swing Pivot Length"
+  , minval  = 1
+  , maxval  = 50
+  , group   = GROUP_DETECT
+  , tooltip = "Bars to the left and right a price extreme must dominate to register as a swing point. A pattern confirms this many bars after its second swing - smaller values react faster, larger values pick cleaner swings.")
+
+maxDistInput = input.int(60, "Max Bars Between Swings"
+  , minval  = 5
+  , maxval  = 250
+  , group   = GROUP_DETECT
+  , tooltip = "Maximum spacing for two swing points to count as successive. Swing pairs further apart than this are ignored.")
+
+directionInput = input.string(BOTH_OPTION, "Signals"
+  , options = [BOTH_OPTION, POS_OPTION, NEG_OPTION]
+  , group   = GROUP_DETECT
+  , tooltip = "Restrict detection to one pattern side. Positive reversals argue for bullish continuation, negative reversals for bearish continuation.")
+
+midRangeInput = input.bool(true, "Mid-Range Swings Only"
+  , group   = GROUP_FILTER
+  , tooltip = "Require both RSI swings to form outside the extreme zones - above the oversold level for positive reversals, below the overbought level for negative ones. Cardwell observed that reversals typically develop from the mid-range, while deep extremes are more associated with regular divergences. Disable to accept the raw geometry anywhere in the range.")
+
+obLevelInput = input.float(70, "Overbought Level"
+  , minval  = 50
+  , maxval  = 100
+  , step    = 1
+  , group   = GROUP_FILTER
+  , tooltip = "Upper extreme displayed on the pane. With the mid-range filter on, both RSI highs of a negative reversal must stay below it.")
+
+osLevelInput = input.float(30, "Oversold Level"
+  , minval  = 0
+  , maxval  = 50
+  , step    = 1
+  , group   = GROUP_FILTER
+  , tooltip = "Lower extreme displayed on the pane. With the mid-range filter on, both RSI lows of a positive reversal must stay above it.")
+
+trendFilterInput = input.bool(true, "Trend Filter"
+  , group   = GROUP_FILTER
+  , tooltip = "Cardwell reads reversals as with-trend patterns: positive reversals belong to uptrends, negative reversals to downtrends. When enabled, the second swing must close above the trend SMA for a positive reversal and below it for a negative one.")
+
+trendLenInput = input.int(200, "Trend SMA Length"
+  , minval  = 2
+  , group   = GROUP_FILTER
+  , tooltip = "Length of the simple moving average acting as the trend reference. The filter needs at least this much chart history before it can pass patterns.")
+
+showTargetsInput = input.bool(true, "Show Price Targets"
+  , group   = GROUP_TARGET
+  , tooltip = "Projects Cardwell's measured objective on the price chart: the price distance from the first swing to the intervening extreme, projected from the second swing. The dashed line extends until price reaches it or it expires. Treat it as a minimum objective, not a precise forecast - this toggle also powers the target-reached alerts.")
+
+targetExpiryInput = input.int(250, "Target Expiry"
+  , minval  = 20
+  , maxval  = 500
+  , group   = GROUP_TARGET
+  , tooltip = "Bars an unreached objective keeps extending before it is abandoned. Reached objectives stop at the bar that tags them.")
+
+showDashInput = input.bool(true, "Show Dashboard"
+  , group   = GROUP_DASH
+  , tooltip = "Compact panel counting the recent positive and negative reversals and the regime that balance argues for.")
+
+regimeWindowInput = input.int(500, "Regime Window"
+  , minval  = 50
+  , maxval  = 5000
+  , group   = GROUP_DASH
+  , tooltip = "Lookback, in bars, for the dashboard pattern counts. Cardwell reads repeated positive reversals as the signature of a healthy uptrend and repeated negative reversals as a downtrend.")
+
+dashLocationInput = input.string(TOP_RIGHT_OPTION, "Location"
+  , options = [TOP_RIGHT_OPTION, TOP_LEFT_OPTION, BOTTOM_RIGHT_OPTION, BOTTOM_LEFT_OPTION]
+  , group   = GROUP_DASH
+  , tooltip = "Corner of the pane holding the dashboard.")
+
+dashSizeInput = input.string(SMALL_OPTION, "Size"
+  , options = [TINY_OPTION, SMALL_OPTION, NORMAL_OPTION]
+  , group   = GROUP_DASH
+  , tooltip = "Text size of the dashboard.")
+
+showPatternInput = input.bool(true, "Pattern Lines"
+  , group   = GROUP_STYLE
+  , tooltip = "Draws the segment connecting the two RSI swings of a completed reversal.")
+
+showPriceLinesInput = input.bool(true, "Price Swing Lines"
+  , group   = GROUP_STYLE
+  , tooltip = "Draws the matching segment connecting the two price swings on the price chart.")
+
+showLabelsInput = input.bool(true, "Signal Labels"
+  , group   = GROUP_STYLE
+  , tooltip = "Marks the second swing with the pattern name - the tooltip carries the swing values and the measured objective.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish Color", group = GROUP_STYLE)
+
+bearColorInput = input.color(BEAR_COLOR, "Bearish Color", group = GROUP_STYLE)
+
+levelsColorInput = input.color(NEUTRAL_COLOR, "Levels Color", group = GROUP_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+//Extreme of a rolling buffer between two "bars ago" offsets (both inclusive), newest element last.
+//Used for the intervening swing extreme of the measured-move projection.
+windowExtreme(array<float> valuesArray, int fromOffset, int toOffset, bool useMax) =>
+    float result = na
+    int sizeValue = array.size(valuesArray)
+    for k = fromOffset to toOffset
+        int idx = sizeValue - 1 - k
+        if idx >= 0
+            float sampleValue = array.get(valuesArray, idx)
+            result := na(result) ? sampleValue : (useMax ? math.max(result, sampleValue) : math.min(result, sampleValue))
+    result
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Reversal Detection
+//---------------------------------------------------------------------------------------------------------------------{
+
+float rsiValue = ta.rsi(sourceInput, rsiLengthInput)
+float trendMa  = ta.sma(close, trendLenInput)
+
+//The page identifies the patterns from successive PRICE swings, with RSI read at the corresponding bars -
+//so pivots are taken on price and the oscillator is sampled at the confirmed swing
+float pivotLowVal  = ta.pivotlow(low, pivotLenInput, pivotLenInput)
+float pivotHighVal = ta.pivothigh(high, pivotLenInput, pivotLenInput)
+bool  newPivotLow  = not na(pivotLowVal)
+bool  newPivotHigh = not na(pivotHighVal)
+int   pivotBar     = bar_index - pivotLenInput
+float rsiAtPivot   = rsiValue[pivotLenInput]
+float closeAtPivot = close[pivotLenInput]
+float maAtPivot    = trendMa[pivotLenInput]
+
+bool detectPositive = directionInput != NEG_OPTION
+bool detectNegative = directionInput != POS_OPTION
+
+//Rolling high/low buffers so the intervening extreme between two swings can be read back exactly
+var array<float> highArray = array.new<float>()
+var array<float> lowArray  = array.new<float>()
+
+array.push(highArray, high)
+array.push(lowArray, low)
+
+int bufferCap = maxDistInput + pivotLenInput + 2
+
+while array.size(highArray) > bufferCap
+    array.shift(highArray)
+    array.shift(lowArray)
+
+//Positive reversal: price higher low while RSI prints a lower low - momentum weakened more than price,
+//read as bullish continuation of the prevailing uptrend
+var int   prevLowBar   = na
+var float prevLowPrice = na
+var float prevLowRsi   = na
+
+bool  posEvent  = false
+int   posBar1   = na
+float posPrice1 = na
+float posRsi1   = na
+int   posBar2   = na
+float posPrice2 = na
+float posRsi2   = na
+float posTarget = na
+
+if newPivotLow
+    if not na(prevLowBar) and not na(rsiAtPivot) and not na(prevLowRsi)
+        int  swingDist   = pivotBar - prevLowBar
+        bool higherLow   = pivotLowVal > prevLowPrice
+        bool lowerRsiLow = rsiAtPivot < prevLowRsi
+        bool midRangeOk  = not midRangeInput or math.min(rsiAtPivot, prevLowRsi) > osLevelInput
+        bool trendOk     = not trendFilterInput or (not na(maAtPivot) and closeAtPivot > maAtPivot)
+
+        if detectPositive and swingDist <= maxDistInput and higherLow and lowerRsiLow and midRangeOk and trendOk
+            //Measured objective: rise from the first swing's price to the intervening swing high,
+            //projected above the second (higher) low
+            float midHigh = windowExtreme(highArray, pivotLenInput, pivotLenInput + swingDist, true)
+
+            posEvent  := true
+            posBar1   := prevLowBar
+            posPrice1 := prevLowPrice
+            posRsi1   := prevLowRsi
+            posBar2   := pivotBar
+            posPrice2 := pivotLowVal
+            posRsi2   := rsiAtPivot
+            posTarget := pivotLowVal + (midHigh - prevLowPrice)
+
+    prevLowBar   := pivotBar
+    prevLowPrice := pivotLowVal
+    prevLowRsi   := rsiAtPivot
+
+//Negative reversal: price lower high while RSI prints a higher high - momentum out-performed price,
+//read as bearish continuation of the prevailing downtrend
+var int   prevHighBar   = na
+var float prevHighPrice = na
+var float prevHighRsi   = na
+
+bool  negEvent  = false
+int   negBar1   = na
+float negPrice1 = na
+float negRsi1   = na
+int   negBar2   = na
+float negPrice2 = na
+float negRsi2   = na
+float negTarget = na
+
+if newPivotHigh
+    if not na(prevHighBar) and not na(rsiAtPivot) and not na(prevHighRsi)
+        int  swingDist     = pivotBar - prevHighBar
+        bool lowerHigh     = pivotHighVal < prevHighPrice
+        bool higherRsiHigh = rsiAtPivot > prevHighRsi
+        bool midRangeOk    = not midRangeInput or math.max(rsiAtPivot, prevHighRsi) < obLevelInput
+        bool trendOk       = not trendFilterInput or (not na(maAtPivot) and closeAtPivot < maAtPivot)
+
+        if detectNegative and swingDist <= maxDistInput and lowerHigh and higherRsiHigh and midRangeOk and trendOk
+            //Measured objective: decline from the first swing's price to the intervening swing low,
+            //projected below the second (lower) high
+            float midLow = windowExtreme(lowArray, pivotLenInput, pivotLenInput + swingDist, false)
+
+            negEvent  := true
+            negBar1   := prevHighBar
+            negPrice1 := prevHighPrice
+            negRsi1   := prevHighRsi
+            negBar2   := pivotBar
+            negPrice2 := pivotHighVal
+            negRsi2   := rsiAtPivot
+            negTarget := pivotHighVal - (prevHighPrice - midLow)
+
+    prevHighBar   := pivotBar
+    prevHighPrice := pivotHighVal
+    prevHighRsi   := rsiAtPivot
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+
+color oscColor = rsiValue > CENTER_LEVEL ? bullColorInput : bearColorInput
+
+oscPlotId = plot(rsiValue, "RSI", oscColor, 1)
+
+centerPlotId = plot(CENTER_LEVEL, "Center Anchor", editable = false, display = display.none)
+
+//Vertical gradient fill from the midpoint to the RSI value, fully transparent at the midpoint
+fill(oscPlotId, centerPlotId
+  , top_value    = math.max(rsiValue, CENTER_LEVEL)
+  , bottom_value = math.min(rsiValue, CENTER_LEVEL)
+  , top_color    = rsiValue > CENTER_LEVEL ? color.new(bullColorInput, HALF_TRANSP) : color.new(bearColorInput, FULL_TRANSP)
+  , bottom_color = rsiValue > CENTER_LEVEL ? color.new(bullColorInput, FULL_TRANSP) : color.new(bearColorInput, HALF_TRANSP)
+  , title        = "Gradient Fill")
+
+//Dashed extreme thresholds and dotted midpoint
+if barstate.isfirst
+    line.new(bar_index, obLevelInput, bar_index + 1, obLevelInput, extend = extend.both, color = levelsColorInput, style = line.style_dashed)
+    line.new(bar_index, osLevelInput, bar_index + 1, osLevelInput, extend = extend.both, color = levelsColorInput, style = line.style_dashed)
+    line.new(bar_index, CENTER_LEVEL, bar_index + 1, CENTER_LEVEL, extend = extend.both, color = color.new(levelsColorInput, HALF_TRANSP), style = line.style_dotted)
+
+//Completed patterns: the swing-to-swing segment on the RSI, its counterpart on price, and a label whose
+//tooltip carries the exact swing readings and the measured objective
+if posEvent
+    if showPatternInput
+        line.new(posBar1, posRsi1, posBar2, posRsi2, color = bullColorInput, width = 2)
+    if showPriceLinesInput
+        line.new(posBar1, posPrice1, posBar2, posPrice2, color = bullColorInput, width = 2, force_overlay = true)
+    if showLabelsInput
+        string posTip = "Positive reversal: price set a higher low (" + str.tostring(posPrice1, format.mintick) + " -> "
+          + str.tostring(posPrice2, format.mintick) + ") while RSI set a lower low (" + str.tostring(posRsi1, "#.##")
+          + " -> " + str.tostring(posRsi2, "#.##") + "). Momentum weakened more than price did - bullish continuation favored. Measured objective: "
+          + str.tostring(posTarget, format.mintick) + "."
+        label.new(posBar2, posRsi2, "Positive Reversal", color = TRANSP_COLOR, textcolor = bullColorInput, style = label.style_label_up, size = size.small, tooltip = posTip)
+
+if negEvent
+    if showPatternInput
+        line.new(negBar1, negRsi1, negBar2, negRsi2, color = bearColorInput, width = 2)
+    if showPriceLinesInput
+        line.new(negBar1, negPrice1, negBar2, negPrice2, color = bearColorInput, width = 2, force_overlay = true)
+    if showLabelsInput
+        string negTip = "Negative reversal: price set a lower high (" + str.tostring(negPrice1, format.mintick) + " -> "
+          + str.tostring(negPrice2, format.mintick) + ") while RSI set a higher high (" + str.tostring(negRsi1, "#.##")
+          + " -> " + str.tostring(negRsi2, "#.##") + "). Momentum out-performed price - bearish continuation favored. Measured objective: "
+          + str.tostring(negTarget, format.mintick) + "."
+        label.new(negBar2, negRsi2, "Negative Reversal", color = TRANSP_COLOR, textcolor = bearColorInput, style = label.style_label_down, size = size.small, tooltip = negTip)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Price Targets
+//---------------------------------------------------------------------------------------------------------------------{
+
+var array<line>  targetLineArray  = array.new<line>()
+var array<float> targetLevelArray = array.new<float>()
+var array<int>   targetSideArray  = array.new<int>()
+var array<int>   targetStartArray = array.new<int>()
+
+if posEvent and showTargetsInput and not na(posTarget) and posTarget > 0
+    line posTargetLine = line.new(posBar2, posTarget, bar_index, posTarget, color = bullColorInput, style = line.style_dashed, force_overlay = true)
+    array.push(targetLineArray, posTargetLine)
+    array.push(targetLevelArray, posTarget)
+    array.push(targetSideArray, POS_SIDE)
+    array.push(targetStartArray, bar_index)
+
+if negEvent and showTargetsInput and not na(negTarget) and negTarget > 0
+    line negTargetLine = line.new(negBar2, negTarget, bar_index, negTarget, color = bearColorInput, style = line.style_dashed, force_overlay = true)
+    array.push(targetLineArray, negTargetLine)
+    array.push(targetLevelArray, negTarget)
+    array.push(targetSideArray, NEG_SIDE)
+    array.push(targetStartArray, bar_index)
+
+//Oldest objectives drop out of live management first, their lines stay as drawn
+while array.size(targetLineArray) > MAX_TRACKED_TARGETS
+    array.shift(targetLineArray)
+    array.shift(targetLevelArray)
+    array.shift(targetSideArray)
+    array.shift(targetStartArray)
+
+bool posTargetHit = false
+bool negTargetHit = false
+
+//Extend every live objective to the current bar, close it out when price tags it, abandon it when it expires
+int targetIndex = array.size(targetLineArray) - 1
+
+while targetIndex >= 0
+    line  targetLine  = array.get(targetLineArray, targetIndex)
+    float targetLevel = array.get(targetLevelArray, targetIndex)
+    int   targetSide  = array.get(targetSideArray, targetIndex)
+    int   targetStart = array.get(targetStartArray, targetIndex)
+
+    line.set_x2(targetLine, bar_index)
+
+    bool targetHit   = targetSide == POS_SIDE ? high >= targetLevel : low <= targetLevel
+    bool targetStale = bar_index - targetStart > targetExpiryInput
+
+    if targetHit or targetStale
+        if targetHit
+            posTargetHit := posTargetHit or targetSide == POS_SIDE
+            negTargetHit := negTargetHit or targetSide == NEG_SIDE
+        array.remove(targetLineArray, targetIndex)
+        array.remove(targetLevelArray, targetIndex)
+        array.remove(targetSideArray, targetIndex)
+        array.remove(targetStartArray, targetIndex)
+
+    targetIndex -= 1
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+
+//Recent pattern census - Cardwell used the balance of reversal patterns as a regime cue: repeated positive
+//reversals mark healthy uptrends, repeated negative reversals mark downtrends
+var array<int> posBarsArray = array.new<int>()
+var array<int> negBarsArray = array.new<int>()
+
+if posEvent
+    array.push(posBarsArray, bar_index)
+if negEvent
+    array.push(negBarsArray, bar_index)
+
+while array.size(posBarsArray) > 0 and bar_index - array.get(posBarsArray, 0) > regimeWindowInput
+    array.shift(posBarsArray)
+while array.size(negBarsArray) > 0 and bar_index - array.get(negBarsArray, 0) > regimeWindowInput
+    array.shift(negBarsArray)
+
+dashLocation = switch dashLocationInput
+    TOP_RIGHT_OPTION    => position.top_right
+    TOP_LEFT_OPTION     => position.top_left
+    BOTTOM_RIGHT_OPTION => position.bottom_right
+    => position.bottom_left
+
+dashTextSize = switch dashSizeInput
+    TINY_OPTION  => size.tiny
+    SMALL_OPTION => size.small
+    => size.normal
+
+var table dashTable = table.new(dashLocation, 2, 3, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+if showDashInput and barstate.islast
+    int posCount = array.size(posBarsArray)
+    int negCount = array.size(negBarsArray)
+
+    string regimeText  = posCount > negCount ? "Leaning Bullish" : negCount > posCount ? "Leaning Bearish" : "Balanced"
+    color  regimeColor = posCount > negCount ? bullColorInput : negCount > posCount ? bearColorInput : NEUTRAL_COLOR
+
+    table.cell(dashTable, 0, 0, "Positive", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left, tooltip = "Positive reversals (price higher low, RSI lower low) confirmed inside the regime window.")
+    table.cell(dashTable, 1, 0, str.tostring(posCount), text_color = bullColorInput, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 1, "Negative", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left, tooltip = "Negative reversals (price lower high, RSI higher high) confirmed inside the regime window.")
+    table.cell(dashTable, 1, 1, str.tostring(negCount), text_color = bearColorInput, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 2, "Regime Read", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left, tooltip = "Which side dominates the recent pattern count. Reversals side with the trend, so repeated positive reversals argue for a bull regime and repeated negative reversals for a bear regime.")
+    table.cell(dashTable, 1, 2, regimeText, text_color = regimeColor, text_size = dashTextSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(posEvent, "Positive Reversal", "Cardwell positive reversal on {{ticker}} ({{interval}}) - price set a higher low while RSI set a lower low, bullish continuation favored")
+
+alertcondition(negEvent, "Negative Reversal", "Cardwell negative reversal on {{ticker}} ({{interval}}) - price set a lower high while RSI set a higher high, bearish continuation favored")
+
+alertcondition(posTargetHit, "Positive Reversal Target Reached", "Positive reversal objective reached on {{ticker}} ({{interval}}) - price tagged the measured move projected from the pattern")
+
+alertcondition(negTargetHit, "Negative Reversal Target Reached", "Negative reversal objective reached on {{ticker}} ({{interval}}) - price tagged the measured move projected from the pattern")
+
+//---------------------------------------------------------------------------------------------------------------------}

@@ -1,0 +1,316 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("RSI Failure Swing", shorttitle = "RSI Failure Swing", overlay = false, format = format.price, precision = 2, max_lines_count = 500, max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+MID_LEVEL         = 50          // RSI midline separating bullish from bearish momentum
+BULL_COLOR        = #089981
+BEAR_COLOR        = #f23645
+LEVELS_COLOR      = #787b86
+LABEL_BG          = #00000000   // transparent background for the unobtrusive swing point labels
+SWING_LINE_WIDTH  = 2
+FILL_VALUE_TRANSP = 50          // gradient transparency at the oscillator value
+FILL_MID_TRANSP   = 100         // gradient transparency at the midline
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+rsiLengthInput = input.int(14, "RSI Length", minval = 2, group = "Settings",
+     tooltip = "Lookback of the Wilder RSI the failure swings are read on. Wilder demonstrated the pattern on the 14-period RSI he recommended throughout his 1978 book.")
+
+srcInput = input.source(close, "Source", group = "Settings",
+     tooltip = "Series the RSI is computed from. The pattern is self-contained on the oscillator and needs no price reference, so it transfers unchanged to RSI of alternative sources.")
+
+obInput = input.float(70, "Overbought Level", minval = 50, maxval = 100, step = 1, group = "Settings",
+     tooltip = "Extreme certifying a genuine momentum high. A bearish failure swing must start from a swing high above this level - Wilder used 70.")
+
+osInput = input.float(30, "Oversold Level", minval = 0, maxval = 50, step = 1, group = "Settings",
+     tooltip = "Extreme certifying a genuine momentum low. A bullish failure swing must start from a swing low below this level - Wilder used 30.")
+
+swingInput = input.int(3, "Swing Strength", minval = 1, maxval = 50, group = "Settings",
+     tooltip = "Bars required on each side of an RSI turning point before it counts as a swing. Detection only reacts to confirmed swings, so marked points do not repaint - higher values isolate larger structures but confirm them later.")
+
+strictInput = input.bool(true, "Strict Pullback Rule", group = "Settings",
+     tooltip = "Common reading of Wilder's pattern: once the fail point forms, the bullish pullback must hold above the oversold level and the bearish rebound must stay below the overbought level - re-entering the extreme zone voids the setup and detection restarts from the new extreme. Disable to require only the higher low / lower high against the initial extreme.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Style
+//---------------------------------------------------------------------------------------------------------------------{
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "direction", group = "Style",
+     tooltip = "Color of bullish failure swing structures, fail point lines and completion labels, and of RSI above its midline.")
+
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "direction", group = "Style",
+     tooltip = "Color of bearish failure swing structures, fail point lines and completion labels, and of RSI below its midline.")
+
+levelsColorInput = input.color(LEVELS_COLOR, "Levels Color", group = "Style",
+     tooltip = "Color of the dashed overbought/oversold bands and of the dotted midline.")
+
+gradientFillInput = input.bool(true, "Gradient Fill", group = "Style",
+     tooltip = "Vertical gradient between RSI and the 50 midline, fully transparent at the midline and more opaque at the oscillator value.")
+
+showStructureInput = input.bool(true, "Swing Structure", group = "Style",
+     tooltip = "Draws the legs connecting the initial extreme, the fail point and the higher low / lower high of each failure swing, plus the completing leg once the fail point breaks.")
+
+showTriggerInput = input.bool(true, "Fail Point Line", group = "Style",
+     tooltip = "Extends a dashed trigger line from the fail point while a setup is armed - the level whose break completes the failure swing.")
+
+showPointLabelsInput = input.bool(true, "Swing Point Labels", group = "Style",
+     tooltip = "Marks the fail point and the higher low / lower high of armed setups with small text labels.")
+
+showSignalLabelsInput = input.bool(true, "Completion Labels", group = "Style",
+     tooltip = "Labels the bar where RSI breaks its fail point and the failure swing completes - the traditional trigger of the pattern.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+// Wilder RSI plus its confirmed swing points - the failure swing is defined on these alone, without price
+rsiValue = ta.rsi(srcInput, rsiLengthInput)
+
+pivotHigh = ta.pivothigh(rsiValue, swingInput, swingInput)
+pivotLow  = ta.pivotlow(rsiValue, swingInput, swingInput)
+
+// Extremes of the bars printed since a candidate swing point (its confirmation window), used by the strict rule
+highestSince = ta.highest(rsiValue, swingInput)
+lowestSince  = ta.lowest(rsiValue, swingInput)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Failure Swing Detection
+//---------------------------------------------------------------------------------------------------------------------{
+// Each side runs Wilder's four-step sequence as a state machine over confirmed RSI swings:
+// stage 1 - RSI printed a swing low below the oversold level (the certified extreme)
+// stage 2 - RSI rebounded above the level to a swing high: the fail point
+// stage 3 - the pullback confirmed a higher low without taking out the extreme, arming the setup
+// completion - RSI breaks above the fail point. The bearish top mirrors every step above the overbought level
+
+var int   bullStage    = 0
+var float bullLowVal   = na    // initial oversold swing low
+var int   bullLowBar   = na
+var float bullFailVal  = na    // fail point - the interim rebound peak
+var int   bullFailBar  = na
+var float bullHlVal    = na    // higher low holding above the initial extreme
+var int   bullHlBar    = na
+var bool  bullLeftZone = false // RSI has traded back above the oversold level since the low was anchored
+
+var int   bearStage    = 0
+var float bearHighVal  = na    // initial overbought swing high
+var int   bearHighBar  = na
+var float bearFailVal  = na    // fail point - the interim pullback trough
+var int   bearFailBar  = na
+var float bearLhVal    = na    // lower high holding below the initial extreme
+var int   bearLhBar    = na
+var bool  bearLeftZone = false // RSI has traded back below the overbought level since the high was anchored
+
+// Drawing handles of the setup currently armed on each side
+var line  bullLegLine     = na
+var line  bullPullbackLine = na
+var line  bullTriggerLine  = na
+var label bullFailLabel    = na
+var label bullHlLabel      = na
+
+var line  bearLegLine      = na
+var line  bearPullbackLine = na
+var line  bearTriggerLine  = na
+var label bearFailLabel    = na
+var label bearLhLabel      = na
+
+bool bullSetup = false
+bool bullBreak = false
+bool bearSetup = false
+bool bearBreak = false
+bool bullReset = false
+bool bearReset = false
+
+// State only advances on confirmed bars so signals and drawings do not repaint intrabar
+if barstate.isconfirmed
+    // Swing low confirmations - bullish anchor / higher low, bearish fail point
+    if not na(pivotLow)
+        int swingBar = bar_index - swingInput
+        if bullStage >= 2 and pivotLow > bullLowVal and pivotLow < bullFailVal and (bullStage == 2 or pivotLow < bullHlVal) and (not strictInput or pivotLow > osInput)
+            // Higher low held above the initial extreme - the setup arms, or an armed pullback extends deeper
+            bullHlVal := pivotLow
+            bullHlBar := swingBar
+            if bullStage == 2
+                bullStage := 3
+                bullSetup := true
+                if showStructureInput
+                    bullLegLine      := line.new(bullLowBar, bullLowVal, bullFailBar, bullFailVal, color = bullColorInput, width = SWING_LINE_WIDTH)
+                    bullPullbackLine := line.new(bullFailBar, bullFailVal, bullHlBar, bullHlVal, color = bullColorInput, width = SWING_LINE_WIDTH)
+                if showTriggerInput
+                    bullTriggerLine := line.new(bullFailBar, bullFailVal, bar_index, bullFailVal, color = bullColorInput, style = line.style_dashed)
+                if showPointLabelsInput
+                    bullFailLabel := label.new(bullFailBar, bullFailVal, "Fail Point", style = label.style_label_down, color = LABEL_BG, textcolor = bullColorInput, size = size.tiny, tooltip = "Interim rebound peak - RSI breaking above it completes the bullish failure swing")
+                    bullHlLabel   := label.new(bullHlBar, bullHlVal, "HL", style = label.style_label_up, color = LABEL_BG, textcolor = bullColorInput, size = size.tiny, tooltip = "Higher low - the pullback bottomed above the prior RSI low")
+            else
+                if not na(bullPullbackLine)
+                    line.set_xy2(bullPullbackLine, bullHlBar, bullHlVal)
+                if not na(bullHlLabel)
+                    label.set_xy(bullHlLabel, bullHlBar, bullHlVal)
+        else if pivotLow < osInput and bullStage <= 1
+            // Oversold swing low - anchor a new sequence, or deepen the low of the excursion in progress
+            if bullStage == 1 and (not strictInput or not bullLeftZone)
+                if pivotLow < bullLowVal
+                    bullLowVal := pivotLow
+                    bullLowBar := swingBar
+            else
+                bullStage    := 1
+                bullLowVal   := pivotLow
+                bullLowBar   := swingBar
+                bullLeftZone := highestSince > osInput
+        if bearStage == 1 and pivotLow < obInput and (not strictInput or highestSince <= obInput)
+            // First pullback trough below the overbought level - the bearish fail point
+            bearStage   := 2
+            bearFailVal := pivotLow
+            bearFailBar := swingBar
+        else if bearStage == 2 and pivotLow < bearFailVal
+            bearFailVal := pivotLow
+            bearFailBar := swingBar
+
+    // Swing high confirmations - bearish anchor / lower high, bullish fail point
+    if not na(pivotHigh)
+        int swingBar = bar_index - swingInput
+        if bearStage >= 2 and pivotHigh < bearHighVal and pivotHigh > bearFailVal and (bearStage == 2 or pivotHigh > bearLhVal) and (not strictInput or pivotHigh < obInput)
+            // Lower high held below the initial extreme - the setup arms, or an armed rebound extends higher
+            bearLhVal := pivotHigh
+            bearLhBar := swingBar
+            if bearStage == 2
+                bearStage := 3
+                bearSetup := true
+                if showStructureInput
+                    bearLegLine      := line.new(bearHighBar, bearHighVal, bearFailBar, bearFailVal, color = bearColorInput, width = SWING_LINE_WIDTH)
+                    bearPullbackLine := line.new(bearFailBar, bearFailVal, bearLhBar, bearLhVal, color = bearColorInput, width = SWING_LINE_WIDTH)
+                if showTriggerInput
+                    bearTriggerLine := line.new(bearFailBar, bearFailVal, bar_index, bearFailVal, color = bearColorInput, style = line.style_dashed)
+                if showPointLabelsInput
+                    bearFailLabel := label.new(bearFailBar, bearFailVal, "Fail Point", style = label.style_label_up, color = LABEL_BG, textcolor = bearColorInput, size = size.tiny, tooltip = "Interim pullback trough - RSI breaking below it completes the bearish failure swing")
+                    bearLhLabel   := label.new(bearLhBar, bearLhVal, "LH", style = label.style_label_down, color = LABEL_BG, textcolor = bearColorInput, size = size.tiny, tooltip = "Lower high - the rebound topped below the prior RSI high")
+            else
+                if not na(bearPullbackLine)
+                    line.set_xy2(bearPullbackLine, bearLhBar, bearLhVal)
+                if not na(bearLhLabel)
+                    label.set_xy(bearLhLabel, bearLhBar, bearLhVal)
+        else if pivotHigh > obInput and bearStage <= 1
+            // Overbought swing high - anchor a new sequence, or extend the high of the excursion in progress
+            if bearStage == 1 and (not strictInput or not bearLeftZone)
+                if pivotHigh > bearHighVal
+                    bearHighVal := pivotHigh
+                    bearHighBar := swingBar
+            else
+                bearStage    := 1
+                bearHighVal  := pivotHigh
+                bearHighBar  := swingBar
+                bearLeftZone := lowestSince < obInput
+        if bullStage == 1 and pivotHigh > osInput and (not strictInput or lowestSince >= osInput)
+            // First rebound peak back above the oversold level - the bullish fail point
+            bullStage   := 2
+            bullFailVal := pivotHigh
+            bullFailBar := swingBar
+        else if bullStage == 2 and pivotHigh > bullFailVal
+            bullFailVal := pivotHigh
+            bullFailBar := swingBar
+
+    // Track whether RSI has left the extreme zone since each anchor - the strict rule restarts on re-entry
+    if bullStage == 1 and rsiValue > osInput
+        bullLeftZone := true
+    if bearStage == 1 and rsiValue < obInput
+        bearLeftZone := true
+
+    // Structural invalidation - the prior extreme gives way, or the extreme zone is re-entered under the strict rule
+    if bullStage >= 2 and (rsiValue < bullLowVal or (strictInput and rsiValue < osInput))
+        bullReset := true
+        bullSetup := false
+        bullStage := 0
+    if bearStage >= 2 and (rsiValue > bearHighVal or (strictInput and rsiValue > obInput))
+        bearReset := true
+        bearSetup := false
+        bearStage := 0
+
+    if bullReset
+        line.delete(bullLegLine)
+        line.delete(bullPullbackLine)
+        line.delete(bullTriggerLine)
+        label.delete(bullFailLabel)
+        label.delete(bullHlLabel)
+        bullLegLine      := na
+        bullPullbackLine := na
+        bullTriggerLine  := na
+        bullFailLabel    := na
+        bullHlLabel      := na
+    if bearReset
+        line.delete(bearLegLine)
+        line.delete(bearPullbackLine)
+        line.delete(bearTriggerLine)
+        label.delete(bearFailLabel)
+        label.delete(bearLhLabel)
+        bearLegLine      := na
+        bearPullbackLine := na
+        bearTriggerLine  := na
+        bearFailLabel    := na
+        bearLhLabel      := na
+
+    // Keep the armed trigger lines extended to the current bar
+    if bullStage == 3 and not na(bullTriggerLine)
+        line.set_x2(bullTriggerLine, bar_index)
+    if bearStage == 3 and not na(bearTriggerLine)
+        line.set_x2(bearTriggerLine, bar_index)
+
+    // Completion - RSI takes out the fail point, the traditional trigger of the pattern
+    if bullStage == 3 and rsiValue > bullFailVal
+        bullBreak := true
+        if showStructureInput
+            line.new(bullHlBar, bullHlVal, bar_index, bullFailVal, color = bullColorInput, width = SWING_LINE_WIDTH)
+        if showSignalLabelsInput
+            label.new(bar_index, bullFailVal, "Bull FS", style = label.style_label_up, color = bullColorInput, textcolor = chart.bg_color, size = size.small, tooltip = "Bullish failure swing completed - RSI broke above its fail point after holding a higher low above the oversold low")
+        bullStage        := 0
+        bullLegLine      := na
+        bullPullbackLine := na
+        bullTriggerLine  := na
+        bullFailLabel    := na
+        bullHlLabel      := na
+    if bearStage == 3 and rsiValue < bearFailVal
+        bearBreak := true
+        if showStructureInput
+            line.new(bearLhBar, bearLhVal, bar_index, bearFailVal, color = bearColorInput, width = SWING_LINE_WIDTH)
+        if showSignalLabelsInput
+            label.new(bar_index, bearFailVal, "Bear FS", style = label.style_label_down, color = bearColorInput, textcolor = chart.bg_color, size = size.small, tooltip = "Bearish failure swing completed - RSI broke below its fail point after holding a lower high below the overbought high")
+        bearStage        := 0
+        bearLegLine      := na
+        bearPullbackLine := na
+        bearTriggerLine  := na
+        bearFailLabel    := na
+        bearLhLabel      := na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visuals
+//---------------------------------------------------------------------------------------------------------------------{
+rsiColor = rsiValue > MID_LEVEL ? bullColorInput : bearColorInput
+
+fillTopColor    = rsiValue > MID_LEVEL ? color.new(bullColorInput, FILL_VALUE_TRANSP) : color.new(bearColorInput, FILL_MID_TRANSP)
+fillBottomColor = rsiValue > MID_LEVEL ? color.new(bullColorInput, FILL_MID_TRANSP) : color.new(bearColorInput, FILL_VALUE_TRANSP)
+
+rsiPlotId = plot(rsiValue, "RSI", rsiColor, 1)
+midPlotId = plot(MID_LEVEL, "Midline", editable = false, display = display.none)
+
+fill(rsiPlotId, midPlotId
+  , math.max(rsiValue, MID_LEVEL)
+  , math.min(rsiValue, MID_LEVEL)
+  , gradientFillInput ? fillTopColor : na
+  , gradientFillInput ? fillBottomColor : na
+  , title = "RSI Gradient Fill")
+
+hline(obInput, "Overbought", levelsColorInput, hline.style_dashed)
+hline(osInput, "Oversold", levelsColorInput, hline.style_dashed)
+hline(MID_LEVEL, "Midline", color.new(levelsColorInput, 50), hline.style_dotted)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(bullSetup, "Bullish Failure Swing Setup", "Bullish RSI failure swing setup on {{ticker}} ({{interval}}) - RSI holds a higher low above its oversold low; a break of the fail point completes the pattern")
+alertcondition(bullBreak, "Bullish Failure Swing Completed", "Bullish RSI failure swing completed on {{ticker}} ({{interval}}) - RSI broke above its fail point after holding a higher low")
+alertcondition(bearSetup, "Bearish Failure Swing Setup", "Bearish RSI failure swing setup on {{ticker}} ({{interval}}) - RSI holds a lower high below its overbought high; a break of the fail point completes the pattern")
+alertcondition(bearBreak, "Bearish Failure Swing Completed", "Bearish RSI failure swing completed on {{ticker}} ({{interval}}) - RSI broke below its fail point after holding a lower high")
+
+//---------------------------------------------------------------------------------------------------------------------}

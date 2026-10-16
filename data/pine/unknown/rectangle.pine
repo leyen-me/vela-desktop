@@ -1,0 +1,347 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator('Rectangle'
+  , shorttitle       = 'Rectangle'
+  , overlay          = true
+  , max_boxes_count  = 250
+  , max_lines_count  = 500
+  , max_labels_count = 500
+  , max_bars_back    = 1000)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+NEUTRAL_COLOR = #787b86 // the unresolved rectangle - two-sided structure until it breaks
+CLEAR_COLOR   = #00000000
+
+MAX_PIVOTS = 30
+
+CEILING =  1
+FLOOR   = -1
+NO_SIDE =  0
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+DET_GROUP = 'Rectangle Detection'
+BRK_GROUP = 'Breakout & Measure Rule'
+INT_GROUP = 'Interior Reads'
+STL_GROUP = 'Style'
+
+swingLengthInput = input.int(5, 'Swing Length', minval = 1, maxval = 50, group = DET_GROUP
+  , tooltip = 'Bars to the left and right of a swing point required to confirm it. Boundary touches are taken from these confirmed swing highs and lows; larger values keep only the more significant touches.')
+
+minTouchesInput = input.int(2, 'Minimum Touches per Boundary', minval = 2, maxval = 6, group = DET_GROUP
+  , tooltip = 'Genuine swing touches required at the ceiling and at the floor before the consolidation earns the rectangle name. Classical convention asks for at least two touches per boundary.')
+
+toleranceInput = input.float(0.5, 'Boundary Tolerance', minval = 0.05, maxval = 3, step = 0.05, group = DET_GROUP
+  , tooltip = 'Maximum distance, as an ATR multiple, between swing touches sharing one boundary. Keeps the boundaries roughly horizontal and parallel — touches spread wider than this belong to sloping channels or converging triangles. Also sets the depth of the boundary test zones and the intrabar poke allowance.')
+
+atrLengthInput = input.int(14, 'Tolerance ATR Length', minval = 1, maxval = 200, group = DET_GROUP
+  , tooltip = 'Averaging length of the ATR used to scale the boundary tolerance.')
+
+maxSpanInput = input.int(200, 'Maximum Formation Length', minval = 20, maxval = 500, group = DET_GROUP
+  , tooltip = 'Maximum number of bars between the earliest and the latest boundary touch when the rectangle is first confirmed. Once formed the pattern has no expiry: the box extends until a boundary gives way.')
+
+showTargetInput = input.bool(true, 'Measured Target', group = BRK_GROUP
+  , tooltip = 'Projects the box height from the broken boundary after a breakout — the classical measure rule minimum objective — as a dotted level.')
+
+showFailedInput = input.bool(true, 'Mark Failed Breakouts', group = BRK_GROUP
+  , tooltip = 'Flags a breakout that closes back inside the rectangle before the measured objective is reached — the standard failure signal that traps one side, and a cue to stand down or consider the reverse.')
+
+volumeNoteInput = input.bool(true, 'Volume Note on Breakouts', group = BRK_GROUP
+  , tooltip = 'Appends breakout volume, as a multiple of its recent average, to the breakout label. Activity conventionally contracts inside the box and expands on the resolution; a conspicuously quiet breakout earns extra suspicion of failure.')
+
+volumeLengthInput = input.int(20, 'Volume Average Length', minval = 1, maxval = 200, group = BRK_GROUP
+  , tooltip = 'Length of the simple moving average used as the reference for the breakout volume ratio.')
+
+partialsInput = input.bool(true, 'Partial Rises & Declines', group = INT_GROUP
+  , tooltip = 'Marks incomplete rotations inside an active rectangle: a partial rise leaves the floor but rolls over before reaching the ceiling, and a partial decline mirrors it from above. Both are documented leans toward the opposite boundary breaking. Confirmed once price returns to the boundary the rotation started from.')
+
+partialPctInput = input.float(50, 'Minimum Rotation %', minval = 25, maxval = 95, step = 5, group = INT_GROUP
+  , tooltip = 'Minimum travel across the box, as a percentage of its height, for an incomplete rotation to qualify as a partial rise or partial decline.')
+
+rectangleColorInput = input.color(NEUTRAL_COLOR, 'Rectangle', group = STL_GROUP
+  , tooltip = 'Color of the rectangle boundaries, interior fill and touch markers. The pattern is two-sided by construction, so the box itself stays direction-neutral until it resolves.')
+
+bullColorInput = input.color(BULL_COLOR, 'Bullish', inline = 'direction', group = STL_GROUP
+  , tooltip = 'Color of bullish breakout labels, upside measured targets and upside-leaning interior reads.')
+
+bearColorInput = input.color(BEAR_COLOR, 'Bearish', inline = 'direction', group = STL_GROUP
+  , tooltip = 'Color of bearish breakout labels, downside measured targets and downside-leaning interior reads.')
+
+showTouchesInput = input.bool(true, 'Show Boundary Touches', group = STL_GROUP
+  , tooltip = 'Marks the swing touches that prove each boundary — the failed pushes at the ceiling and the held dips at the floor.')
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Gathers the stored swings clustering with the most recent one and returns the boundary they prove
+boundaryCluster(array<float> pricesArray, array<int> barsArray, float tol, int minBar, bool isCeiling) =>
+    int   touchCount = 0
+    float level      = na
+    float anchor     = na
+    int   firstBar   = na
+    int   lastBar    = na
+    int   arraySize  = pricesArray.size()
+    if arraySize > 0
+        int anchorBar = barsArray.get(arraySize - 1)
+        if anchorBar > minBar
+            anchor := pricesArray.get(arraySize - 1)
+            for i = 0 to arraySize - 1
+                float swingPrice = pricesArray.get(i)
+                int   swingBar   = barsArray.get(i)
+                if swingBar > minBar and math.abs(swingPrice - anchor) <= tol
+                    touchCount += 1
+                    level    := na(level)    ? swingPrice : (isCeiling ? math.max(level, swingPrice) : math.min(level, swingPrice))
+                    firstBar := na(firstBar) ? swingBar   : math.min(firstBar, swingBar)
+                    lastBar  := na(lastBar)  ? swingBar   : math.max(lastBar, swingBar)
+    [touchCount, level, anchor, firstBar, lastBar]
+
+// Small dot marking a proven boundary touch
+touchDot(int x, float y) =>
+    label.new(x, y, '•', style = label.style_label_center, color = CLEAR_COLOR, textcolor = rectangleColorInput, size = size.small)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Swing detection
+//---------------------------------------------------------------------------------------------------------------------{
+atrValue  = ta.atr(atrLengthInput)
+tolerance = atrValue * toleranceInput
+volumeAvg = ta.sma(nz(volume), volumeLengthInput)
+
+swingHigh = ta.pivothigh(swingLengthInput, swingLengthInput)
+swingLow  = ta.pivotlow(swingLengthInput, swingLengthInput)
+
+newSwingHigh = not na(swingHigh)
+newSwingLow  = not na(swingLow)
+
+var swingHighPriceArray = array.new_float()
+var swingHighBarArray   = array.new_int()
+var swingLowPriceArray  = array.new_float()
+var swingLowBarArray    = array.new_int()
+
+if newSwingHigh
+    swingHighPriceArray.push(swingHigh)
+    swingHighBarArray.push(bar_index - swingLengthInput)
+    if swingHighPriceArray.size() > MAX_PIVOTS
+        swingHighPriceArray.shift()
+        swingHighBarArray.shift()
+
+if newSwingLow
+    swingLowPriceArray.push(swingLow)
+    swingLowBarArray.push(bar_index - swingLengthInput)
+    if swingLowPriceArray.size() > MAX_PIVOTS
+        swingLowPriceArray.shift()
+        swingLowBarArray.shift()
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Rectangle detection
+//---------------------------------------------------------------------------------------------------------------------{
+var box  rectangleBox = na
+var line ceilingLine  = na
+var line floorLine    = na
+
+var bool  rectangleActive = false
+var float ceilingLevel    = na
+var float floorLevel      = na
+var float boundaryTol     = na
+var int   lastEndBar      = -1
+
+var int   lastSideTouched  = NO_SIDE
+var float rotationHigh     = na
+var int   rotationHighBar  = na
+var float rotationLow      = na
+var int   rotationLowBar   = na
+var bool  wasInCeilingZone = false
+var bool  wasInFloorZone   = false
+
+var bool  monitorActive  = false
+var int   breakDirection = NO_SIDE
+var int   breakBar       = na
+var float monitorTop     = na
+var float monitorBot     = na
+var float targetLevel    = na
+var line  targetLine     = na
+
+bool formedEvent         = false
+bool ceilingTestEvent    = false
+bool floorTestEvent      = false
+bool bullishBreakEvent   = false
+bool bearishBreakEvent   = false
+bool failedBreakEvent    = false
+bool targetReachedEvent  = false
+bool partialRiseEvent    = false
+bool partialDeclineEvent = false
+
+// formation attempt on each newly confirmed swing while no rectangle is active
+if not rectangleActive and (newSwingHigh or newSwingLow) and not na(tolerance)
+    int minBar = math.max(bar_index - maxSpanInput, lastEndBar)
+    [ceilingTouches, ceilLevel, ceilAnchor, ceilFirstBar, ceilLastBar] = boundaryCluster(swingHighPriceArray, swingHighBarArray, tolerance, minBar, true)
+    [floorTouches, botLevel, floorAnchor, floorFirstBar, floorLastBar] = boundaryCluster(swingLowPriceArray, swingLowBarArray, tolerance, minBar, false)
+    if ceilingTouches >= minTouchesInput and floorTouches >= minTouchesInput
+        float boxHeight = ceilLevel - botLevel
+        // parallel horizontal boundaries with a real interior, proven over overlapping test windows
+        bool structureOk = boxHeight > tolerance * 2 and math.max(ceilFirstBar, floorFirstBar) <= math.min(ceilLastBar, floorLastBar)
+        if structureOk
+            int startBar = math.min(ceilFirstBar, floorFirstBar)
+            // containment: no decisive close beyond either boundary and no poke deeper than the tolerance since the first touch
+            bool contained = true
+            for i = 0 to bar_index - startBar
+                if close[i] > ceilLevel or close[i] < botLevel or high[i] > ceilLevel + tolerance or low[i] < botLevel - tolerance
+                    contained := false
+                    break
+            if contained
+                rectangleActive  := true
+                ceilingLevel     := ceilLevel
+                floorLevel       := botLevel
+                boundaryTol      := tolerance
+                lastSideTouched  := ceilLastBar > floorLastBar ? CEILING : FLOOR
+                rotationHigh     := high
+                rotationHighBar  := bar_index
+                rotationLow      := low
+                rotationLowBar   := bar_index
+                wasInCeilingZone := high >= ceilLevel - tolerance
+                wasInFloorZone   := low <= botLevel + tolerance
+                rectangleBox     := box.new(startBar, ceilLevel, bar_index, botLevel, border_color = CLEAR_COLOR, bgcolor = color.new(rectangleColorInput, 90))
+                ceilingLine      := line.new(startBar, ceilLevel, bar_index, ceilLevel, color = rectangleColorInput)
+                floorLine        := line.new(startBar, botLevel, bar_index, botLevel, color = rectangleColorInput)
+                formedEvent      := true
+                if showTouchesInput
+                    for i = 0 to swingHighPriceArray.size() - 1
+                        float swingPrice = swingHighPriceArray.get(i)
+                        int   swingBar   = swingHighBarArray.get(i)
+                        if swingBar > minBar and math.abs(swingPrice - ceilAnchor) <= tolerance
+                            touchDot(swingBar, swingPrice)
+                    for i = 0 to swingLowPriceArray.size() - 1
+                        float swingPrice = swingLowPriceArray.get(i)
+                        int   swingBar   = swingLowBarArray.get(i)
+                        if swingBar > minBar and math.abs(swingPrice - floorAnchor) <= tolerance
+                            touchDot(swingBar, swingPrice)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Active rectangle management
+//---------------------------------------------------------------------------------------------------------------------{
+if rectangleActive and not formedEvent
+    rectangleBox.set_right(bar_index)
+    ceilingLine.set_x2(bar_index)
+    floorLine.set_x2(bar_index)
+
+    float boxHeight   = ceilingLevel - floorLevel
+    float ceilingZone = ceilingLevel - boundaryTol
+    float floorZone   = floorLevel + boundaryTol
+
+    bool bullishBreak = close > ceilingLevel
+    bool bearishBreak = close < floorLevel
+
+    if bullishBreak or bearishBreak
+        // a decisive close beyond a boundary resolves the pattern
+        rectangleActive := false
+        lastEndBar      := bar_index
+        color breakColor = bullishBreak ? bullColorInput : bearColorInput
+        string volumeNote = ''
+        if volumeNoteInput and not na(volume) and volumeAvg > 0
+            volumeNote := '\n×' + str.tostring(volume / volumeAvg, '#.##') + ' vol'
+        label.new(bar_index, bullishBreak ? low : high, 'Breakout' + volumeNote, style = bullishBreak ? label.style_label_up : label.style_label_down, color = breakColor, textcolor = chart.bg_color, size = size.small)
+        monitorActive  := true
+        breakDirection := bullishBreak ? CEILING : FLOOR
+        breakBar       := bar_index
+        monitorTop     := ceilingLevel
+        monitorBot     := floorLevel
+        targetLevel    := showTargetInput ? (bullishBreak ? ceilingLevel + boxHeight : floorLevel - boxHeight) : na
+        if showTargetInput
+            targetLine := line.new(bar_index, targetLevel, bar_index + 1, targetLevel, color = breakColor, style = line.style_dotted)
+            label.new(bar_index, targetLevel, 'Target', style = label.style_label_left, color = CLEAR_COLOR, textcolor = breakColor, size = size.tiny)
+        lastSideTouched   := NO_SIDE
+        wasInCeilingZone  := false
+        wasInFloorZone    := false
+        bullishBreakEvent := bullishBreak
+        bearishBreakEvent := bearishBreak
+    else
+        // rotation bookkeeping between the proven boundaries
+        if na(rotationHigh) or high > rotationHigh
+            rotationHigh    := high
+            rotationHighBar := bar_index
+        if na(rotationLow) or low < rotationLow
+            rotationLow    := low
+            rotationLowBar := bar_index
+
+        bool touchesCeiling = high >= ceilingZone
+        bool touchesFloor   = low <= floorZone
+        if touchesCeiling and touchesFloor
+            // a wide bar spanning both zones is attributed to the side it closed on
+            if close >= (ceilingLevel + floorLevel) / 2
+                touchesFloor := false
+            else
+                touchesCeiling := false
+
+        if touchesCeiling
+            if not wasInCeilingZone
+                ceilingTestEvent := true
+            if lastSideTouched == CEILING and partialsInput and not na(rotationLow) and rotationLow > floorZone and ceilingLevel - rotationLow >= boxHeight * partialPctInput / 100
+                partialDeclineEvent := true
+                label.new(rotationLowBar, rotationLow, 'Partial Decline', style = label.style_label_up, color = CLEAR_COLOR, textcolor = bullColorInput, size = size.tiny)
+            lastSideTouched := CEILING
+            rotationHigh    := high
+            rotationHighBar := bar_index
+            rotationLow     := low
+            rotationLowBar  := bar_index
+        else if touchesFloor
+            if not wasInFloorZone
+                floorTestEvent := true
+            if lastSideTouched == FLOOR and partialsInput and not na(rotationHigh) and rotationHigh < ceilingZone and rotationHigh - floorLevel >= boxHeight * partialPctInput / 100
+                partialRiseEvent := true
+                label.new(rotationHighBar, rotationHigh, 'Partial Rise', style = label.style_label_down, color = CLEAR_COLOR, textcolor = bearColorInput, size = size.tiny)
+            lastSideTouched := FLOOR
+            rotationHigh    := high
+            rotationHighBar := bar_index
+            rotationLow     := low
+            rotationLowBar  := bar_index
+
+        wasInCeilingZone := touchesCeiling
+        wasInFloorZone   := touchesFloor
+
+        // newly confirmed swings keep proving the boundaries
+        if showTouchesInput
+            if newSwingHigh and math.abs(swingHigh - ceilingLevel) <= boundaryTol
+                touchDot(bar_index - swingLengthInput, swingHigh)
+            if newSwingLow and math.abs(swingLow - floorLevel) <= boundaryTol
+                touchDot(bar_index - swingLengthInput, swingLow)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Breakout monitoring
+//---------------------------------------------------------------------------------------------------------------------{
+if monitorActive and bar_index > breakBar
+    if not na(targetLine)
+        targetLine.set_x2(bar_index)
+    bool failedBack    = breakDirection == CEILING ? close < monitorTop : close > monitorBot
+    bool targetReached = not na(targetLevel) and (breakDirection == CEILING ? high >= targetLevel : low <= targetLevel)
+    if targetReached
+        targetReachedEvent := true
+        monitorActive      := false
+    else if failedBack
+        failedBreakEvent := true
+        if showFailedInput
+            label.new(bar_index, breakDirection == CEILING ? high : low, 'Failed', style = breakDirection == CEILING ? label.style_label_down : label.style_label_up, color = CLEAR_COLOR, textcolor = breakDirection == CEILING ? bearColorInput : bullColorInput, size = size.small)
+        if not na(targetLine)
+            targetLine.delete()
+            targetLine := na
+        monitorActive := false
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(formedEvent, 'Rectangle Formed', 'Rectangle confirmed: ceiling and floor each proven by the minimum number of swing touches, with price rotating between parallel horizontal boundaries.')
+alertcondition(ceilingTestEvent, 'Ceiling Test', 'Price is testing the ceiling of the active rectangle.')
+alertcondition(floorTestEvent, 'Floor Test', 'Price is testing the floor of the active rectangle.')
+alertcondition(bullishBreakEvent, 'Bullish Breakout', 'Decisive close above the rectangle ceiling. Measure rule: box height projected up from the broken boundary.')
+alertcondition(bearishBreakEvent, 'Bearish Breakout', 'Decisive close below the rectangle floor. Measure rule: box height projected down from the broken boundary.')
+alertcondition(failedBreakEvent, 'Failed Breakout', 'Price closed back inside the rectangle after the breakout — standard failure signal, a cue to stand down or consider the reverse.')
+alertcondition(targetReachedEvent, 'Measured Target Reached', 'Price reached the measure-rule objective projected from the rectangle breakout.')
+alertcondition(partialRiseEvent, 'Partial Rise', 'Partial rise: price left the floor but rolled over before reaching the ceiling — documented lean toward a downside break.')
+alertcondition(partialDeclineEvent, 'Partial Decline', 'Partial decline: price left the ceiling but turned up before testing the floor — documented lean toward an upside break.')
+
+//---------------------------------------------------------------------------------------------------------------------}

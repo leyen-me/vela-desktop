@@ -1,0 +1,293 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Strength/weakness Background", "Strength/weakness Background", overlay = true
+  , precision = 2
+  , max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+float OFF_LOWS_CLOSE  = 0.4   // minimum close position for stopping volume to count as closing off the lows
+float OFF_HIGHS_CLOSE = 0.6   // maximum close position for heavy up-effort to count as producing no result
+float TEST_CLOSE      = 0.5   // minimum close position of a successful test bar
+float SHAKEOUT_CLOSE  = 0.6   // minimum close position of a shakeout recovery
+float UPTHRUST_CLOSE  = 0.4   // maximum close position of an upthrust
+float EDGE_ZONE       = 0.25  // fraction of the recent range treated as "near the lows/highs"
+
+int MAX_BG_TRANSP = 98  // background transparency when evidence is near zero
+int MIN_BG_TRANSP = 76  // background transparency at full-intensity evidence
+
+color COLOR_HIDDEN = #00000000
+
+color BULL_COLOR    = #089981
+color BEAR_COLOR    = #f23645
+color NEUTRAL_COLOR = #787b86 // neutral verdict, unconfirmed structure
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+string GRP_CLS = "Bar Classification"
+string GRP_SOS = "Signs of Strength"
+string GRP_SOW = "Signs of Weakness"
+string GRP_EVD = "Evidence"
+string GRP_DSP = "Display"
+string GRP_STL = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Inputs
+//---------------------------------------------------------------------------------------------------------------------{
+volLenInput = input.int(20, "Average Length", minval = 2, group = GRP_CLS
+  , tooltip = "Bars used to average volume and bar spread (high - low). Heavy volume and narrow spreads are judged against these averages.")
+
+highVolMultInput = input.float(1.5, "High Volume Multiplier", minval = 1, step = 0.1, group = GRP_CLS
+  , tooltip = "Volume must exceed its average by this multiple to count as climactic effort (stopping volume, effort without result).")
+
+rangeLenInput = input.int(20, "Range Lookback", minval = 5, group = GRP_CLS
+  , tooltip = "Bars defining the recent trading range. Shakeouts and upthrusts must poke beyond its extremes, stopping volume must print near its lows, and failed up-effort near its highs.")
+
+swingLenInput = input.int(10, "Swing Length", minval = 2, group = GRP_CLS
+  , tooltip = "Pivot length (bars on each side) locating the prior swing high/low. A background flip only counts as a confirmed regime change once price closes beyond that prior swing in the flip's direction.")
+
+stopVolInput = input.bool(true, "Stopping Volume", group = GRP_SOS
+  , tooltip = "Down bar on climactic volume printing near the range lows yet closing off its low - potential absorption of supply.")
+
+shakeoutInput = input.bool(true, "Shakeout", group = GRP_SOS
+  , tooltip = "Bar that breaks below the recent range low but fails to find supply, recovering to close back above the broken level and firm within its range.")
+
+testInput = input.bool(true, "Successful Test", group = GRP_SOS
+  , tooltip = "Low-volume, narrow-spread dip below the prior bar's low that holds above the range low and closes firm - supply was checked and not found.")
+
+upthrustInput = input.bool(true, "Upthrust", group = GRP_SOW
+  , tooltip = "Bar that pushes above the recent range high but closes back below it and near its low - a failed markup meeting supply.")
+
+noDemandInput = input.bool(true, "No Demand", group = GRP_SOW
+  , tooltip = "Up bar making a higher high on a narrow spread with volume below the two preceding bars - a rally without professional interest.")
+
+effortFailInput = input.bool(true, "Effort Without Result", group = GRP_SOW
+  , tooltip = "Climactic volume on an up bar near the range highs that closes weakly, or whose strong close fails to follow through on the next bar - heavy effort producing no upward progress.")
+
+windowInput = input.int(30, "Evidence Window", minval = 5, group = GRP_EVD
+  , tooltip = "Approximate number of bars an event keeps influencing the verdict. Evidence decays exponentially at this rate, so newer events count more than older ones.")
+
+climacticWeightInput = input.float(2, "Climactic Event Weight", minval = 0, step = 0.5, group = GRP_EVD
+  , tooltip = "Evidence added by the major events: stopping volume and shakeouts (strength), upthrusts and effort without result (weakness).")
+
+responseWeightInput = input.float(1, "Response Event Weight", minval = 0, step = 0.5, group = GRP_EVD
+  , tooltip = "Evidence added by the quieter response bars: successful tests (strength) and no-demand rallies (weakness).")
+
+thresholdInput = input.float(1, "Verdict Threshold", minval = 0.1, step = 0.1, group = GRP_EVD
+  , tooltip = "Net evidence must reach +/- this level before the background verdict is set or flipped. Between the thresholds the previous verdict persists, so a single contrary bar rarely flips it.")
+
+showEventsInput = input.bool(false, "Event Markers", group = GRP_DSP
+  , tooltip = "Tag the individual bar events feeding the background. SV = stopping volume, SO = shakeout, T = test, UT = upthrust, ER = effort without result, ND = no demand.")
+
+showDashInput = input.bool(true, "Dashboard", group = GRP_DSP
+  , tooltip = "Panel with the current verdict, whether structure has confirmed it (a close beyond the prior swing since the flip), net evidence, event counts inside the evidence window, and the most recent sign of strength/weakness. (n) after an event name is the number of bars since it printed.")
+
+dashPosInput = input.string("Top Right", "Dashboard Position", group = GRP_DSP
+  , options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"]
+  , tooltip = "Position of the dashboard on the chart.")
+
+dashSizeInput = input.string("Small", "Dashboard Size", group = GRP_DSP
+  , options = ["Tiny", "Small", "Normal"]
+  , tooltip = "Text size of the dashboard.")
+
+bullColorInput = input.color(BULL_COLOR, "Strength", group = GRP_STL, inline = "c1")
+bearColorInput = input.color(BEAR_COLOR, "Weakness", group = GRP_STL, inline = "c1")
+
+fullShadeInput = input.float(4, "Full Intensity Evidence", minval = 0.5, step = 0.5, group = GRP_STL
+  , tooltip = "Absolute net evidence at which the background reaches its deepest shading. The shading darkens as evidence accumulates and fades as it decays.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Bar Classification
+//---------------------------------------------------------------------------------------------------------------------{
+float barSpread = high - low
+float avgVolume = ta.sma(volume, volLenInput)
+float avgSpread = ta.sma(barSpread, volLenInput)
+
+float rangeHigh      = ta.highest(high, rangeLenInput)
+float rangeLow       = ta.lowest(low, rangeLenInput)
+float priorRangeHigh = rangeHigh[1]
+float priorRangeLow  = rangeLow[1]
+float rangeWidth     = rangeHigh - rangeLow
+
+float closePos = barSpread > 0 ? (close - low) / barSpread : 0.5
+float lowPos   = rangeWidth > 0 ? (low - rangeLow) / rangeWidth : 0.5
+float highPos  = rangeWidth > 0 ? (high - rangeLow) / rangeWidth : 0.5
+
+bool ready = not na(avgVolume) and not na(avgSpread) and not na(priorRangeLow) and not na(volume[2])
+  and not na(close[1]) and rangeWidth > 0
+
+bool upBar        = close > close[1]
+bool downBar      = close < close[1]
+bool highVolume   = ready and volume >= avgVolume * highVolMultInput
+bool lowVolume    = ready and volume < volume[1] and volume < volume[2]
+bool narrowSpread = ready and barSpread <= avgSpread
+bool nearLows     = ready and lowPos <= EDGE_ZONE
+bool nearHighs    = ready and highPos >= 1 - EDGE_ZONE
+
+// signs of strength - evidence of professional buying
+bool stoppingVolume = stopVolInput and ready and downBar and highVolume and nearLows and closePos >= OFF_LOWS_CLOSE
+bool shakeoutBar    = shakeoutInput and ready and low < priorRangeLow and close > priorRangeLow and closePos >= SHAKEOUT_CLOSE
+bool testBar        = testInput and ready and lowVolume and narrowSpread and low < low[1] and low > priorRangeLow and closePos >= TEST_CLOSE
+
+// signs of weakness - evidence of professional selling
+bool upthrustBar        = upthrustInput and ready and high > priorRangeHigh and close < priorRangeHigh and closePos <= UPTHRUST_CLOSE
+bool noDemandBar        = noDemandInput and ready and upBar and high > high[1] and lowVolume and narrowSpread
+bool heavyUpEffort      = ready and upBar and highVolume and nearHighs
+bool effortNoResult     = effortFailInput and heavyUpEffort and closePos <= OFF_HIGHS_CLOSE
+bool failedFollowThrough = effortFailInput and ready and heavyUpEffort[1] and closePos[1] > OFF_HIGHS_CLOSE and close < close[1]
+
+// prior swing structure used to confirm background flips
+float pivotHigh = ta.pivothigh(high, swingLenInput, swingLenInput)
+float pivotLow  = ta.pivotlow(low, swingLenInput, swingLenInput)
+
+var float lastSwingHigh = na
+var float lastSwingLow  = na
+lastSwingHigh := not na(pivotHigh) ? pivotHigh : lastSwingHigh
+lastSwingLow  := not na(pivotLow)  ? pivotLow  : lastSwingLow
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Evidence Aggregation
+//---------------------------------------------------------------------------------------------------------------------{
+float sosScore = (stoppingVolume ? climacticWeightInput : 0)
+  + (shakeoutBar ? climacticWeightInput : 0)
+  + (testBar ? responseWeightInput : 0)
+
+float sowScore = (upthrustBar ? climacticWeightInput : 0)
+  + (effortNoResult or failedFollowThrough ? climacticWeightInput : 0)
+  + (noDemandBar ? responseWeightInput : 0)
+
+float netScore = sosScore - sowScore
+
+// running verdict: exponentially decaying tally, newer events count more
+float decayFactor = 1 - 2.0 / (windowInput + 1)
+var float evidence = 0.0
+evidence := evidence * decayFactor + netScore
+
+// the verdict only flips once evidence crosses the opposite threshold
+var int regime = 0
+regime := evidence >= thresholdInput ? 1 : evidence <= -thresholdInput ? -1 : regime
+
+bool flipToStrength = regime == 1 and nz(regime[1]) != 1
+bool flipToWeakness = regime == -1 and nz(regime[1]) != -1
+
+// a flip is only treated as a confirmed regime change once price breaks the prior swing in its direction
+var bool regimeConfirmed = false
+if regime != nz(regime[1])
+    regimeConfirmed := false
+
+bool strengthConfirmed = regime == 1 and not regimeConfirmed and not na(lastSwingHigh) and close > lastSwingHigh
+bool weaknessConfirmed = regime == -1 and not regimeConfirmed and not na(lastSwingLow) and close < lastSwingLow
+
+if strengthConfirmed or weaknessConfirmed
+    regimeConfirmed := true
+
+int sosCount     = math.round(math.sum(sosScore > 0 ? 1 : 0, windowInput))
+int sowCount     = math.round(math.sum(sowScore > 0 ? 1 : 0, windowInput))
+int sosBarsSince = ta.barssince(sosScore > 0)
+int sowBarsSince = ta.barssince(sowScore > 0)
+
+var string lastSosName = "-"
+var string lastSowName = "-"
+if sosScore > 0
+    lastSosName := stoppingVolume ? "Stopping Volume" : shakeoutBar ? "Shakeout" : "Test"
+if sowScore > 0
+    lastSowName := upthrustBar ? "Upthrust" : noDemandBar ? "No Demand" : "Effort w/o Result"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Background & Event Markers
+//---------------------------------------------------------------------------------------------------------------------{
+float alignedEvidence = regime == 1 ? math.max(evidence, 0) : regime == -1 ? math.max(-evidence, 0) : 0
+float shadeIntensity  = math.min(alignedEvidence / fullShadeInput, 1.0)
+color regimeColor     = regime == -1 ? bearColorInput : bullColorInput
+color backgroundColor = regime == 0 ? na
+  : color.from_gradient(shadeIntensity, 0, 1, color.new(regimeColor, MAX_BG_TRANSP), color.new(regimeColor, MIN_BG_TRANSP))
+
+bgcolor(backgroundColor, title = "Strength/Weakness Background")
+
+plot(evidence, "Net Evidence", evidence >= 0 ? bullColorInput : bearColorInput, display = display.data_window)
+
+if showEventsInput and sosScore > 0
+    array<string> sosTagsArray = array.new<string>()
+    if stoppingVolume
+        array.push(sosTagsArray, "SV")
+    if shakeoutBar
+        array.push(sosTagsArray, "SO")
+    if testBar
+        array.push(sosTagsArray, "T")
+    label.new(bar_index, na, array.join(sosTagsArray, " "), yloc = yloc.belowbar, color = COLOR_HIDDEN
+      , style = label.style_label_up, textcolor = bullColorInput, size = size.tiny)
+
+if showEventsInput and sowScore > 0
+    array<string> sowTagsArray = array.new<string>()
+    if upthrustBar
+        array.push(sowTagsArray, "UT")
+    if effortNoResult or failedFollowThrough
+        array.push(sowTagsArray, "ER")
+    if noDemandBar
+        array.push(sowTagsArray, "ND")
+    label.new(bar_index, na, array.join(sowTagsArray, " "), yloc = yloc.abovebar, color = COLOR_HIDDEN
+      , style = label.style_label_down, textcolor = bearColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+string dashPosition = switch dashPosInput
+    "Top Right"    => position.top_right
+    "Top Left"     => position.top_left
+    "Bottom Right" => position.bottom_right
+    => position.bottom_left
+
+string dashTextSize = switch dashSizeInput
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    => size.small
+
+var bool anyVolume = false
+anyVolume := anyVolume or (not na(volume) and volume > 0)
+
+if barstate.islast and showDashInput
+    var table dashTable = table.new(dashPosition, 2, 7, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+    string biasText   = regime == 1 ? "Strength ▲" : regime == -1 ? "Weakness ▼" : "Neutral"
+    color  biasColor  = regime == 1 ? bullColorInput : regime == -1 ? bearColorInput : NEUTRAL_COLOR
+    color  evColor    = evidence > 0 ? bullColorInput : evidence < 0 ? bearColorInput : NEUTRAL_COLOR
+    string structText = regime == 0 ? "-" : regimeConfirmed ? "Break Confirmed" : "Awaiting Break"
+    color  structColor = regime != 0 and regimeConfirmed ? biasColor : NEUTRAL_COLOR
+    table.cell(dashTable, 0, 0, "Strength/Weakness", text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_center)
+    table.merge_cells(dashTable, 0, 0, 1, 0)
+    table.cell(dashTable, 0, 1, "Background", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 1, biasText, text_color = biasColor, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 2, "Structure", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 2, structText, text_color = structColor, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 3, "Net Evidence", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 3, (evidence >= 0 ? "+" : "") + str.tostring(evidence, "0.00"), text_color = evColor, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 4, "Events (" + str.tostring(windowInput) + " bars)", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 4, str.tostring(nz(sosCount)) + " SoS / " + str.tostring(nz(sowCount)) + " SoW", text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 5, "Last SoS", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 5, na(sosBarsSince) ? "-" : lastSosName + " (" + str.tostring(sosBarsSince) + ")", text_color = bullColorInput, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 6, "Last SoW", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 6, na(sowBarsSince) ? "-" : lastSowName + " (" + str.tostring(sowBarsSince) + ")", text_color = bearColorInput, text_size = dashTextSize, text_halign = text.align_right)
+
+if barstate.islast and not anyVolume
+    var table warnTable = table.new(position.middle_center, 1, 1)
+    table.cell(warnTable, 0, 0, "strength/weakness background requires volume data\nthis symbol reports none"
+      , text_color = DASH_TEXT, bgcolor = color.new(BEAR_COLOR, 85), text_size = size.small)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(flipToStrength, "Strength Background Begins", "Background flipped to strength - the balance of VSA evidence now favors accumulation")
+alertcondition(flipToWeakness, "Weakness Background Begins", "Background flipped to weakness - the balance of VSA evidence now favors distribution")
+alertcondition(strengthConfirmed, "Strength Regime Confirmed", "Strength background confirmed by structure - price closed above the prior swing high")
+alertcondition(weaknessConfirmed, "Weakness Regime Confirmed", "Weakness background confirmed by structure - price closed below the prior swing low")
+alertcondition(sosScore > 0, "Sign of Strength", "Sign of strength printed (stopping volume, shakeout, or successful test)")
+alertcondition(sowScore > 0, "Sign of Weakness", "Sign of weakness printed (upthrust, effort without result, or no-demand rally)")
+alertcondition(sosScore > 0 and regime == 1, "Aligned Sign of Strength", "Sign of strength printed while the background already shows strength - bar-level timing aligned with the prevailing bias")
+alertcondition(sowScore > 0 and regime == -1, "Aligned Sign of Weakness", "Sign of weakness printed while the background already shows weakness - bar-level timing aligned with the prevailing bias")
+
+//---------------------------------------------------------------------------------------------------------------------}

@@ -1,0 +1,423 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator('Motive Wave', 'Motive Wave', overlay = true, max_lines_count = 500, max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+RETRACE_LO  = 0.382
+RETRACE_HI  = 0.618
+WAVE3_RATIO = 1.618
+WAVE5_EQ    = 1.0
+WAVE5_ALT   = 0.618
+MAX_PIVOTS  = 120
+MAX_MINOR   = 300
+TRANSP      = #00000000
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+DETECT_GROUP  = 'Wave Detection'
+MEASURE_GROUP = 'Wave Measurement'
+STYLE_GROUP   = 'Style'
+
+lengthInput      = input.int(10, 'ZigZag Length', minval = 2, maxval = 50, group = DETECT_GROUP, tooltip = 'Pivot length used to build the swing structure the waves are counted on. Larger values detect larger degree five wave structures. A pivot confirms after this many bars.')
+showLastInput    = input.int(3, 'Show Last Motive Waves', minval = 1, maxval = 20, group = DETECT_GROUP, tooltip = 'Maximum number of completed motive wave counts kept on the chart.')
+showDevInput     = input.bool(true, 'Show Developing Count', group = DETECT_GROUP, tooltip = 'Once waves 1 to 4 are in place, shows the partial count (dotted), the presumed fifth wave in progress, and the dashed invalidation level at the start of wave 1.')
+trendFilterInput = input.bool(false, 'Larger-Degree Trend Filter', inline = 'trend', group = DETECT_GROUP, tooltip = 'Only accept counts whose direction matches the current leg of a larger degree ZigZag, per identification step 1: a motive wave moves with the trend one degree larger.')
+trendMultInput   = input.int(4, 'x', minval = 2, maxval = 6, inline = 'trend', group = DETECT_GROUP, tooltip = 'Multiplier applied to the ZigZag length to build the larger degree ZigZag used by the trend filter.')
+subdivInput      = input.bool(false, 'Check Subdivisions', inline = 'sub', group = DETECT_GROUP, tooltip = 'Require internal subdivisions: actionary waves (1, 3, 5) must contain at least five sub swings on the minor ZigZag, interruptions (2, 4) at least three.')
+minorLenInput    = input.int(3, 'Minor Length', minval = 1, maxval = 20, inline = 'sub', group = DETECT_GROUP, tooltip = 'Pivot length of the minor ZigZag used to count sub swings inside each wave when the subdivision check is enabled.')
+
+tolInput    = input.float(0.1, 'Ratio Tolerance', minval = 0.01, maxval = 0.5, step = 0.01, group = MEASURE_GROUP, tooltip = 'Tolerance used when scoring the count against the standard relationships: wave 3 near 1.618 of wave 1, wave 5 near equality with wave 1 or 0.618 of the wave 1 to 3 span. Waves 2 and 4 are checked against the 0.382 to 0.618 retracement band.')
+momLenInput = input.int(14, 'Momentum Length', minval = 2, group = MEASURE_GROUP, tooltip = 'RSI length used to compare momentum at the ends of waves 3 and 5. A fifth wave reaching a new extreme on weaker momentum is flagged as a divergence, a classic exhaustion cue.')
+
+bullColorInput = input.color(#089981, 'Bullish', inline = 'colors', group = STYLE_GROUP, tooltip = 'Color of bullish motive wave structures.')
+bearColorInput = input.color(#f23645, 'Bearish', inline = 'colors', group = STYLE_GROUP, tooltip = 'Color of bearish motive wave structures.')
+invColorInput  = input.color(#787b86, 'Invalidation', inline = 'colors', group = STYLE_GROUP, tooltip = 'Color of the invalidation level shown while a count is developing.')
+lineWidthInput = input.int(2, 'Line Width', minval = 1, maxval = 5, group = STYLE_GROUP, tooltip = 'Width of the structure lines of completed counts. Developing counts use a thinner dotted style.')
+labelSizeInput = input.string('Small', 'Label Size', options = ['Tiny', 'Small', 'Normal'], group = STYLE_GROUP, tooltip = 'Size of the wave number and classification labels.')
+
+labelSz = labelSizeInput == 'Tiny' ? size.tiny : labelSizeInput == 'Normal' ? size.normal : size.small
+
+//---------------------------------------------------------------------------------------------------------------------}
+// State
+//---------------------------------------------------------------------------------------------------------------------{
+var pivotPriceArray = array.new_float()
+var pivotBarArray   = array.new_int()
+var pivotDirArray   = array.new_int()
+var pivotOscArray   = array.new_float()
+var minorPriceArray = array.new_float()
+var minorBarArray   = array.new_int()
+var minorDirArray   = array.new_int()
+var countLineArray  = array.new_line()
+var countLabelArray = array.new_label()
+var devLineArray    = array.new_line()
+var devLabelArray   = array.new_label()
+
+var int   lastHigherDir         = 0
+var int   lastCompletedStartBar = na
+var int   lastCompletedEndBar   = na
+var int   lastCompletedDir      = 0
+var bool  lastCountDivAlerted   = false
+var bool  devActive             = false
+var int   devDir                = 0
+var float devStartPrice         = na
+var int   devStartBar           = na
+var int   lastDevAlertBar       = na
+var int   lastDevAlertDir       = 0
+var int   invalidatedStartBar   = na
+var int   invalidatedDir        = 0
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// format a ratio with two decimals
+fmtRatio(value) =>
+    str.tostring(value, '#.##')
+
+// append or improve the last pivot of an alternating swing sequence, returns 0 none / 1 replaced / 2 pushed
+addPivot(prices, bars, dirs, dirVal, priceVal, barVal, maxN) =>
+    int act = 0
+    sz = array.size(prices)
+    if sz > 0 and array.get(dirs, sz - 1) == dirVal
+        if (dirVal == 1 and priceVal > array.get(prices, sz - 1)) or (dirVal == -1 and priceVal < array.get(prices, sz - 1))
+            array.set(prices, sz - 1, priceVal)
+            array.set(bars, sz - 1, barVal)
+            act := 1
+    else
+        array.push(prices, priceVal)
+        array.push(bars, barVal)
+        array.push(dirs, dirVal)
+        act := 2
+        if array.size(prices) > maxN
+            array.shift(prices)
+            array.shift(bars)
+            array.shift(dirs)
+    act
+
+// update the wave-degree swing sequence, keeping the momentum series in sync
+doMajor(dirVal, priceVal, oscVal) =>
+    act = addPivot(pivotPriceArray, pivotBarArray, pivotDirArray, dirVal, priceVal, bar_index - lengthInput, MAX_PIVOTS)
+    if act == 2
+        array.push(pivotOscArray, oscVal)
+        if array.size(pivotOscArray) > MAX_PIVOTS
+            array.shift(pivotOscArray)
+    else if act == 1
+        array.set(pivotOscArray, array.size(pivotOscArray) - 1, oscVal)
+    act != 0
+
+// update the minor swing sequence used by the subdivision check
+doMinor(dirVal, priceVal) =>
+    addPivot(minorPriceArray, minorBarArray, minorDirArray, dirVal, priceVal, bar_index - minorLenInput, MAX_MINOR) != 0
+
+// number of minor swing turns strictly inside a bar span
+countInside(barsArr, spanStart, spanEnd) =>
+    int cnt = 0
+    sz = array.size(barsArr)
+    if sz > 0
+        for i = 0 to sz - 1
+            v = array.get(barsArr, i)
+            if v > spanStart and v < spanEnd
+                cnt += 1
+    cnt
+
+// remove every developing-count drawing
+clearDev() =>
+    if array.size(devLineArray) > 0
+        for devLine in devLineArray
+            line.delete(devLine)
+        array.clear(devLineArray)
+    if array.size(devLabelArray) > 0
+        for devLabel in devLabelArray
+            label.delete(devLabel)
+        array.clear(devLabelArray)
+
+// remove the drawings of the most recent completed count
+removeLastCount() =>
+    if array.size(countLineArray) >= 5
+        for i = 1 to 5
+            line.delete(array.pop(countLineArray))
+    if array.size(countLabelArray) >= 6
+        for i = 1 to 6
+            label.delete(array.pop(countLabelArray))
+
+// keep only the most recent completed counts
+trimCounts() =>
+    while array.size(countLineArray) > showLastInput * 5
+        line.delete(array.shift(countLineArray))
+    while array.size(countLabelArray) > showLastInput * 6
+        label.delete(array.shift(countLabelArray))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Swing Detection
+//---------------------------------------------------------------------------------------------------------------------{
+higherLen = lengthInput * trendMultInput
+
+oscSeries  = ta.rsi(close, momLenInput)
+majorPh    = ta.pivothigh(lengthInput, lengthInput)
+majorPl    = ta.pivotlow(lengthInput, lengthInput)
+minorPh    = ta.pivothigh(minorLenInput, minorLenInput)
+minorPl    = ta.pivotlow(minorLenInput, minorLenInput)
+higherPh   = ta.pivothigh(higherLen, higherLen)
+higherPl   = ta.pivotlow(higherLen, higherLen)
+oscAtMajor = oscSeries[lengthInput]
+recentLow  = ta.lowest(low, lengthInput + 1)
+recentHigh = ta.highest(high, lengthInput + 1)
+
+// larger-degree leg direction: last confirmed higher-degree pivot low -> leg up, pivot high -> leg down
+if not na(higherPh)
+    lastHigherDir := 1
+if not na(higherPl)
+    lastHigherDir := -1
+
+// minor swings feed the subdivision check only
+if subdivInput
+    if not na(minorPh)
+        doMinor(1, minorPh)
+    if not na(minorPl)
+        doMinor(-1, minorPl)
+
+// wave-degree swings, processed in alternation order when both confirm on the same bar
+sizePre    = array.size(pivotDirArray)
+lastDirPre = sizePre > 0 ? array.get(pivotDirArray, sizePre - 1) : 0
+
+bool pivotChanged = false
+if lastDirPre == 1
+    if not na(majorPl)
+        pivotChanged := doMajor(-1, majorPl, oscAtMajor) or pivotChanged
+    if not na(majorPh)
+        pivotChanged := doMajor(1, majorPh, oscAtMajor) or pivotChanged
+else
+    if not na(majorPh)
+        pivotChanged := doMajor(1, majorPh, oscAtMajor) or pivotChanged
+    if not na(majorPl)
+        pivotChanged := doMajor(-1, majorPl, oscAtMajor) or pivotChanged
+
+n = array.size(pivotPriceArray)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Wave Count Evaluation
+//---------------------------------------------------------------------------------------------------------------------{
+bool bullCompleteEvent   = false
+bool bearCompleteEvent   = false
+bool bullFifthEvent      = false
+bool bearFifthEvent      = false
+bool bullDivergenceEvent = false
+bool bearDivergenceEvent = false
+bool bullInvalidEvent    = false
+bool bearInvalidEvent    = false
+
+if pivotChanged and n >= 6
+    dirSign = array.get(pivotDirArray, n - 1)
+    p0 = array.get(pivotPriceArray, n - 6)
+    p1 = array.get(pivotPriceArray, n - 5)
+    p2 = array.get(pivotPriceArray, n - 4)
+    p3 = array.get(pivotPriceArray, n - 3)
+    p4 = array.get(pivotPriceArray, n - 2)
+    p5 = array.get(pivotPriceArray, n - 1)
+    b0 = array.get(pivotBarArray, n - 6)
+    b1 = array.get(pivotBarArray, n - 5)
+    b2 = array.get(pivotBarArray, n - 4)
+    b3 = array.get(pivotBarArray, n - 3)
+    b4 = array.get(pivotBarArray, n - 2)
+    b5 = array.get(pivotBarArray, n - 1)
+    osc3Val = array.get(pivotOscArray, n - 3)
+    osc5Val = array.get(pivotOscArray, n - 1)
+
+    // signed wave travels, positive when each wave behaves (actionary with, interruption against)
+    w1 = (p1 - p0) * dirSign
+    w2 = (p1 - p2) * dirSign
+    w3 = (p3 - p2) * dirSign
+    w4 = (p3 - p4) * dirSign
+    w5 = (p5 - p4) * dirSign
+
+    isReplacement = not na(lastCompletedStartBar) and b0 == lastCompletedStartBar and dirSign == lastCompletedDir
+
+    // five-swing progression sanity: three advancing waves separated by two interruptions
+    structureOk = w1 > 0 and w2 > 0 and w3 > 0 and w4 > 0 and w5 > 0 and (p2 - p0) * dirSign > 0 and (p3 - p1) * dirSign > 0 and (p4 - p0) * dirSign > 0
+
+    // hard rules: wave 2 held the start of wave 1 (in structureOk), wave 3 never the shortest actionary wave
+    ruleTwoOk = not (w3 < w1 and w3 < w5)
+
+    // form: wave 4 out of wave 1 territory -> impulse, overlapping and wedge shaped -> diagonal
+    hasOverlap = (p4 - p1) * dirSign <= 0
+    slopeOne   = (p3 - p1) / (b3 - b1)
+    gapEarly   = math.abs(p1 + slopeOne * (b2 - b1) - p2)
+    gapLate    = math.abs(p3 + slopeOne * (b4 - b3) - p4)
+    formOk     = not hasOverlap or gapLate < gapEarly
+
+    trendOk        = not trendFilterInput or lastHigherDir == 0 or lastHigherDir == -dirSign
+    regionOk       = isReplacement or na(lastCompletedEndBar) or b0 >= lastCompletedEndBar
+    notInvalidated = na(invalidatedStartBar) or b0 != invalidatedStartBar or dirSign != invalidatedDir
+
+    subdivOk = true
+    if subdivInput
+        subdivOk := countInside(minorBarArray, b0, b1) >= 4 and countInside(minorBarArray, b2, b3) >= 4 and countInside(minorBarArray, b4, b5) >= 4 and countInside(minorBarArray, b1, b2) >= 2 and countInside(minorBarArray, b3, b4) >= 2
+
+    countValid = structureOk and ruleTwoOk and formOk and trendOk and subdivOk and regionOk and notInvalidated
+
+    if countValid
+        // reads: extension, truncation, fifth-wave momentum divergence, ratio measurements
+        extWave       = w3 >= w1 and w3 >= w5 ? 3 : w1 >= w5 ? 1 : 5
+        isTruncated   = (p5 - p3) * dirSign < 0
+        hasDivergence = not isTruncated and not na(osc3Val) and not na(osc5Val) and (dirSign == 1 ? osc5Val < osc3Val : osc5Val > osc3Val)
+        r2     = w2 / w1
+        r3     = w3 / w1
+        r4     = w4 / w3
+        r5     = w5 / w1
+        r5Span = w5 / ((p3 - p0) * dirSign)
+        inBand2  = r2 >= RETRACE_LO and r2 <= RETRACE_HI
+        inBand4  = r4 >= RETRACE_LO and r4 <= RETRACE_HI
+        fitScore = (inBand2 ? 1 : 0) + (inBand4 ? 1 : 0) + (math.abs(r3 - WAVE3_RATIO) <= tolInput ? 1 : 0) + (math.abs(r5 - WAVE5_EQ) <= tolInput or math.abs(r5Span - WAVE5_ALT) <= tolInput ? 1 : 0)
+
+        countColor = dirSign == 1 ? bullColorInput : bearColorInput
+        if isReplacement
+            removeLastCount()
+
+        for i = 0 to 4
+            array.push(countLineArray, line.new(array.get(pivotBarArray, n - 6 + i), array.get(pivotPriceArray, n - 6 + i), array.get(pivotBarArray, n - 5 + i), array.get(pivotPriceArray, n - 5 + i), color = countColor, width = lineWidthInput))
+
+        tip1 = 'Wave 1 - travel ' + str.tostring(w1, format.mintick) + (extWave == 1 ? '. Extended wave (largest actionary travel).' : '.')
+        tip2 = 'Wave 2 - retraced ' + fmtRatio(r2) + ' of wave 1' + (inBand2 ? ' (inside the 0.382-0.618 band).' : '.') + ' Hard rule: held the start of wave 1.'
+        tip3 = 'Wave 3 - ' + fmtRatio(r3) + ' x wave 1' + (extWave == 3 ? '. Extended wave (largest actionary travel)' : '') + '. Hard rule: not the shortest actionary wave.'
+        tip4 = 'Wave 4 - retraced ' + fmtRatio(r4) + ' of wave 3' + (inBand4 ? ' (inside the 0.382-0.618 band).' : '.') + (hasOverlap ? ' Overlaps wave 1 territory (diagonal form).' : ' Holds outside wave 1 territory (impulse form).')
+        tip5 = 'Wave 5 - ' + fmtRatio(r5) + ' x wave 1, ' + fmtRatio(r5Span) + ' of the wave 1-3 span' + (extWave == 5 ? '. Extended wave' : '') + (isTruncated ? '. Truncated: stopped short of the wave 3 extreme' : '') + (hasDivergence ? '. Momentum divergence against wave 3' : '') + '.'
+        tipArray = array.from(tip1, tip2, tip3, tip4, tip5)
+
+        for i = 1 to 5
+            isHighPivot = (i % 2 == 1 ? dirSign : -dirSign) == 1
+            array.push(countLabelArray, label.new(array.get(pivotBarArray, n - 6 + i), array.get(pivotPriceArray, n - 6 + i), str.tostring(i), style = isHighPivot ? label.style_label_down : label.style_label_up, color = TRANSP, textcolor = countColor, size = labelSz, tooltip = array.get(tipArray, i - 1)))
+
+        formText = hasOverlap ? 'Diagonal' : 'Impulse'
+        sumText  = formText + (isTruncated ? '\nTruncated 5th' : '')
+        sumTip   = (dirSign == 1 ? 'Bullish' : 'Bearish') + ' motive wave - ' + (hasOverlap ? 'diagonal (waves 1 and 4 overlap, wedge shaped)' : 'impulse (wave 4 held out of wave 1 territory)') + '\nHard rules passed: wave 2 held the start of wave 1, wave 3 not the shortest actionary wave.' + '\nExtension: wave ' + str.tostring(extWave) + '\nW2 ' + fmtRatio(r2) + ' of W1 | W3 ' + fmtRatio(r3) + ' x W1 | W4 ' + fmtRatio(r4) + ' of W3 | W5 ' + fmtRatio(r5) + ' x W1 (' + fmtRatio(r5Span) + ' of W1-3)' + '\nRatio fit: ' + str.tostring(fitScore) + '/4 standard relationships' + (isTruncated ? '\nTruncated fifth - severe weakness, forceful reversals often follow.' : '') + (hasDivergence ? '\nFifth wave momentum divergence - the motive phase may be complete.' : '') + (hasOverlap ? '\nDiagonal read: leading at the start of a larger move, ending (exhaustion) at its end.' : '') + '\nExpectation: a corrective phase against the completed five wave move.'
+        array.push(countLabelArray, label.new(b5, p5, sumText, style = dirSign == 1 ? label.style_label_up : label.style_label_down, color = TRANSP, textcolor = countColor, size = labelSz, tooltip = sumTip))
+
+        trimCounts()
+
+        if not isReplacement
+            if dirSign == 1
+                bullCompleteEvent := true
+            else
+                bearCompleteEvent := true
+            lastCountDivAlerted := false
+        lastCompletedStartBar := b0
+        lastCompletedEndBar   := b5
+        lastCompletedDir      := dirSign
+        if hasDivergence and not lastCountDivAlerted
+            if dirSign == 1
+                bullDivergenceEvent := true
+            else
+                bearDivergenceEvent := true
+            lastCountDivAlerted := true
+    else if isReplacement
+        // a wave 5 extension broke the count (e.g. left wave 3 the shortest): discard and free the region for a recount
+        removeLastCount()
+        lastCompletedEndBar   := b0
+        lastCompletedStartBar := na
+        lastCompletedDir      := 0
+        if dirSign == 1
+            bullInvalidEvent := true
+        else
+            bearInvalidEvent := true
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Developing Count
+//---------------------------------------------------------------------------------------------------------------------{
+if pivotChanged
+    clearDev()
+    devActive := false
+    if n >= 5
+        devSign = -array.get(pivotDirArray, n - 1)
+        q0 = array.get(pivotPriceArray, n - 5)
+        q1 = array.get(pivotPriceArray, n - 4)
+        q2 = array.get(pivotPriceArray, n - 3)
+        q3 = array.get(pivotPriceArray, n - 2)
+        q4 = array.get(pivotPriceArray, n - 1)
+        c0 = array.get(pivotBarArray, n - 5)
+        c1 = array.get(pivotBarArray, n - 4)
+        c2 = array.get(pivotBarArray, n - 3)
+        c3 = array.get(pivotBarArray, n - 2)
+        c4 = array.get(pivotBarArray, n - 1)
+        v1 = (q1 - q0) * devSign
+        v2 = (q1 - q2) * devSign
+        v3 = (q3 - q2) * devSign
+        v4 = (q3 - q4) * devSign
+
+        devStructureOk    = v1 > 0 and v2 > 0 and v3 > 0 and v4 > 0 and (q2 - q0) * devSign > 0 and (q3 - q1) * devSign > 0 and (q4 - q0) * devSign > 0
+        devTrendOk        = not trendFilterInput or lastHigherDir == 0 or lastHigherDir == -devSign
+        devRegionOk       = na(lastCompletedEndBar) or c0 >= lastCompletedEndBar
+        devOriginOk       = devSign == 1 ? recentLow >= q0 : recentHigh <= q0
+        devNotInvalidated = na(invalidatedStartBar) or c0 != invalidatedStartBar or devSign != invalidatedDir
+        devSubdivOk       = true
+        if subdivInput
+            devSubdivOk := countInside(minorBarArray, c0, c1) >= 4 and countInside(minorBarArray, c2, c3) >= 4 and countInside(minorBarArray, c1, c2) >= 2 and countInside(minorBarArray, c3, c4) >= 2
+
+        if devStructureOk and devTrendOk and devRegionOk and devOriginOk and devNotInvalidated and devSubdivOk
+            devActive     := true
+            devDir        := devSign
+            devStartPrice := q0
+            devStartBar   := c0
+            if na(lastDevAlertBar) or lastDevAlertBar != c0 or lastDevAlertDir != devSign
+                if devSign == 1
+                    bullFifthEvent := true
+                else
+                    bearFifthEvent := true
+                lastDevAlertBar := c0
+                lastDevAlertDir := devSign
+            if showDevInput
+                devColor      = devSign == 1 ? bullColorInput : bearColorInput
+                devHasOverlap = (q4 - q1) * devSign <= 0
+                rD2 = v2 / v1
+                rD3 = v3 / v1
+                rD4 = v4 / v3
+                devTip1 = 'Wave 1 - travel ' + str.tostring(v1, format.mintick) + '.'
+                devTip2 = 'Wave 2 - retraced ' + fmtRatio(rD2) + ' of wave 1' + (rD2 >= RETRACE_LO and rD2 <= RETRACE_HI ? ' (inside the 0.382-0.618 band).' : '.')
+                devTip3 = 'Wave 3 - ' + fmtRatio(rD3) + ' x wave 1.'
+                devTip4 = 'Wave 4 - retraced ' + fmtRatio(rD4) + ' of wave 3.' + (devHasOverlap ? ' Overlaps wave 1: impulse ruled out, diagonal form still possible.' : ' No overlap with wave 1: impulse form intact.')
+                devTipArray = array.from(devTip1, devTip2, devTip3, devTip4)
+                for i = 0 to 3
+                    array.push(devLineArray, line.new(array.get(pivotBarArray, n - 5 + i), array.get(pivotPriceArray, n - 5 + i), array.get(pivotBarArray, n - 4 + i), array.get(pivotPriceArray, n - 4 + i), color = devColor, style = line.style_dotted, width = math.max(1, lineWidthInput - 1)))
+                for i = 1 to 4
+                    isHighPivotDev = (i % 2 == 1 ? devSign : -devSign) == 1
+                    array.push(devLabelArray, label.new(array.get(pivotBarArray, n - 5 + i), array.get(pivotPriceArray, n - 5 + i), str.tostring(i), style = isHighPivotDev ? label.style_label_down : label.style_label_up, color = TRANSP, textcolor = devColor, size = labelSz, tooltip = array.get(devTipArray, i - 1)))
+                array.push(devLineArray, line.new(c0, q0, bar_index, q0, color = invColorInput, style = line.style_dashed, width = 1))
+                array.push(devLineArray, line.new(c4, q4, bar_index, close, color = devColor, style = line.style_dotted, width = math.max(1, lineWidthInput - 1)))
+                array.push(devLabelArray, label.new(bar_index, q0, 'Invalidation', style = label.style_label_left, color = TRANSP, textcolor = invColorInput, size = size.tiny, tooltip = 'Hard rule anchor: a retrace past the start of wave 1 voids the developing count and forces a recount.'))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Invalidation Monitor & Updates
+//---------------------------------------------------------------------------------------------------------------------{
+if devActive
+    breachedOrigin = devDir == 1 ? low < devStartPrice : high > devStartPrice
+    if breachedOrigin
+        clearDev()
+        invalidatedStartBar := devStartBar
+        invalidatedDir      := devDir
+        if devDir == 1
+            bullInvalidEvent := true
+        else
+            bearInvalidEvent := true
+        devActive := false
+
+if devActive and array.size(devLineArray) >= 2
+    line.set_x2(array.get(devLineArray, array.size(devLineArray) - 2), bar_index)
+    line.set_xy2(array.get(devLineArray, array.size(devLineArray) - 1), bar_index, close)
+    label.set_x(array.get(devLabelArray, array.size(devLabelArray) - 1), bar_index)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(bullCompleteEvent, 'Bullish Motive Wave Completed', 'A bullish five wave motive structure has completed and passed the Elliott hard rules. The chart label shows the impulse or diagonal form; a corrective phase against the move is now expected.')
+alertcondition(bearCompleteEvent, 'Bearish Motive Wave Completed', 'A bearish five wave motive structure has completed and passed the Elliott hard rules. The chart label shows the impulse or diagonal form; a corrective phase against the move is now expected.')
+alertcondition(bullFifthEvent, 'Bullish Fifth Wave Underway', 'Waves 1 to 4 of a bullish motive candidate are in place and the fifth wave is presumed underway. Invalidation sits at the start of wave 1.')
+alertcondition(bearFifthEvent, 'Bearish Fifth Wave Underway', 'Waves 1 to 4 of a bearish motive candidate are in place and the fifth wave is presumed underway. Invalidation sits at the start of wave 1.')
+alertcondition(bullDivergenceEvent, 'Fifth Wave Divergence (Bullish Count)', 'The bullish motive wave completed with wave 5 reaching a new extreme on weaker momentum than wave 3 - an exhaustion cue suggesting the motive phase may be over.')
+alertcondition(bearDivergenceEvent, 'Fifth Wave Divergence (Bearish Count)', 'The bearish motive wave completed with wave 5 reaching a new extreme on weaker momentum than wave 3 - an exhaustion cue suggesting the motive phase may be over.')
+alertcondition(bullInvalidEvent, 'Bullish Count Invalidated', 'The bullish count was discarded per the hard rules: price retraced past the start of wave 1, or a wave 5 extension left wave 3 as the shortest actionary wave.')
+alertcondition(bearInvalidEvent, 'Bearish Count Invalidated', 'The bearish count was discarded per the hard rules: price retraced past the start of wave 1, or a wave 5 extension left wave 3 as the shortest actionary wave.')
+
+//---------------------------------------------------------------------------------------------------------------------}

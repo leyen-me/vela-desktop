@@ -1,0 +1,136 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("JMA", shorttitle = "JMA", overlay = true, format = format.price)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+PHASE_SCALE       = 100   // published phase input range is -100..+100
+PHASE_RATIO_BASE  = 1.5   // published neutral phase ratio (phase 0 maps to a ratio of 1.5)
+PHASE_RATIO_MIN   = 0.5   // published lower clamp of the phase ratio (phase -100)
+PHASE_RATIO_MAX   = 2.5   // published upper clamp of the phase ratio (phase +100)
+BULL_COLOR        = #089981
+BEAR_COLOR        = #f23645
+NEUTRAL_COLOR     = #787b86
+COMPARE_COLOR     = #787b86
+FILL_PRICE_TRANSP = 60    // gradient transparency at the price end of the fill
+FILL_JMA_TRANSP   = 100   // gradient transparency at the JMA end of the fill
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+srcInput     = input.source(close, "Source", group = "Settings",
+     tooltip = "Price series the average smooths. The close is the usual choice; feeding another series here also covers the smoothing-core use — running an oscillator such as RSI, or a volume series, through JMA smoothing before any signal logic runs.")
+
+lengthInput  = input.int(7, "Length", minval = 1, group = "Settings",
+     tooltip = "Smoothing length in bars. It maps loosely to the lookback you would use for any moving average — longer holds the line smoother and slower, shorter tracks price more closely. 7 is the customary JMA default; choose it for your timeframe.")
+
+phaseInput   = input.float(0, "Phase", minval = -100, maxval = 100, step = 5, group = "Settings",
+     tooltip = "Repositions the lag-overshoot trade-off (-100 to +100). Higher phase lets the average turn earlier at the cost of overshoot at reversals; lower phase damps overshoot at the cost of extra lag. 0 is the neutral starting point — no setting removes the trade-off, it only chooses where to sit on it.")
+
+powerInput   = input.float(2, "Power", minval = 1, maxval = 10, step = 0.5, group = "Settings",
+     tooltip = "Governs how aggressively the filter adapts to price. Higher values keep the average hugging price through fast directional moves (earlier turns, less smoothing); lower values hold it flatter through congestion (smoother, more lag). 2 is the customary default.")
+
+compareInput = input.string("None", "Comparison Average", options = ["None", "SMA", "EMA"], group = "Settings",
+     tooltip = "Overlays a standard average of the same length and source to calibrate against: the JMA should turn earlier at real swings while ignoring more of the noise between them.")
+
+trendColorInput   = input.bool(true, "Slope Trend Coloring", group = "Style",
+     tooltip = "Colors the JMA by its slope — bullish while the line is rising, bearish while it is falling. The line is designed to hold nearly level through congestion, so a horizontal stretch is a usable no-trend flag whatever its color. Disable to draw the line in the neutral color.")
+
+bullColorInput    = input.color(BULL_COLOR, "Bullish", inline = "direction", group = "Style",
+     tooltip = "Bullish color, used while the JMA slope is rising and for bullish crossings/fill.")
+
+bearColorInput    = input.color(BEAR_COLOR, "Bearish", inline = "direction", group = "Style",
+     tooltip = "Bearish color, used while the JMA slope is falling and for bearish crossings/fill.")
+
+neutralColorInput = input.color(NEUTRAL_COLOR, "Neutral", group = "Style",
+     tooltip = "Line color used when slope trend coloring is disabled, or when the slope is flat.")
+
+compColorInput    = input.color(COMPARE_COLOR, "Comparison", group = "Style",
+     tooltip = "Color of the optional comparison average of the same length.")
+
+showFillInput     = input.bool(true, "Price / JMA Gradient Fill", group = "Style",
+     tooltip = "Fills the area between the source and the JMA with a vertical gradient — bullish while price holds above the line, bearish while below — fading to fully transparent at the JMA. The fill width visualizes extension: a sharp move away from a still-flat JMA reads as stretch, not confirmed trend.")
+
+showSignalsInput  = input.bool(false, "Price Crossing Markers", group = "Style",
+     tooltip = "Displays small triangle markers when the source crosses over or under the JMA. Off by default to keep the chart clean — the crossing alerts work regardless.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Jurik Research licensed the original JMA algorithm and never published it, so any public JMA is an approximation
+// of the original built to match its documented behavior. This is the standard published three-stage approximation
+// with the published length/phase/power parameter mapping:
+//   beta       = 0.45*(length - 1) / (0.45*(length - 1) + 2)
+//   phaseRatio = phase/100 + 1.5, clamped to [0.5, 2.5]
+//   alpha      = beta^power
+//   e0  = (1 - alpha)*price + alpha*e0[1]                               — stage 1: adaptive EMA tracking price
+//   e1  = (price - e0)*(1 - beta) + beta*e1[1]                          — stage 2: smoothed residual of stage 1
+//   e2  = (e0 + phaseRatio*e1 - jma[1])*(1 - alpha)^2 + alpha^2*e2[1]   — stage 3: phase-shifted adaptive correction
+//   jma = jma[1] + e2
+// Each stage is na-seeded with its own input so the line starts on price.
+jurikMovingAverage(float src, simple int length, simple float phase, simple float power) =>
+    betaNum    = 0.45 * (length - 1) // published length-to-beta mapping of the approximation
+    beta       = betaNum / (betaNum + 2)
+    phaseRatio = math.min(math.max(phase / PHASE_SCALE + PHASE_RATIO_BASE, PHASE_RATIO_MIN), PHASE_RATIO_MAX)
+    alpha      = math.pow(beta, power)
+    float e0  = na
+    float e1  = na
+    float e2  = na
+    float jma = na
+    prevJma = nz(jma[1], src)
+    e0  := (1 - alpha) * src + alpha * nz(e0[1], src)
+    e1  := (src - e0) * (1 - beta) + beta * nz(e1[1])
+    e2  := (e0 + phaseRatio * e1 - prevJma) * math.pow(1 - alpha, 2) + math.pow(alpha, 2) * nz(e2[1])
+    jma := prevJma + e2
+    jma
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+jma = jurikMovingAverage(srcInput, lengthInput, phaseInput, powerInput)
+
+// Standard averages of the same length for calibration — both run on every bar so their histories stay consistent
+smaValue     = ta.sma(srcInput, lengthInput)
+emaValue     = ta.ema(srcInput, lengthInput)
+comparisonMa = compareInput == "SMA" ? smaValue : compareInput == "EMA" ? emaValue : na
+
+// Slope of the line — the trend read of the smoother, and the event most systems key on when it turns
+slope = jma - nz(jma[1], jma)
+
+slopeTurnUp   = slope > 0 and nz(slope[1]) <= 0
+slopeTurnDown = slope < 0 and nz(slope[1]) >= 0
+
+// Price crossings — the standard moving average crossover grammar with a smoother, lower-lag line
+crossUp   = ta.crossover(srcInput, jma)
+crossDown = ta.crossunder(srcInput, jma)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+jmaColor = trendColorInput ? (slope > 0 ? bullColorInput : slope < 0 ? bearColorInput : neutralColorInput) : neutralColorInput
+
+priceAbove      = srcInput > jma
+fillTopColor    = showFillInput ? (priceAbove ? color.new(bullColorInput, FILL_PRICE_TRANSP) : color.new(bearColorInput, FILL_JMA_TRANSP)) : na
+fillBottomColor = showFillInput ? (priceAbove ? color.new(bullColorInput, FILL_JMA_TRANSP) : color.new(bearColorInput, FILL_PRICE_TRANSP)) : na
+
+plot(comparisonMa, "Comparison Average", color = compColorInput, linewidth = 1)
+
+srcPlotId = plot(srcInput, "Source", color = na, editable = false, display = display.none)
+jmaPlotId = plot(jma, "JMA", color = jmaColor, linewidth = 2)
+
+fill(srcPlotId, jmaPlotId, top_value = math.max(srcInput, jma), bottom_value = math.min(srcInput, jma), top_color = fillTopColor, bottom_color = fillBottomColor, title = "Price / JMA Gradient Fill")
+
+plotshape(showSignalsInput and crossUp, "Bullish Cross", shape.triangleup, location.belowbar, color = bullColorInput, size = size.tiny)
+plotshape(showSignalsInput and crossDown, "Bearish Cross", shape.triangledown, location.abovebar, color = bearColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(crossUp, "Bullish Price Cross", "Price crossed above the JMA on {{ticker}} ({{interval}})")
+alertcondition(crossDown, "Bearish Price Cross", "Price crossed below the JMA on {{ticker}} ({{interval}})")
+alertcondition(slopeTurnUp, "JMA Slope Up", "JMA slope turned upward on {{ticker}} ({{interval}})")
+alertcondition(slopeTurnDown, "JMA Slope Down", "JMA slope turned downward on {{ticker}} ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

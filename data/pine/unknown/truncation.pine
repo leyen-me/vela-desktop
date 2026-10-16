@@ -1,0 +1,462 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Truncation", "Truncation", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 100)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+int MAX_MAJOR_PIVOTS    = 60
+int MAX_MINOR_PIVOTS    = 500
+int MIN_INTERIOR_SWINGS = 4
+
+string DETECTION_GROUP     = 'Impulse Detection'
+string CORROBORATION_GROUP = 'Exhaustion Corroboration'
+string STYLE_GROUP         = 'Style'
+
+color TRANSPARENT_COLOR = #00000000
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Inputs
+//---------------------------------------------------------------------------------------------------------------------{
+
+majorLengthInput = input.int(8, 'Swing Length', minval = 2, maxval = 50, group = DETECTION_GROUP, tooltip = 'Pivot length used to detect the swing points forming waves 1 through 5. Larger values search for truncations at a higher degree. Each swing point, and therefore each detection, confirms this many bars after its extreme.')
+
+minorLengthInput = input.int(3, 'Sub-Wave Length', minval = 1, group = DETECTION_GROUP, tooltip = 'Smaller pivot length used to count the sub-swings inside wave 5. Values equal to or above the swing length are clamped below it.')
+
+requireSubdivisionInput = input.bool(true, 'Require Five-Wave Subdivision In Wave 5', group = DETECTION_GROUP, tooltip = 'Requires the move after wave 4 to subdivide into its own five-wave structure: at least four interior sub-swings whose sub-highs and sub-lows both progress in the wave 5 direction. This internal count is what separates a truncated fifth from a correction already underway. Disable only on charts too fast for sub-swings to register.')
+
+requireExtendedInput = input.bool(false, 'Extended Wave 3 Filter', inline = 'ext3', group = DETECTION_GROUP, tooltip = 'Only accepts truncations that follow an extended third wave, the context in which the literature expects a failed fifth. Wave 3 must reach at least the multiple of wave 1 set beside the toggle.')
+extendedRatioInput   = input.float(1.618, '', inline = 'ext3', minval = 1, step = 0.01, group = DETECTION_GROUP, tooltip = 'Minimum length of wave 3 as a multiple of wave 1 for the extended wave 3 filter.')
+
+momentumLengthInput = input.int(14, 'Momentum Length', minval = 2, group = CORROBORATION_GROUP, tooltip = 'RSI length used to compare momentum at the wave 5 extreme against the wave 3 extreme when looking for exhaustion.')
+
+requireDivergenceInput = input.bool(false, 'Require Momentum Divergence', group = CORROBORATION_GROUP, tooltip = 'Only accepts truncations whose wave 5 extreme prints weaker momentum than the wave 3 extreme. When disabled, divergence is still reported in the pattern tooltip as corroborating evidence.')
+
+requireVolumeInput = input.bool(false, 'Require Fading Volume', group = CORROBORATION_GROUP, tooltip = 'Only accepts truncations where the average volume of wave 5 is below that of wave 3. Ignored when the symbol provides no volume; when disabled, the volume comparison is still reported in the pattern tooltip.')
+
+bullColorInput = input.color(#089981, 'Bullish Truncations', group = STYLE_GROUP, inline = 'colors')
+bearColorInput = input.color(#f23645, 'Bearish Truncations', group = STYLE_GROUP, inline = 'colors')
+
+showImpulseInput = input.bool(true, 'Impulse Lines', group = STYLE_GROUP, tooltip = 'Draws the five zigzag legs of the detected impulse.')
+
+showWaveLabelsInput = input.bool(true, 'Wave Labels', group = STYLE_GROUP, tooltip = 'Numbers waves 1 to 4 at their swing points. The truncated wave 5 carries the pattern label itself.')
+
+showZoneInput = input.bool(true, 'Shortfall Zone', group = STYLE_GROUP, tooltip = 'Shades the gap between the wave 3 extreme and the truncated wave 5 extreme, the ground the failed fifth never covered.')
+
+showLevelsInput = input.bool(true, 'Confirmation & Invalidation Levels', group = STYLE_GROUP, tooltip = 'Extends the wave 4 extreme (confirmation) and the wave 3 extreme (invalidation) to the right while the truncation awaits resolution.')
+
+showSwingsInput = input.bool(true, 'Show Swings', group = STYLE_GROUP, inline = 'swings', tooltip = 'Faint zigzag joining the detected swing points, useful for auditing the count behind each pattern.')
+swingColorInput = input.color(color.new(#787b86, 50), '', group = STYLE_GROUP, inline = 'swings')
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+// registers a confirmed pivot into a zigzag, returns 0 = no change, 1 = new swing point, 2 = last swing point extended
+f_addPivot(array<float> priceArray, array<int> barArray, array<int> dirArray, array<float> momArray, array<float> cumVolArray, float pivotPrice, int pivotBar, int pivotDir, float pivotMom, float pivotCumVol, int maxSize) =>
+    int changeType = 0
+    int n = array.size(priceArray)
+    if n == 0
+        array.push(priceArray, pivotPrice)
+        array.push(barArray, pivotBar)
+        array.push(dirArray, pivotDir)
+        array.push(momArray, pivotMom)
+        array.push(cumVolArray, pivotCumVol)
+        changeType := 1
+    else
+        if pivotDir == array.get(dirArray, n - 1)
+            float lastPrice = array.get(priceArray, n - 1)
+            if (pivotDir == 1 and pivotPrice >= lastPrice) or (pivotDir == -1 and pivotPrice <= lastPrice)
+                array.set(priceArray, n - 1, pivotPrice)
+                array.set(barArray, n - 1, pivotBar)
+                array.set(momArray, n - 1, pivotMom)
+                array.set(cumVolArray, n - 1, pivotCumVol)
+                changeType := 2
+        else
+            array.push(priceArray, pivotPrice)
+            array.push(barArray, pivotBar)
+            array.push(dirArray, pivotDir)
+            array.push(momArray, pivotMom)
+            array.push(cumVolArray, pivotCumVol)
+            changeType := 1
+            if array.size(priceArray) > maxSize
+                array.shift(priceArray)
+                array.shift(barArray)
+                array.shift(dirArray)
+                array.shift(momArray)
+                array.shift(cumVolArray)
+    changeType
+
+// examines the sub-wave pivots strictly inside a wave: how many there are, and whether their
+// sub-highs and sub-lows both progress in the wave direction the way a five-wave subdivision does
+f_interiorStructure(array<float> priceArray, array<int> barArray, array<int> dirArray, int startBar, int endBar, int waveDir) =>
+    int interiorCount = 0
+    bool progressing = true
+    float lastSubHigh = na
+    float lastSubLow  = na
+    int n = array.size(barArray)
+    if n > 0
+        for i = 0 to n - 1
+            int subBar = array.get(barArray, i)
+            if subBar >= endBar
+                break
+            if subBar > startBar
+                interiorCount += 1
+                float subPrice = array.get(priceArray, i)
+                if array.get(dirArray, i) == 1
+                    if not na(lastSubHigh) and (waveDir == 1 ? subPrice <= lastSubHigh : subPrice >= lastSubHigh)
+                        progressing := false
+                    lastSubHigh := subPrice
+                else
+                    if not na(lastSubLow) and (waveDir == 1 ? subPrice <= lastSubLow : subPrice >= lastSubLow)
+                        progressing := false
+                    lastSubLow := subPrice
+    [interiorCount, progressing]
+
+// draws or extends the faint zigzag segment joining the two most recent swing points
+f_swingSegment(array<float> priceArray, array<int> barArray, int changeType, line previousSegment) =>
+    line segment = previousSegment
+    if showSwingsInput
+        int n = array.size(priceArray)
+        if changeType == 1 and n >= 2
+            segment := line.new(array.get(barArray, n - 2), array.get(priceArray, n - 2), array.get(barArray, n - 1), array.get(priceArray, n - 1), color = swingColorInput, style = line.style_dotted)
+        else if changeType == 2 and not na(previousSegment)
+            line.set_xy2(previousSegment, array.get(barArray, n - 1), array.get(priceArray, n - 1))
+    segment
+
+// deletes every pending drawing held in the candidate arrays
+f_deleteDrawings(array<line> lineArray, array<label> labelArray) =>
+    int lineCount = array.size(lineArray)
+    if lineCount > 0
+        for i = 0 to lineCount - 1
+            line.delete(array.get(lineArray, i))
+    array.clear(lineArray)
+    int labelCount = array.size(labelArray)
+    if labelCount > 0
+        for i = 0 to labelCount - 1
+            label.delete(array.get(labelArray, i))
+    array.clear(labelArray)
+
+// builds the pattern tooltip, ending with 'Status: ' so the caller can append the current state
+f_tooltip(int patternDir, float wave3Price, float wave4Price, float wave5Price, int interiorCount, bool interiorProgressing, bool momDiverging, bool volumeFading, bool volumeKnown) =>
+    float rangeSpan = math.abs(wave3Price - wave4Price)
+    string shortfallText = rangeSpan > 0 ? str.tostring(100 * math.abs(wave3Price - wave5Price) / rangeSpan, '#.#') + '% of the wave 4 to wave 3 range' : 'n/a'
+    string tooltipText = patternDir == 1 ? 'Truncated 5th at a top, wave 5 high below the wave 3 high' : 'Truncated 5th at a bottom, wave 5 low above the wave 3 low'
+    tooltipText += '\nShortfall: ' + shortfallText
+    tooltipText += '\nWave 5 interior sub-swings: ' + str.tostring(interiorCount) + (interiorCount > 0 ? interiorProgressing ? ', progressing' : ', overlapping' : '')
+    tooltipText += '\nMomentum divergence vs wave 3: ' + (momDiverging ? 'present' : 'absent')
+    tooltipText += '\nWave 5 volume vs wave 3: ' + (volumeKnown ? (volumeFading ? 'fading' : 'not fading') : 'unavailable')
+    tooltipText += '\nConfirmation, wave 4 extreme: ' + str.tostring(wave4Price, format.mintick)
+    tooltipText += '\nInvalidation, wave 3 extreme: ' + str.tostring(wave3Price, format.mintick)
+    tooltipText + '\nStatus: '
+
+// recolors a resolved pattern to its full strength colors and freezes its live levels
+f_solidify(array<line> lineArray, array<label> labelArray, box gapBox, line confLine, line invLine, label mainLabel, color fullColor, string tooltipBase) =>
+    int lineCount = array.size(lineArray)
+    if lineCount > 0
+        for i = 0 to lineCount - 1
+            line.set_color(array.get(lineArray, i), fullColor)
+    int labelCount = array.size(labelArray)
+    if labelCount > 0
+        for i = 0 to labelCount - 1
+            label.set_textcolor(array.get(labelArray, i), fullColor)
+    if not na(gapBox)
+        box.set_border_color(gapBox, color.new(fullColor, 25))
+        box.set_bgcolor(gapBox, color.new(fullColor, 86))
+    if not na(confLine)
+        line.set_color(confLine, fullColor)
+        line.set_x2(confLine, bar_index)
+    if not na(invLine)
+        line.set_color(invLine, fullColor)
+        line.set_x2(invLine, bar_index)
+    if not na(mainLabel)
+        label.set_textcolor(mainLabel, fullColor)
+        label.set_tooltip(mainLabel, tooltipBase + 'confirmed, price reversed through the wave 4 extreme')
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Momentum & Volume Series
+//---------------------------------------------------------------------------------------------------------------------{
+
+float momValue = ta.rsi(close, momentumLengthInput)
+
+var float cumVolValue = 0.0
+cumVolValue += nz(volume)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Candidate State & Resolution
+//---------------------------------------------------------------------------------------------------------------------{
+
+var int    candDir         = 0
+var int    candB4          = -1
+var float  candP3          = na
+var float  candP4          = na
+var color  candColor       = na
+var string candTooltipBase = na
+
+var array<line>  candLineArray  = array.new<line>()
+var array<label> candLabelArray = array.new<label>()
+var box   candGapBox    = na
+var line  candConfLine  = na
+var line  candInvLine   = na
+var label candMainLabel = na
+
+var int lastDoneDir = 0
+var int lastDoneB4  = -1
+
+bool bearishDetectedAlert  = false
+bool bullishDetectedAlert  = false
+bool bearishConfirmedAlert = false
+bool bullishConfirmedAlert = false
+bool bearishRefutedAlert   = false
+bool bullishRefutedAlert   = false
+
+// a pending truncation resolves on price action, a new extreme beyond wave 3 refutes it,
+// a close back through the wave 4 extreme confirms the reversal
+if candDir != 0
+    bool refuted   = candDir == 1 ? high > candP3 : low < candP3
+    bool confirmed = not refuted and (candDir == 1 ? close < candP4 : close > candP4)
+    if refuted
+        f_deleteDrawings(candLineArray, candLabelArray)
+        if not na(candGapBox)
+            box.delete(candGapBox)
+        if not na(candConfLine)
+            line.delete(candConfLine)
+        if not na(candInvLine)
+            line.delete(candInvLine)
+        if not na(candMainLabel)
+            label.delete(candMainLabel)
+        candGapBox    := na
+        candConfLine  := na
+        candInvLine   := na
+        candMainLabel := na
+        if candDir == 1
+            bearishRefutedAlert := true
+        else
+            bullishRefutedAlert := true
+        candDir := 0
+        candB4  := -1
+    else if confirmed
+        f_solidify(candLineArray, candLabelArray, candGapBox, candConfLine, candInvLine, candMainLabel, candColor, candTooltipBase)
+        if candDir == 1
+            bearishConfirmedAlert := true
+        else
+            bullishConfirmedAlert := true
+        lastDoneDir := candDir
+        lastDoneB4  := candB4
+        array.clear(candLineArray)
+        array.clear(candLabelArray)
+        candGapBox    := na
+        candConfLine  := na
+        candInvLine   := na
+        candMainLabel := na
+        candDir := 0
+        candB4  := -1
+    else
+        if not na(candConfLine)
+            line.set_x2(candConfLine, bar_index)
+        if not na(candInvLine)
+            line.set_x2(candInvLine, bar_index)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Swing Detection
+//---------------------------------------------------------------------------------------------------------------------{
+
+int minorLengthEff = math.max(1, math.min(minorLengthInput, majorLengthInput - 1))
+
+var array<float> majorPriceArray  = array.new<float>()
+var array<int>   majorBarArray    = array.new<int>()
+var array<int>   majorDirArray    = array.new<int>()
+var array<float> majorMomArray    = array.new<float>()
+var array<float> majorCumVolArray = array.new<float>()
+
+var array<float> minorPriceArray  = array.new<float>()
+var array<int>   minorBarArray    = array.new<int>()
+var array<int>   minorDirArray    = array.new<int>()
+var array<float> minorMomArray    = array.new<float>()
+var array<float> minorCumVolArray = array.new<float>()
+
+var line lastSwingSegment = na
+
+float majorPivotHigh = ta.pivothigh(majorLengthInput, majorLengthInput)
+float majorPivotLow  = ta.pivotlow(majorLengthInput, majorLengthInput)
+float minorPivotHigh = ta.pivothigh(minorLengthEff, minorLengthEff)
+float minorPivotLow  = ta.pivotlow(minorLengthEff, minorLengthEff)
+
+if not na(minorPivotHigh)
+    f_addPivot(minorPriceArray, minorBarArray, minorDirArray, minorMomArray, minorCumVolArray, minorPivotHigh, bar_index - minorLengthEff, 1, float(na), 0.0, MAX_MINOR_PIVOTS)
+if not na(minorPivotLow)
+    f_addPivot(minorPriceArray, minorBarArray, minorDirArray, minorMomArray, minorCumVolArray, minorPivotLow, bar_index - minorLengthEff, -1, float(na), 0.0, MAX_MINOR_PIVOTS)
+
+int majorChange = 0
+if not na(majorPivotHigh)
+    int changeType = f_addPivot(majorPriceArray, majorBarArray, majorDirArray, majorMomArray, majorCumVolArray, majorPivotHigh, bar_index - majorLengthInput, 1, momValue[majorLengthInput], cumVolValue[majorLengthInput], MAX_MAJOR_PIVOTS)
+    if changeType != 0
+        majorChange := changeType
+        lastSwingSegment := f_swingSegment(majorPriceArray, majorBarArray, changeType, lastSwingSegment)
+if not na(majorPivotLow)
+    int changeType = f_addPivot(majorPriceArray, majorBarArray, majorDirArray, majorMomArray, majorCumVolArray, majorPivotLow, bar_index - majorLengthInput, -1, momValue[majorLengthInput], cumVolValue[majorLengthInput], MAX_MAJOR_PIVOTS)
+    if changeType != 0
+        majorChange := changeType
+        lastSwingSegment := f_swingSegment(majorPriceArray, majorBarArray, changeType, lastSwingSegment)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Truncation Detection
+//---------------------------------------------------------------------------------------------------------------------{
+
+if majorChange != 0 and array.size(majorPriceArray) >= 6
+    int n = array.size(majorPriceArray)
+    float v0 = array.get(majorPriceArray, n - 6)
+    float v1 = array.get(majorPriceArray, n - 5)
+    float v2 = array.get(majorPriceArray, n - 4)
+    float v3 = array.get(majorPriceArray, n - 3)
+    float v4 = array.get(majorPriceArray, n - 2)
+    float v5 = array.get(majorPriceArray, n - 1)
+    int x0 = array.get(majorBarArray, n - 6)
+    int x1 = array.get(majorBarArray, n - 5)
+    int x2 = array.get(majorBarArray, n - 4)
+    int x3 = array.get(majorBarArray, n - 3)
+    int x4 = array.get(majorBarArray, n - 2)
+    int x5 = array.get(majorBarArray, n - 1)
+    int d5 = array.get(majorDirArray, n - 1)
+    float m3 = array.get(majorMomArray, n - 3)
+    float m5 = array.get(majorMomArray, n - 1)
+    float cv2 = array.get(majorCumVolArray, n - 4)
+    float cv3 = array.get(majorCumVolArray, n - 3)
+    float cv4 = array.get(majorCumVolArray, n - 2)
+    float cv5 = array.get(majorCumVolArray, n - 1)
+
+    float wave1Length = math.abs(v1 - v0)
+    float wave3Length = math.abs(v3 - v2)
+    float wave5Length = math.abs(v5 - v4)
+
+    // hard rules through wave 4: wave 2 holds above the impulse origin, wave 3 makes trend progress,
+    // wave 4 stays out of wave 1 territory, wave 3 is never the shortest actionary wave
+    bool wave3NotShortest = not (wave3Length < wave1Length and wave3Length < wave5Length)
+    bool hardRulesUp = v1 > v0 and v2 > v0 and v2 < v1 and v3 > v1 and v4 > v1 and v4 < v3 and wave3NotShortest
+    bool hardRulesDn = v1 < v0 and v2 < v0 and v2 > v1 and v3 < v1 and v4 < v1 and v4 > v3 and wave3NotShortest
+
+    // the truncation itself: a completed fifth that stops short of the wave 3 extreme
+    bool truncatedUp = d5 == 1 and hardRulesUp and v5 > v4 and v5 < v3
+    bool truncatedDn = d5 == -1 and hardRulesDn and v5 < v4 and v5 > v3
+
+    // optional context and corroboration
+    bool extended3 = wave1Length > 0 and wave3Length >= extendedRatioInput * wave1Length
+    [interiorCnt, interiorProgressing] = f_interiorStructure(minorPriceArray, minorBarArray, minorDirArray, x4, x5, d5)
+    bool interiorOk = interiorCnt >= MIN_INTERIOR_SWINGS and interiorProgressing
+    bool momDiverging = not na(m3) and not na(m5) and (d5 == 1 ? m5 < m3 : m5 > m3)
+    float avgVol3 = x3 > x2 ? (cv3 - cv2) / (x3 - x2) : na
+    float avgVol5 = x5 > x4 ? (cv5 - cv4) / (x5 - x4) : na
+    bool volumeKnown  = not na(avgVol3) and not na(avgVol5) and avgVol3 > 0
+    bool volumeFading = volumeKnown and avgVol5 < avgVol3
+
+    bool filtersOk = (not requireSubdivisionInput or interiorOk) and (not requireExtendedInput or extended3) and (not requireDivergenceInput or momDiverging) and (not requireVolumeInput or not volumeKnown or volumeFading)
+
+    if (truncatedUp or truncatedDn) and filtersOk
+        int mDir = truncatedUp ? 1 : -1
+        bool alreadyResolved = lastDoneDir == mDir and lastDoneB4 == x4
+        if not alreadyResolved
+            // replay the bars since the wave 5 extreme, the pattern may already be refuted or confirmed
+            // by the time the swing point confirms
+            bool preRefuted   = false
+            bool preConfirmed = false
+            if bar_index > x5
+                for testBar = x5 + 1 to bar_index
+                    int offset = bar_index - testBar
+                    bool refutesNow  = mDir == 1 ? high[offset] > v3 : low[offset] < v3
+                    bool confirmsNow = mDir == 1 ? close[offset] < v4 : close[offset] > v4
+                    if refutesNow
+                        preRefuted := true
+                        break
+                    if confirmsNow
+                        preConfirmed := true
+                        break
+            if not preRefuted
+                bool sameCandidate = candDir == mDir and candB4 == x4
+
+                // clear any previous pending drawings, the pattern is rebuilt or superseded
+                f_deleteDrawings(candLineArray, candLabelArray)
+                if not na(candGapBox)
+                    box.delete(candGapBox)
+                if not na(candConfLine)
+                    line.delete(candConfLine)
+                if not na(candInvLine)
+                    line.delete(candInvLine)
+                if not na(candMainLabel)
+                    label.delete(candMainLabel)
+                candGapBox    := na
+                candConfLine  := na
+                candInvLine   := na
+                candMainLabel := na
+
+                candDir         := mDir
+                candB4          := x4
+                candP3          := v3
+                candP4          := v4
+                candColor       := mDir == 1 ? bearColorInput : bullColorInput
+                candTooltipBase := f_tooltip(mDir, v3, v4, v5, interiorCnt, interiorProgressing, momDiverging, volumeFading, volumeKnown)
+
+                color pendingColor = color.new(candColor, 45)
+                color levelColor   = color.new(candColor, 50)
+
+                if showImpulseInput
+                    array.push(candLineArray, line.new(x0, v0, x1, v1, color = pendingColor, width = 2))
+                    array.push(candLineArray, line.new(x1, v1, x2, v2, color = pendingColor, width = 2))
+                    array.push(candLineArray, line.new(x2, v2, x3, v3, color = pendingColor, width = 2))
+                    array.push(candLineArray, line.new(x3, v3, x4, v4, color = pendingColor, width = 2))
+                    array.push(candLineArray, line.new(x4, v4, x5, v5, color = pendingColor, width = 2))
+
+                if showWaveLabelsInput
+                    string extremeStyle = mDir == 1 ? label.style_label_down : label.style_label_up
+                    string innerStyle   = mDir == 1 ? label.style_label_up : label.style_label_down
+                    array.push(candLabelArray, label.new(x1, v1, '1', color = TRANSPARENT_COLOR, textcolor = pendingColor, style = extremeStyle, size = size.small))
+                    array.push(candLabelArray, label.new(x2, v2, '2', color = TRANSPARENT_COLOR, textcolor = pendingColor, style = innerStyle, size = size.small))
+                    array.push(candLabelArray, label.new(x3, v3, '3', color = TRANSPARENT_COLOR, textcolor = pendingColor, style = extremeStyle, size = size.small))
+                    array.push(candLabelArray, label.new(x4, v4, '4', color = TRANSPARENT_COLOR, textcolor = pendingColor, style = innerStyle, size = size.small))
+
+                if showZoneInput
+                    candGapBox := box.new(x3, math.max(v3, v5), x5, math.min(v3, v5), border_color = levelColor, border_style = line.style_dashed, border_width = 1, bgcolor = color.new(candColor, 92))
+
+                if showLevelsInput
+                    candConfLine := line.new(x4, v4, bar_index, v4, color = levelColor, style = line.style_dashed)
+                    candInvLine  := line.new(x3, v3, bar_index, v3, color = levelColor, style = line.style_dashed)
+
+                candMainLabel := label.new(x5, v5, 'Truncated 5th', color = TRANSPARENT_COLOR, textcolor = pendingColor, style = mDir == 1 ? label.style_label_down : label.style_label_up, size = size.small, tooltip = candTooltipBase + 'awaiting a reversal through the wave 4 extreme')
+
+                if not sameCandidate
+                    if mDir == 1
+                        bearishDetectedAlert := true
+                    else
+                        bullishDetectedAlert := true
+
+                if preConfirmed
+                    f_solidify(candLineArray, candLabelArray, candGapBox, candConfLine, candInvLine, candMainLabel, candColor, candTooltipBase)
+                    if mDir == 1
+                        bearishConfirmedAlert := true
+                    else
+                        bullishConfirmedAlert := true
+                    lastDoneDir := mDir
+                    lastDoneB4  := x4
+                    array.clear(candLineArray)
+                    array.clear(candLabelArray)
+                    candGapBox    := na
+                    candConfLine  := na
+                    candInvLine   := na
+                    candMainLabel := na
+                    candDir := 0
+                    candB4  := -1
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(bearishDetectedAlert, 'Bearish Truncation Detected', 'Truncated 5th at a top: a five-wave advance completed with wave 5 below the wave 3 high. Awaiting a close below the wave 4 low.')
+alertcondition(bullishDetectedAlert, 'Bullish Truncation Detected', 'Truncated 5th at a bottom: a five-wave decline completed with wave 5 above the wave 3 low. Awaiting a close above the wave 4 high.')
+alertcondition(bearishConfirmedAlert, 'Bearish Truncation Confirmed', 'Close below the wave 4 low confirms the bearish truncated 5th.')
+alertcondition(bullishConfirmedAlert, 'Bullish Truncation Confirmed', 'Close above the wave 4 high confirms the bullish truncated 5th.')
+alertcondition(bearishRefutedAlert, 'Bearish Truncation Refuted', 'Price exceeded the wave 3 high: the bearish truncation count is refuted, wave 5 extended instead.')
+alertcondition(bullishRefutedAlert, 'Bullish Truncation Refuted', 'Price broke the wave 3 low: the bullish truncation count is refuted, wave 5 extended instead.')
+
+//---------------------------------------------------------------------------------------------------------------------}

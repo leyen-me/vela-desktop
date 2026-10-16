@@ -1,0 +1,344 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Execution Algo Footprints", "Execution Algo Footprints", overlay = false, format = format.price, precision = 1)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+int   MIN_SLICES    = 10    // minimum intrabar slices inside the analysis window before the score is considered ready
+float RELEASE_RATIO = 0.75  // an active footprint releases once its score falls below this fraction of the threshold
+int   MS_PER_MINUTE = 60000
+
+color BULL_COLOR    = #089981 // buy program
+color BEAR_COLOR    = #f23645 // sell program
+color NEUTRAL_COLOR = #787b86 // no dominant side, thresholds, zero line
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+int ZONE_TRANSP  = 91  // transparency of the soft detection-zone shading
+int SCORE_EXTENT = 100 // the composite score is bounded to +/- 100
+
+string DETECTION_GROUP = "Detection"
+string SLICE_GROUP     = "Intrabar Slices"
+string VWAP_GROUP      = "VWAP Tell"
+string DASH_GROUP      = "Dashboard"
+string STYLE_GROUP     = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Inputs
+//---------------------------------------------------------------------------------------------------------------------{
+
+windowInput     = input.int(30, "Analysis Window (bars)", minval = 5, maxval = 200, group = DETECTION_GROUP, tooltip = "Number of chart bars over which slice uniformity, one-sided pressure, pullback persistence and volume participation are measured.")
+thresholdInput  = input.float(50, "Detection Threshold", minval = 10, maxval = 90, step = 5, group = DETECTION_GROUP, tooltip = "Composite footprint score (0-100) required to flag a working execution program. An active footprint releases once the score falls back below 75% of this value or the dominant side flips.")
+persistInput    = input.int(60, "Confirmation Time (minutes)", minval = 1, group = DETECTION_GROUP, tooltip = "How long a detected footprint must persist before it is treated as confirmed rather than tentative. Genuine parent orders work over long horizons, so the read stays tentative until it survives about an hour or more.")
+minSpanAtrInput = input.float(1.0, "Min Price Span (ATR)", minval = 0, step = 0.25, group = DETECTION_GROUP, tooltip = "A confirmed program must have worked across a price range of at least this many ATRs. A schedule of child orders persists across price levels, unlike an iceberg defending a single level.")
+atrLenInput     = input.int(14, "ATR Length", minval = 1, group = DETECTION_GROUP, tooltip = "ATR length used to normalize the price-span and VWAP-proximity checks.")
+
+useAutoLtfInput = input.bool(true, "Auto Intrabar Timeframe", group = SLICE_GROUP, tooltip = "Automatically pick a lower timeframe from the chart timeframe (roughly a dozen slices per chart bar, e.g. 1min slices up to 12min charts, 5min slices up to 1H charts) used to approximate individual child-order prints from intrabar data.")
+ltfInput        = input.timeframe("1", "Custom Intrabar Timeframe", group = SLICE_GROUP, tooltip = "Lower timeframe used to build slices when the automatic selection is disabled. Timeframes at or above the chart timeframe fall back to the chart timeframe.")
+
+vwapProxInput   = input.float(0.25, "VWAP Proximity (ATR)", minval = 0, step = 0.05, group = VWAP_GROUP, tooltip = "Distance from the session VWAP, in ATRs, within which benchmark behavior is checked. Persistent buy delta on dips just below the session VWAP during a buy program is a common tell that an algo is benchmarking to it.")
+
+showDashInput   = input.bool(true, "Show Dashboard", group = DASH_GROUP, tooltip = "Display the footprint dashboard summarizing every detection component.")
+dashLocInput    = input.string("Top Right", "Location", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = DASH_GROUP, tooltip = "Dashboard position on the pane.")
+dashSizeInput   = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = DASH_GROUP, tooltip = "Dashboard text size.")
+
+bullColorInput  = input.color(BULL_COLOR, "Buy Program", group = STYLE_GROUP)
+bearColorInput  = input.color(BEAR_COLOR, "Sell Program", group = STYLE_GROUP)
+neutColorInput  = input.color(NEUTRAL_COLOR, "Neutral", group = STYLE_GROUP)
+showBgInput     = input.bool(true, "Highlight Active Program", group = STYLE_GROUP)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Clamp a value into the [0, 1] range
+clamp01(float value) =>
+    math.min(math.max(value, 0), 1)
+
+// Intrabar expression: slice volume and signed slice delta (up-close slices buy, down-close slices sell)
+ltfData() =>
+    float dirSign = close > open ? 1.0 : close < open ? -1.0 : 0.0
+    [volume, volume * dirSign]
+
+// Percentage text from a 0-1 fraction
+pctText(float fraction) =>
+    str.tostring(fraction * 100, "#.#") + "%"
+
+// Compact duration text from milliseconds
+durText(int ms) =>
+    int totalMin = ms / MS_PER_MINUTE
+    int hrs      = totalMin / 60
+    int mins     = totalMin % 60
+    hrs > 0 ? str.tostring(hrs) + "h " + str.tostring(mins) + "m" : str.tostring(mins) + "m"
+
+// One dashboard row
+dashRow(table tbl, int row, string lbl, string val, color valColor, string txtSize) =>
+    table.cell(tbl, 0, row, lbl, text_color = DASH_HEADER, text_size = txtSize, text_halign = text.align_left)
+    table.cell(tbl, 1, row, val, text_color = valColor, text_size = txtSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Intrabar Slice Data
+//---------------------------------------------------------------------------------------------------------------------{
+
+int chartSec = timeframe.in_seconds()
+
+// Automatic slice timeframe: roughly a dozen intrabar slices per chart bar, never above the chart timeframe
+string autoTf = chartSec <= 60 ? timeframe.period : chartSec <= 720 ? "1" : chartSec <= 3600 ? "5" : chartSec <= 14400 ? "15" : chartSec <= 43200 ? "30" : chartSec <= 86400 ? "60" : "240"
+
+// Custom slice timeframe, clamped to the chart timeframe
+string customTf = switch
+    timeframe.in_seconds(ltfInput) > chartSec => timeframe.period
+    => ltfInput
+
+string sliceTf = switch
+    useAutoLtfInput => autoTf
+    => customTf
+
+[intraVolArray, intraDeltaArray] = request.security_lower_tf(syminfo.tickerid, sliceTf, ltfData())
+
+// Per-bar aggregates of the intrabar slices
+float barVol    = 0.0
+float barVolSq  = 0.0
+float barDelta  = 0.0
+int   barSliceN = 0
+int   barBuyN   = 0
+int   barSellN  = 0
+
+float fallbackDir = close > open ? 1.0 : close < open ? -1.0 : 0.0
+
+int intraN = 0
+if not na(intraVolArray) and not na(intraDeltaArray)
+    intraN := array.size(intraVolArray)
+
+if intraN > 0
+    for i = 0 to intraN - 1
+        float sliceVol   = nz(array.get(intraVolArray, i))
+        float sliceDelta = nz(array.get(intraDeltaArray, i))
+        if sliceVol > 0
+            barVol    += sliceVol
+            barVolSq  += sliceVol * sliceVol
+            barDelta  += sliceDelta
+            barSliceN += 1
+            barBuyN   += sliceDelta > 0 ? 1 : 0
+            barSellN  += sliceDelta < 0 ? 1 : 0
+else
+    // No intrabar data on deep history: fall back to the chart bar as a single slice
+    float fbVol = nz(volume)
+    if fbVol > 0
+        barVol    := fbVol
+        barVolSq  := fbVol * fbVol
+        barDelta  := fbVol * fallbackDir
+        barSliceN := 1
+        barBuyN   := fallbackDir > 0 ? 1 : 0
+        barSellN  := fallbackDir < 0 ? 1 : 0
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Footprint Metrics
+//---------------------------------------------------------------------------------------------------------------------{
+
+float atrValue = nz(ta.atr(atrLenInput))
+float vwapRaw  = ta.vwap(hlc3)
+bool  vwapOk   = not na(vwapRaw)
+float proxBand = vwapProxInput * atrValue
+
+bool nearBelowVwap = vwapOk and low <= vwapRaw + proxBand
+bool nearAboveVwap = vwapOk and high >= vwapRaw - proxBand
+
+// Rolling sums over the analysis window
+float sumSliceN = math.sum(barSliceN * 1.0, windowInput)
+float sumVol    = math.sum(barVol, windowInput)
+float sumVolSq  = math.sum(barVolSq, windowInput)
+float sumBuyN   = math.sum(barBuyN * 1.0, windowInput)
+float sumSellN  = math.sum(barSellN * 1.0, windowInput)
+float netDelta  = math.sum(barDelta, windowInput)
+float posBarN   = math.sum(barDelta > 0 ? 1.0 : 0.0, windowInput)
+float negBarN   = math.sum(barDelta < 0 ? 1.0 : 0.0, windowInput)
+float actBarN   = math.sum(barSliceN > 0 ? 1.0 : 0.0, windowInput)
+float downBarN  = math.sum(close < open ? 1.0 : 0.0, windowInput)
+float upBarN    = math.sum(close > open ? 1.0 : 0.0, windowInput)
+float dipBuyN   = math.sum(close < open and barDelta > 0 ? 1.0 : 0.0, windowInput)
+float popSellN  = math.sum(close > open and barDelta < 0 ? 1.0 : 0.0, windowInput)
+
+float nearBelowN = math.sum(nearBelowVwap ? 1.0 : 0.0, windowInput)
+float nearAboveN = math.sum(nearAboveVwap ? 1.0 : 0.0, windowInput)
+float vwapBuyN   = math.sum(nearBelowVwap and barDelta > 0 ? 1.0 : 0.0, windowInput)
+float vwapSellN  = math.sum(nearAboveVwap and barDelta < 0 ? 1.0 : 0.0, windowInput)
+
+// Percent-of-volume signature: pressure that scales with whatever the market prints
+float povCorr = ta.correlation(barDelta, barVol, windowInput)
+
+// Slice uniformity: metronomic child orders print with a low coefficient of variation
+float meanSliceVol = sumSliceN > 0 ? sumVol / sumSliceN : na
+float sliceVar     = na(meanSliceVol) ? na : math.max(sumVolSq / sumSliceN - meanSliceVol * meanSliceVol, 0)
+float sliceCv      = not na(meanSliceVol) and meanSliceVol > 0 ? math.sqrt(sliceVar) / meanSliceVol : na
+float uniformScore = na(sliceCv) ? 0 : 1 / (1 + sliceCv)
+
+// One-sided pressure: share of same-side slices and net delta as a share of total volume
+float sidedSliceN = sumBuyN + sumSellN
+float sideFrac    = sidedSliceN > 0 ? math.max(sumBuyN, sumSellN) / sidedSliceN : 0.5
+float sideScore   = clamp01((sideFrac - 0.5) * 2)
+
+float deltaShare    = sumVol > 0 ? math.abs(netDelta) / sumVol : 0
+float pressureScore = (deltaShare + sideScore) / 2
+
+int side = netDelta > 0 ? 1 : netDelta < 0 ? -1 : 0
+
+// Pullback grind: bar-level delta keeps favoring the dominant side even while price pulls back
+float favorBarN  = side > 0 ? posBarN : side < 0 ? negBarN : 0
+float favorFrac  = actBarN > 0 ? favorBarN / actBarN : 0
+float grindScore = clamp01((favorFrac - 0.5) * 2)
+
+float povScore = clamp01(nz(povCorr) * side)
+
+bool ready = bar_index >= windowInput and sumSliceN >= MIN_SLICES and sumVol > 0
+
+float score       = ready ? 25 * (uniformScore + pressureScore + grindScore + povScore) : 0
+float signedScore = score * side
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Program Detection
+//---------------------------------------------------------------------------------------------------------------------{
+
+var int   fpDir   = 0
+var int   fpStart = 0
+var bool  fpConf  = false
+var float fpHigh  = na
+var float fpLow   = na
+
+bool evStart   = false
+bool evConfirm = false
+bool evFade    = false
+
+int  scoreDir = signedScore > 0 ? 1 : signedScore < 0 ? -1 : 0
+bool detected = ready and math.abs(signedScore) >= thresholdInput
+
+if fpDir == 0
+    if detected
+        fpDir   := scoreDir
+        fpStart := time
+        fpConf  := false
+        fpHigh  := high
+        fpLow   := low
+        evStart := true
+else
+    fpHigh := math.max(fpHigh, high)
+    fpLow  := math.min(fpLow, low)
+    if detected and scoreDir != fpDir
+        // The opposite side took over: the old program is done, a new one starts
+        evFade  := true
+        evStart := true
+        fpDir   := scoreDir
+        fpStart := time
+        fpConf  := false
+        fpHigh  := high
+        fpLow   := low
+    else if signedScore * fpDir < thresholdInput * RELEASE_RATIO
+        // The schedule faded: the support or pressure it provided is gone
+        evFade := true
+        fpDir  := 0
+        fpConf := false
+        fpHigh := na
+        fpLow  := na
+    else if not fpConf
+        bool durOk  = time - fpStart >= persistInput * MS_PER_MINUTE
+        bool spanOk = atrValue > 0 and fpHigh - fpLow >= minSpanAtrInput * atrValue
+        if durOk and spanOk
+            fpConf    := true
+            evConfirm := true
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visuals
+//---------------------------------------------------------------------------------------------------------------------{
+
+color sideColor = signedScore > 0 ? bullColorInput : signedScore < 0 ? bearColorInput : neutColorInput
+
+scorePlotId = plot(signedScore, "Footprint Score", sideColor, 2)
+zeroPlotId  = plot(0, "Zero Line", color.new(NEUTRAL_COLOR, 50), 1)
+
+fill(zeroPlotId, scorePlotId, top_value = math.max(signedScore, 0), bottom_value = math.min(signedScore, 0), top_color = signedScore > 0 ? color.new(bullColorInput, 50) : color.new(bearColorInput, 100), bottom_color = signedScore > 0 ? color.new(bullColorInput, 100) : color.new(bearColorInput, 50), title = "Score Gradient")
+
+hline(thresholdInput, "Upper Detection Threshold", color.new(NEUTRAL_COLOR, 50), hline.style_dashed)
+hline(-thresholdInput, "Lower Detection Threshold", color.new(NEUTRAL_COLOR, 50), hline.style_dashed)
+
+// Soft detection-zone shading - buy-program zone above the upper threshold, sell-program zone below the lower one
+upperZoneId    = plot(thresholdInput, "Upper Zone Anchor", color(na), editable = false, display = display.none)
+lowerZoneId    = plot(-thresholdInput, "Lower Zone Anchor", color(na), editable = false, display = display.none)
+topAnchorId    = plot(SCORE_EXTENT, "Top Anchor", color(na), editable = false, display = display.none)
+bottomAnchorId = plot(-SCORE_EXTENT, "Bottom Anchor", color(na), editable = false, display = display.none)
+
+fill(upperZoneId, topAnchorId, color.new(bullColorInput, ZONE_TRANSP), title = "Buy Program Zone")
+fill(lowerZoneId, bottomAnchorId, color.new(bearColorInput, ZONE_TRANSP), title = "Sell Program Zone")
+
+color bgCol = showBgInput and fpDir != 0 ? color.new(fpDir > 0 ? bullColorInput : bearColorInput, fpConf ? 85 : 92) : na
+bgcolor(bgCol, title = "Active Program Highlight")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+
+string dashPos = switch dashLocInput
+    "Top Right"    => position.top_right
+    "Top Left"     => position.top_left
+    "Bottom Right" => position.bottom_right
+    "Bottom Left"  => position.bottom_left
+    => position.top_right
+
+string dashTxtSize = switch dashSizeInput
+    "Tiny"   => size.tiny
+    "Small"  => size.small
+    "Normal" => size.normal
+    => size.small
+
+var table dashTable = na
+
+if showDashInput and barstate.islast
+    if na(dashTable)
+        dashTable := table.new(dashPos, 2, 13, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+        table.merge_cells(dashTable, 0, 0, 1, 0)
+
+    string statusTxt = fpDir == 0 ? "No footprint" : (fpConf ? "Confirmed " : "Tentative ") + (fpDir > 0 ? "buy program" : "sell program")
+    color  statusCol = fpDir > 0 ? bullColorInput : fpDir < 0 ? bearColorInput : neutColorInput
+    string schedTxt  = fpDir == 0 ? "-" : povScore > uniformScore + 0.1 ? "VWAP/POV-like" : uniformScore > povScore + 0.1 ? "TWAP-like" : "Mixed"
+
+    string activeTxt = fpDir != 0 ? durText(time - fpStart) : "-"
+    string spanTxt   = fpDir != 0 and atrValue > 0 ? str.tostring((fpHigh - fpLow) / atrValue, "#.##") + " ATR" : "-"
+    string cvTxt     = na(sliceCv) ? "-" : pctText(uniformScore) + " (CV " + str.tostring(sliceCv, "#.##") + ")"
+    string sidedTxt  = sidedSliceN > 0 ? pctText(sideFrac) + (sumBuyN >= sumSellN ? " buy" : " sell") : "-"
+    string shareTxt  = sumVol > 0 ? pctText(deltaShare) + (netDelta >= 0 ? " buy" : " sell") : "-"
+    string dipTxt    = side > 0 ? (downBarN > 0 ? pctText(dipBuyN / downBarN) : "-") : side < 0 ? (upBarN > 0 ? pctText(popSellN / upBarN) : "-") : "-"
+    string vwapTxt   = side > 0 ? (nearBelowN > 0 ? pctText(vwapBuyN / nearBelowN) : "-") : side < 0 ? (nearAboveN > 0 ? pctText(vwapSellN / nearAboveN) : "-") : "-"
+
+    color sidedCol = sidedSliceN > 0 ? (sumBuyN >= sumSellN ? bullColorInput : bearColorInput) : DASH_TEXT
+    color shareCol = netDelta > 0 ? bullColorInput : netDelta < 0 ? bearColorInput : DASH_TEXT
+
+    table.cell(dashTable, 0, 0, "Execution Algo Footprints", text_color = DASH_TEXT, text_size = dashTxtSize, text_halign = text.align_center)
+    dashRow(dashTable, 1, "Status", statusTxt, statusCol, dashTxtSize)
+    dashRow(dashTable, 2, "Footprint score", str.tostring(signedScore, "#.#"), sideColor, dashTxtSize)
+    dashRow(dashTable, 3, "Active for", activeTxt, DASH_TEXT, dashTxtSize)
+    dashRow(dashTable, 4, "Price span", spanTxt, DASH_TEXT, dashTxtSize)
+    dashRow(dashTable, 5, "Schedule read", schedTxt, DASH_TEXT, dashTxtSize)
+    dashRow(dashTable, 6, "Slice uniformity", cvTxt, DASH_TEXT, dashTxtSize)
+    dashRow(dashTable, 7, "One-sided prints", sidedTxt, sidedCol, dashTxtSize)
+    dashRow(dashTable, 8, "Delta share", shareTxt, shareCol, dashTxtSize)
+    dashRow(dashTable, 9, "Pullback pressure", dipTxt, DASH_TEXT, dashTxtSize)
+    dashRow(dashTable, 10, "Volume scaling (POV)", str.tostring(nz(povCorr), "#.##"), DASH_TEXT, dashTxtSize)
+    dashRow(dashTable, 11, "VWAP-side pressure", vwapTxt, DASH_TEXT, dashTxtSize)
+    dashRow(dashTable, 12, "Intrabar TF", sliceTf + " / " + str.tostring(sumSliceN, "#") + " slices", DASH_TEXT, dashTxtSize)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(evStart and fpDir == 1, "Buy Program Detected", "{{ticker}}: execution algo footprint - tentative BUY program detected (uniform slicing with persistent one-sided buying)")
+alertcondition(evStart and fpDir == -1, "Sell Program Detected", "{{ticker}}: execution algo footprint - tentative SELL program detected (uniform slicing with persistent one-sided selling)")
+alertcondition(evConfirm, "Program Confirmed", "{{ticker}}: execution algo footprint confirmed - the schedule persisted through the confirmation window and spans multiple price levels")
+alertcondition(evFade, "Program Faded / Completed", "{{ticker}}: execution algo footprint faded - the detected program appears complete and its one-sided pressure is gone")
+
+//---------------------------------------------------------------------------------------------------------------------}

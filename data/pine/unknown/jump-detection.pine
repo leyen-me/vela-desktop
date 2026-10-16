@@ -1,0 +1,216 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Jump Detection", shorttitle = "Jump Detection", overlay = false, format = format.price, precision = 2, max_labels_count = 500, max_lines_count = 25, max_bars_back = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR      = #089981 // up jumps
+BEAR_COLOR      = #f23645 // down jumps
+THRESHOLD_COLOR = #787b86 // dashed threshold lines
+NEUTRAL_COLOR   = #787b86 // zero line
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+FILL_VALUE_TRANSP = 50  // gradient transparency at the standardized-return value
+FILL_ZERO_TRANSP  = 100 // gradient transparency at the zero line
+
+BPV_SCALE = math.pi / 2 // bipower scaling 1 / mu^2 with mu = E|Z| = sqrt(2/pi), per Barndorff-Nielsen & Shephard
+MAD_SCALE = 1.4826      // Gaussian consistency factor for the median absolute deviation
+
+EST_BIPOWER = "Bipower Variation"
+EST_MAD     = "Median Absolute Deviation"
+EST_STDEV   = "Standard Deviation"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+lookbackInput = input.int(20, "Volatility Lookback", minval = 5, maxval = 250, group = "Jump Detection",
+     tooltip = "Trailing bars used to estimate ordinary, diffusion-like volatility - the benchmark a candidate jump is measured against. The window always ends on the prior bar, so the bar being tested never inflates its own benchmark. Longer windows are steadier but slower to accept a new volatility level as normal; 20 bars is roughly a month on daily charts.")
+
+estimatorInput = input.string(EST_BIPOWER, "Volatility Estimator", options = [EST_BIPOWER, EST_MAD, EST_STDEV], group = "Jump Detection",
+     tooltip = "Robust scale used to standardize returns. Bipower Variation (Barndorff-Nielsen & Shephard) averages products of absolute adjacent returns, so an outsized return lands next to ordinary neighbors and barely moves the estimate - an isolated dislocation stands out sharply, while a persistent stretch of large bars raises the benchmark and stops being flagged, which is what separates a jump from range expansion. Median Absolute Deviation (scaled by 1.4826) is an alternative jump-robust scale. Standard Deviation is the classic non-robust benchmark: a single jump inflates it for a full window, muting the detector right after an event.")
+
+thresholdInput = input.float(3.0, "Jump Threshold (σ)", minval = 1.0, step = 0.25, group = "Jump Detection",
+     tooltip = "Flags a jump when the bar's log return exceeds this many standard deviations of the robust volatility benchmark. 3 is the classic three-sigma convention; raise it toward 4-5 to keep only the most extreme dislocations, especially on noisy intraday data.")
+
+showLabelsInput = input.bool(true, "Mark Jumps on Chart", group = "Jump Detection",
+     tooltip = "Labels detected jumps on the price chart with their standardized magnitude. Each label's tooltip reports the gap component - whether the bar repriced at the open, a true discontinuity where price never traded at the levels between, or within the bar.")
+
+showDashInput = input.bool(true, "Show Dashboard", group = "Dashboard",
+     tooltip = "Displays the current standardized return alongside the realized-versus-bipower decomposition of variance: total volatility, its continuous jump-robust part, the share of variance attributable to jumps, the number of jumps inside the window, and the bars elapsed since the last one.")
+
+dashPosInput = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], inline = "dash", group = "Dashboard",
+     tooltip = "Corner of the pane the dashboard is anchored to.")
+
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], inline = "dash", group = "Dashboard",
+     tooltip = "Dashboard text size.")
+
+bullColorInput = input.color(BULL_COLOR, "Up Jumps", group = "Style",
+     tooltip = "Color of upside readings - the standardized-return line above zero, its gradient fill, jump markers, and chart labels.")
+
+bearColorInput = input.color(BEAR_COLOR, "Down Jumps", group = "Style",
+     tooltip = "Color of downside readings - the standardized-return line below zero, its gradient fill, jump markers, and chart labels.")
+
+thresholdColorInput = input.color(THRESHOLD_COLOR, "Threshold Lines", group = "Style",
+     tooltip = "Color of the dashed jump-threshold lines drawn at +threshold and -threshold in the pane.")
+
+gradientInput = input.bool(true, "Gradient Fill", group = "Style",
+     tooltip = "Fills the area between zero and the standardized return with a vertical gradient - fully transparent at zero, strongest at the value - green above zero, red below.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+getTablePosition(positionText) =>
+    switch positionText
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        => position.bottom_left
+
+getTextSize(sizeText) =>
+    switch sizeText
+        "Tiny"  => size.tiny
+        "Small" => size.small
+        => size.normal
+
+formatSigned(float value) =>
+    na(value) ? "-" : (value > 0 ? "+" : "") + str.tostring(value, "0.00") + "σ"
+
+formatPercent(float value) =>
+    na(value) ? "-" : str.tostring(value * 100, "0.00") + "%"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+// Log returns - close-to-close carries the whole move including any opening gap, while open-versus-prior-close
+// isolates the discontinuous part that printed without trading through the levels between
+logReturn = math.log(close / close[1])
+gapReturn = math.log(open / close[1])
+
+// Realized versus bipower variance over the window (per-bar figures). Squared returns total continuous variation
+// plus jumps; products of absolute adjacent returns are barely moved by a single outsized return, so scaled by
+// 1/mu^2 they estimate the continuous part alone - the gap between the two is the jump contribution
+absReturnProduct = math.abs(logReturn) * math.abs(logReturn[1])
+bipowerMean      = ta.sma(absReturnProduct, lookbackInput)
+realizedVariance = ta.sma(logReturn * logReturn, lookbackInput)
+bipowerVariance  = BPV_SCALE * bipowerMean
+
+// Robust volatility benchmarks - every window ends on the PRIOR bar so the bar being tested never contaminates
+// its own benchmark, mirroring the Lee-Mykland local-volatility construction
+priorBipowerVariance = BPV_SCALE * bipowerMean[1]
+sigmaBipower         = priorBipowerVariance > 0 ? math.sqrt(priorBipowerVariance) : na
+sigmaStdev           = ta.stdev(logReturn, lookbackInput)[1]
+
+// Median absolute deviation of the trailing returns (excluding the current bar), rescaled to Gaussian sigma
+madWindowArray = array.new_float()
+for windowOffset = 1 to lookbackInput
+    pastReturn = logReturn[windowOffset]
+    if not na(pastReturn)
+        array.push(madWindowArray, pastReturn)
+
+float sigmaMad = na
+if array.size(madWindowArray) == lookbackInput
+    windowMedian      = array.median(madWindowArray)
+    absDeviationArray = array.new_float()
+    for windowReturn in madWindowArray
+        array.push(absDeviationArray, math.abs(windowReturn - windowMedian))
+    sigmaMad := MAD_SCALE * array.median(absDeviationArray)
+
+// Standardized returns - the jump statistic. Guarded for the warm-up bars where the window is not yet full
+// and for degenerate flat stretches where the benchmark collapses to zero
+sigmaEstimate = estimatorInput == EST_BIPOWER ? sigmaBipower : estimatorInput == EST_MAD ? sigmaMad : sigmaStdev
+sigmaValid    = not na(sigmaEstimate) and sigmaEstimate > 0
+
+jumpZScore = sigmaValid and not na(logReturn) ? logReturn / sigmaEstimate : na
+gapZScore  = sigmaValid and not na(gapReturn) ? gapReturn / sigmaEstimate : na
+
+// Jump events - a bar is a jump when its standardized return clears the threshold; it is additionally a gap jump
+// when the open-versus-prior-close component clears the threshold on its own (a discontinuous open)
+jumpDetected = not na(jumpZScore) and math.abs(jumpZScore) > thresholdInput
+jumpUp       = jumpDetected and jumpZScore > 0
+jumpDown     = jumpDetected and jumpZScore < 0
+gapJump      = jumpDetected and not na(gapZScore) and math.abs(gapZScore) > thresholdInput
+
+// Jump contribution to variance - realized minus bipower, truncated at zero as is standard, expressed as a share
+jumpVariance      = math.max(realizedVariance - bipowerVariance, 0)
+jumpShare         = not na(realizedVariance) and realizedVariance > 0 ? jumpVariance / realizedVariance : na
+realizedVolPerBar = math.sqrt(realizedVariance)
+bipowerVolPerBar  = math.sqrt(bipowerVariance)
+
+jumpCount = math.sum(jumpDetected ? 1 : 0, lookbackInput)
+
+var int lastJumpBar = na
+if jumpDetected
+    lastJumpBar := bar_index
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+zScoreColor     = jumpZScore >= 0 ? bullColorInput : bearColorInput
+fillTopColor    = gradientInput ? (jumpZScore >= 0 ? color.new(bullColorInput, FILL_VALUE_TRANSP) : color.new(bearColorInput, FILL_ZERO_TRANSP)) : na
+fillBottomColor = gradientInput ? (jumpZScore >= 0 ? color.new(bullColorInput, FILL_ZERO_TRANSP) : color.new(bearColorInput, FILL_VALUE_TRANSP)) : na
+
+zScorePlotId = plot(jumpZScore, "Standardized Return (σ)", color = zScoreColor, linewidth = 1)
+zeroPlotId   = plot(0, "Zero Line", color = color.new(NEUTRAL_COLOR, 50), linewidth = 1)
+
+fill(zScorePlotId, zeroPlotId, top_value = math.max(nz(jumpZScore), 0), bottom_value = math.min(nz(jumpZScore), 0), top_color = fillTopColor, bottom_color = fillBottomColor, title = "Jump Gradient Fill")
+
+plot(jumpDetected ? jumpZScore : na, "Jump Markers", style = plot.style_circles, linewidth = 2, color = zScoreColor)
+
+// Dashed threshold levels, drawn once and extended across the pane
+if barstate.isfirst
+    line.new(0, thresholdInput, 1, thresholdInput, extend = extend.both, color = thresholdColorInput, style = line.style_dashed)
+    line.new(0, -thresholdInput, 1, -thresholdInput, extend = extend.both, color = thresholdColorInput, style = line.style_dashed)
+
+// On-chart jump labels - direction by color, magnitude in the text, gap-versus-intrabar detail in the tooltip
+if jumpDetected and showLabelsInput
+    directionText = jumpUp ? "Up jump " : "Down jump "
+    kindText      = gapJump ? "Discontinuous open: the gap component alone clears the threshold - price skipped the levels between" : "Intrabar repricing: the dislocation developed inside the bar rather than at the open"
+    tooltipText   = directionText + formatSigned(jumpZScore) + " against the " + str.tostring(lookbackInput) + "-bar robust benchmark" + "\nGap component (open vs prior close): " + formatSigned(gapZScore) + "\n" + kindText
+    labelText     = (jumpUp ? "+" : "") + str.tostring(jumpZScore, "0.0") + "σ"
+    if jumpUp
+        label.new(bar_index, low, labelText, style = label.style_label_up, color = bullColorInput, textcolor = chart.bg_color, size = size.small, tooltip = tooltipText, force_overlay = true)
+    else
+        label.new(bar_index, high, labelText, style = label.style_label_down, color = bearColorInput, textcolor = chart.bg_color, size = size.small, tooltip = tooltipText, force_overlay = true)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dashTable = na
+
+if barstate.isfirst and showDashInput
+    dashTable := table.new(getTablePosition(dashPosInput), 2, 6, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+if barstate.islast and showDashInput and not na(dashTable)
+    labelColor   = DASH_HEADER
+    dashTextSize = getTextSize(dashSizeInput)
+    zValueColor  = jumpDetected ? (jumpUp ? bullColorInput : bearColorInput) : DASH_TEXT
+    countText    = na(jumpCount) ? "-" : str.tostring(jumpCount, "#")
+    lastJumpText = na(lastJumpBar) ? "None yet" : bar_index == lastJumpBar ? "This bar" : str.tostring(bar_index - lastJumpBar) + " bars ago"
+    table.cell(dashTable, 0, 0, "Standardized Return", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 0, formatSigned(jumpZScore), text_color = zValueColor, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 1, "Realized Vol / Bar", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 1, formatPercent(realizedVolPerBar), text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 2, "Continuous Vol / Bar", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 2, formatPercent(bipowerVolPerBar), text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 3, "Jump Share of Variance", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 3, formatPercent(jumpShare), text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 4, "Jumps in Window", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 4, countText, text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 5, "Last Jump", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 5, lastJumpText, text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(jumpUp, "Up Jump", "Jump Detection: up jump on {{ticker}} - the bar's return cleared the jump threshold above its robust volatility benchmark ({{interval}})")
+alertcondition(jumpDown, "Down Jump", "Jump Detection: down jump on {{ticker}} - the bar's return cleared the jump threshold below its robust volatility benchmark ({{interval}})")
+alertcondition(jumpDetected, "Jump - Either Direction", "Jump Detection: jump on {{ticker}} - a one-bar repricing beyond the volatility-scaled threshold; volatility estimates and band tags spanning this bar deserve separate treatment ({{interval}})")
+alertcondition(gapJump, "Gap Jump - Discontinuous Open", "Jump Detection: gap jump on {{ticker}} - the open itself repriced beyond the threshold from the prior close, so price skipped the levels between ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

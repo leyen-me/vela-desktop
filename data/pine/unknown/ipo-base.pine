@@ -1,0 +1,406 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("IPO Base", "IPO Base", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, max_bars_back = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+//Base machine states
+ST_SEARCH   = 0
+ST_FORMING  = 1
+ST_VALID    = 2
+ST_BREAKOUT = 3
+
+MS_PER_DAY        = 86400000.0
+MAX_DRAW_LOOKBACK = 4000
+BACKFILL_CAP      = 400
+SEGMENT_BARS      = 5
+
+FORMING_TRANSPARENCY = 92
+ACTIVE_TRANSPARENCY  = 88
+SHADE_TRANSPARENCY   = 90
+LABEL_BG             = #00000000
+
+BULL_COLOR    = #089981 // buy point, breakouts
+BEAR_COLOR    = #f23645 // invalidation, failures
+NEUTRAL_COLOR = #787b86 // base range structure, lockup shade
+ACCENT_COLOR  = #ff9800 // shakeout - the one accent
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+maxAgeInput = input.int(365, "Recent Listing Window (Days)", minval = 30, group = "Listing Context",
+  tooltip = "The first bar of chart history is treated as the market debut, so base detection only arms while the listing is younger than this many days. IPO bases belong to stocks that listed recently - typically within their first year, often their first few months. Best used on daily charts of recent listings, where history genuinely starts at the debut.")
+
+lockupStartInput = input.int(90, "Lockup Window (Days)", minval = 0, inline = "lockup", group = "Listing Context")
+
+lockupEndInput = input.int(180, "to", minval = 1, inline = "lockup", group = "Listing Context",
+  tooltip = "Bounds of the typical insider lockup expiration window, in days after the debut - commonly 90 to 180. Expirations are a scheduled supply event that can land mid-pattern, so the window is shaded on the chart and reported on the dashboard. A base can absorb that supply and be stronger for it, or break on the added float.")
+
+pullbackBarsInput = input.int(5, "Pullback Confirmation (Bars)", minval = 1, maxval = 50, group = "Base Detection",
+  tooltip = "Bars without a fresh post-debut high before the decline counts as a pullback rather than a pause in the debut run. Together with the minimum depth, this marks the moment debut excitement resolves into a range: a defined high and a floor forming below it.")
+
+minDepthInput = input.float(5.0, "Minimum Pullback Depth (%)", minval = 0.5, step = 0.5, group = "Base Detection",
+  tooltip = "Smallest decline from the post-debut high, in percent, for a candidate base to begin - filters trivial dips. No maximum depth is enforced: with no established support below, an IPO base may run far deeper than a standard base would tolerate.")
+
+minLengthInput = input.int(10, "Minimum Base Length (Bars)", minval = 3, group = "Base Detection",
+  tooltip = "Bars from the post-debut high before the range counts as a defined base with an actionable buy point. There is no fixed rule: IPO bases are the deliberate exception to the five-to-seven-week minimums of standard bases, with accepted lengths of just a few weeks, so the default of 10 approximates two weeks on a daily chart.")
+
+shakeoutBarsInput = input.int(2, "Shakeout Snapback (Bars)", minval = 1, maxval = 5, group = "Base Detection",
+  tooltip = "Consecutive closes below the base low tolerated before the base is invalidated. A probe that snaps back inside the range within this many bars is flagged as a shakeout - a supply test common in thin new issues - rather than an automatic failure.")
+
+volumeLengthInput = input.int(50, "Volume Average Length", minval = 1, group = "Breakout Confirmation",
+  tooltip = "Length of the average-volume baseline used to judge breakout participation. Fifty bars is the conventional reference on daily charts.")
+
+volumePickupInput = input.float(40, "Volume Pickup Above Average (%)", minval = 0, step = 5, group = "Breakout Confirmation",
+  tooltip = "Required pickup, in percent above the volume average, for a close over the base high to count as volume-confirmed - 40% is the commonly published breakout guideline. Clears without the pickup are reported separately, since a thin-float new issue can push through a level on noise alone. Ignored when the symbol reports no volume.")
+
+showDashboardInput = input.bool(true, "Show Dashboard", group = "Dashboard",
+  tooltip = "Watchlist-style summary of the screening read: listing age, base status, buy point, invalidation, depth, tightening, closes near the highs, volume dry-up and the lockup window.")
+
+dashboardLocationInput = input.string("Top Right", "Location", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], inline = "dash", group = "Dashboard")
+
+dashboardSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], inline = "dash", group = "Dashboard",
+  tooltip = "Chart corner and text size of the dashboard.")
+
+baseColorInput = input.color(NEUTRAL_COLOR, "Base Range", group = "Style",
+  tooltip = "Fill of the base range while it forms and once it is defined.")
+
+bullColorInput = input.color(BULL_COLOR, "Buy Point / Breakout", group = "Style",
+  tooltip = "Buy point level, breakout markers and the pivot once it turns into a support reference.")
+
+bearColorInput = input.color(BEAR_COLOR, "Invalidation / Failure", group = "Style",
+  tooltip = "Invalidation level, failed bases and failed breakouts.")
+
+shakeoutColorInput = input.color(ACCENT_COLOR, "Shakeout", group = "Style",
+  tooltip = "Markers for probes below the base low that snap back inside the range.")
+
+lockupColorInput = input.color(NEUTRAL_COLOR, "Lockup Shade", group = "Style",
+  tooltip = "Background shade of the lockup expiration window.")
+
+showLevelsInput = input.bool(true, "Level Price Tags", group = "Style",
+  tooltip = "Price tags at the right edge of the base showing the buy point and the invalidation level.")
+
+showMarkersInput = input.bool(true, "Event Markers", group = "Style",
+  tooltip = "Chart markers on breakouts, shakeouts, invalidations and failed breakouts.")
+
+showLockupInput = input.bool(true, "Shade Lockup Window", group = "Style",
+  tooltip = "Shade the bars falling inside the lockup expiration window.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+//Dashboard position from the location option
+tableLocation(string positionText) =>
+    switch positionText
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        => position.bottom_left
+
+//Dashboard text size from the size option
+tableTextSize(string sizeText) =>
+    switch sizeText
+        "Tiny"  => size.tiny
+        "Small" => size.small
+        => size.normal
+
+//Price formatted to the symbol's tick size
+formatPrice(float value) =>
+    str.tostring(value, format.mintick)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Listing Context
+//---------------------------------------------------------------------------------------------------------------------{
+var int listingTime = time
+
+float daysSinceListing = (time - listingTime) / MS_PER_DAY
+bool  recentListing    = daysSinceListing <= maxAgeInput
+bool  lockupActive     = daysSinceListing >= lockupStartInput and daysSinceListing <= lockupEndInput
+bool  lockupOpenEvent  = lockupActive and nz(daysSinceListing[1], 0.) < lockupStartInput
+
+float volumeAverage = ta.sma(nz(volume), volumeLengthInput)
+bool  hasVolume     = not na(volume) and volumeAverage > 0
+bool  volumePickup  = hasVolume and volume >= volumeAverage * (1 + volumePickupInput / 100)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Base Detection
+//---------------------------------------------------------------------------------------------------------------------{
+bool formingEvent           = false
+bool definedEvent           = false
+bool confirmedBreakoutEvent = false
+bool quietBreakoutEvent     = false
+bool shakeoutEvent          = false
+bool invalidationEvent      = false
+bool failedBreakoutEvent    = false
+
+var int   baseState     = ST_SEARCH
+var float debutHigh     = high
+var int   debutHighBar  = 0
+var float pullbackLow   = low
+var float baseHigh      = na
+var float baseLow       = na
+var int   baseAnchorBar = na
+var int   breakoutBar   = na
+var int   probeCount    = 0
+var float probeLow      = na
+var int   baseCount     = 0
+
+var box   baseBox   = na
+var line  pivotLine = na
+var line  stopLine  = na
+var label pivotTag  = na
+var label stopTag   = na
+
+var array<float> rangeArray  = array.new<float>()
+var array<float> volumeArray = array.new<float>()
+
+if barstate.isconfirmed
+    if baseState == ST_SEARCH
+        //Track the post-debut high and the pullback low beneath it
+        if high >= debutHigh
+            debutHigh    := high
+            debutHighBar := bar_index
+            pullbackLow  := low
+        else
+            pullbackLow := math.min(pullbackLow, low)
+        float pullbackDepth = debutHigh > 0 ? 100 * (debutHigh - pullbackLow) / debutHigh : 0.
+        //Debut excitement has resolved into a range: a defined high with a floor forming below it
+        if recentListing and bar_index - debutHighBar >= pullbackBarsInput and pullbackDepth >= minDepthInput
+            baseState     := ST_FORMING
+            baseHigh      := debutHigh
+            baseLow       := pullbackLow
+            baseAnchorBar := debutHighBar
+            baseCount     += 1
+            formingEvent  := true
+            array.clear(rangeArray)
+            array.clear(volumeArray)
+            int backfillBars = math.min(bar_index - baseAnchorBar, BACKFILL_CAP)
+            if backfillBars >= 1
+                for j = 0 to backfillBars - 1
+                    int backOffset = backfillBars - j
+                    array.push(rangeArray, high[backOffset] - low[backOffset])
+                    array.push(volumeArray, nz(volume[backOffset]))
+            baseBox := box.new(math.max(baseAnchorBar, bar_index - MAX_DRAW_LOOKBACK), baseHigh, bar_index, baseLow,
+              border_color = color.new(baseColorInput, 50), border_style = line.style_dotted, bgcolor = color.new(baseColorInput, FORMING_TRANSPARENCY))
+    else if baseState == ST_FORMING
+        //The pullback keeps hunting for its floor while the range matures
+        baseLow := math.min(baseLow, low)
+        if close > baseHigh
+            //Cleared the high before the range matured - the debut advance resumed, no valid base yet
+            box.delete(baseBox)
+            baseBox      := box(na)
+            baseState    := ST_SEARCH
+            debutHigh    := high
+            debutHighBar := bar_index
+            pullbackLow  := low
+        else
+            box.set_rightbottom(baseBox, bar_index, baseLow)
+            if bar_index - baseAnchorBar >= minLengthInput
+                //The range has met its minimum length: buy point and invalidation become actionable
+                baseState    := ST_VALID
+                definedEvent := true
+                box.set_border_color(baseBox, color(na))
+                box.set_bgcolor(baseBox, color.new(baseColorInput, ACTIVE_TRANSPARENCY))
+                box.set_text(baseBox, "IPO BASE")
+                box.set_text_color(baseBox, color.new(DASH_TEXT, 50))
+                box.set_text_size(baseBox, size.small)
+                box.set_text_halign(baseBox, text.align_left)
+                box.set_text_valign(baseBox, text.align_top)
+                int lineStart = math.max(baseAnchorBar, bar_index - MAX_DRAW_LOOKBACK)
+                pivotLine := line.new(lineStart, baseHigh, bar_index, baseHigh, color = bullColorInput)
+                stopLine  := line.new(lineStart, baseLow, bar_index, baseLow, color = bearColorInput, style = line.style_dashed)
+                label.delete(pivotTag)
+                label.delete(stopTag)
+                if showLevelsInput
+                    pivotTag := label.new(bar_index, baseHigh, "Buy point " + formatPrice(baseHigh), style = label.style_label_left, color = LABEL_BG, textcolor = bullColorInput, size = size.small)
+                    stopTag  := label.new(bar_index, baseLow, "Invalidation " + formatPrice(baseLow), style = label.style_label_left, color = LABEL_BG, textcolor = bearColorInput, size = size.small)
+    else if baseState == ST_VALID
+        box.set_right(baseBox, bar_index)
+        line.set_x2(pivotLine, bar_index)
+        line.set_x2(stopLine, bar_index)
+        if close > baseHigh
+            //Conventional buy point: price clears the high of the base, volume does the confirming
+            baseState   := ST_BREAKOUT
+            breakoutBar := bar_index
+            probeCount  := 0
+            box.set_bgcolor(baseBox, color.new(bullColorInput, ACTIVE_TRANSPARENCY))
+            line.set_style(pivotLine, line.style_dotted)
+            if volumePickup
+                confirmedBreakoutEvent := true
+            else
+                quietBreakoutEvent := true
+        else if close < baseLow
+            //Close below the floor: a shakeout if it snaps back quickly, a failure if it holds
+            probeCount += 1
+            probeLow   := probeCount == 1 ? low : math.min(probeLow, low)
+            if probeCount > shakeoutBarsInput
+                invalidationEvent := true
+                box.set_bgcolor(baseBox, color.new(bearColorInput, FORMING_TRANSPARENCY))
+                box.set_text(baseBox, "FAILED BASE")
+                box.set_text_color(baseBox, color.new(bearColorInput, 40))
+                label.delete(pivotTag)
+                label.delete(stopTag)
+                pivotTag := label(na)
+                stopTag  := label(na)
+                //A failed first attempt rebuilds into a longer structure sharing the same high
+                baseState     := ST_FORMING
+                baseAnchorBar := bar_index
+                baseLow       := probeLow
+                probeCount    := 0
+                array.clear(rangeArray)
+                array.clear(volumeArray)
+                baseBox := box.new(bar_index, baseHigh, bar_index, baseLow,
+                  border_color = color.new(baseColorInput, 50), border_style = line.style_dotted, bgcolor = color.new(baseColorInput, FORMING_TRANSPARENCY))
+                pivotLine := line(na)
+                stopLine  := line(na)
+        else
+            if probeCount > 0
+                //The probe snapped back inside the range within tolerance - a supply test, not failure
+                shakeoutEvent := true
+                probeCount    := 0
+            else if low < baseLow
+                //Intrabar probe beneath the floor that closed back inside the same bar
+                shakeoutEvent := true
+    else if baseState == ST_BREAKOUT
+        line.set_x2(pivotLine, bar_index)
+        line.set_x2(stopLine, bar_index)
+        if close < baseHigh
+            //The breakout lost the base high - price is back inside the range
+            failedBreakoutEvent := true
+            baseState           := ST_VALID
+            breakoutBar         := na
+            box.set_bgcolor(baseBox, color.new(baseColorInput, ACTIVE_TRANSPARENCY))
+            line.set_style(pivotLine, line.style_solid)
+    //Collect in-base statistics for the tightening and dry-up reads
+    if baseState == ST_FORMING or baseState == ST_VALID
+        array.push(rangeArray, high - low)
+        array.push(volumeArray, nz(volume))
+    //Keep the level tags pinned to the latest bar
+    if baseState == ST_VALID or baseState == ST_BREAKOUT
+        if not na(pivotTag)
+            label.set_x(pivotTag, bar_index)
+        if not na(stopTag)
+            label.set_x(stopTag, bar_index)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dashboardTable = na
+
+if showDashboardInput and barstate.islast
+    if na(dashboardTable)
+        dashboardTable := table.new(tableLocation(dashboardLocationInput), 2, 11, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+        table.merge_cells(dashboardTable, 0, 0, 1, 0)
+
+    string textSize   = tableTextSize(dashboardSizeInput)
+    color  labelColor = DASH_HEADER
+    color  valueColor = DASH_TEXT
+
+    bool  hasBase   = baseState != ST_SEARCH
+    int   baseBars  = hasBase ? bar_index - baseAnchorBar : 0
+    int   shownBars = baseState == ST_BREAKOUT and not na(breakoutBar) ? breakoutBar - baseAnchorBar : baseBars
+    float depthPct  = hasBase and baseHigh > 0 ? 100 * (baseHigh - baseLow) / baseHigh : na
+
+    //Tightening: recent bar ranges against the earliest bars of the base; volume dry-up read the same way
+    int   sampleSize  = array.size(rangeArray)
+    float tightRatio  = na
+    float volumeRatio = na
+    if sampleSize >= 2 * SEGMENT_BARS
+        float earlyRange  = 0.
+        float lateRange   = 0.
+        float earlyVolume = 0.
+        float lateVolume  = 0.
+        for k = 0 to SEGMENT_BARS - 1
+            earlyRange  += array.get(rangeArray, k)
+            lateRange   += array.get(rangeArray, sampleSize - 1 - k)
+            earlyVolume += array.get(volumeArray, k)
+            lateVolume  += array.get(volumeArray, sampleSize - 1 - k)
+        tightRatio  := earlyRange > 0 ? lateRange / earlyRange : na
+        volumeRatio := earlyVolume > 0 ? lateVolume / earlyVolume : na
+
+    //Closes collecting in the upper third of the range over the last stretch of the base
+    string nearHighsText = "—"
+    if hasBase and baseState != ST_BREAKOUT and baseHigh > baseLow
+        int lookback  = math.min(10, baseBars + 1)
+        int nearCount = 0
+        for k = 0 to lookback - 1
+            if close[k] >= baseHigh - (baseHigh - baseLow) / 3
+                nearCount += 1
+        nearHighsText := str.tostring(nearCount) + "/" + str.tostring(lookback)
+
+    string statusText = switch baseState
+        ST_SEARCH   => recentListing ? "Awaiting first pullback" : (baseCount == 0 ? "Beyond listing window" : "Idle - window passed")
+        ST_FORMING  => "Base forming (" + str.tostring(baseBars) + " bars)"
+        ST_VALID    => probeCount > 0 ? "Probing the base low" : "Defined - watching pivot"
+        ST_BREAKOUT => "Breakout - above pivot"
+        => ""
+    color statusColor = baseState == ST_BREAKOUT ? bullColorInput : baseState == ST_VALID and probeCount > 0 ? bearColorInput : valueColor
+
+    string listedText = str.tostring(math.round(daysSinceListing)) + " days ago"
+    string buyLabel   = hasBase ? "Buy point" : "Post-debut high"
+    string buyText    = formatPrice(hasBase ? baseHigh : debutHigh)
+    string stopText   = hasBase ? formatPrice(baseLow) : "—"
+    string depthText  = hasBase ? str.tostring(depthPct, "#.##") + "%" : "—"
+    string lengthText = hasBase ? str.tostring(shownBars) + " bars" : "—"
+    string tightText  = not hasBase or na(tightRatio) ? "—" : (tightRatio < 1 ? "Yes · " : "No · ") + str.tostring(tightRatio, "#.##") + "x"
+    string dryUpText  = not hasVolume ? "n/a" : not hasBase or na(volumeRatio) ? "—" : volumeRatio < 1 ? "Drying up" : "Elevated"
+    string lockupText = daysSinceListing < lockupStartInput ? "Opens in " + str.tostring(math.ceil(lockupStartInput - daysSinceListing)) + "d" :
+      daysSinceListing <= lockupEndInput ? "Open · day " + str.tostring(math.round(daysSinceListing)) : "Passed"
+
+    table.cell(dashboardTable, 0, 0, "IPO Base", text_color = DASH_TEXT, text_size = textSize, text_halign = text.align_center)
+    table.cell(dashboardTable, 0, 1, "Listed", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 1, listedText, text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 2, "Status", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 2, statusText, text_color = statusColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 3, buyLabel, text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 3, buyText, text_color = hasBase ? bullColorInput : valueColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 4, "Invalidation", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 4, stopText, text_color = hasBase ? bearColorInput : valueColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 5, "Depth", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 5, depthText, text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 6, "Base length", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 6, lengthText, text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 7, "Tightening", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 7, tightText, text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 8, "Closes near highs", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 8, nearHighsText, text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 9, "Volume dry-up", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 9, dryUpText, text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 10, "Lockup " + str.tostring(lockupStartInput) + "-" + str.tostring(lockupEndInput) + "d", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 10, lockupText, text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Output
+//---------------------------------------------------------------------------------------------------------------------{
+bgcolor(showLockupInput and lockupActive ? color.new(lockupColorInput, SHADE_TRANSPARENCY) : na, title = "Lockup Window")
+
+plotshape(showMarkersInput and confirmedBreakoutEvent, "Breakout (Volume Confirmed)", shape.triangleup, location.belowbar, bullColorInput, size = size.tiny)
+plotshape(showMarkersInput and quietBreakoutEvent, "Breakout (No Volume Pickup)", shape.circle, location.belowbar, bullColorInput, size = size.tiny)
+plotshape(showMarkersInput and shakeoutEvent, "Shakeout", shape.diamond, location.belowbar, shakeoutColorInput, size = size.tiny)
+plotshape(showMarkersInput and invalidationEvent, "Base Invalidated", shape.xcross, location.belowbar, bearColorInput, size = size.tiny)
+plotshape(showMarkersInput and failedBreakoutEvent, "Failed Breakout", shape.xcross, location.abovebar, bearColorInput, size = size.tiny)
+
+plot(baseState == ST_VALID or baseState == ST_BREAKOUT ? baseHigh : na, "Buy Point", bullColorInput, display = display.data_window)
+plot(baseState == ST_VALID or baseState == ST_BREAKOUT ? baseLow : na, "Invalidation Level", bearColorInput, display = display.data_window)
+plot(daysSinceListing, "Days Since Listing", NEUTRAL_COLOR, display = display.data_window)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(formingEvent, "IPO Base Forming", "IPO base forming on {{ticker}} ({{interval}}): the post-debut pullback has settled into a candidate range - a defined high with a floor taking shape below it. The range still needs its minimum length before the buy point is actionable.")
+alertcondition(definedEvent, "IPO Base Defined", "IPO base defined on {{ticker}} ({{interval}}): the first post-debut range has met its minimum length. Buy point at the base high, invalidation at the base low - a watchlist flag, not an automatic entry.")
+alertcondition(confirmedBreakoutEvent, "IPO Base Breakout (Volume Confirmed)", "IPO base breakout on {{ticker}} ({{interval}}): close above the base high with volume running clearly above average - the conventional buy point of the first post-debut base. Manage with defined risk; first bases fail often.")
+alertcondition(quietBreakoutEvent, "IPO Base Breakout (No Volume Pickup)", "IPO base cleared quietly on {{ticker}} ({{interval}}): close above the base high without the required volume pickup. A thin-float new issue can clear a level on noise alone - treat the move as unconfirmed.")
+alertcondition(shakeoutEvent, "IPO Base Shakeout", "Shakeout on {{ticker}} ({{interval}}): a probe below the IPO base low snapped back inside the range. In thin new issues this reads as a supply test rather than automatic failure.")
+alertcondition(invalidationEvent, "IPO Base Invalidated", "IPO base invalidated on {{ticker}} ({{interval}}): price held below the base low beyond shakeout tolerance. The invalidation level is gone; the stock may need a longer structure before another attempt.")
+alertcondition(failedBreakoutEvent, "IPO Base Failed Breakout", "Failed breakout on {{ticker}} ({{interval}}): price lost the IPO base high after clearing it. Failure is planned for - the stop below the range defines the exit.")
+alertcondition(lockupOpenEvent, "Lockup Window Opens", "{{ticker}} ({{interval}}) is entering the typical lockup expiration window: insiders may soon be free to sell, a scheduled supply event that can land mid-pattern.")
+
+//---------------------------------------------------------------------------------------------------------------------}

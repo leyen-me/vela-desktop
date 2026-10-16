@@ -1,0 +1,296 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Higher Timeframe Stochastic Buckets", "HTF Stochastic Buckets", overlay = false, max_polylines_count = 100, max_labels_count = 100, calc_bars_count = 5000)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types
+//---------------------------------------------------------------------------------------------------------------------{
+
+type BucketInfo
+    polyline id
+    label lbl
+    int direction
+    float limitPrice
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+BULLISH_DIRECTION = -1
+BEARISH_DIRECTION = 1
+
+DETECTION_GROUP = "Detection"
+BUCKET_GROUP = "Buckets"
+RSI_GROUP = "Chart Timeframe RSI"
+STYLE_GROUP = "Style"
+
+higherTimeframeTooltip = "Select the higher timeframe used to calculate the stochastic oscillator. For the intended behavior, choose a timeframe above the chart timeframe."
+kLengthTooltip = "Set the lookback length used in the raw stochastic calculation."
+kSmoothingTooltip = "Set the smoothing length applied to the stochastic %K line."
+dSmoothingTooltip = "Set the smoothing length used to calculate the %D signal line."
+overboughtTooltip = "Set the stochastic level at or above which the higher timeframe is considered overbought."
+oversoldTooltip = "Set the stochastic level at or below which the higher timeframe is considered oversold."
+requireDTooltip = "Require both the confirmed higher-timeframe %K and %D lines to be inside a zone before creating a bucket."
+atrLengthTooltip = "Set the ATR length used to scale bucket depth to current chart volatility."
+depthMultiplierTooltip = "Set bucket depth as a multiple of the chart-timeframe ATR."
+maximumBucketsTooltip = "Set the maximum number of recent buckets retained on the chart."
+hideBrokenTooltip = "When enabled, buckets are automatically removed from the chart if the price significantly breaks their extreme level (closes beyond the bucket's depth limit)."
+lineWidthTooltip = "Set the outline width of each bucket."
+fillTransparencyTooltip = "Set the transparency of the bucket interior. Higher values are more transparent."
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Inputs
+//---------------------------------------------------------------------------------------------------------------------{
+
+higherTimeframeInput = input.timeframe("240", "Higher Timeframe", group = DETECTION_GROUP, tooltip = higherTimeframeTooltip)
+kLengthInput = input.int(14, "%K Length", minval = 1, group = DETECTION_GROUP, tooltip = kLengthTooltip)
+kSmoothingInput = input.int(3, "%K Smoothing", minval = 1, group = DETECTION_GROUP, tooltip = kSmoothingTooltip)
+dSmoothingInput = input.int(3, "%D Smoothing", minval = 1, group = DETECTION_GROUP, tooltip = dSmoothingTooltip)
+overboughtInput = input.float(80.0, "Overbought", minval = 0.0, maxval = 100.0, step = 0.5, group = DETECTION_GROUP, tooltip = overboughtTooltip)
+oversoldInput = input.float(20.0, "Oversold", minval = 0.0, maxval = 100.0, step = 0.5, group = DETECTION_GROUP, tooltip = oversoldTooltip)
+requireDInput = input.bool(false, "Require %D Confirmation", group = DETECTION_GROUP, tooltip = requireDTooltip)
+
+atrLengthInput = input.int(14, "ATR Length", minval = 1, group = BUCKET_GROUP, tooltip = atrLengthTooltip)
+depthMultiplierInput = input.float(1.5, "ATR Depth", minval = 0.1, maxval = 10.0, step = 0.1, group = BUCKET_GROUP, tooltip = depthMultiplierTooltip)
+maximumBucketsInput = input.int(30, "Maximum Buckets", minval = 1, maxval = 100, group = BUCKET_GROUP, tooltip = maximumBucketsTooltip)
+hideBrokenInput = input.bool(true, "Hide Broken Zones", group = BUCKET_GROUP, tooltip = hideBrokenTooltip)
+showLabelsInput = input.bool(true, "Show Volume & Delta Labels", group = BUCKET_GROUP)
+
+showRsiSignalsInput = input.bool(true, "Show RSI Signals Inside Zones", group = RSI_GROUP)
+rsiLengthInput = input.int(14, "RSI Length", minval = 1, group = RSI_GROUP)
+rsiOverboughtInput = input.float(70.0, "Overbought", minval = 0.0, maxval = 100.0, group = RSI_GROUP)
+rsiOversoldInput = input.float(30.0, "Oversold", minval = 0.0, maxval = 100.0, group = RSI_GROUP)
+
+overboughtColorInput = input.color(#f23645, "Overbought", inline = "colors", group = STYLE_GROUP)
+oversoldColorInput = input.color(#089981, "Oversold", inline = "colors", group = STYLE_GROUP)
+lineWidthInput = input.int(2, "Outline Width", minval = 1, maxval = 5, group = STYLE_GROUP, tooltip = lineWidthTooltip)
+fillTransparencyInput = input.int(85, "Fill Transparency", minval = 0, maxval = 100, group = STYLE_GROUP, tooltip = fillTransparencyTooltip)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+calculateStochastic() =>
+    float rawK = ta.stoch(close, high, low, kLengthInput)
+    float smoothK = ta.sma(rawK, kSmoothingInput)
+    float smoothD = ta.sma(smoothK, dSmoothingInput)
+    [smoothK, smoothD]
+
+createBucket(int direction, float rimPrice, float depth, int startTime, int endTime, int barStep) =>
+    array<chart.point> points = array.new<chart.point>()
+    int numPoints = 40
+    
+    int duration = endTime - startTime
+    // Ensure the bucket has a minimum visual width of 3 bars so it doesn't look like a spiked needle
+    if duration < barStep * 3
+        duration := barStep * 3
+        
+    for i = 0 to numPoints
+        float progress = float(i) / float(numPoints)
+        float normalizedX = 2.0 * progress - 1.0
+        float ellipseFactor = math.sqrt(math.max(0.0, 1.0 - normalizedX * normalizedX))
+        float pointPrice = rimPrice + direction * depth * ellipseFactor
+        int pointTime = math.round(startTime + progress * duration)
+        array.push(points, chart.point.from_time(pointTime, pointPrice))
+
+    color bucketColor = direction == BULLISH_DIRECTION ? oversoldColorInput : overboughtColorInput
+    polyline.new(points, curved = false, closed = true, xloc = xloc.bar_time, line_color = bucketColor, fill_color = color.new(bucketColor, fillTransparencyInput), line_style = line.style_solid, line_width = lineWidthInput, force_overlay = true)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Bucket Drawings
+//---------------------------------------------------------------------------------------------------------------------{
+
+[stochasticK, stochasticD] = calculateStochastic()
+float rawAtr = ta.atr(atrLengthInput)
+
+[htfK, htfD, htfAtr] = request.security(syminfo.tickerid, higherTimeframeInput, [stochasticK[1], stochasticD[1], rawAtr[1]], gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+
+bool oversoldState = htfK <= oversoldInput and (not requireDInput or htfD <= oversoldInput)
+bool overboughtState = htfK >= overboughtInput and (not requireDInput or htfD >= overboughtInput)
+bool oversoldSignal = oversoldState and not oversoldState[1]
+bool overboughtSignal = overboughtState and not overboughtState[1]
+
+float bucketDepth = htfAtr * depthMultiplierInput
+
+int currentBarStep = int(ta.change(time))
+if na(currentBarStep) or currentBarStep == 0
+    currentBarStep := 1000 * 60 * 60 // fallback 1 hour
+
+bool htfClosed = ta.change(time(higherTimeframeInput)) != 0
+
+var array<BucketInfo> historicalBuckets = array.new<BucketInfo>()
+
+var polyline activeBullBucket = na
+var label activeBullLabel = na
+var int bullStartTime = na
+var float bullRimPrice = na
+var float confirmedBullVol = 0.0
+var float confirmedBullDelta = 0.0
+
+var polyline activeBearBucket = na
+var label activeBearLabel = na
+var int bearStartTime = na
+var float bearRimPrice = na
+var float confirmedBearVol = 0.0
+var float confirmedBearDelta = 0.0
+
+float barVol = nz(volume)
+float barDelta = close > open ? barVol : close < open ? -barVol : 0.0
+
+if oversoldSignal
+    bullStartTime := time
+    bullRimPrice := low
+    confirmedBullVol := 0.0
+    confirmedBullDelta := 0.0
+    if showLabelsInput
+        activeBullLabel := label.new(time, low, text = "", xloc = xloc.bar_time, style = label.style_label_up, color = color.new(oversoldColorInput, 80), textcolor = oversoldColorInput, size = size.small, force_overlay = true)
+
+if overboughtSignal
+    bearStartTime := time
+    bearRimPrice := high
+    confirmedBearVol := 0.0
+    confirmedBearDelta := 0.0
+    if showLabelsInput
+        activeBearLabel := label.new(time, high, text = "", xloc = xloc.bar_time, style = label.style_label_down, color = color.new(overboughtColorInput, 80), textcolor = overboughtColorInput, size = size.small, force_overlay = true)
+
+if oversoldState and not na(bullStartTime) and not na(bucketDepth)
+    float displayVol = confirmedBullVol + barVol
+    float displayDelta = confirmedBullDelta + barDelta
+    
+    float bullLimitPrice = bullRimPrice + BULLISH_DIRECTION * bucketDepth
+    bool isBroken = htfClosed and close[1] < bullLimitPrice
+    
+    if isBroken and not na(activeBullLabel)
+        label.delete(activeBullLabel)
+        activeBullLabel := na
+        
+    if hideBrokenInput and isBroken
+        if not na(activeBullBucket)
+            polyline.delete(activeBullBucket)
+            activeBullBucket := na
+        bullStartTime := na
+    else
+        if not na(activeBullBucket)
+            polyline.delete(activeBullBucket)
+        activeBullBucket := createBucket(BULLISH_DIRECTION, bullRimPrice, bucketDepth, bullStartTime, time, currentBarStep)
+        
+        if not na(activeBullLabel)
+            label.set_x(activeBullLabel, math.round((bullStartTime + time) / 2))
+            label.set_y(activeBullLabel, bullLimitPrice)
+            label.set_text(activeBullLabel, "Vol: " + str.tostring(displayVol, format.volume) + "\nΔ: " + str.tostring(displayDelta, format.volume))
+            
+    if barstate.isconfirmed and not isBroken
+        confirmedBullVol += barVol
+        confirmedBullDelta += barDelta
+
+if overboughtState and not na(bearStartTime) and not na(bucketDepth)
+    float displayVol = confirmedBearVol + barVol
+    float displayDelta = confirmedBearDelta + barDelta
+    
+    float bearLimitPrice = bearRimPrice + BEARISH_DIRECTION * bucketDepth
+    bool isBroken = htfClosed and close[1] > bearLimitPrice
+    
+    if isBroken and not na(activeBearLabel)
+        label.delete(activeBearLabel)
+        activeBearLabel := na
+        
+    if hideBrokenInput and isBroken
+        if not na(activeBearBucket)
+            polyline.delete(activeBearBucket)
+            activeBearBucket := na
+        bearStartTime := na
+    else
+        if not na(activeBearBucket)
+            polyline.delete(activeBearBucket)
+        activeBearBucket := createBucket(BEARISH_DIRECTION, bearRimPrice, bucketDepth, bearStartTime, time, currentBarStep)
+        
+        if not na(activeBearLabel)
+            label.set_x(activeBearLabel, math.round((bearStartTime + time) / 2))
+            label.set_y(activeBearLabel, bearLimitPrice)
+            label.set_text(activeBearLabel, "Vol: " + str.tostring(displayVol, format.volume) + "\nΔ: " + str.tostring(displayDelta, format.volume))
+            
+    if barstate.isconfirmed and not isBroken
+        confirmedBearVol += barVol
+        confirmedBearDelta += barDelta
+
+if not oversoldState and oversoldState[1]
+    if not na(activeBullBucket)
+        float finalLimit = bullRimPrice + BULLISH_DIRECTION * bucketDepth
+        historicalBuckets.push(BucketInfo.new(activeBullBucket, activeBullLabel, BULLISH_DIRECTION, finalLimit))
+        activeBullBucket := na
+        activeBullLabel := na
+
+if not overboughtState and overboughtState[1]
+    if not na(activeBearBucket)
+        float finalLimit = bearRimPrice + BEARISH_DIRECTION * bucketDepth
+        historicalBuckets.push(BucketInfo.new(activeBearBucket, activeBearLabel, BEARISH_DIRECTION, finalLimit))
+        activeBearBucket := na
+        activeBearLabel := na
+
+if historicalBuckets.size() > 0
+    for i = historicalBuckets.size() - 1 to 0
+        BucketInfo b = historicalBuckets.get(i)
+        bool isBroken = false
+        if htfClosed
+            if b.direction == BULLISH_DIRECTION and close[1] < b.limitPrice
+                isBroken := true
+            else if b.direction == BEARISH_DIRECTION and close[1] > b.limitPrice
+                isBroken := true
+            
+        if isBroken
+            if not na(b.lbl)
+                label.delete(b.lbl)
+                b.lbl := na
+                historicalBuckets.set(i, b)
+                
+            if hideBrokenInput
+                polyline.delete(b.id)
+                historicalBuckets.remove(i)
+
+while historicalBuckets.size() > maximumBucketsInput
+    BucketInfo b = historicalBuckets.shift()
+    polyline.delete(b.id)
+    if not na(b.lbl)
+        label.delete(b.lbl)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Chart Timeframe RSI Signals
+//---------------------------------------------------------------------------------------------------------------------{
+
+bool isBrokenZone = hideBrokenInput and ((oversoldState and na(bullStartTime)) or (overboughtState and na(bearStartTime)))
+
+float ltfRsi = ta.rsi(close, rsiLengthInput)
+bool ltfObSignal = ltfRsi >= rsiOverboughtInput and ltfRsi[1] < rsiOverboughtInput
+bool ltfOsSignal = ltfRsi <= rsiOversoldInput and ltfRsi[1] > rsiOversoldInput
+
+bool validBullSignal = oversoldState and ltfOsSignal and not isBrokenZone
+bool validBearSignal = overboughtState and ltfObSignal and not isBrokenZone
+
+plotshape(showRsiSignalsInput and validBullSignal, "LTF Bullish RSI Signal", shape.triangleup, location.belowbar, color = oversoldColorInput, size = size.small, force_overlay = true)
+plotshape(showRsiSignalsInput and validBearSignal, "LTF Bearish RSI Signal", shape.triangledown, location.abovebar, color = overboughtColorInput, size = size.small, force_overlay = true)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Oscillator & Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+color kColor = htfK > 50 ? #089981 : #f23645
+color transColor = color.new(chart.bg_color, 100)
+color topGradColor = htfK > 50 ? color.new(kColor, 50) : transColor
+color botGradColor = htfK > 50 ? transColor : color.new(kColor, 50)
+
+plot(50, "Center Line", color = color.new(#808080, 50))
+plot(overboughtInput, "Overbought", color = color.new(#808080, 50), linestyle = plot.linestyle_dashed)
+plot(oversoldInput, "Oversold", color = color.new(#808080, 50), linestyle = plot.linestyle_dashed)
+
+centerPlot = plot(50, "Fill Center", color = na, display = display.none)
+kPlot = plot(htfK, "Confirmed HTF %K", color = kColor)
+dPlot = plot(htfD, "Confirmed HTF %D", color = color.new(#5b9cf6, 40))
+
+fill(kPlot, centerPlot, top_value = math.max(50, htfK), bottom_value = math.min(50, htfK), top_color = topGradColor, bottom_color = botGradColor, title = "Stochastic Gradient")
+
+alertcondition(oversoldSignal, "HTF Stochastic Oversold", "{{ticker}} confirmed higher-timeframe stochastic entered the oversold zone.")
+alertcondition(overboughtSignal, "HTF Stochastic Overbought", "{{ticker}} confirmed higher-timeframe stochastic entered the overbought zone.")
+
+//---------------------------------------------------------------------------------------------------------------------}

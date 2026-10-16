@@ -1,0 +1,174 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Whittaker Envelope", "Whittaker Envelope", overlay = true)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants & Inputs
+//---------------------------------------------------------------------------------------------------------------------{
+int   LENGTH_MIN    = 5
+float LAMBDA_MIN    = 0.1
+int   ITERS_MAX     = 50
+
+string SETTINGS_GRP = "Settings"
+lengthInput         = input.int(500,    "Length",           minval = LENGTH_MIN,    group = SETTINGS_GRP, tooltip = "Number of most recent prices to include in the calculation.")
+lambdaInput         = input.float(1000, "Lambda (λ)",       minval = LAMBDA_MIN,    group = SETTINGS_GRP, tooltip = "Smoothing factor. Higher values produce smoother envelopes.")
+pLowerInput         = input.float(0.001, "Lower Asymmetry (p)", minval = 0.0, maxval = 0.5, step = 0.001, group = SETTINGS_GRP, tooltip = "Typically very small (0.001) to follow troughs.")
+pUpperInput         = input.float(0.999, "Upper Asymmetry (p)", minval = 0.5, maxval = 1.0, step = 0.001, group = SETTINGS_GRP, tooltip = "Typically very large (0.999) to follow peaks.")
+itersInput          = input.int(10,     "Iterations",       minval = 1,   maxval = ITERS_MAX,  group = SETTINGS_GRP, tooltip = "Number of ALS iterations. More iterations lead to better fit but higher CPU load.")
+extrapInput         = input.int(50,     "Extrapolation",    minval = 0,   maxval = 500,        group = SETTINGS_GRP, tooltip = "Number of bars to project the fit into the future.")
+srcInput            = input.source(close, "Source",                                 group = SETTINGS_GRP)
+
+// Signature Colors
+color BULL_COLOR    = #089981
+color BEAR_COLOR    = #f23645
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types & Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+// @function Solves a symmetric pentadiagonal system A * x = b.
+// Optimized for symmetric positive definite systems.
+solvePentadiagonal(array<float> b, array<float> d, array<float> c, array<float> f, int n, array<float> x) =>
+    var d_tmp = array.new_float(n)
+    var c_tmp = array.new_float(n)
+    var b_tmp = array.new_float(n)
+    
+    for i = 0 to n - 1
+        d_tmp.set(i, d.get(i))
+        c_tmp.set(i, c.get(i))
+        b_tmp.set(i, b.get(i))
+
+    float r = c_tmp.get(0)
+    float s = c_tmp.get(1)
+    float t = f.get(0)
+    float xmult = 0.0
+    
+    int l1 = n - 1
+    int l2 = n - 2
+
+    for i = 1 to l2
+        float d_prev = d_tmp.get(i - 1)
+        xmult := r / d_prev
+        d_tmp.set(i, d_tmp.get(i) - xmult * c_tmp.get(i - 1))
+        c_tmp.set(i, c_tmp.get(i) - xmult * f.get(i - 1))
+        b_tmp.set(i, b_tmp.get(i) - xmult * b_tmp.get(i - 1))
+        
+        xmult := t / d_prev
+        r     := s - xmult * c_tmp.get(i - 1)
+        d_tmp.set(i + 1, d_tmp.get(i + 1) - xmult * f.get(i - 1))
+        b_tmp.set(i + 1, b_tmp.get(i + 1) - xmult * b_tmp.get(i - 1))
+        
+        if i < l2
+            s := c_tmp.get(i + 1)
+            t := f.get(i)
+        
+    xmult := r / d_tmp.get(l2)
+    d_tmp.set(l1, d_tmp.get(l1) - xmult * c_tmp.get(l2))
+    
+    x.set(l1, (b_tmp.get(l1) - xmult * b_tmp.get(l2)) / d_tmp.get(l1))
+    x.set(l2, (b_tmp.get(l2) - c_tmp.get(l2) * x.get(l1)) / d_tmp.get(l2))
+    
+    for i = n - 3 to 0 by 1
+        x.set(i, (b_tmp.get(i) - f.get(i) * x.get(i + 2) - c_tmp.get(i) * x.get(i + 1)) / d_tmp.get(i))
+
+// @function Performs ALS Whittaker smoothing.
+whittakerALS(array<float> prices, array<float> d_base, array<float> c_base, array<float> f_base, int n, int iters, float p, array<float> z) =>
+    var weights = array.new_float(lengthInput, 1.0)
+    var b_curr  = array.new_float(lengthInput)
+    var d_curr  = array.new_float(lengthInput)
+    
+    weights.fill(1.0)
+    for it = 1 to iters
+        for i = 0 to n - 1
+            float w = weights.get(i)
+            d_curr.set(i, d_base.get(i) + w)
+            b_curr.set(i, w * prices.get(i))
+        
+        solvePentadiagonal(b_curr, d_curr, c_base, f_base, n, z)
+        
+        for i = 0 to n - 1
+            weights.set(i, prices.get(i) > z.get(i) ? p : 1.0 - p)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Main Logic
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Pre-calculate D^T * D components (Smoothing matrix λ * D'D)
+var d_base = array.new_float(lengthInput)
+var c_base = array.new_float(lengthInput)
+var f_base = array.new_float(lengthInput)
+
+if barstate.isfirst
+    float k = lambdaInput
+    for i = 0 to lengthInput - 1
+        float di = 6.0 * k
+        float ci = -4.0 * k
+        float fi = k
+        if i == 0
+            di := k, ci := -2.0 * k
+        else if i == 1
+            di := 5.0 * k
+        else if i == lengthInput - 2
+            di := 5.0 * k, ci := -2.0 * k
+        else if i == lengthInput - 1
+            di := k, ci := 0.0, fi := 0.0
+        d_base.set(i, di), c_base.set(i, ci), f_base.set(i, fi)
+
+// Processing
+var prices = array.new_float(lengthInput)
+var zLower = array.new_float(lengthInput)
+var zUpper = array.new_float(lengthInput)
+
+var polyline lowerLine = na
+var polyline upperLine = na
+var polyline avgLine   = na
+
+if barstate.islast and bar_index >= lengthInput
+    // Collect price window
+    for i = 0 to lengthInput - 1
+        prices.set(i, srcInput[i])
+    
+    // Calculate envelopes
+    whittakerALS(prices, d_base, c_base, f_base, lengthInput, itersInput, pLowerInput, zLower)
+    whittakerALS(prices, d_base, c_base, f_base, lengthInput, itersInput, pUpperInput, zUpper)
+
+    // Delete existing polylines
+    polyline.delete(lowerLine)
+    polyline.delete(upperLine)
+    polyline.delete(avgLine)
+    
+    array<chart.point> lowerPoints = array.new<chart.point>()
+    array<chart.point> upperPoints = array.new<chart.point>()
+    array<chart.point> avgPoints   = array.new<chart.point>()
+    
+    // Fit Points (Historical)
+    for i = lengthInput - 1 to 0
+        int idx = bar_index - i
+        float zl = zLower.get(i)
+        float zu = zUpper.get(i)
+        float za = (zl + zu) / 2.0
+        
+        lowerPoints.push(chart.point.from_index(idx, zl))
+        upperPoints.push(chart.point.from_index(idx, zu))
+        avgPoints.push(chart.point.from_index(idx, za))
+    
+    // Extrapolation (Future)
+    if extrapInput > 0
+        float mLower = zLower.get(0) - zLower.get(1)
+        float mUpper = zUpper.get(0) - zUpper.get(1)
+        
+        for i = 1 to extrapInput
+            int idx = bar_index + i
+            float extL = zLower.get(0) + i * mLower
+            float extU = zUpper.get(0) + i * mUpper
+            
+            lowerPoints.push(chart.point.from_index(idx, extL))
+            upperPoints.push(chart.point.from_index(idx, extU))
+            avgPoints.push(chart.point.from_index(idx, (extL + extU) / 2.0))
+    
+    lowerLine := polyline.new(lowerPoints, line_color = BULL_COLOR, line_width = 2)
+    upperLine := polyline.new(upperPoints, line_color = BEAR_COLOR, line_width = 2)
+    avgLine   := polyline.new(avgPoints,   line_color = chart.fg_color, line_width = 1, line_style = line.style_dashed)
+
+//---------------------------------------------------------------------------------------------------------------------}

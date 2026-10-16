@@ -1,0 +1,461 @@
+// This work is licensed under Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Role Reversal"
+  , shorttitle       = "Role Reversal"
+  , overlay          = true
+  , format           = format.price
+  , max_lines_count  = 500
+  , max_labels_count = 500
+  , max_boxes_count  = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+color BULL_COLOR    = #089981
+color BEAR_COLOR    = #f23645
+color NEUTRAL_COLOR = #787b86
+color LABEL_BG      = #00000000
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+// Level lifecycle
+int STATE_ACTIVE  = 0
+int STATE_BROKEN  = 1
+int STATE_FLIPPED = 2
+
+int ZONE_BG_TRANSP       = 85
+int ZONE_BORDER_TRANSP   = 50
+int CANDIDATE_BG_TRANSP  = 88
+int RETIRED_BG_TRANSP    = 93
+int POSITION_BG_TRANSP   = 88
+
+string BREAK_BODY  = "Full-Bodied Close"
+string BREAK_CLOSE = "Any Close"
+
+string GROUP_LEVELS = "Levels With History"
+string GROUP_BREAK  = "Break & Return"
+string GROUP_TRADE  = "Trade Plan"
+string GROUP_DASH   = "Dashboard"
+string GROUP_STYLE  = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+pivotLengthInput = input.int(5, "Swing Length", minval = 1, maxval = 50, group = GROUP_LEVELS
+  , tooltip = "Bars on each side a high or low must dominate to count as a swing. Every confirmed swing is a touch of the level it lands on.")
+
+minTouchesInput = input.int(2, "Minimum Touches", minval = 1, maxval = 10, group = GROUP_LEVELS
+  , tooltip = "Swings a level needs before its break counts. The flip runs on trapped positions and resting interest, so only boundaries the market demonstrably traded around qualify; lines with no history flip weakly if at all.")
+
+touchTolInput = input.float(0.3, "Touch Tolerance (ATR)", minval = 0.05, maxval = 3, step = 0.05, group = GROUP_LEVELS
+  , tooltip = "A swing within this distance of a level, in 14-bar ATR, joins it as a touch and widens the zone to cover it.")
+
+minZoneInput = input.float(0.25, "Minimum Zone Width (ATR)", minval = 0, maxval = 3, step = 0.05, group = GROUP_LEVELS
+  , tooltip = "Levels are zones rather than ticks: the zone spans its touches and is at least this wide. Its thickness carries into the new role and sets the grading tolerance of the return.")
+
+maxZoneInput = input.float(1, "Maximum Zone Width (ATR)", minval = 0.1, maxval = 5, step = 0.1, group = GROUP_LEVELS
+  , tooltip = "A touch that would stretch the zone beyond this width still counts but no longer widens it.")
+
+maxLevelsInput = input.int(12, "Levels Tracked", minval = 1, maxval = 50, group = GROUP_LEVELS
+  , tooltip = "Unbroken levels watched at once; the oldest is dropped first.")
+
+breakRuleInput = input.string(BREAK_BODY, "Break Rule", options = [BREAK_BODY, BREAK_CLOSE], group = GROUP_BREAK
+  , tooltip = "A decisive break is where the flip begins. 'Full-Bodied Close' wants a candle in the break direction with a body of at least half its range closing beyond the zone; 'Any Close' accepts any close beyond it. Wick probes never count.")
+
+bufferInput = input.float(0.1, "Break Buffer (ATR)", minval = 0, maxval = 2, step = 0.05, group = GROUP_BREAK
+  , tooltip = "Distance beyond the zone, in ATR, a close needs to count as a break, and later as a failure back through it.")
+
+excursionInput = input.float(1, "Minimum Excursion (ATR)", minval = 0, maxval = 10, step = 0.25, group = GROUP_BREAK
+  , tooltip = "How far price must travel beyond the zone, in ATR, before a trip back into it counts as the return. Without it the bar after every break would be graded as a retest; the flip is tested by a return from the far side.")
+
+retestWindowInput = input.int(30, "Return Window", minval = 1, maxval = 500, group = GROUP_BREAK
+  , tooltip = "Bars after the break during which a return to the zone is watched. A break that never comes back inside the window is recorded as No Return.")
+
+showTradeInput = input.bool(true, "Trade Levels", group = GROUP_TRADE
+  , tooltip = "Plan a trade on each graded return: with the breakout when the flipped zone holds (stop beyond the zone's far side), against it when the flip fails (stop beyond the break's extreme, since the breakout crowd is now trapped).")
+
+tradeFailedInput = input.bool(true, "Trade Failed Flips", group = GROUP_TRADE
+  , tooltip = "A return that is accepted back inside the old range converts the break into a false break, a setup of its own pointing back across the old range.")
+
+stopBufferInput = input.float(0.1, "Stop Buffer (ATR)", minval = 0, maxval = 2, step = 0.05, group = GROUP_TRADE)
+
+targetRInput = input.float(2, "Target (R)", minval = 0.5, maxval = 10, step = 0.25, group = GROUP_TRADE
+  , tooltip = "Target as a multiple of the planned risk.")
+
+maxHoldInput = input.int(40, "Maximum Hold (Bars)", minval = 1, maxval = 500, group = GROUP_TRADE
+  , tooltip = "A position that reaches neither its target nor its stop within this many bars is closed at the bar's close and recorded as Timed Out.")
+
+showDashInput = input.bool(true, "Show Dashboard", group = GROUP_DASH
+  , tooltip = "How every qualified break on the chart was graded: returned or not, flip held or failed, and how the planned trades resolved.")
+
+dashPosInput = input.string("Bottom Right", "Position", options = ["Top Right", "Bottom Right", "Bottom Left", "Top Left"], group = GROUP_DASH)
+
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = GROUP_DASH)
+
+showCandidatesInput = input.bool(true, "Show Unbroken Levels", group = GROUP_STYLE
+  , tooltip = "Draw qualified levels before they break, in the neutral color.")
+
+showLabelsInput = input.bool(true, "Event Labels", group = GROUP_STYLE
+  , tooltip = "Break marks the decisive close through a level, Flip Held the return that respected its new role, Failed Flip the return accepted back inside the old range.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "colors", group = GROUP_STYLE)
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "colors", group = GROUP_STYLE)
+neutralColorInput = input.color(NEUTRAL_COLOR, "Neutral", inline = "colors", group = GROUP_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types
+//---------------------------------------------------------------------------------------------------------------------{
+// A horizontal zone built from swings and its role-reversal lifecycle
+type Level
+    float top
+    float bottom
+    int   firstBar
+    int   touches
+    int   side
+    int   state
+    int   flipDir
+    int   breakBar
+    float breakExtreme
+    int   returnBar
+    box   zone
+
+// A planned trade from a graded return
+type Trade
+    int   dir
+    int   startBar
+    float entry
+    float stop
+    float target
+    bool  fromFailure
+    line  entryLine
+    line  stopLine
+    line  targetLine
+    box   rewardBox
+    box   riskBox
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Open a planned trade with its levels and position boxes
+openTrade(int dir, float entry, float stop, bool fromFailure) =>
+    float risk   = math.abs(entry - stop)
+    float target = entry + dir * risk * targetRInput
+    color dirColor = dir == 1 ? bullColorInput : bearColorInput
+    color oppColor = dir == 1 ? bearColorInput : bullColorInput
+    line  eLine = line.new(bar_index, entry, bar_index + 1, entry, color = dirColor, width = 2)
+    line  sLine = line.new(bar_index, stop, bar_index + 1, stop, color = oppColor, style = line.style_dashed)
+    line  tLine = line.new(bar_index, target, bar_index + 1, target, color = dirColor, style = line.style_dashed)
+    box   rBox  = box.new(bar_index, target, bar_index + 1, entry, border_color = LABEL_BG, bgcolor = color.new(dirColor, POSITION_BG_TRANSP)
+      , text = "Target " + str.tostring(targetRInput, "#.##") + "R", text_color = dirColor, text_size = size.small, text_halign = text.align_right, text_valign = dir == 1 ? text.align_top : text.align_bottom)
+    box   kBox  = box.new(bar_index, entry, bar_index + 1, stop, border_color = LABEL_BG, bgcolor = color.new(oppColor, POSITION_BG_TRANSP)
+      , text = "Stop", text_color = oppColor, text_size = size.small, text_halign = text.align_right, text_valign = dir == 1 ? text.align_bottom : text.align_top)
+    Trade.new(dir, bar_index, entry, stop, target, fromFailure, eLine, sLine, tLine, rBox, kBox)
+
+// Extend a trade's drawings to the given bar
+extendTrade(Trade t, int x) =>
+    line.set_x2(t.entryLine, x)
+    line.set_x2(t.stopLine, x)
+    line.set_x2(t.targetLine, x)
+    box.set_right(t.rewardBox, x)
+    box.set_right(t.riskBox, x)
+
+// Delete a trade's drawings (trade levels hidden)
+deleteTrade(Trade t) =>
+    line.delete(t.entryLine)
+    line.delete(t.stopLine)
+    line.delete(t.targetLine)
+    box.delete(t.rewardBox)
+    box.delete(t.riskBox)
+
+// Retire a level's zone: stop extending it and fade it
+retireZone(Level lv, int x) =>
+    if not na(lv.zone)
+        box.set_right(lv.zone, x)
+        box.set_bgcolor(lv.zone, color.new(neutralColorInput, RETIRED_BG_TRANSP))
+        box.set_border_color(lv.zone, color.new(neutralColorInput, 70))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+float atrValue  = ta.atr(14)
+float pivotHigh = ta.pivothigh(high, pivotLengthInput, pivotLengthInput)
+float pivotLow  = ta.pivotlow(low, pivotLengthInput, pivotLengthInput)
+float candleBody  = math.abs(close - open)
+float candleRange = high - low
+
+var array<Level> levels = array.new<Level>()
+var array<Trade> trades = array.new<Trade>()
+
+var int countBreaks   = 0
+var int countReturned = 0
+var int countHeld     = 0
+var int countFailed   = 0
+var int countNoReturn = 0
+var int heldTarget    = 0
+var int heldStop      = 0
+var int failedTarget  = 0
+var int failedStop    = 0
+var int countTimed    = 0
+
+bool breakUpEvent   = false
+bool breakDownEvent = false
+bool heldBullEvent  = false
+bool heldBearEvent  = false
+bool failBullEvent  = false
+bool failBearEvent  = false
+
+// Resolve open trades first, so a trade never resolves on the bar that opened it
+if barstate.isconfirmed and array.size(trades) > 0
+    for i = array.size(trades) - 1 to 0
+        Trade t = array.get(trades, i)
+        bool hitStop   = t.dir == 1 ? low <= t.stop : high >= t.stop
+        bool hitTarget = not hitStop and (t.dir == 1 ? high >= t.target : low <= t.target)
+        bool timedOut  = not hitStop and not hitTarget and bar_index - t.startBar >= maxHoldInput
+        if hitStop or hitTarget or timedOut
+            float r = hitStop ? -1.0 : hitTarget ? targetRInput : (close - t.entry) * t.dir / math.abs(t.entry - t.stop)
+            if hitTarget
+                if t.fromFailure
+                    failedTarget += 1
+                else
+                    heldTarget += 1
+            else if hitStop
+                if t.fromFailure
+                    failedStop += 1
+                else
+                    heldStop += 1
+            else
+                countTimed += 1
+            if showTradeInput
+                extendTrade(t, bar_index)
+                bool  above = (t.dir == 1) == (r >= 0)
+                color resultColor = hitTarget ? (t.dir == 1 ? bullColorInput : bearColorInput) : hitStop ? (t.dir == 1 ? bearColorInput : bullColorInput) : neutralColorInput
+                label.new(bar_index, na, (r >= 0 ? "+" : "") + str.tostring(r, "#.#") + "R"
+                  , yloc      = above ? yloc.abovebar : yloc.belowbar
+                  , style     = above ? label.style_label_down : label.style_label_up
+                  , color     = resultColor
+                  , textcolor = color.white
+                  , size      = size.small
+                  , tooltip   = hitTarget ? "Target reached" : hitStop ? "Stopped" : "Closed at the maximum hold")
+            array.remove(trades, i)
+        else if showTradeInput
+            extendTrade(t, bar_index)
+
+// Level lifecycle: decisive break, return to the zone, then the flip holds or fails
+if barstate.isconfirmed and array.size(levels) > 0 and not na(atrValue)
+    float buffer = atrValue * bufferInput
+    for i = array.size(levels) - 1 to 0
+        Level lv = array.get(levels, i)
+        bool remove = false
+        if lv.state == STATE_ACTIVE
+            bool qualified = lv.touches >= minTouchesInput
+            bool bodyOk    = breakRuleInput == BREAK_CLOSE or (candleRange > 0 and candleBody >= candleRange * 0.5)
+            // The break candle has to cross the zone itself: it opens no further than the buffer beyond it
+            bool upBreak   = lv.side == -1 and close > lv.top + buffer and open <= lv.top + buffer and (breakRuleInput == BREAK_CLOSE or close > open) and bodyOk
+            bool downBreak = lv.side == 1 and close < lv.bottom - buffer and open >= lv.bottom - buffer and (breakRuleInput == BREAK_CLOSE or close < open) and bodyOk
+            // A qualified level crossed without a decisive break and left behind by an ATR is retired
+            bool drifted   = qualified and (lv.side == -1 ? close > lv.top + atrValue : lv.side == 1 ? close < lv.bottom - atrValue : false)
+            if qualified and (upBreak or downBreak)
+                lv.state        := STATE_BROKEN
+                lv.flipDir      := upBreak ? 1 : -1
+                lv.breakBar     := bar_index
+                lv.breakExtreme := upBreak ? high : low
+                countBreaks     += 1
+                if upBreak
+                    breakUpEvent := true
+                else
+                    breakDownEvent := true
+                color flipColor = upBreak ? bullColorInput : bearColorInput
+                if not na(lv.zone)
+                    box.set_right(lv.zone, bar_index)
+                    box.set_bgcolor(lv.zone, color.new(flipColor, ZONE_BG_TRANSP))
+                    box.set_border_color(lv.zone, color.new(flipColor, ZONE_BORDER_TRANSP))
+                if showLabelsInput
+                    label.new(bar_index, na, "Break"
+                      , yloc      = upBreak ? yloc.abovebar : yloc.belowbar
+                      , style     = upBreak ? label.style_label_down : label.style_label_up
+                      , color     = LABEL_BG
+                      , textcolor = flipColor
+                      , size      = size.small
+                      , tooltip   = (upBreak ? "Resistance" : "Support") + " with " + str.tostring(lv.touches) + " touches broken on a decisive close. Under the role-reversal convention the zone " + str.tostring(lv.bottom, format.mintick) + " to " + str.tostring(lv.top, format.mintick) + " is now candidate " + (upBreak ? "support." : "resistance."))
+            else if drifted
+                retireZone(lv, bar_index)
+                remove := true
+            else
+                int newSide = close > lv.top ? 1 : close < lv.bottom ? -1 : 0
+                if newSide != 0 and newSide != lv.side and lv.side != 0 and not qualified
+                    // Crossed without enough history to matter: the line is spent
+                    if not na(lv.zone)
+                        box.delete(lv.zone)
+                    remove := true
+                else
+                    // A qualified level keeps the role it earned until a decisive break
+                    if newSide != 0 and (lv.side == 0 or not qualified)
+                        lv.side := newSide
+                    if not na(lv.zone)
+                        box.set_right(lv.zone, bar_index)
+        else if lv.state == STATE_BROKEN or lv.state == STATE_FLIPPED
+            int   dir      = lv.flipDir
+            float nearEdge = dir == 1 ? lv.top : lv.bottom
+            float farEdge  = dir == 1 ? lv.bottom : lv.top
+            if not na(lv.zone)
+                box.set_right(lv.zone, bar_index)
+            if lv.state == STATE_BROKEN
+                lv.breakExtreme := dir == 1 ? math.max(lv.breakExtreme, high) : math.min(lv.breakExtreme, low)
+            bool away     = math.abs(lv.breakExtreme - nearEdge) >= atrValue * excursionInput
+            bool touched  = bar_index > lv.breakBar and away and (dir == 1 ? low <= nearEdge : high >= nearEdge)
+            bool failed   = bar_index > lv.breakBar and (dir == 1 ? close < farEdge - buffer : close > farEdge + buffer)
+            if lv.state == STATE_BROKEN
+                if touched and na(lv.returnBar)
+                    lv.returnBar := bar_index
+                    countReturned += 1
+                if failed
+                    // Accepted back inside the old range: the break was false
+                    if na(lv.returnBar)
+                        lv.returnBar := bar_index
+                        countReturned += 1
+                    countFailed += 1
+                    if dir == 1
+                        failBearEvent := true
+                    else
+                        failBullEvent := true
+                    retireZone(lv, bar_index)
+                    if showLabelsInput
+                        label.new(bar_index, na, "Failed Flip"
+                          , yloc      = dir == 1 ? yloc.abovebar : yloc.belowbar
+                          , style     = dir == 1 ? label.style_label_down : label.style_label_up
+                          , color     = dir == 1 ? bearColorInput : bullColorInput
+                          , textcolor = color.white
+                          , size      = size.small
+                          , tooltip   = "The return was accepted back inside the old range: the break was false and the breakout crowd is trapped. Stop beyond the break extreme at " + str.tostring(lv.breakExtreme, format.mintick))
+                    if tradeFailedInput
+                        Trade t = openTrade(-dir, close, lv.breakExtreme + dir * atrValue * stopBufferInput, true)
+                        if not showTradeInput
+                            deleteTrade(t)
+                        array.push(trades, t)
+                    remove := true
+                else if not na(lv.returnBar) and (dir == 1 ? close > nearEdge : close < nearEdge)
+                    // The return was rejected from the zone's new side: the flip holds
+                    lv.state := STATE_FLIPPED
+                    countHeld += 1
+                    if dir == 1
+                        heldBullEvent := true
+                    else
+                        heldBearEvent := true
+                    if showLabelsInput
+                        label.new(bar_index, na, "Flip Held"
+                          , yloc      = dir == 1 ? yloc.belowbar : yloc.abovebar
+                          , style     = dir == 1 ? label.style_label_up : label.style_label_down
+                          , color     = dir == 1 ? bullColorInput : bearColorInput
+                          , textcolor = color.white
+                          , size      = size.small
+                          , tooltip   = "Old " + (dir == 1 ? "resistance held as support" : "support held as resistance") + " on the first return, " + str.tostring(bar_index - lv.breakBar) + " bars after the break" + (bar_index > lv.returnBar ? " (the hold took " + str.tostring(bar_index - lv.returnBar + 1) + " bars, a slower reaction)" : " (rejected on the touch)") + ". Stop beyond the zone at " + str.tostring(farEdge - dir * atrValue * stopBufferInput, format.mintick))
+                    Trade t = openTrade(dir, close, farEdge - dir * atrValue * stopBufferInput, false)
+                    if not showTradeInput
+                        deleteTrade(t)
+                    array.push(trades, t)
+                else if na(lv.returnBar) and bar_index - lv.breakBar >= retestWindowInput
+                    countNoReturn += 1
+                    retireZone(lv, bar_index)
+                    remove := true
+            else
+                // Flipped zone: keep it as the live reference until price closes back through it
+                if failed or bar_index - lv.breakBar >= retestWindowInput * 4
+                    retireZone(lv, bar_index)
+                    remove := true
+        if remove
+            array.remove(levels, i)
+
+// Register confirmed swings: join a nearby unbroken level as a touch, or start a new one
+addSwing(float price, int swingBar) =>
+    float tol     = atrValue * touchTolInput
+    float minW    = atrValue * minZoneInput
+    float maxW    = atrValue * maxZoneInput
+    bool  joined  = false
+    if array.size(levels) > 0
+        for i = array.size(levels) - 1 to 0
+            Level lv = array.get(levels, i)
+            if lv.state == STATE_ACTIVE and price <= lv.top + tol and price >= lv.bottom - tol
+                lv.touches += 1
+                float newTop    = math.max(lv.top, price)
+                float newBottom = math.min(lv.bottom, price)
+                if newTop - newBottom <= maxW
+                    lv.top    := newTop
+                    lv.bottom := newBottom
+                if lv.touches >= minTouchesInput and na(lv.zone) and showCandidatesInput
+                    lv.zone := box.new(lv.firstBar, lv.top, bar_index, lv.bottom, border_color = color.new(neutralColorInput, 60), bgcolor = color.new(neutralColorInput, CANDIDATE_BG_TRANSP))
+                else if not na(lv.zone)
+                    box.set_top(lv.zone, lv.top)
+                    box.set_bottom(lv.zone, lv.bottom)
+                joined := true
+                break
+    if not joined
+        Level lv = Level.new(price + minW / 2, price - minW / 2, swingBar, 1, close > price + minW / 2 ? 1 : close < price - minW / 2 ? -1 : 0, STATE_ACTIVE, 0, na, na, na, box(na))
+        if minTouchesInput <= 1 and showCandidatesInput
+            lv.zone := box.new(swingBar, lv.top, bar_index, lv.bottom, border_color = color.new(neutralColorInput, 60), bgcolor = color.new(neutralColorInput, CANDIDATE_BG_TRANSP))
+        array.push(levels, lv)
+    // Cap the unbroken levels watched at once
+    int active = 0
+    for i = array.size(levels) - 1 to 0
+        Level lv = array.get(levels, i)
+        if lv.state == STATE_ACTIVE
+            active += 1
+            if active > maxLevelsInput
+                box.delete(lv.zone)
+                array.remove(levels, i)
+
+if barstate.isconfirmed and not na(atrValue)
+    if not na(pivotHigh)
+        addSwing(pivotHigh, bar_index - pivotLengthInput)
+    if not na(pivotLow)
+        addSwing(pivotLow, bar_index - pivotLengthInput)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var string dashPos = switch dashPosInput
+    "Top Right"    => position.top_right
+    "Bottom Left"  => position.bottom_left
+    "Top Left"     => position.top_left
+    => position.bottom_right
+
+var string dashSize = switch dashSizeInput
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    => size.small
+
+var table dash = table.new(dashPos, 2, 8, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+dashRow(int row, string name, string value, color nameColor) =>
+    table.cell(dash, 0, row, name, text_color = nameColor, text_size = dashSize, text_halign = text.align_left)
+    table.cell(dash, 1, row, value, text_color = DASH_TEXT, text_size = dashSize, text_halign = text.align_right)
+
+shareText(int part, int whole) =>
+    whole > 0 ? str.tostring(part) + "  (" + str.tostring(math.round(part * 100.0 / whole)) + "%)" : str.tostring(part)
+
+if showDashInput and barstate.islast
+    table.cell(dash, 0, 0, "Role Reversal", text_color = DASH_HEADER, text_size = dashSize, text_halign = text.align_left)
+    table.cell(dash, 1, 0, "Count", text_color = DASH_HEADER, text_size = dashSize, text_halign = text.align_right)
+    dashRow(1, "Decisive Breaks", str.tostring(countBreaks), DASH_TEXT)
+    dashRow(2, "Returned", shareText(countReturned, countBreaks), DASH_TEXT)
+    dashRow(3, "No Return", shareText(countNoReturn, countBreaks), neutralColorInput)
+    dashRow(4, "Flip Held", shareText(countHeld, countReturned), bullColorInput)
+    dashRow(5, "Failed Flip", shareText(countFailed, countReturned), bearColorInput)
+    dashRow(6, "Held Trades: Target / Stop", str.tostring(heldTarget) + " / " + str.tostring(heldStop), DASH_TEXT)
+    dashRow(7, "Failed Trades: Target / Stop", str.tostring(failedTarget) + " / " + str.tostring(failedStop), DASH_TEXT)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(breakUpEvent, "Resistance Broken", "A resistance level with history broke on a decisive close on {{ticker}} ({{interval}}): candidate support now")
+alertcondition(breakDownEvent, "Support Broken", "A support level with history broke on a decisive close on {{ticker}} ({{interval}}): candidate resistance now")
+alertcondition(heldBullEvent, "Flip Held as Support", "Old resistance held as support on the return on {{ticker}} ({{interval}})")
+alertcondition(heldBearEvent, "Flip Held as Resistance", "Old support held as resistance on the return on {{ticker}} ({{interval}})")
+alertcondition(failBearEvent, "Failed Flip (Bearish)", "A broken resistance failed as support on {{ticker}} ({{interval}}): price was accepted back below it, a false break")
+alertcondition(failBullEvent, "Failed Flip (Bullish)", "A broken support failed as resistance on {{ticker}} ({{interval}}): price was accepted back above it, a false break")
+
+//---------------------------------------------------------------------------------------------------------------------}

@@ -1,0 +1,230 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Death Cross", shorttitle = "Death Cross", overlay = true, max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BEAR_COLOR     = #f23645
+CAUTION_COLOR  = #ff9800
+RECOVERY_COLOR = #089981
+FAST_COLOR     = #089981 // fast MA while no death cross stands - it turns bearish under a standing cross
+NEUTRAL_COLOR  = #787b86
+HIDDEN_COLOR   = #00000000
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+MA_GROUP    = 'Moving Averages'
+CTX_GROUP   = 'Cross Context'
+DASH_GROUP  = 'Dashboard'
+STYLE_GROUP = 'Style'
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+fastLenInput = input.int(50, 'Fast Length', minval = 1, group = MA_GROUP, tooltip = 'Length of the shorter moving average. The classic death cross uses the 50-period average on the daily chart.')
+
+slowLenInput = input.int(200, 'Slow Length', minval = 1, group = MA_GROUP, tooltip = 'Length of the longer moving average that defines the long-term base. The classic death cross uses the 200-period average on the daily chart.')
+
+maTypeInput = input.string('SMA', 'MA Type', options = ['SMA', 'EMA'], group = MA_GROUP, tooltip = 'Average family applied to both lengths. The canonical death cross uses simple averages; exponential averages weight recent bars more and can shift cross dates by days.')
+
+srcInput = input.source(close, 'Source', group = MA_GROUP, tooltip = 'Price source used to compute both moving averages.')
+
+slopeLookbackInput = input.int(20, 'Slow MA Slope Lookback', minval = 1, group = CTX_GROUP, tooltip = 'Bars used to measure the slow MA slope. A slow MA that has flattened or turned down at the cross makes it a cleaner bearish regime statement; a still-rising slow MA warns the cross may be shallow.')
+
+whipsawWindowInput = input.int(20, 'Whipsaw Window', minval = 1, group = CTX_GROUP, tooltip = 'A cross back above the slow MA within this many bars of a death cross is flagged as a whipsaw — the failure mode most common when the averages braid through a sideways market.')
+
+showDashInput = input.bool(true, 'Show Dashboard', group = DASH_GROUP, tooltip = 'Summarizes the moving average pair, the current regime, the slow MA slope, the separation between the averages, price against the slow MA, and the context recorded at the last death cross.')
+
+dashPosInput = input.string('Top Right', 'Position', options = ['Top Right', 'Top Left', 'Bottom Right', 'Bottom Left'], group = DASH_GROUP, tooltip = 'Chart corner where the dashboard is anchored.')
+
+dashSizeInput = input.string('Small', 'Size', options = ['Tiny', 'Small', 'Normal'], group = DASH_GROUP, tooltip = 'Dashboard text size.')
+
+showCrossInput = input.bool(true, 'Death Cross Markers', group = STYLE_GROUP, tooltip = 'Mark each death cross with a point at the crossing and a label above the bar. The label tooltip reports the slow MA slope at the cross and the decline already consumed from the preceding regime high.')
+
+showRecInput = input.bool(true, 'Recovery Marks', group = STYLE_GROUP, tooltip = 'Mark the bar where the fast MA crosses back above the slow MA — the golden cross that ends the standing death cross. An immediate re-cross is the whipsaw failure mode.')
+
+showFillInput = input.bool(true, 'Regime Fill', group = STYLE_GROUP, tooltip = 'Shade the area between the averages — bearish while a death cross is standing, neutral while it is not.')
+
+fastColorInput = input.color(FAST_COLOR, 'Fast MA', group = STYLE_GROUP, inline = 'ma', tooltip = 'Fast moving average color while no death cross stands; the line takes the bearish color under a standing death cross.')
+slowColorInput = input.color(NEUTRAL_COLOR, 'Slow MA', group = STYLE_GROUP, inline = 'ma', tooltip = 'Slow moving average color, also used for the neutral regime shading.')
+
+bearColorInput = input.color(BEAR_COLOR, 'Bearish', group = STYLE_GROUP, inline = 'sig', tooltip = 'Color for death crosses printing with a flat or falling slow MA, for the standing-cross regime shading, and for bearish dashboard readings.')
+cautionColorInput = input.color(CAUTION_COLOR, 'Caution', group = STYLE_GROUP, inline = 'sig', tooltip = 'Color for death crosses printing while the slow MA is still rising — a shallower regime statement more likely to mark a brief dip than a rollover.')
+
+recColorInput = input.color(RECOVERY_COLOR, 'Recovery', group = STYLE_GROUP, tooltip = 'Color of the marks where the fast MA crosses back above the slow MA, ending the standing death cross.')
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+fmtSignedPct(value) =>
+    (value >= 0 ? '+' : '') + str.tostring(value, '#.##') + '%'
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Cross Detection
+//---------------------------------------------------------------------------------------------------------------------{
+fastSma = ta.sma(srcInput, fastLenInput)
+fastEma = ta.ema(srcInput, fastLenInput)
+slowSma = ta.sma(srcInput, slowLenInput)
+slowEma = ta.ema(srcInput, slowLenInput)
+
+fastMa = maTypeInput == 'EMA' ? fastEma : fastSma
+slowMa = maTypeInput == 'EMA' ? slowEma : slowSma
+
+bothValid = not na(fastMa) and not na(slowMa)
+
+deathCross = ta.crossunder(fastMa, slowMa)
+recovery   = ta.crossover(fastMa, slowMa)
+deathState = bothValid and fastMa < slowMa
+
+dcAge   = ta.barssince(deathCross)
+whipsaw = recovery and not na(dcAge) and dcAge <= whipsawWindowInput
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Cross Context
+//---------------------------------------------------------------------------------------------------------------------{
+// Slow MA slope — grades how clean a regime statement the cross is
+prevSlow    = slowMa[slopeLookbackInput]
+slopeKnown  = bothValid and not na(prevSlow)
+slowRising  = slopeKnown and slowMa > prevSlow
+slowFalling = slopeKnown and slowMa < prevSlow
+slopePct    = slopeKnown and prevSlow != 0 ? (slowMa - prevSlow) / prevSlow * 100 : na
+
+// Separation between the averages — distance/momentum of the standing regime
+sepPct   = bothValid and slowMa != 0 ? (fastMa - slowMa) / slowMa * 100 : na
+sepKnown = not na(sepPct) and not na(sepPct[1])
+widening = sepKnown and sepPct < sepPct[1]
+
+// Price against the slow MA — companion read for the composite regime picture
+priceVsSlowPct = bothValid and slowMa != 0 ? (close - slowMa) / slowMa * 100 : na
+
+crossClean = deathCross and slopeKnown and not slowRising
+
+// Decline already consumed before the cross — drop from the high of the preceding above-regime
+var float regimeHigh     = na
+var float declineAtCross = na
+var int   lastCrossBar   = na
+var int   lastCrossGrade = -1     // 2: slow MA falling · 1: flat · 0: rising · -1: unknown
+var bool  lastCrossWhip  = false
+
+if recovery
+    regimeHigh := high
+    if whipsaw
+        lastCrossWhip := true
+else if bothValid and fastMa >= slowMa
+    regimeHigh := math.max(nz(regimeHigh, high), high)
+
+if deathCross
+    declineAtCross := not na(regimeHigh) and regimeHigh > 0 ? (close - regimeHigh) / regimeHigh * 100 : na
+    lastCrossBar   := bar_index
+    lastCrossGrade := slopeKnown ? (slowRising ? 0 : slowFalling ? 2 : 1) : -1
+    lastCrossWhip  := false
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visuals
+//---------------------------------------------------------------------------------------------------------------------{
+crossGradeColor = slowRising ? cautionColorInput : bearColorInput
+
+fastPlotId = plot(fastMa, 'Fast MA', deathState ? bearColorInput : fastColorInput, 1)
+slowPlotId = plot(slowMa, 'Slow MA', slowColorInput, 2)
+
+// Regime fill — gradient anchored at the fast MA, fading toward the slow MA
+fastOnTop  = bothValid and fastMa >= slowMa
+stateColor = deathState ? bearColorInput : slowColorInput
+nearColor  = color.new(stateColor, deathState ? 65 : 88)
+farColor   = color.new(stateColor, 100)
+
+fillTopColor    = showFillInput ? (fastOnTop ? nearColor : farColor) : na
+fillBottomColor = showFillInput ? (fastOnTop ? farColor : nearColor) : na
+
+fill(fastPlotId, slowPlotId, top_value = math.max(fastMa, slowMa), bottom_value = math.min(fastMa, slowMa), top_color = fillTopColor, bottom_color = fillBottomColor, title = 'Regime Fill')
+
+// Death cross markers — the event itself
+crossPoint = showCrossInput and deathCross ? math.avg(fastMa, slowMa) : na
+plot(crossPoint, 'Death Cross Point', crossGradeColor, 3, plot.style_circles)
+
+if deathCross and showCrossInput
+    slopeTxt = slopeKnown ? (slowRising ? 'rising' : slowFalling ? 'falling' : 'flat') : 'n/a'
+    declTxt  = na(declineAtCross) ? 'n/a' : fmtSignedPct(declineAtCross)
+    tipTxt   = str.format('Slow MA {0} at the cross\nDecline from the regime high: {1}', slopeTxt, declTxt)
+    label.new(bar_index, high, 'Death Cross', yloc = yloc.abovebar, style = label.style_label_down, color = HIDDEN_COLOR, textcolor = crossGradeColor, size = size.small, tooltip = tipTxt)
+
+// Recovery marks — the golden cross upward that ends the standing death cross
+recPoint = showRecInput and recovery ? math.avg(fastMa, slowMa) : na
+plotshape(recPoint, 'Recovery Mark', shape.xcross, location.absolute, recColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+dashPos = switch dashPosInput
+    'Top Right'    => position.top_right
+    'Top Left'     => position.top_left
+    'Bottom Right' => position.bottom_right
+    => position.bottom_left
+
+dashTxtSize = switch dashSizeInput
+    'Tiny'  => size.tiny
+    'Small' => size.small
+    => size.normal
+
+var table dashTable = na
+
+if showDashInput and barstate.islast
+    if na(dashTable)
+        dashTable := table.new(dashPos, 2, 7, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+    labelColor = DASH_HEADER
+    fadedColor = NEUTRAL_COLOR
+
+    classicSetup = fastLenInput == 50 and slowLenInput == 200 and maTypeInput == 'SMA' and timeframe.isdaily and timeframe.multiplier == 1
+    pairTxt      = maTypeInput + ' ' + str.tostring(fastLenInput) + '/' + str.tostring(slowLenInput) + (classicSetup ? '' : ' · nonstandard')
+
+    regimeTxt   = deathState ? 'Death Cross' + (na(dcAge) ? '' : ' · ' + str.tostring(dcAge) + ' bars') : 'No Death Cross'
+    regimeColor = deathState ? bearColorInput : recColorInput
+
+    slopeDashTxt = not slopeKnown ? '—' : (slowRising ? 'Rising' : slowFalling ? 'Falling' : 'Flat') + (na(slopePct) ? '' : ' ' + fmtSignedPct(slopePct))
+    slopeColor   = slowFalling ? bearColorInput : slowRising ? cautionColorInput : DASH_TEXT
+
+    sepTxt   = na(sepPct) ? '—' : fmtSignedPct(sepPct) + (sepKnown ? (widening ? ' · widening' : ' · narrowing') : '')
+    sepColor = deathState ? bearColorInput : DASH_TEXT
+
+    priceTxt   = na(priceVsSlowPct) ? '—' : fmtSignedPct(priceVsSlowPct) + (close >= slowMa ? ' · above' : ' · below')
+    priceColor = not na(priceVsSlowPct) and close < slowMa ? bearColorInput : DASH_TEXT
+
+    lastTxt   = na(lastCrossBar) ? 'None' : str.tostring(bar_index - lastCrossBar) + ' bars ago' + (lastCrossWhip ? ' · whipsawed' : lastCrossGrade == 2 ? ' · slow MA falling' : lastCrossGrade == 1 ? ' · slow MA flat' : lastCrossGrade == 0 ? ' · slow MA rising' : '')
+    lastColor = na(lastCrossBar) ? fadedColor : lastCrossWhip ? recColorInput : lastCrossGrade == 0 ? cautionColorInput : bearColorInput
+
+    declDashTxt = na(declineAtCross) ? '—' : fmtSignedPct(declineAtCross)
+
+    table.cell(dashTable, 0, 0, 'Pair',             text_color = labelColor,     text_size = dashTxtSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 0, pairTxt,            text_color = DASH_TEXT, text_size = dashTxtSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 1, 'Regime',           text_color = labelColor,     text_size = dashTxtSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 1, regimeTxt,          text_color = regimeColor,    text_size = dashTxtSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 2, 'Slow MA Slope',    text_color = labelColor,     text_size = dashTxtSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 2, slopeDashTxt,       text_color = slopeColor,     text_size = dashTxtSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 3, 'Separation',       text_color = labelColor,     text_size = dashTxtSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 3, sepTxt,             text_color = sepColor,       text_size = dashTxtSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 4, 'Price vs Slow MA', text_color = labelColor,     text_size = dashTxtSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 4, priceTxt,           text_color = priceColor,     text_size = dashTxtSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 5, 'Last Cross',       text_color = labelColor,     text_size = dashTxtSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 5, lastTxt,            text_color = lastColor,      text_size = dashTxtSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 6, 'Decline at Cross', text_color = labelColor,     text_size = dashTxtSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 6, declDashTxt,        text_color = DASH_TEXT, text_size = dashTxtSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(deathCross, 'Death Cross', 'Death cross on {{ticker}} ({{interval}}) — the fast MA closed below the slow MA, long-term regime turning down')
+
+alertcondition(crossClean, 'Clean Death Cross', 'Death cross on {{ticker}} ({{interval}}) with the slow MA flat or falling — a cleaner bearish regime statement')
+
+alertcondition(recovery, 'Death Cross Ended', 'Fast MA crossed back above the slow MA on {{ticker}} ({{interval}}) — the golden cross that ends the standing death cross')
+
+alertcondition(whipsaw, 'Death Cross Whipsaw', 'Death cross on {{ticker}} ({{interval}}) reversed back above the slow MA within the whipsaw window — whipsaw failure mode')
+
+//---------------------------------------------------------------------------------------------------------------------}

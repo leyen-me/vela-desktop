@@ -1,0 +1,377 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("80% Rule", shorttitle = "80% Rule", overlay = true, format = format.price, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+color NEUTRAL_COLOR = #787b86 // prior value area and POC are structure
+color BULL_COLOR    = #089981
+color BEAR_COLOR    = #f23645
+color LABEL_BG      = #00000000
+
+DASH_BG       = #161616
+DASH_FRAME    = #2E2E2E
+DASH_HEADER   = #808080
+DASH_TEXT     = #DBDBDB
+
+string VA_GROUP      = "Value Area"
+string SESSION_GROUP = "Session"
+string SETUP_GROUP   = "Setup"
+string STYLE_GROUP   = "Style"
+
+string WEIGHT_VOLUME = "Volume"
+string WEIGHT_TPO    = "TPO (Time)"
+
+string POS_TOP_RIGHT    = "Top Right"
+string POS_TOP_LEFT     = "Top Left"
+string POS_BOTTOM_RIGHT = "Bottom Right"
+string POS_BOTTOM_LEFT  = "Bottom Left"
+
+// Session setup states
+int ST_IDLE      = 0
+int ST_AWAIT     = 1
+int ST_BUILD     = 2
+int ST_TRIGGERED = 3
+int ST_DONE      = 4
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+vaPercentInput = input.float(70, "Value Area %", minval = 10, maxval = 100, step = 1, group = VA_GROUP, tooltip = "Share of the prior session's profile weight, expanded around the point of control, that defines the value area. 70% is the standard Market Profile convention.")
+
+rowsInput = input.int(25, "Profile Rows", minval = 5, maxval = 100, group = VA_GROUP, tooltip = "Number of price rows the prior session profile is built on. More rows resolve the value area high, value area low and POC more finely; fewer rows smooth them.")
+
+weightingInput = input.string(WEIGHT_VOLUME, "Profile Weighting", options = [WEIGHT_VOLUME, WEIGHT_TPO], group = VA_GROUP, tooltip = "How the prior session profile is weighted. 'Volume' distributes each bar's volume across the rows it spans, giving a volume profile value area. 'TPO (Time)' counts one unit per row a bar traded at, giving a TPO-style value area. Both are valid for the rule; use TPO on symbols without reliable volume.")
+
+useCustomSessionInput = input.bool(false, "Custom Session", inline = "sess", group = SESSION_GROUP, tooltip = "Restrict the value area and the setup to a session window (exchange timezone). Practitioners typically run the rule on regular-trading-hours value areas, since gap-heavy instruments and thin overnight data produce more false re-entries. Off = the chart's full trading day.")
+
+sessionWindowInput = input.session("0930-1600", "", inline = "sess", group = SESSION_GROUP, tooltip = "Session window applied when 'Custom Session' is enabled. The session open, the prior value area and the acceptance clock are all taken from this window.")
+
+acceptanceMinutesInput = input.int(60, "Acceptance Time (Minutes)", minval = 1, maxval = 720, group = SETUP_GROUP, tooltip = "Consecutive time price must close inside the prior value area after re-entering before the signal fires. 60 minutes reproduces the classic requirement of two consecutive 30-minute TPO periods inside value. Measured from bar closes, so a 30-minute or lower chart timeframe gives the most faithful timing.")
+
+showValueAreaInput = input.bool(true, "Prior Value Area", inline = "va", group = STYLE_GROUP)
+vaColorInput       = input.color(NEUTRAL_COLOR, "", inline = "va", group = STYLE_GROUP)
+
+showPocInput  = input.bool(true, "Prior POC", inline = "poc", group = STYLE_GROUP)
+pocColorInput = input.color(NEUTRAL_COLOR, "", inline = "poc", group = STYLE_GROUP)
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "dir", group = STYLE_GROUP)
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "dir", group = STYLE_GROUP)
+
+showSignalsInput = input.bool(true, "Signal Labels", group = STYLE_GROUP, tooltip = "Labels for the confirmed signal and its outcome: rotation complete, re-entry rejected or stopped out.")
+
+showStepMarkersInput = input.bool(true, "Setup Step Markers", group = STYLE_GROUP, tooltip = "Small markers for the two identification steps that precede the signal: the open outside the prior value area and the re-entry into it.")
+
+showTableInput     = input.bool(true, "Status Table", inline = "tbl", group = STYLE_GROUP)
+tablePositionInput = input.string(POS_TOP_RIGHT, "", options = [POS_TOP_RIGHT, POS_TOP_LEFT, POS_BOTTOM_RIGHT, POS_BOTTOM_LEFT], inline = "tbl", group = STYLE_GROUP)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Table position constant from the style option
+getTablePosition(string positionName) =>
+    switch positionName
+        POS_TOP_LEFT     => position.top_left
+        POS_BOTTOM_RIGHT => position.bottom_right
+        POS_BOTTOM_LEFT  => position.bottom_left
+        => position.top_right
+
+// Price text for the status table
+formatPrice(float priceValue) =>
+    na(priceValue) ? "n/a" : str.tostring(priceValue, format.mintick)
+
+// Value area of the stored session: profile rows around the POC, expanded two rows at a time (standard Market Profile
+// procedure) until the requested share of the total weight is contained. Returns [value area high, POC, value area low].
+computeValueArea(array<float> highArray, array<float> lowArray, array<float> volumeArray, int rows, float vaPercent, bool volumeWeighted) =>
+    float vaHigh   = na
+    float pocPrice = na
+    float vaLow    = na
+    int barCount = array.size(highArray)
+    if barCount > 0
+        float profileHigh = array.max(highArray)
+        float profileLow  = array.min(lowArray)
+        if profileHigh > profileLow
+            float rowStep = (profileHigh - profileLow) / rows
+            array<float> rowWeightArray = array.new_float(rows, 0.0)
+
+            // Distribute each bar over the rows its range covers, volume pro-rata or one TPO count per row touched
+            for i = 0 to barCount - 1
+                float barHigh   = array.get(highArray, i)
+                float barLow    = array.get(lowArray, i)
+                float barVolume = array.get(volumeArray, i)
+                int rowLo = math.max(0, math.min(rows - 1, int(math.floor((barLow - profileLow) / rowStep))))
+                int rowHi = math.max(0, math.min(rows - 1, int(math.floor((barHigh - profileLow) / rowStep))))
+                for j = rowLo to rowHi
+                    float addWeight = 1.0
+                    if volumeWeighted
+                        float rowTop    = profileLow + (j + 1) * rowStep
+                        float rowBottom = profileLow + j * rowStep
+                        float overlap   = math.min(barHigh, rowTop) - math.max(barLow, rowBottom)
+                        addWeight := barHigh > barLow ? barVolume * math.max(overlap, 0.0) / (barHigh - barLow) : barVolume
+                    array.set(rowWeightArray, j, array.get(rowWeightArray, j) + addWeight)
+
+            float totalWeight = array.sum(rowWeightArray)
+            if totalWeight > 0
+                // POC row: heaviest row, ties resolved toward the middle of the session range
+                int rowMid = (rows - 1) / 2
+                int pocIndex = 0
+                float pocWeight = array.get(rowWeightArray, 0)
+                for j = 1 to rows - 1
+                    float rowWeight = array.get(rowWeightArray, j)
+                    if rowWeight > pocWeight or (rowWeight == pocWeight and math.abs(j - rowMid) < math.abs(pocIndex - rowMid))
+                        pocWeight := rowWeight
+                        pocIndex  := j
+
+                // Expand around the POC, adding the heavier of the two rows above vs the two rows below
+                float targetWeight = totalWeight * vaPercent / 100
+                float accumWeight  = pocWeight
+                int upIndex = pocIndex + 1
+                int dnIndex = pocIndex - 1
+                while accumWeight < targetWeight and (upIndex < rows or dnIndex >= 0)
+                    float upWeight = (upIndex < rows ? array.get(rowWeightArray, upIndex) : 0.0) + (upIndex + 1 < rows ? array.get(rowWeightArray, upIndex + 1) : 0.0)
+                    float dnWeight = (dnIndex >= 0 ? array.get(rowWeightArray, dnIndex) : 0.0) + (dnIndex - 1 >= 0 ? array.get(rowWeightArray, dnIndex - 1) : 0.0)
+                    if upIndex >= rows or (dnIndex >= 0 and dnWeight > upWeight)
+                        accumWeight += dnWeight
+                        dnIndex -= 2
+                    else
+                        accumWeight += upWeight
+                        upIndex += 2
+
+                int hiIndex = math.min(upIndex - 1, rows - 1)
+                int loIndex = math.max(dnIndex + 1, 0)
+                vaHigh   := profileLow + (hiIndex + 1) * rowStep
+                vaLow    := profileLow + loIndex * rowStep
+                pocPrice := profileLow + (pocIndex + 0.5) * rowStep
+    [vaHigh, pocPrice, vaLow]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Session Tracking & Prior Value Area
+//---------------------------------------------------------------------------------------------------------------------{
+
+bool  intradayOk     = timeframe.isintraday
+float barMinutes     = timeframe.in_seconds(timeframe.period) / 60.0
+bool  volumeWeighted = weightingInput == WEIGHT_VOLUME
+
+bool inSession = not useCustomSessionInput or not na(time(timeframe.period, sessionWindowInput))
+bool dayChange = timeframe.change("D")
+
+// A session starts on the first in-scope bar of each trading day
+var int dayCounter = 0
+if dayChange
+    dayCounter += 1
+
+var int lastSessionDay = na
+bool newSession = intradayOk and inSession and (na(lastSessionDay) or dayCounter != lastSessionDay)
+
+// Bars of the running session, stored to build its profile once it completes
+var array<float> sessionHighArray   = array.new<float>()
+var array<float> sessionLowArray    = array.new<float>()
+var array<float> sessionVolumeArray = array.new<float>()
+
+// Prior session value area and setup state
+var float priorVaHigh = na
+var float priorPoc    = na
+var float priorVaLow  = na
+
+var int    setupState = ST_IDLE
+var int    setupDir   = 0
+var float  accMinutes = 0.0
+var bool   pocReached = false
+var string statusText = "Waiting for the first completed session"
+
+var box  vaBox      = na
+var line pocLine    = na
+var line targetLine = na
+
+// Per-bar events feeding markers and alerts
+bool openAboveEvent        = false
+bool openBelowEvent        = false
+bool reentryEvent          = false
+bool triggerBullEvent      = false
+bool triggerBearEvent      = false
+bool pocTouchEvent         = false
+bool rotationCompleteEvent = false
+bool rejectionEvent        = false
+bool stopOutEvent          = false
+
+if newSession
+    lastSessionDay := dayCounter
+
+    // The session that just completed becomes the prior value area for today
+    [vaHighNew, pocNew, vaLowNew] = computeValueArea(sessionHighArray, sessionLowArray, sessionVolumeArray, rowsInput, vaPercentInput, volumeWeighted)
+    priorVaHigh := vaHighNew
+    priorPoc    := pocNew
+    priorVaLow  := vaLowNew
+
+    array.clear(sessionHighArray)
+    array.clear(sessionLowArray)
+    array.clear(sessionVolumeArray)
+
+    // Reset the setup for the new session and classify its open against prior value
+    setupState := ST_IDLE
+    setupDir   := 0
+    accMinutes := 0.0
+    pocReached := false
+    vaBox      := na
+    pocLine    := na
+    targetLine := na
+
+    if na(priorVaHigh) or na(priorVaLow) or na(priorPoc)
+        statusText := "No prior session value area yet"
+    else
+        if open > priorVaHigh
+            setupState     := ST_AWAIT
+            setupDir       := -1
+            openAboveEvent := true
+            statusText     := "Opened above value - awaiting re-entry"
+        else if open < priorVaLow
+            setupState     := ST_AWAIT
+            setupDir       := 1
+            openBelowEvent := true
+            statusText     := "Opened below value - awaiting re-entry"
+        else
+            statusText := "Opened inside prior value - no setup"
+
+        if showValueAreaInput
+            vaBox := box.new(bar_index, priorVaHigh, bar_index, priorVaLow, border_color = color.new(vaColorInput, 40), border_width = 1, bgcolor = color.new(vaColorInput, 92))
+        if showPocInput
+            pocLine := line.new(bar_index, priorPoc, bar_index, priorPoc, color = color.new(pocColorInput, 25), style = line.style_dotted, width = 1)
+
+// Store the bar into the running session profile
+if intradayOk and inSession and not na(high) and not na(low)
+    array.push(sessionHighArray, high)
+    array.push(sessionLowArray, low)
+    array.push(sessionVolumeArray, nz(volume))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Setup Detection
+//---------------------------------------------------------------------------------------------------------------------{
+
+bool hasValueArea = not na(priorVaHigh) and not na(priorVaLow) and not na(priorPoc)
+bool triggerNow   = false
+
+if intradayOk and inSession and hasValueArea
+    bool insideValue = close <= priorVaHigh and close >= priorVaLow
+
+    if setupState == ST_AWAIT and insideValue
+        // Price traded back inside prior value: the acceptance clock starts
+        setupState   := ST_BUILD
+        accMinutes   := barMinutes
+        reentryEvent := true
+        statusText   := "Re-entry - building acceptance"
+        triggerNow   := accMinutes >= acceptanceMinutesInput
+    else if setupState == ST_BUILD
+        if insideValue
+            accMinutes := accMinutes + barMinutes
+            triggerNow := accMinutes >= acceptanceMinutesInput
+        else if setupDir == -1 and close > priorVaHigh or setupDir == 1 and close < priorVaLow
+            // Rejection: price re-exited on the entry side shortly after re-entering, acceptance failed
+            setupState     := ST_AWAIT
+            accMinutes     := 0.0
+            rejectionEvent := true
+            statusText     := "Re-entry rejected - awaiting new re-entry"
+        else
+            // Price crossed the whole area before acceptance completed: no mechanical signal
+            setupState := ST_DONE
+            statusText := "Crossed value before acceptance - no signal"
+    else if setupState == ST_TRIGGERED
+        bool targetTouch = setupDir == 1 ? high >= priorVaHigh : low <= priorVaLow
+        bool pocTouch    = setupDir == 1 ? high >= priorPoc : low <= priorPoc
+
+        if pocTouch and not pocReached
+            pocReached    := true
+            pocTouchEvent := true
+
+        if targetTouch
+            setupState            := ST_DONE
+            rotationCompleteEvent := true
+            statusText            := "Rotation complete - opposite boundary reached"
+        else if setupDir == 1 and close < priorVaLow or setupDir == -1 and close > priorVaHigh
+            setupState   := ST_DONE
+            stopOutEvent := true
+            statusText   := "Stopped out - closed back outside entry side"
+
+if triggerNow
+    // Acceptance confirmed: rotation trade toward the far side of the prior value area
+    setupState       := ST_TRIGGERED
+    triggerBullEvent := setupDir == 1
+    triggerBearEvent := setupDir == -1
+    statusText       := setupDir == 1 ? "Signal on - rotating toward prior VAH" : "Signal on - rotating toward prior VAL"
+    targetLine       := line.new(bar_index, setupDir == 1 ? priorVaHigh : priorVaLow, bar_index, setupDir == 1 ? priorVaHigh : priorVaLow, color = setupDir == 1 ? bullColorInput : bearColorInput, style = line.style_dashed, width = 1)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Identification step markers: the open outside prior value and the re-entry into it
+if showStepMarkersInput and (openAboveEvent or openBelowEvent)
+    label.new(bar_index, open, "", style = label.style_circle, color = color.new(vaColorInput, 40), size = size.tiny, tooltip = openAboveEvent ? "Opened above the prior value area" : "Opened below the prior value area")
+
+if showStepMarkersInput and reentryEvent
+    label.new(bar_index, na, "", yloc = setupDir == -1 ? yloc.abovebar : yloc.belowbar, style = setupDir == -1 ? label.style_triangledown : label.style_triangleup, color = color.new(setupDir == -1 ? bearColorInput : bullColorInput, 30), size = size.tiny, tooltip = "Re-entered the prior value area - acceptance clock running")
+
+// Confirmed signal and its outcomes
+if showSignalsInput and (triggerBullEvent or triggerBearEvent)
+    label.new(bar_index, na, "80% Rule", yloc = triggerBullEvent ? yloc.belowbar : yloc.abovebar, style = triggerBullEvent ? label.style_label_up : label.style_label_down, color = LABEL_BG, textcolor = triggerBullEvent ? bullColorInput : bearColorInput, size = size.small, tooltip = "Acceptance confirmed inside the prior value area - rotation targets the opposite value area boundary, prior POC as interim reference")
+
+if showSignalsInput and rotationCompleteEvent
+    label.new(bar_index, setupDir == 1 ? priorVaHigh : priorVaLow, "✓", style = setupDir == 1 ? label.style_label_down : label.style_label_up, color = LABEL_BG, textcolor = setupDir == 1 ? bullColorInput : bearColorInput, size = size.small, tooltip = "Rotation complete - price reached the opposite value area boundary")
+
+if showSignalsInput and rejectionEvent
+    label.new(bar_index, na, "✕", yloc = setupDir == -1 ? yloc.abovebar : yloc.belowbar, style = setupDir == -1 ? label.style_label_down : label.style_label_up, color = LABEL_BG, textcolor = NEUTRAL_COLOR, size = size.tiny, tooltip = "Re-entry rejected - price closed back outside the entry side, setup off")
+
+if showSignalsInput and stopOutEvent
+    label.new(bar_index, na, "✕", yloc = setupDir == -1 ? yloc.abovebar : yloc.belowbar, style = setupDir == -1 ? label.style_label_down : label.style_label_up, color = LABEL_BG, textcolor = NEUTRAL_COLOR, size = size.tiny, tooltip = "Signal stopped out - price closed back outside the entry-side boundary")
+
+// Extend the prior value area, POC and target lines across the running session
+if intradayOk and inSession
+    if not na(vaBox)
+        box.set_right(vaBox, bar_index)
+    if not na(pocLine)
+        line.set_x2(pocLine, bar_index)
+    if not na(targetLine) and (setupState == ST_TRIGGERED or rotationCompleteEvent or stopOutEvent)
+        line.set_x2(targetLine, bar_index)
+
+// Status table: prior value area levels and the live state of the setup
+var table infoTable = table.new(getTablePosition(tablePositionInput), 2, 4, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+if barstate.islast
+    if not intradayOk
+        table.cell(infoTable, 0, 0, "80% rule runs on intraday charts only - the prior session value area needs intraday data", text_color = BEAR_COLOR, text_size = size.small, bgcolor = DASH_BG)
+    else if showTableInput
+        string statusDisplay = setupState == ST_BUILD ? str.format("Inside value {0}/{1} min", math.round(accMinutes), acceptanceMinutesInput) : statusText
+        color statusColor = setupState == ST_TRIGGERED ? (setupDir == 1 ? bullColorInput : bearColorInput) : DASH_TEXT
+        table.cell(infoTable, 0, 0, "Prior VAH", text_color = DASH_HEADER, text_size = size.small, text_halign = text.align_left)
+        table.cell(infoTable, 1, 0, formatPrice(priorVaHigh), text_color = DASH_TEXT, text_size = size.small, text_halign = text.align_right)
+        table.cell(infoTable, 0, 1, "Prior POC", text_color = DASH_HEADER, text_size = size.small, text_halign = text.align_left)
+        table.cell(infoTable, 1, 1, formatPrice(priorPoc), text_color = DASH_TEXT, text_size = size.small, text_halign = text.align_right)
+        table.cell(infoTable, 0, 2, "Prior VAL", text_color = DASH_HEADER, text_size = size.small, text_halign = text.align_left)
+        table.cell(infoTable, 1, 2, formatPrice(priorVaLow), text_color = DASH_TEXT, text_size = size.small, text_halign = text.align_right)
+        table.cell(infoTable, 0, 3, "Setup", text_color = DASH_HEADER, text_size = size.small, text_halign = text.align_left)
+        table.cell(infoTable, 1, 3, statusDisplay, text_color = statusColor, text_size = size.small, text_halign = text.align_right)
+
+// Data window readout of the prior session levels
+plot(priorVaHigh, "Prior VA High", vaColorInput, display = display.data_window)
+plot(priorPoc, "Prior POC", pocColorInput, display = display.data_window)
+plot(priorVaLow, "Prior VA Low", vaColorInput, display = display.data_window)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(openAboveEvent, "Opened Above Prior Value", "80% rule: {{ticker}} {{interval}} opened above the prior session value area - watching for re-entry")
+alertcondition(openBelowEvent, "Opened Below Prior Value", "80% rule: {{ticker}} {{interval}} opened below the prior session value area - watching for re-entry")
+alertcondition(reentryEvent, "Re-Entered Prior Value Area", "80% rule: price re-entered the prior value area on {{ticker}} {{interval}} - acceptance clock running")
+alertcondition(triggerBullEvent, "Bullish 80% Rule Signal", "Bullish 80% rule on {{ticker}} {{interval}}: acceptance confirmed after an open below value - rotation targets the prior value area high")
+alertcondition(triggerBearEvent, "Bearish 80% Rule Signal", "Bearish 80% rule on {{ticker}} {{interval}}: acceptance confirmed after an open above value - rotation targets the prior value area low")
+alertcondition(pocTouchEvent, "Prior POC Reached", "80% rule on {{ticker}} {{interval}}: rotation reached the prior point of control, a common interim scale-out reference")
+alertcondition(rotationCompleteEvent, "Rotation Target Reached", "80% rule on {{ticker}} {{interval}}: price rotated across the prior value area to the opposite boundary")
+alertcondition(rejectionEvent, "Re-Entry Rejected", "80% rule on {{ticker}} {{interval}}: price closed back outside the entry side shortly after re-entering - setup off")
+alertcondition(stopOutEvent, "Signal Stopped Out", "80% rule on {{ticker}} {{interval}}: price closed back outside the entry-side boundary after the signal")
+
+//---------------------------------------------------------------------------------------------------------------------}

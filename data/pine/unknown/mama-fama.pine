@@ -1,0 +1,143 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("MAMA/FAMA", shorttitle = "MAMA/FAMA", overlay = true)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR       = #089981
+BEAR_COLOR       = #f23645
+PERIOD_MIN       = 6.   // published lower clamp of the measured dominant cycle period
+PERIOD_MAX       = 50.  // published upper clamp of the measured dominant cycle period
+FILL_MAMA_TRANSP = 60   // gradient transparency at the MAMA end of the fill
+FILL_FAMA_TRANSP = 100  // gradient transparency at the FAMA end of the fill
+FAMA_TRANSP      = 40   // FAMA line transparency, keeps the pair distinguishable
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+srcInput       = input.source(hl2, "Source", group = "Settings",
+     tooltip = "Price series the adaptive pair is computed on. Ehlers' 2001 study uses the bar midpoint hl2 = (high + low) / 2.")
+
+fastLimitInput = input.float(0.5, "Fast Limit", minval = 0.01, maxval = 1, step = 0.01, group = "Settings",
+     tooltip = "Upper bound of MAMA's adaptive smoothing factor, reached when the dominant cycle phase stops advancing — that is, when price breaks into a directional move and the line jumps to price. Ehlers' published default of 0.5 is roughly a 3-bar EMA. Widening the limits exaggerates the stair-step and adds whipsaw risk; tightening them tames the ratchet and slows signals.")
+
+slowLimitInput = input.float(0.05, "Slow Limit", minval = 0.01, maxval = 1, step = 0.01, group = "Settings",
+     tooltip = "Lower bound of the smoothing factor, where MAMA is pinned while the dominant cycle phase advances steadily (cyclic price) so the line goes nearly flat. Ehlers' published default of 0.05 is roughly a 39-bar EMA.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "state", group = "Style",
+     tooltip = "Pair and fill color while MAMA is above FAMA — the conventional long bias.")
+
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "state", group = "Style",
+     tooltip = "Pair and fill color while MAMA is below FAMA — the conventional short bias.")
+
+showFillInput  = input.bool(true, "Gradient Fill", group = "Style",
+     tooltip = "Fills the span between the two lines with a vertical gradient in the cross-state color, strongest at MAMA and fading to fully transparent at FAMA — wide trend separation glows while braided cycle stretches stay quiet.")
+
+showCrossInput = input.bool(false, "Crossover Markers", group = "Style",
+     tooltip = "Displays a small circle on the lines where MAMA crosses FAMA. Off by default to keep the chart clean — the crossover alerts work regardless.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// One-sided Hilbert transform FIR approximation — Ehlers' published 0.0962 / 0.5769 coefficient pair.
+// Missing warm-up taps are zero-seeded, matching the zero-initialized series of the original formulation.
+hilbertTransform(float x) =>
+    0.0962 * x + 0.5769 * nz(x[2]) - 0.5769 * nz(x[4]) - 0.0962 * nz(x[6])
+
+// MESA Adaptive Moving Average pair — John Ehlers (TASC, 2001), implemented exactly as published:
+// a Hilbert-transform homodyne discriminator measures the dominant cycle period and phase from the
+// in-phase / quadrature components, the phase rate of change sets MAMA's EMA factor between the two
+// limits, and FAMA follows as an EMA of MAMA run at half of MAMA's current factor.
+mesaAdaptivePair(float price, simple float fastLimit, simple float slowLimit) =>
+    var float period = 0.
+    var float phase  = 0.
+    var float i2     = 0.
+    var float q2     = 0.
+    var float re     = 0.
+    var float im     = 0.
+    var float mama   = na
+    var float fama   = na
+    // amplitude-correction coefficient, driven by the previous bar's dominant cycle period
+    float mult = 0.075 * period + 0.54
+    // 4-bar weighted smoothing of price
+    float smooth = (4 * price + 3 * nz(price[1], price) + 2 * nz(price[2], price) + nz(price[3], price)) / 10
+    // detrend, then derive the in-phase (I1) and quadrature (Q1) components
+    float detrender = hilbertTransform(smooth) * mult
+    float q1 = hilbertTransform(detrender) * mult
+    float i1 = nz(detrender[3])
+    // advance the phase of I1 and Q1 by 90 degrees
+    float jI = hilbertTransform(i1) * mult
+    float jQ = hilbertTransform(q1) * mult
+    // phasor addition for 3-bar averaging, then the published 0.2 / 0.8 component smoothing
+    i2 := 0.2 * (i1 - jQ) + 0.8 * i2
+    q2 := 0.2 * (q1 + jI) + 0.8 * q2
+    // homodyne discriminator — dominant cycle period from the bar-to-bar phasor rotation
+    re := 0.2 * (i2 * nz(i2[1]) + q2 * nz(q2[1])) + 0.8 * re
+    im := 0.2 * (i2 * nz(q2[1]) - q2 * nz(i2[1])) + 0.8 * im
+    float prevPeriod = period
+    float rawPeriod  = prevPeriod
+    if im != 0 and re != 0
+        float angle = math.todegrees(math.atan(im / re))
+        if angle != 0
+            rawPeriod := 360 / angle
+    // published step limits (0.67x - 1.5x per bar), then the absolute 6-50 bar clamp and final smoothing
+    rawPeriod := math.max(math.min(rawPeriod, 1.5 * prevPeriod), 0.67 * prevPeriod)
+    rawPeriod := math.min(math.max(rawPeriod, PERIOD_MIN), PERIOD_MAX)
+    period    := 0.2 * rawPeriod + 0.8 * prevPeriod
+    // dominant cycle phase (degrees) and its bar-to-bar advance, floored at 1 degree
+    float prevPhase = phase
+    if i1 != 0
+        phase := math.todegrees(math.atan(q1 / i1))
+    float deltaPhase = math.max(prevPhase - phase, 1.)
+    // adaptive factor — steady phase rotation pins it at the slow limit, a stalled phase snaps it toward the fast limit
+    float alpha = math.max(fastLimit / deltaPhase, slowLimit)
+    // MAMA recursion, FAMA following at half of MAMA's current factor — both seeded at price
+    mama := alpha * price + (1 - alpha) * nz(mama[1], price)
+    fama := 0.5 * alpha * mama + (1 - 0.5 * alpha) * nz(fama[1], mama)
+    [mama, fama]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+// na-proof source — the recursive filter chain must never ingest na
+float src = nz(srcInput, close)
+
+[mama, fama] = mesaAdaptivePair(src, fastLimitInput, slowLimitInput)
+
+// cross state and crossover events
+bullish   = mama >= fama
+bullCross = ta.crossover(mama, fama)
+bearCross = ta.crossunder(mama, fama)
+
+// stair-step legs — slope reversals of MAMA
+mamaSlope = mama - nz(mama[1], mama)
+slopeUp   = mamaSlope > 0 and nz(mamaSlope[1]) <= 0
+slopeDown = mamaSlope < 0 and nz(mamaSlope[1]) >= 0
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+stateColor = bullish ? bullColorInput : bearColorInput
+
+fillTopColor    = showFillInput ? color.new(stateColor, bullish ? FILL_MAMA_TRANSP : FILL_FAMA_TRANSP) : na
+fillBottomColor = showFillInput ? color.new(stateColor, bullish ? FILL_FAMA_TRANSP : FILL_MAMA_TRANSP) : na
+
+mamaPlotId = plot(mama, "MAMA", color = stateColor, linewidth = 2)
+famaPlotId = plot(fama, "FAMA", color = color.new(stateColor, FAMA_TRANSP))
+
+fill(mamaPlotId, famaPlotId, top_value = math.max(mama, fama), bottom_value = math.min(mama, fama), top_color = fillTopColor, bottom_color = fillBottomColor, title = "MAMA / FAMA Gradient Fill")
+
+plotshape(showCrossInput and bullCross ? fama : na, "Bullish Cross", shape.circle, location.absolute, color = bullColorInput, size = size.tiny)
+plotshape(showCrossInput and bearCross ? fama : na, "Bearish Cross", shape.circle, location.absolute, color = bearColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(bullCross, "Bullish Cross", "MAMA crossed above FAMA on {{ticker}} ({{interval}})")
+alertcondition(bearCross, "Bearish Cross", "MAMA crossed below FAMA on {{ticker}} ({{interval}})")
+alertcondition(slopeUp, "MAMA Slope Up", "MAMA slope turned upward on {{ticker}} ({{interval}})")
+alertcondition(slopeDown, "MAMA Slope Down", "MAMA slope turned downward on {{ticker}} ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

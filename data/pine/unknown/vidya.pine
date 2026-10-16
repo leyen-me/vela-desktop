@@ -1,0 +1,190 @@
+//@version=6
+indicator("VIDYA", shorttitle = "VIDYA", overlay = true)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+MOMENTUM_SCALER   = "Momentum (|CMO|)"
+VOLATILITY_SCALER = "Volatility (StDev Ratio)"
+
+TREND_UP   =  1
+TREND_FLAT =  0
+TREND_DOWN = -1
+
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+FLAT_COLOR    = #787b86 // congestion - the line reads flat
+NEUTRAL_COLOR = #787b86 // trend regime coloring disabled
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+FILL_PRICE_TRANSP = 60  // gradient transparency at the price end of the fill
+FILL_LINE_TRANSP  = 100 // gradient transparency at the VIDYA end of the fill
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+srcInput           = input.source(close, "Source", group = "Settings",
+     tooltip = "Price series the average smooths. VIDYA is classically computed on the close.")
+
+lengthInput        = input.int(12, "VIDYA Length", minval = 1, group = "Settings",
+     tooltip = "EMA-equivalent length N of the base smoothing constant, alpha = 2 / (N + 1). The adaptive scaler rescales this base speed bar by bar — longer settings suit slower regimes and higher timeframes.")
+
+scalerInput        = input.string(MOMENTUM_SCALER, "Adaptive Scaler", options = [MOMENTUM_SCALER, VOLATILITY_SCALER], group = "Settings",
+     tooltip = "Bar-by-bar measure that rescales the smoothing constant. Momentum (|CMO|) is the widely used form from Chande & Kroll's The New Technical Trader — the absolute Chande Momentum Oscillator divided by 100, so strong one-sided movement speeds the average up and balanced movement flattens it. Volatility (StDev Ratio) is Chande's original 1992 reading — short-term standard deviation relative to a reference standard deviation.")
+
+scalerLengthInput  = input.int(9, "Scaler Lookback", minval = 1, group = "Settings",
+     tooltip = "Lookback of the adaptive scaler — the CMO period in momentum mode (classically 9), or the short-term standard deviation window in volatility mode.")
+
+refLengthInput     = input.int(30, "Reference StDev Length", minval = 2, group = "Settings",
+     tooltip = "Volatility mode only — window of the reference standard deviation the short-term reading is divided by. Ratios above 1 speed the average up beyond its base alpha; ratios below 1 slow it down.")
+
+flatThresholdInput = input.float(0.05, "Flat Threshold", minval = 0, step = 0.01, group = "Trend Regime",
+     tooltip = "One-bar change of VIDYA, as a fraction of ATR, below which the line is read as flat (congestion). Beyond it, the slope marks a directional phase. Raise the threshold to demand steeper trends; lower it for more sensitive regime shifts.")
+
+atrLengthInput     = input.int(14, "ATR Normalization Length", minval = 1, group = "Trend Regime",
+     tooltip = "ATR window used to normalize VIDYA's one-bar slope, so the flat threshold behaves consistently across symbols and timeframes.")
+
+showDashboardInput     = input.bool(true, "Show Dashboard", group = "Dashboard",
+     tooltip = "Displays a compact panel with the current regime read, the adaptive scaler value, and the effective EMA-equivalent length of the average.")
+
+dashboardLocationInput = input.string("Top Right", "Location", options = ["Top Right", "Bottom Right", "Bottom Left", "Top Left"], group = "Dashboard",
+     tooltip = "Chart corner the dashboard is anchored to.")
+
+dashboardSizeInput     = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = "Dashboard",
+     tooltip = "Text size of the dashboard.")
+
+trendColorInput    = input.bool(true, "Trend Regime Coloring", group = "Style",
+     tooltip = "Colors VIDYA by its regime read — bullish while sloping up beyond the flat threshold, bearish while sloping down, flat color inside congestion. Disable to draw the line in the neutral color.")
+
+gradientInput      = input.bool(true, "Adaptive Gradient", group = "Style",
+     tooltip = "Blends the trend color toward the flat color according to the adaptive scaler, so the line pales as momentum dies and saturates as one-sided movement builds.")
+
+bullColorInput     = input.color(BULL_COLOR, "Bullish", inline = "state", group = "Style",
+     tooltip = "Bullish color, used while VIDYA slopes upward and for bullish crossings/fill.")
+
+bearColorInput     = input.color(BEAR_COLOR, "Bearish", inline = "state", group = "Style",
+     tooltip = "Bearish color, used while VIDYA slopes downward and for bearish crossings/fill.")
+
+flatColorInput     = input.color(FLAT_COLOR, "Flat", inline = "state", group = "Style",
+     tooltip = "Color used while VIDYA is flat, and as the faded end of the adaptive gradient.")
+
+neutralColorInput  = input.color(NEUTRAL_COLOR, "Neutral", group = "Style",
+     tooltip = "Line color used when trend regime coloring is disabled.")
+
+lineWidthInput     = input.int(2, "Line Width", minval = 1, maxval = 5, group = "Style",
+     tooltip = "Width of the VIDYA line.")
+
+showFillInput      = input.bool(true, "Price / VIDYA Gradient Fill", group = "Style",
+     tooltip = "Fills the area between the source and VIDYA with a vertical gradient — bullish while price holds above the average, bearish while below — fading to fully transparent at the line. Visualizes how price hugs the average in trends and detaches from it in ranges.")
+
+showCrossesInput   = input.bool(false, "Price Crossing Markers", group = "Style",
+     tooltip = "Displays small triangle markers when the source crosses over or under VIDYA. Off by default to keep the chart clean — the crossing alerts work regardless.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+// Momentum scaler — the common form: |CMO| / 100, 0 when movement is fully balanced, 1 when fully one-sided
+cmoValue       = ta.cmo(srcInput, scalerLengthInput)
+momentumFactor = math.abs(cmoValue) / 100
+
+// Volatility scaler — Chande's original 1992 variant: recent standard deviation relative to a reference standard deviation
+shortStdev       = ta.stdev(srcInput, scalerLengthInput)
+refStdev         = ta.stdev(srcInput, refLengthInput)
+volatilityFactor = na(shortStdev) or na(refStdev) ? float(na) : refStdev > 0 ? shortStdev / refStdev : 0.0
+
+// Effective smoothing constant — the EMA-style base alpha rescaled by the selected factor on every bar
+scaleFactor    = scalerInput == MOMENTUM_SCALER ? momentumFactor : volatilityFactor
+alphaBase      = 2.0 / (lengthInput + 1)
+effectiveAlpha = math.min(alphaBase * scaleFactor, 1)
+
+// VIDYA recursion — effective alpha * price + (1 - effective alpha) * previous value, seeded with the source
+float vidya = na
+vidya := na(vidya[1]) or na(scaleFactor) ? srcInput : effectiveAlpha * srcInput + (1 - effectiveAlpha) * vidya[1]
+
+// Trend regime — ATR-normalized one-bar slope measured against the flat threshold
+atrValue        = ta.atr(atrLengthInput)
+vidyaSlope      = vidya - nz(vidya[1], vidya)
+normalizedSlope = na(atrValue) or atrValue == 0 ? 0.0 : vidyaSlope / atrValue
+trendState      = normalizedSlope > flatThresholdInput ? TREND_UP : normalizedSlope < -flatThresholdInput ? TREND_DOWN : TREND_FLAT
+
+// Events — price crossings, regime transitions, and breakouts away from a flat line
+crossUp   = ta.crossover(srcInput, vidya)
+crossDown = ta.crossunder(srcInput, vidya)
+
+prevState       = nz(trendState[1], TREND_FLAT)
+bullishPhase    = trendState == TREND_UP   and prevState != TREND_UP
+bearishPhase    = trendState == TREND_DOWN and prevState != TREND_DOWN
+flatPhase       = trendState == TREND_FLAT and prevState != TREND_FLAT
+bullishBreakout = bullishPhase and prevState == TREND_FLAT and srcInput > vidya
+bearishBreakout = bearishPhase and prevState == TREND_FLAT and srcInput < vidya
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+gradientFactor = math.min(nz(scaleFactor), 1)
+
+vidyaColor = switch
+    not trendColorInput      => neutralColorInput
+    trendState == TREND_UP   => gradientInput ? color.from_gradient(gradientFactor, 0, 1, flatColorInput, bullColorInput) : bullColorInput
+    trendState == TREND_DOWN => gradientInput ? color.from_gradient(gradientFactor, 0, 1, flatColorInput, bearColorInput) : bearColorInput
+    => flatColorInput
+
+priceAbove      = srcInput > vidya
+fillTopColor    = showFillInput ? (priceAbove ? color.new(bullColorInput, FILL_PRICE_TRANSP) : color.new(bearColorInput, FILL_LINE_TRANSP)) : na
+fillBottomColor = showFillInput ? (priceAbove ? color.new(bullColorInput, FILL_LINE_TRANSP) : color.new(bearColorInput, FILL_PRICE_TRANSP)) : na
+
+srcPlotId   = plot(srcInput, "Source", color = na, editable = false, display = display.none)
+vidyaPlotId = plot(vidya, "VIDYA", color = vidyaColor, linewidth = lineWidthInput)
+
+fill(srcPlotId, vidyaPlotId, top_value = math.max(srcInput, vidya), bottom_value = math.min(srcInput, vidya), top_color = fillTopColor, bottom_color = fillBottomColor, title = "Price / VIDYA Gradient Fill")
+
+plotshape(showCrossesInput and crossUp, "Bullish Price Cross", shape.triangleup, location.belowbar, color = bullColorInput, size = size.tiny)
+plotshape(showCrossesInput and crossDown, "Bearish Price Cross", shape.triangledown, location.abovebar, color = bearColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+dashboardLocation = switch dashboardLocationInput
+    "Top Right"    => position.top_right
+    "Bottom Right" => position.bottom_right
+    "Bottom Left"  => position.bottom_left
+    => position.top_left
+
+dashboardTextSize = switch dashboardSizeInput
+    "Tiny"  => size.tiny
+    "Small" => size.small
+    => size.normal
+
+var table dashboardTable = table.new(dashboardLocation, 2, 3, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+if barstate.islast and showDashboardInput
+    regimeText  = trendState == TREND_UP ? "Trending Up" : trendState == TREND_DOWN ? "Trending Down" : "Ranging"
+    regimeColor = trendState == TREND_UP ? bullColorInput : trendState == TREND_DOWN ? bearColorInput : flatColorInput
+
+    // Effective EMA-equivalent length implied by the current effective alpha — the "variable index" read
+    lastAlpha       = nz(effectiveAlpha)
+    effectiveLength = lastAlpha > 0 ? 2 / lastAlpha - 1 : float(na)
+    lengthText      = na(effectiveLength) or effectiveLength > 999 ? "> 999" : str.tostring(effectiveLength, "#.#")
+
+    table.cell(dashboardTable, 0, 0, "Regime",      text_color = DASH_HEADER, text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 0, regimeText,    text_color = regimeColor,    text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 1, "Adaptivity",  text_color = DASH_HEADER, text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 1, str.tostring(nz(scaleFactor) * 100, "#.#") + "%", text_color = DASH_TEXT, text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 2, "Eff. Length", text_color = DASH_HEADER, text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 2, lengthText,    text_color = DASH_TEXT, text_size = dashboardTextSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(crossUp, "Bullish Price Cross", "Price crossed above VIDYA on {{ticker}} ({{interval}})")
+alertcondition(crossDown, "Bearish Price Cross", "Price crossed below VIDYA on {{ticker}} ({{interval}})")
+alertcondition(bullishPhase, "Bullish Trend Phase", "VIDYA slope turned decisively upward on {{ticker}} ({{interval}}) — bullish directional phase")
+alertcondition(bearishPhase, "Bearish Trend Phase", "VIDYA slope turned decisively downward on {{ticker}} ({{interval}}) — bearish directional phase")
+alertcondition(flatPhase, "Flat Regime", "VIDYA flattened on {{ticker}} ({{interval}}) — congestion regime")
+alertcondition(bullishBreakout, "Bullish Breakout From Flat", "Price broke away upward from a flat VIDYA on {{ticker}} ({{interval}}) — potential start of a directional phase")
+alertcondition(bearishBreakout, "Bearish Breakout From Flat", "Price broke away downward from a flat VIDYA on {{ticker}} ({{interval}}) — potential start of a directional phase")
+
+//---------------------------------------------------------------------------------------------------------------------}

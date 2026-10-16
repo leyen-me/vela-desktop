@@ -1,0 +1,178 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Trade Volume Index", "Trade Volume Index", overlay = false, format = format.volume)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+color BULL_COLOR    = #089981
+color BEAR_COLOR    = #f23645
+color NEUTRAL_COLOR = #787b86
+
+int ACCUMULATION = 1
+int NEUTRAL      = 0
+int DISTRIBUTION = -1
+
+string GRAN_CHART = 'Chart Bars'
+string GRAN_LTF   = 'Lower Timeframe (Intrabars)'
+
+string TVI_GROUP    = 'Trade Volume Index'
+string SIGNAL_GROUP = 'Signals'
+string STYLE_GROUP  = 'Style'
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+mtvInput = input.float(0, 'Minimum Tick Value', minval = 0, group = TVI_GROUP, tooltip = 'Smallest price change treated as meaningful. A change larger than this value classifies the print as accumulation, a change below its negative as distribution, and changes at or inside the threshold inherit the direction of the last qualifying move. Set to 0 to use the instrument tick size, the most common choice. Larger values are less sensitive and keep the direction latched longer.')
+
+granularityInput = input.string(GRAN_CHART, 'Granularity', options = [GRAN_CHART, GRAN_LTF], group = TVI_GROUP, tooltip = 'Prints fed into the running total. "Chart Bars" applies the rule to each bar close and volume, the standard rendition on time-based charts. "Lower Timeframe (Intrabars)" applies the same rule to intrabar closes and volumes, approximating the tick data TVI was designed for. Bars without intrabar coverage fall back to chart bars so the line stays continuous.')
+
+ltfInput = input.timeframe('1', 'Lower Timeframe', group = TVI_GROUP, tooltip = 'Intrabar timeframe used when Granularity is set to "Lower Timeframe (Intrabars)". Select a timeframe below the chart timeframe, invalid selections fall back to chart bars.')
+
+extremeLengthInput = input.int(20, 'Extreme Lookback', minval = 2, group = SIGNAL_GROUP, tooltip = 'Window, in bars, defining a new extreme. Price sets a new extreme when it exceeds its prior highest high or lowest low over this window, and TVI confirmation is tested against its own prior extreme over the same window. Used by the non-confirmation and breakout qualification signals.')
+
+flatLengthInput = input.int(20, 'Flat Market Lookback', minval = 2, group = SIGNAL_GROUP, tooltip = 'Window, in bars, for the flat market read: price is considered flat when its total range over the window stays below the range threshold, while TVI is tested for rising or falling across the same window.')
+
+flatRangeInput = input.float(2, 'Flat Market Range %', minval = 0, step = 0.25, group = SIGNAL_GROUP, tooltip = 'Maximum high-low range over the flat market lookback, as a percentage of the average close, for price to be considered flat. A rising TVI inside such a window is the classic quiet accumulation read, a falling one the distribution read.')
+
+bullColorInput    = input.color(BULL_COLOR, 'Accumulation', inline = 'colors', group = STYLE_GROUP)
+bearColorInput    = input.color(BEAR_COLOR, 'Distribution', inline = 'colors', group = STYLE_GROUP)
+neutralColorInput = input.color(NEUTRAL_COLOR, 'Neutral', inline = 'colors', group = STYLE_GROUP)
+
+showMarkersInput = input.bool(false, 'Non-Confirmation Markers', group = STYLE_GROUP, tooltip = 'Mark bars where price sets a new extreme that TVI fails to confirm. Alerts for these events remain available even when markers are disabled.')
+
+showFlatInput = input.bool(true, 'Quiet Accumulation/Distribution Highlight', group = STYLE_GROUP, tooltip = 'Shade the pane background while TVI rises (accumulation) or falls (distribution) inside a flat price window.')
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Classify one print against the minimum tick value and return the updated direction, the signed
+// volume contribution, and the new reference price. Direction only flips on a change strictly
+// larger than the threshold, smaller changes inherit the last qualifying direction
+tviStep(float price, float printVolume, float referencePrice, int priorDirection, float threshold) =>
+    int   nextDirection = priorDirection
+    float contribution  = 0.0
+    float nextReference = referencePrice
+
+    if not na(price)
+        if not na(nextReference)
+            // Snap the change to the instrument tick grid so threshold comparisons are free of floating point noise
+            float priceChange = math.round((price - nextReference) / syminfo.mintick) * syminfo.mintick
+
+            nextDirection := priceChange > threshold ? ACCUMULATION : priceChange < -threshold ? DISTRIBUTION : nextDirection
+            contribution  := nextDirection * nz(printVolume)
+
+        nextReference := price
+
+    [nextDirection, contribution, nextReference]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Trade Volume Index
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Volume guard, TVI is undefined on symbols without volume data
+float cumulativeVolume = ta.cum(nz(volume))
+
+if barstate.islast and cumulativeVolume == 0
+    runtime.error('Trade Volume Index requires volume data, but the data vendor provides none for this symbol.')
+
+float minTickValue = mtvInput > 0 ? mtvInput : syminfo.mintick
+
+bool   useIntrabars = granularityInput == GRAN_LTF
+string requestTf    = useIntrabars ? ltfInput : timeframe.period
+
+[intrabarPrices, intrabarVolumes] = request.security_lower_tf(syminfo.tickerid, requestTf, [close, volume], ignore_invalid_timeframe = true)
+
+var float tvi            = 0.0
+var int   flowDirection  = NEUTRAL
+var float referencePrice = na
+
+bool hasIntrabars = useIntrabars and not na(intrabarPrices) and array.size(intrabarPrices) > 0
+
+if hasIntrabars
+    for i = 0 to array.size(intrabarPrices) - 1
+        [stepDirection, stepContribution, stepReference] = tviStep(array.get(intrabarPrices, i), array.get(intrabarVolumes, i), referencePrice, flowDirection, minTickValue)
+
+        flowDirection  := stepDirection
+        tvi            += stepContribution
+        referencePrice := stepReference
+else
+    [stepDirection, stepContribution, stepReference] = tviStep(close, volume, referencePrice, flowDirection, minTickValue)
+
+    flowDirection  := stepDirection
+    tvi            += stepContribution
+    referencePrice := stepReference
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Signals
+//---------------------------------------------------------------------------------------------------------------------{
+
+// New extremes, the bar takes out its prior lookback high or low, and TVI is tested the same way
+float priorHighestHigh = ta.highest(high, extremeLengthInput)[1]
+float priorLowestLow   = ta.lowest(low, extremeLengthInput)[1]
+float priorHighestTvi  = ta.highest(tvi, extremeLengthInput)[1]
+float priorLowestTvi   = ta.lowest(tvi, extremeLengthInput)[1]
+
+bool priceNewHigh = high > priorHighestHigh
+bool priceNewLow  = low < priorLowestLow
+bool tviNewHigh   = tvi > priorHighestTvi
+bool tviNewLow    = tvi < priorLowestTvi
+
+// Non-confirmation, price pushes to a new extreme while TVI fails to follow, and breakout qualification,
+// price and TVI make new highs together
+bool bearishNonConfirmation = priceNewHigh and not tviNewHigh
+bool bullishNonConfirmation = priceNewLow and not tviNewLow
+bool confirmedBreakout      = priceNewHigh and tviNewHigh
+
+// Flat market read, a tight price range while the running total keeps building on one side
+float flatRangePct = (ta.highest(high, flatLengthInput) - ta.lowest(low, flatLengthInput)) / ta.sma(close, flatLengthInput) * 100
+
+bool priceIsFlat       = flatRangePct <= flatRangeInput
+bool quietAccumulation = priceIsFlat and tvi > tvi[flatLengthInput]
+bool quietDistribution = priceIsFlat and tvi < tvi[flatLengthInput]
+
+// Event onsets, first bar a condition appears, used for markers and alerts
+bool bearishNonConfirmationEvent = bearishNonConfirmation and not bearishNonConfirmation[1]
+bool bullishNonConfirmationEvent = bullishNonConfirmation and not bullishNonConfirmation[1]
+bool confirmedBreakoutEvent      = confirmedBreakout and not confirmedBreakout[1]
+bool quietAccumulationEvent      = quietAccumulation and not quietAccumulation[1]
+bool quietDistributionEvent      = quietDistribution and not quietDistribution[1]
+
+bool accumulationFlip = flowDirection == ACCUMULATION and flowDirection[1] != ACCUMULATION
+bool distributionFlip = flowDirection == DISTRIBUTION and flowDirection[1] != DISTRIBUTION
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visuals
+//---------------------------------------------------------------------------------------------------------------------{
+
+// The starting value is arbitrary, only slope and divergence carry meaning, so the line is colored
+// by the current classification instead of by its level
+color tviColor = flowDirection == ACCUMULATION ? bullColorInput : flowDirection == DISTRIBUTION ? bearColorInput : neutralColorInput
+
+plot(tvi, 'TVI', tviColor, 1)
+
+plotshape(showMarkersInput and bearishNonConfirmationEvent ? tvi : na, 'Bearish Non-Confirmation', shape.circle, location.absolute, bearColorInput, size = size.tiny)
+plotshape(showMarkersInput and bullishNonConfirmationEvent ? tvi : na, 'Bullish Non-Confirmation', shape.circle, location.absolute, bullColorInput, size = size.tiny)
+
+color flatShade = not showFlatInput ? na : quietAccumulation ? color.new(bullColorInput, 90) : quietDistribution ? color.new(bearColorInput, 90) : na
+
+bgcolor(flatShade, title = 'Quiet Accumulation/Distribution')
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(accumulationFlip, 'Accumulation Flip', 'TVI classification flipped to accumulation on {{ticker}} {{interval}}, price change exceeded the minimum tick value to the upside.')
+alertcondition(distributionFlip, 'Distribution Flip', 'TVI classification flipped to distribution on {{ticker}} {{interval}}, price change exceeded the minimum tick value to the downside.')
+alertcondition(bearishNonConfirmationEvent, 'Bearish Non-Confirmation', 'New price high without a new TVI high on {{ticker}} {{interval}}, the push lacks buy-side participation and is prone to fading.')
+alertcondition(bullishNonConfirmationEvent, 'Bullish Non-Confirmation', 'New price low without a new TVI low on {{ticker}} {{interval}}, the decline lacks sell-side participation and is prone to fading.')
+alertcondition(confirmedBreakoutEvent, 'Confirmed Upside Breakout', 'Price and TVI made new highs together on {{ticker}} {{interval}}, the breakout is qualified by buy-side volume.')
+alertcondition(quietAccumulationEvent, 'Quiet Accumulation', 'TVI rising while price is flat on {{ticker}} {{interval}}, buyers may be absorbing supply before a markup.')
+alertcondition(quietDistributionEvent, 'Quiet Distribution', 'TVI falling while price is flat on {{ticker}} {{interval}}, sellers may be distributing into passive demand.')
+
+//---------------------------------------------------------------------------------------------------------------------}

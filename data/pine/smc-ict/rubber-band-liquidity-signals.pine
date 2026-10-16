@@ -1,0 +1,154 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Rubber Band Liquidity Signals", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+
+// --- Inputs ---
+var grp_trend = "Trend & Range Settings"
+trendLookback = input.int(20, "Trend Lookback", group = grp_trend)
+trendAtrMult  = input.float(2.0, "Trend Move ATR Multiplier", group = grp_trend, tooltip = "Minimum move size to be considered a strong trend")
+rangeLength   = input.int(10, "Consolidation Length", group = grp_trend)
+rangeMaxAtr   = input.float(3.5, "Range Max ATR Multiplier", group = grp_trend, tooltip = "Maximum width of the consolidation range")
+maxRangeBars  = input.int(50, "Max Range Duration", group = grp_trend)
+
+var grp_style = "Style"
+bullColor     = input.color(#089981, "Bullish Color", group = grp_style)
+bearColor     = input.color(#f23645, "Bearish Color", group = grp_style)
+
+var grp_alerts = "Alerts"
+alertSweep    = input.bool(true, "Alert on Sweep", group = grp_alerts)
+alertBreakout = input.bool(true, "Alert on Breakout (B)", group = grp_alerts)
+
+// --- Calculations ---
+atr = ta.atr(14)
+
+// 1. Identify Strong Trend
+// Check if the price moved significantly over the trendLookback period
+moveSize = close - close[trendLookback]
+isBullTrend = moveSize > (trendAtrMult * atr[trendLookback])
+isBearTrend = moveSize < -(trendAtrMult * atr[trendLookback])
+
+// 2. Identify Range
+// Calculate the highest and lowest points over the consolidation period
+rangeHigh = ta.highest(high, rangeLength)
+rangeLow  = ta.lowest(low, rangeLength)
+rangeWidth = rangeHigh - rangeLow
+
+isConsolidating = rangeWidth < (rangeMaxAtr * atr)
+
+// State tracking
+var int state = 0 // 0 = searching, 1 = range formed (bull), -1 = range formed (bear), 2 = sweep bull, -2 = sweep bear
+var float activeRangeHigh = na
+var float activeRangeLow = na
+var int rangeStartBar = na
+var int sweepBarIndex = na
+var box currentBox = na
+
+// Only start looking for a range if we are in state 0
+// We look back to see if there was a trend leading up to this consolidation
+bullRangeCondition = isBullTrend[rangeLength] and isConsolidating
+bearRangeCondition = isBearTrend[rangeLength] and isConsolidating
+
+if state == 0
+    if bullRangeCondition
+        state := 1
+        activeRangeHigh := rangeHigh
+        activeRangeLow := rangeLow
+        rangeStartBar := bar_index - rangeLength
+        currentBox := box.new(rangeStartBar, activeRangeHigh, bar_index, activeRangeLow, border_color = color.new(bullColor, 50), bgcolor = color.new(bullColor, 90))
+    else if bearRangeCondition
+        state := -1
+        activeRangeHigh := rangeHigh
+        activeRangeLow := rangeLow
+        rangeStartBar := bar_index - rangeLength
+        currentBox := box.new(rangeStartBar, activeRangeHigh, bar_index, activeRangeLow, border_color = color.new(bearColor, 50), bgcolor = color.new(bearColor, 90))
+
+// Handle states once a range is formed
+if state == 1 // Bullish Trend -> Range -> Waiting for Sweep (Liquidity Grab below range low)
+    if not na(currentBox)
+        box.set_right(currentBox, bar_index)
+    
+    // Check for liquidity grab (sweep below range low)
+    if low < activeRangeLow and close > activeRangeLow
+        state := 2
+        sweepBarIndex := bar_index
+        // Draw sweep indicator
+        line.new(bar_index, low, bar_index, activeRangeLow, color = bullColor, style = line.style_solid, width = 2)
+        label.new(bar_index, low, "Sweep", style = label.style_label_up, color = color.new(bullColor, 100), textcolor = bullColor, size = size.small)
+        
+        if alertSweep
+            alert("Bullish Sweep Detected", alert.freq_once_per_bar_close)
+    
+    // Invalidation (Price breaks out without a sweep)
+    else if close < activeRangeLow or close > activeRangeHigh
+        state := 0
+        if not na(currentBox)
+            currentBox.delete()
+
+else if state == -1 // Bearish Trend -> Range -> Waiting for Sweep (Liquidity Grab above range high)
+    if not na(currentBox)
+        box.set_right(currentBox, bar_index)
+    
+    // Check for liquidity grab (sweep above range high)
+    if high > activeRangeHigh and close < activeRangeHigh
+        state := -2
+        sweepBarIndex := bar_index
+        // Draw sweep indicator
+        line.new(bar_index, activeRangeHigh, bar_index, high, color = bearColor, style = line.style_solid, width = 2)
+        label.new(bar_index, high, "Sweep", style = label.style_label_down, color = color.new(bearColor, 100), textcolor = bearColor, size = size.small)
+        
+        if alertSweep
+            alert("Bearish Sweep Detected", alert.freq_once_per_bar_close)
+        
+    // Invalidation (Price breaks out without a sweep)
+    else if close > activeRangeHigh or close < activeRangeLow
+        state := 0
+        if not na(currentBox)
+            currentBox.delete()
+
+else if state == 2 // Swept low, waiting for continuation (breakout above range high)
+    if not na(currentBox)
+        box.set_right(currentBox, bar_index)
+        
+    if close > activeRangeHigh
+        // Continuation signaled
+        state := 0
+        label.new(bar_index, high, "B", style = label.style_label_down, color = bullColor, textcolor = color.white, size = size.small)
+        // Draw the V shape
+        line.new(rangeStartBar, activeRangeHigh, sweepBarIndex, activeRangeLow, color = color.yellow, width = 2)
+        line.new(sweepBarIndex, activeRangeLow, bar_index, activeRangeHigh, color = color.yellow, width = 2)
+        
+        if alertBreakout
+            alert("Bullish Breakout (B)", alert.freq_once_per_bar_close)
+            
+    else if close < activeRangeLow
+        // Invalidation (Fails after sweep)
+        state := 0
+
+else if state == -2 // Swept high, waiting for continuation (breakout below range low)
+    if not na(currentBox)
+        box.set_right(currentBox, bar_index)
+        
+    if close < activeRangeLow
+        // Continuation signaled
+        state := 0
+        label.new(bar_index, low, "B", style = label.style_label_up, color = bearColor, textcolor = color.white, size = size.small)
+        // Draw the inverted V shape
+        line.new(rangeStartBar, activeRangeLow, sweepBarIndex, activeRangeHigh, color = color.yellow, width = 2)
+        line.new(sweepBarIndex, activeRangeHigh, bar_index, activeRangeLow, color = color.yellow, width = 2)
+        
+        if alertBreakout
+            alert("Bearish Breakout (B)", alert.freq_once_per_bar_close)
+            
+    else if close > activeRangeHigh
+        // Invalidation (Fails after sweep)
+        state := 0
+
+// Force states to reset if range gets too long
+if state != 0 and (bar_index - rangeStartBar > maxRangeBars)
+    // If it never reached a sweep or continuation within the time limit, remove the box if it hasn't swept yet
+    if state == 1 or state == -1
+        if not na(currentBox)
+            currentBox.delete()
+    state := 0

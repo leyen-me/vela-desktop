@@ -1,0 +1,481 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Diamond Top/bottom", "Diamond Top/bottom", overlay = true, max_lines_count = 500, max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+int    TARGET_MAX_BARS = 250
+int    FILL_TRANSP     = 88
+color  BULL_COLOR      = #089981
+color  BEAR_COLOR      = #f23645
+color  HIDDEN_COLOR    = #00000000
+string STRUCT_GROUP    = 'Diamond Structure'
+string FILTER_GROUP    = 'Prior Move & Volume'
+string DONE_GROUP      = 'Completion'
+string STYLE_GROUP     = 'Style'
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+pivotLenInput    = input.int(6, 'Swing Length', minval = 2, maxval = 30, group = STRUCT_GROUP, tooltip = 'Bars to the left and right required to confirm the swing highs and lows that anchor the four boundary edges. Larger values isolate slower, more prominent diamonds.')
+
+touchesInput     = input.int(2, 'Touches per Edge', minval = 2, maxval = 4, group = STRUCT_GROUP, tooltip = 'Swing touches required on each of the four boundary segments, counting the widest swing as the shared corner of its two edges. Genuine alternating touches on all four edges are what separate a real diamond from two lines forced over noise.')
+
+maxSwingsInput   = input.int(12, 'Maximum Swings', minval = 6, maxval = 20, group = STRUCT_GROUP, tooltip = 'Cap on the number of consecutive alternating swings scanned for one diamond. The largest window that still expands into the widest point and contracts after it is used.')
+
+breakBufInput    = input.float(0.0, 'Decisive Break Buffer (ATR)', minval = 0, maxval = 2, step = 0.05, group = STRUCT_GROUP, tooltip = 'Extra ATR multiple the close must clear beyond a converging boundary for the resolution to count as decisive. At 0 any close through the edge completes the pattern.')
+
+sharpFilterInput = input.bool(true, 'Require Sharp Prior Move', group = FILTER_GROUP, tooltip = 'Classical diamonds form after a steep advance (tops) or decline (bottoms). When enabled, the move into the first swing of the pattern must reach the minimum size below; when disabled, the prior move only classifies the diamond as a top or a bottom.')
+
+priorLenInput    = input.int(20, 'Prior Move Window (bars)', minval = 5, maxval = 200, group = FILTER_GROUP, tooltip = 'Bars before the first swing of the pattern over which the prior move is measured.')
+
+priorMultInput   = input.float(2.0, 'Minimum Prior Move (x ATR)', minval = 0.5, maxval = 10, step = 0.25, group = FILTER_GROUP, tooltip = 'Minimum size of the prior move as a multiple of the baseline ATR for the setting to qualify as sharp.')
+
+atrLenInput      = input.int(50, 'Volatility Baseline Length', minval = 5, group = FILTER_GROUP, tooltip = 'ATR length used to normalize the prior move and the decisive break buffer, so the same settings adapt across symbols and timeframes.')
+
+volFilterInput   = input.bool(false, 'Volume Fade Filter', group = FILTER_GROUP, tooltip = 'Require average volume through the broadening half to exceed average volume through the contracting half. The page notes this signature is common but not universal, so it is off by default. Ignored when the symbol provides no volume data.')
+
+showTargetInput  = input.bool(true, 'Measure-Rule Target', group = DONE_GROUP, tooltip = 'Project the pattern height at the widest point from the breakout level and track the dotted objective until it is reached. No objective is dependable; diamonds after vertical rallies sometimes retrace much of the prior spike.')
+
+failWinInput     = input.int(12, 'Failure Watch (bars)', minval = 0, maxval = 100, group = DONE_GROUP, tooltip = 'Bars monitored after a breakout for acceptance back inside the broken boundary, which negates the pattern. Diamonds resolve against the expected direction often enough that this failure plan is part of the trade. Set to 0 to disable.')
+
+showFormingInput = input.bool(true, 'Show Forming Diamond', group = STYLE_GROUP, tooltip = 'Preview the dotted boundaries of a confirmed but unresolved diamond on the latest bar. Diamonds only become drawable in their second half, so this is the earliest honest look at one.')
+
+fillInput        = input.bool(true, 'Pattern Fill', group = STYLE_GROUP, tooltip = 'Shade the interior of completed diamonds.')
+
+bullColorInput   = input.color(BULL_COLOR, 'Bullish', inline = 'colors', group = STYLE_GROUP)
+
+bearColorInput   = input.color(BEAR_COLOR, 'Bearish', inline = 'colors', group = STYLE_GROUP)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Append a confirmed swing to the alternating pivot list. Consecutive same-side swings keep only
+// the more extreme one, and the list is capped to the scan window. Returns true when the stored
+// structure changed.
+addPivot(array<int> barArray, array<float> priceArray, array<int> typeArray, array<float> moveArray, int pivotType, float pivotPrice, int pivotBar, float moveValue, int capSize) =>
+    bool changed = false
+    int count = array.size(barArray)
+    if count > 0 and array.get(typeArray, count - 1) == pivotType
+        float lastPrice = array.get(priceArray, count - 1)
+        bool moreExtreme = pivotType == 1 ? pivotPrice >= lastPrice : pivotPrice <= lastPrice
+        if moreExtreme
+            array.set(barArray, count - 1, pivotBar)
+            array.set(priceArray, count - 1, pivotPrice)
+            array.set(moveArray, count - 1, moveValue)
+            changed := true
+    else
+        array.push(barArray, pivotBar)
+        array.push(priceArray, pivotPrice)
+        array.push(typeArray, pivotType)
+        array.push(moveArray, moveValue)
+        if array.size(barArray) > capSize
+            array.shift(barArray)
+            array.shift(priceArray)
+            array.shift(typeArray)
+            array.shift(moveArray)
+        changed := true
+    changed
+
+// Draw a completed diamond: the four boundary edges anchored on actual touches, interior fill,
+// and a name label at the resolution bar
+drawDiamond(bool isTop, bool bullBreak, int upLeftBar, float upLeftPrice, int dnLeftBar, float dnLeftPrice, int apexBar, float apexPrice, int troughBar, float troughPrice, int breakBar, float upperBreakPrice, float lowerBreakPrice, float targetPrice, float stopReference) =>
+    color patternColor = isTop ? bearColorInput : bullColorInput
+    color breakColor   = bullBreak ? bullColorInput : bearColorInput
+    line upLeftLine  = line.new(upLeftBar, upLeftPrice, apexBar, apexPrice, color = patternColor)
+    line dnLeftLine  = line.new(dnLeftBar, dnLeftPrice, troughBar, troughPrice, color = patternColor)
+    line upRightLine = line.new(apexBar, apexPrice, breakBar, upperBreakPrice, color = patternColor)
+    line dnRightLine = line.new(troughBar, troughPrice, breakBar, lowerBreakPrice, color = patternColor)
+    if fillInput
+        linefill.new(upLeftLine, dnLeftLine, color.new(patternColor, FILL_TRANSP))
+        linefill.new(upRightLine, dnRightLine, color.new(patternColor, FILL_TRANSP))
+    string patternName = isTop ? 'Diamond Top' : 'Diamond Bottom'
+    string tip = patternName + (bullBreak ? ' resolved upward' : ' resolved downward') + '\nHeight at widest point: ' + str.tostring(apexPrice - troughPrice, format.mintick) + '\nMeasure-rule objective: ' + str.tostring(targetPrice, format.mintick) + '\nStop reference (last contracting swing): ' + str.tostring(stopReference, format.mintick)
+    label.new(breakBar, bullBreak ? low : high, patternName, style = bullBreak ? label.style_label_up : label.style_label_down, color = HIDDEN_COLOR, textcolor = breakColor, size = size.small, tooltip = tip)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+
+float atrValue = nz(ta.atr(atrLenInput), ta.tr(true))
+
+float pivotHighPrice = ta.pivothigh(pivotLenInput, pivotLenInput)
+float pivotLowPrice  = ta.pivotlow(pivotLenInput, pivotLenInput)
+
+// per-bar history indexed by absolute bar index
+var array<float> closeArray  = array.new<float>()
+var array<float> cumVolArray = array.new<float>()
+
+float prevCumVol = array.size(cumVolArray) > 0 ? array.get(cumVolArray, array.size(cumVolArray) - 1) : 0.0
+array.push(cumVolArray, prevCumVol + nz(volume))
+array.push(closeArray, close)
+
+var bool volumeSeen = false
+if not na(volume) and volume > 0
+    volumeSeen := true
+
+// alternating swing list (type 1 = swing high, 0 = swing low)
+var array<int>   pivotBarArray   = array.new<int>()
+var array<float> pivotPriceArray = array.new<float>()
+var array<int>   pivotTypeArray  = array.new<int>()
+var array<float> pivotMoveArray  = array.new<float>()
+
+int maxSwingsEff = math.max(maxSwingsInput, 4 * touchesInput - 2)
+
+// candidate diamond: confirmed expansion-then-contraction, awaiting its resolution
+var bool  candActive        = false
+var bool  candIsTop         = false
+var int   candFirstBar      = 0
+var int   candEndBar        = 0
+var int   candUpLeftBar     = 0
+var float candUpLeftPrice   = na
+var int   candDnLeftBar     = 0
+var float candDnLeftPrice   = na
+var int   candApexBar       = 0
+var float candApexPrice     = na
+var int   candTroughBar     = 0
+var float candTroughPrice   = na
+var float candLastHighPrice = na
+var float candLastLowPrice  = na
+var float candUpSlope       = na
+var float candDnSlope       = na
+var int   candExpireBar     = 0
+var int   nextStartBar      = 0
+
+// post-break watches
+var bool  failWatchOn     = false
+var bool  failWatchBull   = false
+var int   failWatchUntil  = 0
+var int   failAnchorBar   = 0
+var float failAnchorPrice = na
+var float failSlope       = na
+var int   lastBreakBar    = 0
+var bool  targetWatchOn   = false
+var bool  targetBull      = false
+var float targetLevel     = na
+var line  targetLineId    = na
+
+bool topFormingEvent   = false
+bool btmFormingEvent   = false
+bool topBearBreakEvent = false
+bool topBullBreakEvent = false
+bool btmBullBreakEvent = false
+bool btmBearBreakEvent = false
+bool breakFailEvent    = false
+bool targetHitEvent    = false
+
+if barstate.isconfirmed
+    // -- store freshly confirmed swings, tagged with the prior move into them --------------------
+    int confirmBar = bar_index - pivotLenInput
+    int refBar = confirmBar - priorLenInput
+    float refClose = refBar >= 0 ? array.get(closeArray, refBar) : na
+    float moveHigh = not na(pivotHighPrice) and not na(refClose) and atrValue > 0 ? (pivotHighPrice - refClose) / atrValue : na
+    float moveLow  = not na(pivotLowPrice) and not na(refClose) and atrValue > 0 ? (pivotLowPrice - refClose) / atrValue : na
+    bool addedHigh = false
+    bool addedLow  = false
+    int pivotStored = array.size(pivotTypeArray)
+    bool lastIsHigh = pivotStored > 0 and array.get(pivotTypeArray, pivotStored - 1) == 1
+    if not na(pivotHighPrice) and not na(pivotLowPrice)
+        // both sides confirmed on the same bar: keep alternation with the last stored swing
+        if lastIsHigh
+            addedLow  := addPivot(pivotBarArray, pivotPriceArray, pivotTypeArray, pivotMoveArray, 0, pivotLowPrice, confirmBar, moveLow, maxSwingsEff)
+            addedHigh := addPivot(pivotBarArray, pivotPriceArray, pivotTypeArray, pivotMoveArray, 1, pivotHighPrice, confirmBar, moveHigh, maxSwingsEff)
+        else
+            addedHigh := addPivot(pivotBarArray, pivotPriceArray, pivotTypeArray, pivotMoveArray, 1, pivotHighPrice, confirmBar, moveHigh, maxSwingsEff)
+            addedLow  := addPivot(pivotBarArray, pivotPriceArray, pivotTypeArray, pivotMoveArray, 0, pivotLowPrice, confirmBar, moveLow, maxSwingsEff)
+    else if not na(pivotHighPrice)
+        addedHigh := addPivot(pivotBarArray, pivotPriceArray, pivotTypeArray, pivotMoveArray, 1, pivotHighPrice, confirmBar, moveHigh, maxSwingsEff)
+    else if not na(pivotLowPrice)
+        addedLow := addPivot(pivotBarArray, pivotPriceArray, pivotTypeArray, pivotMoveArray, 0, pivotLowPrice, confirmBar, moveLow, maxSwingsEff)
+    bool listChanged = addedHigh or addedLow
+
+    // -- rescan the swing list for the largest window that expands first and contracts second ----
+    if listChanged
+        bool prevActive = candActive
+        int  prevFirstBar = candFirstBar
+        int  pivotCount = array.size(pivotBarArray)
+        int  minWindow = 4 * touchesInput - 2
+        bool foundPattern = false
+        bool  fIsTop = false
+        int   fFirstBar = 0
+        int   fEndBar = 0
+        int   fUpLeftBar = 0
+        float fUpLeftPrice = na
+        int   fDnLeftBar = 0
+        float fDnLeftPrice = na
+        int   fApexBar = 0
+        float fApexPrice = na
+        int   fTroughBar = 0
+        float fTroughPrice = na
+        int   fLastHighBar = 0
+        float fLastHighPrice = na
+        int   fLastLowBar = 0
+        float fLastLowPrice = na
+        if pivotCount >= minWindow
+            int maxScan = math.min(pivotCount, maxSwingsEff)
+            for winSize = minWindow to maxScan
+                int base = pivotCount - winSize
+                // pass 1: locate the widest swings (the middle of a genuine diamond)
+                float apexPriceW = na
+                float troughPriceW = na
+                int apexPos = -1
+                int troughPos = -1
+                int apexBarW = 0
+                int troughBarW = 0
+                for k = 0 to winSize - 1
+                    int idx = base + k
+                    float price = array.get(pivotPriceArray, idx)
+                    if array.get(pivotTypeArray, idx) == 1
+                        if na(apexPriceW) or price > apexPriceW
+                            apexPriceW := price
+                            apexPos := k
+                            apexBarW := array.get(pivotBarArray, idx)
+                    else
+                        if na(troughPriceW) or price < troughPriceW
+                            troughPriceW := price
+                            troughPos := k
+                            troughBarW := array.get(pivotBarArray, idx)
+                // pass 2: higher highs and lower lows into the widest point, lower highs and
+                // higher lows after it, with enough touches on each of the four edges
+                bool structureOk = apexPos >= 0 and troughPos >= 0
+                int highsBefore = 0
+                int highsAfter = 0
+                int lowsBefore = 0
+                int lowsAfter = 0
+                float prevHigh = na
+                float prevLow = na
+                int   upLeftBarW = 0
+                float upLeftPriceW = na
+                int   dnLeftBarW = 0
+                float dnLeftPriceW = na
+                int   lastHighBarW = 0
+                float lastHighPriceW = na
+                int   lastLowBarW = 0
+                float lastLowPriceW = na
+                for k = 0 to winSize - 1
+                    int idx = base + k
+                    float price = array.get(pivotPriceArray, idx)
+                    int pBar = array.get(pivotBarArray, idx)
+                    if array.get(pivotTypeArray, idx) == 1
+                        if na(upLeftPriceW)
+                            upLeftPriceW := price
+                            upLeftBarW := pBar
+                        if k <= apexPos
+                            highsBefore += 1
+                            if not na(prevHigh) and price <= prevHigh
+                                structureOk := false
+                        else
+                            highsAfter += 1
+                            if price >= prevHigh
+                                structureOk := false
+                        lastHighPriceW := price
+                        lastHighBarW := pBar
+                        prevHigh := price
+                    else
+                        if na(dnLeftPriceW)
+                            dnLeftPriceW := price
+                            dnLeftBarW := pBar
+                        if k <= troughPos
+                            lowsBefore += 1
+                            if not na(prevLow) and price >= prevLow
+                                structureOk := false
+                        else
+                            lowsAfter += 1
+                            if price <= prevLow
+                                structureOk := false
+                        lastLowPriceW := price
+                        lastLowBarW := pBar
+                        prevLow := price
+                structureOk := structureOk and highsBefore >= touchesInput and highsAfter >= touchesInput - 1 and lowsBefore >= touchesInput and lowsAfter >= touchesInput - 1
+                int windowFirstBar = array.get(pivotBarArray, base)
+                int windowEndBar = array.get(pivotBarArray, pivotCount - 1)
+                // patterns cannot reach back into an already completed diamond
+                structureOk := structureOk and windowFirstBar >= nextStartBar
+                // the prior move classifies the diamond and, optionally, must be sharp
+                float priorMove = array.get(pivotMoveArray, base)
+                structureOk := structureOk and not na(priorMove) and priorMove != 0
+                if structureOk and sharpFilterInput
+                    structureOk := math.abs(priorMove) >= priorMultInput
+                // optional volume signature: expansion on volume, contraction on fading volume
+                if structureOk and volFilterInput and volumeSeen
+                    int wideBar = math.max(apexBarW, troughBarW)
+                    float broadAvg = (array.get(cumVolArray, wideBar) - array.get(cumVolArray, windowFirstBar)) / (wideBar - windowFirstBar)
+                    float narrowAvg = (array.get(cumVolArray, windowEndBar) - array.get(cumVolArray, wideBar)) / (windowEndBar - wideBar)
+                    structureOk := narrowAvg < broadAvg
+                if structureOk
+                    foundPattern := true
+                    fIsTop := priorMove > 0
+                    fFirstBar := windowFirstBar
+                    fEndBar := windowEndBar
+                    fUpLeftBar := upLeftBarW
+                    fUpLeftPrice := upLeftPriceW
+                    fDnLeftBar := dnLeftBarW
+                    fDnLeftPrice := dnLeftPriceW
+                    fApexBar := apexBarW
+                    fApexPrice := apexPriceW
+                    fTroughBar := troughBarW
+                    fTroughPrice := troughPriceW
+                    fLastHighBar := lastHighBarW
+                    fLastHighPrice := lastHighPriceW
+                    fLastLowBar := lastLowBarW
+                    fLastLowPrice := lastLowPriceW
+        if foundPattern
+            float upSlopeNew = (fLastHighPrice - fApexPrice) / (fLastHighBar - fApexBar)
+            float dnSlopeNew = (fLastLowPrice - fTroughPrice) / (fLastLowBar - fTroughBar)
+            // bar where the converging edges meet: past it the mouth is closed, capped for housekeeping
+            float crossX = (fTroughPrice - fApexPrice + upSlopeNew * fApexBar - dnSlopeNew * fTroughBar) / (upSlopeNew - dnSlopeNew)
+            int expireBarNew = math.min(math.floor(crossX), fEndBar + 2 * (fEndBar - fFirstBar))
+            if expireBarNew <= bar_index
+                candActive := false
+            else
+                candActive := true
+                candIsTop := fIsTop
+                candFirstBar := fFirstBar
+                candEndBar := fEndBar
+                candUpLeftBar := fUpLeftBar
+                candUpLeftPrice := fUpLeftPrice
+                candDnLeftBar := fDnLeftBar
+                candDnLeftPrice := fDnLeftPrice
+                candApexBar := fApexBar
+                candApexPrice := fApexPrice
+                candTroughBar := fTroughBar
+                candTroughPrice := fTroughPrice
+                candLastHighPrice := fLastHighPrice
+                candLastLowPrice := fLastLowPrice
+                candUpSlope := upSlopeNew
+                candDnSlope := dnSlopeNew
+                candExpireBar := expireBarNew
+                bool newStructure = not prevActive or prevFirstBar != fFirstBar
+                topFormingEvent := newStructure and candIsTop
+                btmFormingEvent := newStructure and not candIsTop
+        else
+            candActive := false
+
+    // -- resolution: a decisive close through a converging boundary completes the diamond --------
+    if candActive
+        if bar_index >= candExpireBar
+            candActive := false
+        else
+            float upperNow = candApexPrice + candUpSlope * (bar_index - candApexBar)
+            float lowerNow = candTroughPrice + candDnSlope * (bar_index - candTroughBar)
+            float breakBuffer = breakBufInput * atrValue
+            bool bullBreakNow = close > upperNow + breakBuffer
+            bool bearBreakNow = close < lowerNow - breakBuffer
+            if bullBreakNow and bearBreakNow
+                // a single bar engulfing both edges resolves with the pattern's classical direction
+                bullBreakNow := not candIsTop
+                bearBreakNow := candIsTop
+            if bullBreakNow or bearBreakNow
+                float heightValue = candApexPrice - candTroughPrice
+                float breakLevel = bullBreakNow ? upperNow : lowerNow
+                float targetPrice = bullBreakNow ? breakLevel + heightValue : breakLevel - heightValue
+                float stopReference = bullBreakNow ? candLastLowPrice : candLastHighPrice
+                color breakColor = bullBreakNow ? bullColorInput : bearColorInput
+                drawDiamond(candIsTop, bullBreakNow, candUpLeftBar, candUpLeftPrice, candDnLeftBar, candDnLeftPrice, candApexBar, candApexPrice, candTroughBar, candTroughPrice, bar_index, upperNow, lowerNow, targetPrice, stopReference)
+                if showTargetInput
+                    targetWatchOn := true
+                    targetBull := bullBreakNow
+                    targetLevel := targetPrice
+                    targetLineId := line.new(bar_index, targetPrice, bar_index + 1, targetPrice, color = breakColor, style = line.style_dotted)
+                    label.new(bar_index, targetPrice, 'Target', style = label.style_label_left, color = HIDDEN_COLOR, textcolor = color.new(breakColor, 30), size = size.tiny, tooltip = 'Height at the widest point projected from the breakout level (measure rule)')
+                if failWinInput > 0
+                    failWatchOn := true
+                    failWatchBull := bullBreakNow
+                    failWatchUntil := bar_index + failWinInput
+                    failAnchorBar := bullBreakNow ? candApexBar : candTroughBar
+                    failAnchorPrice := bullBreakNow ? candApexPrice : candTroughPrice
+                    failSlope := bullBreakNow ? candUpSlope : candDnSlope
+                lastBreakBar := bar_index
+                nextStartBar := candEndBar
+                topBearBreakEvent := candIsTop and bearBreakNow
+                topBullBreakEvent := candIsTop and bullBreakNow
+                btmBullBreakEvent := not candIsTop and bullBreakNow
+                btmBearBreakEvent := not candIsTop and bearBreakNow
+                candActive := false
+
+    // -- failure watch: acceptance back inside the broken boundary negates the pattern -----------
+    if failWatchOn
+        if bar_index > failWatchUntil
+            failWatchOn := false
+        else if bar_index > lastBreakBar
+            float edgeNow = failAnchorPrice + failSlope * (bar_index - failAnchorBar)
+            bool backInside = failWatchBull ? close < edgeNow : close > edgeNow
+            if backInside
+                breakFailEvent := true
+                failWatchOn := false
+                targetWatchOn := false
+                label.new(bar_index, failWatchBull ? high : low, '✕', style = failWatchBull ? label.style_label_down : label.style_label_up, color = HIDDEN_COLOR, textcolor = chart.fg_color, size = size.small, tooltip = 'Failed diamond breakout: acceptance back inside the boundary negates the pattern')
+
+    // -- measure-rule objective tracking ----------------------------------------------------------
+    if targetWatchOn
+        bool targetHitNow = targetBull ? high >= targetLevel : low <= targetLevel
+        if targetHitNow
+            targetHitEvent := true
+            targetWatchOn := false
+            if not na(targetLineId)
+                line.set_x2(targetLineId, bar_index)
+        else if bar_index - lastBreakBar > TARGET_MAX_BARS
+            targetWatchOn := false
+        else if not na(targetLineId)
+            line.set_x2(targetLineId, bar_index)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Dotted preview of a confirmed diamond that has not resolved yet
+var line  previewUpLeftId  = na
+var line  previewDnLeftId  = na
+var line  previewUpRightId = na
+var line  previewDnRightId = na
+var label previewLabelId   = na
+
+if barstate.islast
+    line.delete(previewUpLeftId)
+    line.delete(previewDnLeftId)
+    line.delete(previewUpRightId)
+    line.delete(previewDnRightId)
+    label.delete(previewLabelId)
+    previewUpLeftId := na
+    previewDnLeftId := na
+    previewUpRightId := na
+    previewDnRightId := na
+    previewLabelId := na
+    if showFormingInput and candActive
+        color previewColor = candIsTop ? bearColorInput : bullColorInput
+        float upperEnd = candApexPrice + candUpSlope * (candExpireBar - candApexBar)
+        float lowerEnd = candTroughPrice + candDnSlope * (candExpireBar - candTroughBar)
+        previewUpLeftId := line.new(candUpLeftBar, candUpLeftPrice, candApexBar, candApexPrice, color = previewColor, style = line.style_dotted)
+        previewDnLeftId := line.new(candDnLeftBar, candDnLeftPrice, candTroughBar, candTroughPrice, color = previewColor, style = line.style_dotted)
+        previewUpRightId := line.new(candApexBar, candApexPrice, candExpireBar, upperEnd, color = previewColor, style = line.style_dotted)
+        previewDnRightId := line.new(candTroughBar, candTroughPrice, candExpireBar, lowerEnd, color = previewColor, style = line.style_dotted)
+        float mouthMid = (candApexPrice + candUpSlope * (bar_index - candApexBar) + candTroughPrice + candDnSlope * (bar_index - candTroughBar)) / 2
+        previewLabelId := label.new(bar_index, mouthMid, (candIsTop ? 'Diamond Top' : 'Diamond Bottom') + ' · forming', style = label.style_label_left, color = HIDDEN_COLOR, textcolor = previewColor, size = size.tiny, tooltip = 'Expansion then contraction confirmed on all four edges - awaiting a decisive close through a converging boundary. Acceptance back inside after a break negates it.')
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(topFormingEvent, 'Diamond Top Forming', 'Diamond top forming on {{ticker}} ({{interval}}): broadening swings after a sharp advance folded into contraction - all four edges are drawable, awaiting a decisive close through a converging boundary')
+
+alertcondition(btmFormingEvent, 'Diamond Bottom Forming', 'Diamond bottom forming on {{ticker}} ({{interval}}): broadening swings after a sharp decline folded into contraction - all four edges are drawable, awaiting a decisive close through a converging boundary')
+
+alertcondition(topBearBreakEvent, 'Diamond Top Completed (Downside Break)', 'Diamond top completed on {{ticker}} ({{interval}}): decisive close below the lower right edge - the measure rule projects the height at the widest point downward from the break')
+
+alertcondition(btmBullBreakEvent, 'Diamond Bottom Completed (Upside Break)', 'Diamond bottom completed on {{ticker}} ({{interval}}): decisive close above the upper right edge - the measure rule projects the height at the widest point upward from the break')
+
+alertcondition(topBullBreakEvent, 'Diamond Top Upside Break (Continuation)', 'Diamond top on {{ticker}} ({{interval}}) resolved upward through the upper right edge - trade the direction of the actual break rather than assume the reversal')
+
+alertcondition(btmBearBreakEvent, 'Diamond Bottom Downside Break (Continuation)', 'Diamond bottom on {{ticker}} ({{interval}}) resolved downward through the lower right edge - trade the direction of the actual break rather than assume the reversal')
+
+alertcondition(breakFailEvent, 'Diamond Breakout Failed', 'Diamond breakout failed on {{ticker}} ({{interval}}): price accepted back inside the boundary - the pattern is negated')
+
+alertcondition(targetHitEvent, 'Measure-Rule Target Reached', 'Diamond measure-rule target reached on {{ticker}} ({{interval}}): the height at the widest point has been covered from the breakout level')
+
+//---------------------------------------------------------------------------------------------------------------------}

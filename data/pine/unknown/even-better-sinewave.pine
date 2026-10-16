@@ -1,0 +1,144 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Even-better Sinewave", "Even-better Sinewave", overlay = false, format = format.price, precision = 3)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+EBSW_GROUP   = "Even-Better Sinewave"
+REGIME_GROUP = "Trend Regime"
+STYLE_GROUP  = "Style"
+
+//Square root of 2 approximation used by the published SuperSmoother coefficients
+EHLERS_SQRT2 = 1.414
+
+//Approximate bounds of the normalized output
+UPPER_BOUND =  1.0
+LOWER_BOUND = -1.0
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+srcInput      = input.source(close, "Source", group = EBSW_GROUP
+  , tooltip = "Price series the even-better sinewave is computed on. The listing published by Ehlers uses the close.")
+
+durationInput = input.int(40, "Duration", minval = 5, group = EBSW_GROUP
+  , tooltip = "Wavelength setting in bars separating trend from cycle content. Longer values classify more of the movement as cycle content, shorter values push more of it into the saturated trend reading. Published examples commonly use around 40 bars.")
+
+smoothInput   = input.int(10, "Smoothing Period", minval = 2, group = EBSW_GROUP
+  , tooltip = "Critical period of the SuperSmoother removing fast noise from the high-pass output. Set to 10 bars in the published listing.")
+
+markersInput  = input.bool(false, "Show Zero Cross Markers", group = EBSW_GROUP
+  , tooltip = "Displays markers on the zero line when the wave crosses it, the swing timing events used while the market cycles. Disabled by default, the matching alerts remain available either way.")
+
+satLevelInput = input.float(0.9, "Saturation Level", minval = 0.5, maxval = 1.0, step = 0.05, group = REGIME_GROUP
+  , tooltip = "Absolute reading at or beyond which the wave counts as pinned near +1 or -1, plotted as dashed levels.")
+
+satBarsInput  = input.int(5, "Saturation Bars", minval = 1, group = REGIME_GROUP
+  , tooltip = "Consecutive pinned bars required before an established trend is confirmed. The trend reading then holds until the wave leaves the extreme.")
+
+regimeInput   = input.bool(true, "Highlight Trend Regime", group = REGIME_GROUP
+  , tooltip = "Shades the pane background while the wave is saturated, allowing use of the indicator as a trend versus range regime filter.")
+
+bullColorInput  = input.color(#089981, "Bullish", group = STYLE_GROUP)
+bearColorInput  = input.color(#f23645, "Bearish", group = STYLE_GROUP)
+levelColorInput = input.color(color.gray, "Levels", group = STYLE_GROUP)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// One-pole Ehlers high-pass filter attenuating components slower than the cutoff wavelength.
+// The filter coefficient is derived from the cutoff, with the 360 / duration angle expressed in radians
+highPass(float src, int duration) =>
+    float angle  = 2 * math.pi / duration
+    float alpha1 = (1 - math.sin(angle)) / math.cos(angle)
+    float hp     = na
+    hp := 0.5 * (1 + alpha1) * (src - nz(src[1], src)) + alpha1 * nz(hp[1])
+    hp
+
+// Two-pole Ehlers SuperSmoother removing components faster than the critical period
+superSmoother(float src, int period) =>
+    float a1 = math.exp(-EHLERS_SQRT2 * math.pi / period)
+    float b1 = 2 * a1 * math.cos(EHLERS_SQRT2 * math.pi / period)
+    float c2 = b1
+    float c3 = -a1 * a1
+    float c1 = 1 - c2 - c3
+    float smoothed = na
+    smoothed := c1 * (src + nz(src[1], src)) / 2 + c2 * nz(smoothed[1]) + c3 * nz(smoothed[2])
+    smoothed
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+//Band-filter the source, removing trend components slower than the duration then smoothing out the fast noise
+float hp    = highPass(srcInput, durationInput)
+float filt0 = nz(superSmoother(hp, smoothInput))
+float filt1 = nz(filt0[1])
+float filt2 = nz(filt0[2])
+
+//3 bar average of the wave amplitude and of its power
+float wave  = (filt0 + filt1 + filt2) / 3
+float power = (filt0 * filt0 + filt1 * filt1 + filt2 * filt2) / 3
+
+//Normalize the average wave to the square root of the average power, confining the output near the -1 to +1 range
+float ebsw = power > 0 ? wave / math.sqrt(power) : 0
+
+//Saturation runs, consecutive bars with the wave pinned near an extreme
+var int bullRunLength = 0
+var int bearRunLength = 0
+
+bullRunLength := ebsw >= satLevelInput ? bullRunLength + 1 : 0
+bearRunLength := ebsw <= -satLevelInput ? bearRunLength + 1 : 0
+
+//Established trend once a run reaches the required bar count, held until the reading leaves the extreme
+bool bullRegime = bullRunLength >= satBarsInput
+bool bearRegime = bearRunLength >= satBarsInput
+
+//Events
+bool bullSaturated     = bullRunLength == satBarsInput
+bool bearSaturated     = bearRunLength == satBarsInput
+bool bullSaturationEnd = bullRunLength == 0 and nz(bullRunLength[1]) >= satBarsInput
+bool bearSaturationEnd = bearRunLength == 0 and nz(bearRunLength[1]) >= satBarsInput
+bool crossUpZero       = ta.crossover(ebsw, 0)
+bool crossDownZero     = ta.crossunder(ebsw, 0)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visuals
+//---------------------------------------------------------------------------------------------------------------------{
+//Wave colored by its side of the zero line, with a vertical gradient fill toward zero
+oscPlotId  = plot(ebsw, "Even-Better Sinewave", ebsw > 0 ? bullColorInput : bearColorInput)
+zeroPlotId = plot(0, "Zero Line", color.new(chart.fg_color, 70))
+
+fill(oscPlotId, zeroPlotId
+  , math.max(ebsw, 0)
+  , math.min(ebsw, 0)
+  , ebsw > 0 ? color.new(bullColorInput, 50)  : color.new(bearColorInput, 100)
+  , ebsw > 0 ? color.new(bullColorInput, 100) : color.new(bearColorInput, 50)
+  , title = "Wave Gradient")
+
+//Dotted output bounds and dashed saturation levels
+hline(UPPER_BOUND, "Upper Bound", color.new(color.gray, 50), hline.style_dotted)
+hline(LOWER_BOUND, "Lower Bound", color.new(color.gray, 50), hline.style_dotted)
+hline(satLevelInput, "Upper Saturation Level", levelColorInput, hline.style_dashed)
+hline(-satLevelInput, "Lower Saturation Level", levelColorInput, hline.style_dashed)
+
+//Trend regime background while the wave stays saturated
+bgcolor(regimeInput and bullRegime ? color.new(bullColorInput, 90) : regimeInput and bearRegime ? color.new(bearColorInput, 90) : na, title = "Trend Regime Background")
+
+//Optional zero cross markers, disabled by default
+plotshape(markersInput and crossUpZero ? 0 : na, "Bullish Zero Cross Marker", shape.circle, location.absolute, bullColorInput, size = size.tiny)
+plotshape(markersInput and crossDownZero ? 0 : na, "Bearish Zero Cross Marker", shape.circle, location.absolute, bearColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(bullSaturated, "Bullish Saturation", "Even-better sinewave has pinned near +1, established uptrend confirmed")
+alertcondition(bearSaturated, "Bearish Saturation", "Even-better sinewave has pinned near -1, established downtrend confirmed")
+alertcondition(bullSaturationEnd, "Bullish Saturation End", "Even-better sinewave left the upper extreme, uptrend confirmation ended")
+alertcondition(bearSaturationEnd, "Bearish Saturation End", "Even-better sinewave left the lower extreme, downtrend confirmation ended")
+alertcondition(crossUpZero, "Bullish Zero Cross", "Even-better sinewave crossed above the zero line")
+alertcondition(crossDownZero, "Bearish Zero Cross", "Even-better sinewave crossed below the zero line")
+
+//---------------------------------------------------------------------------------------------------------------------}

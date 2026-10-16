@@ -1,0 +1,592 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Point & Figure Cause Counting"
+  , shorttitle       = "Point & Figure Cause Counting"
+  , overlay          = true
+  , format           = format.price
+  , max_lines_count  = 500
+  , max_labels_count = 500
+  , max_boxes_count  = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+//Box sizing methods for the point & figure grid
+string BOX_ATR   = "Auto (ATR)"
+string BOX_PCT   = "Percent of Price"
+string BOX_FIXED = "Fixed Value"
+
+//Column construction sources
+string SRC_HILO  = "High/Low"
+string SRC_CLOSE = "Close"
+
+color BULL_COLOR    = #089981
+color BEAR_COLOR    = #f23645
+color NEUTRAL_COLOR = #ff9800 // the developing range - the one accent
+color TRANSP_COLOR  = #00000000
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+int RANGE_FILL_TRANSP   = 92
+int RANGE_BORDER_TRANSP = 60
+int ZONE_FILL_TRANSP    = 88
+int ZONE_BORDER_TRANSP  = 55
+int ZONE_TEXT_TRANSP    = 40
+int COUNT_LINE_TRANSP   = 25
+int COUNT_TEXT_TRANSP   = 20
+int PREVIEW_TRANSP      = 50
+int PREVIEW_FILL_TRANSP = 94
+int PREVIEW_TEXT_TRANSP = 25
+int HEADER_BG_TRANSP    = 85
+
+//Sampling caps keeping the count-line scan bounded under pathological box sizes
+int MAX_ROW_SAMPLES = 300
+int MAX_COL_SAMPLES = 250
+
+//How far open objective zones extend beyond the last bar
+int FUTURE_OFFSET = 6
+
+string GROUP_PNF   = "Point & Figure"
+string GROUP_COUNT = "Cause Counting"
+string GROUP_DASH  = "Dashboard"
+string GROUP_STYLE = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+boxMethodInput = input.string(BOX_ATR, "Box Size Method"
+  , options = [BOX_ATR, BOX_PCT, BOX_FIXED]
+  , group   = GROUP_PNF
+  , tooltip = "How the price value of one box on the grid is set: automatically from the average true range, as a percent of the latest price, or as a fixed value. Counts are sensitive to the box size, which is one reason objectives should always be read as zones.")
+
+atrLenInput = input.int(14, "ATR Length"
+  , minval  = 2
+  , maxval  = 200
+  , group   = GROUP_PNF
+  , tooltip = "Average true range length behind the automatic box size. The latest ATR value scales the whole grid, so the point & figure structure adapts to the symbol's volatility.")
+
+boxPctInput = input.float(1.0, "Box Percent"
+  , minval  = 0.01
+  , maxval  = 25
+  , step    = 0.05
+  , group   = GROUP_PNF
+  , tooltip = "Box size as a percent of the latest close, used when the method is Percent of Price.")
+
+boxFixedInput = input.float(1.0, "Fixed Box Size"
+  , minval  = 0.000001
+  , group   = GROUP_PNF
+  , tooltip = "Box size in price units, used when the method is Fixed Value.")
+
+reversalInput = input.int(3, "Reversal (Boxes)"
+  , minval  = 1
+  , maxval  = 10
+  , group   = GROUP_PNF
+  , tooltip = "Boxes price must retrace against the active column before a new column starts. Classic Wyckoff counting was done on 1-box charts, where the multiplier is simply the box size; multiplying by the reversal value is the common adaptation for 3-box charts. The projection is count x box size x reversal.")
+
+sourceMethodInput = input.string(SRC_HILO, "Column Source"
+  , options = [SRC_HILO, SRC_CLOSE]
+  , group   = GROUP_PNF
+  , tooltip = "Price feed used to print the columns: High/Low extends a column with the bar's extreme and reverses on the opposite extreme, Close uses closing prices only.")
+
+minColsInput = input.int(5, "Minimum Range Width (Columns)"
+  , minval  = 3
+  , maxval  = 100
+  , group   = GROUP_COUNT
+  , tooltip = "Fewest columns, walls included, a congestion must span before its resolution can be counted. The sideways congestion is the cause; wider causes fund larger effects.")
+
+fillMinInput = input.float(60, "Count Line Fill (%)"
+  , minval  = 0
+  , maxval  = 100
+  , step    = 5
+  , group   = GROUP_COUNT
+  , tooltip = "The count line must cross a printed box in at least this share of the range's columns. This enforces the classic guidance of drawing the line at a level where most columns are filled, and filters out sloping trend structures that are not genuine sideways causes.")
+
+breakBoxesInput = input.int(1, "Breakout Threshold (Boxes)"
+  , minval  = 1
+  , maxval  = 10
+  , group   = GROUP_COUNT
+  , tooltip = "Boxes beyond the congestion's extreme a column must print to resolve the range and trigger the count. Smaller pokes are absorbed into the range instead.")
+
+tolPctInput = input.float(10, "Stepping-Stone Tolerance (%)"
+  , minval  = 0
+  , maxval  = 100
+  , step    = 5
+  , group   = GROUP_COUNT
+  , tooltip = "Slack, as a percent of the campaign base projection, allowed when checking whether a fresh count's objective zone converges with the base zone. Agreement between counts is the stepping-stone confirmation that the campaign is still on plan.")
+
+histBarsInput = input.int(2000, "Calculation Window (Bars)"
+  , minval  = 200
+  , maxval  = 5000
+  , step    = 100
+  , group   = GROUP_COUNT
+  , tooltip = "Confirmed bars kept for rebuilding the point & figure grid. Larger windows cover more campaigns at a higher computational cost.")
+
+showDashInput = input.bool(true, "Show Dashboard"
+  , group   = GROUP_DASH
+  , tooltip = "Dashboard summarizing the grid settings, the column currently printing, the developing congestion and its pending count, the latest posted objective zone and the stepping-stone status.")
+
+dashPosInput = input.string("Top Right", "Dashboard Position"
+  , options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"]
+  , group   = GROUP_DASH
+  , tooltip = "Chart corner the dashboard is anchored to.")
+
+showRangesInput = input.bool(true, "Counted Ranges (Causes)"
+  , group   = GROUP_STYLE
+  , tooltip = "Draws the completed trading ranges whose width was counted - the cause behind each projection, tinted with the resolution direction.")
+
+showCountLineInput = input.bool(true, "Count Lines"
+  , group   = GROUP_STYLE
+  , tooltip = "Draws the count line across each counted range at the row where most columns printed, with the column count readout and the full arithmetic in its tooltip.")
+
+showObjInput = input.bool(true, "Objective Zones"
+  , group   = GROUP_STYLE
+  , tooltip = "Shades the objective zone between the conservative target (projected from the range low or high) and the aggressive target (projected from the count line level).")
+
+showPreviewInput = input.bool(true, "Developing Count Preview"
+  , group   = GROUP_STYLE
+  , tooltip = "While a congestion is still forming, shows the developing cause with its current count and the objectives it would project either way - the pre-entry check of whether the base projects far enough to be worth trading.")
+
+keepCountsInput = input.int(4, "Completed Counts Kept"
+  , minval  = 1
+  , maxval  = 10
+  , group   = GROUP_STYLE
+  , tooltip = "Number of most recent resolved counts kept on the chart.")
+
+bullColorInput = input.color(BULL_COLOR, "Accumulation", inline = "col", group = GROUP_STYLE)
+
+bearColorInput = input.color(BEAR_COLOR, "Distribution", inline = "col", group = GROUP_STYLE)
+
+neutralColorInput = input.color(NEUTRAL_COLOR, "Developing", inline = "col", group = GROUP_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+//Maps the dashboard position setting to a table anchor
+getTablePosition(string positionTxt) =>
+    switch positionTxt
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        => position.bottom_left
+
+fmtPrice(float priceValue) =>
+    str.tostring(priceValue, format.mintick)
+
+//Best count-line row for a column span: the grid row that crosses the most printed columns.
+//Ascending scan with a strict comparison keeps the lowest tied row (the support/spring side)
+//for upside counts; a non-strict comparison keeps the highest tied row for downside counts.
+findCountLine(array<int> colTopArr, array<int> colBotArr, int fromCol, int toCol, int botRowIdx, int topRowIdx, bool preferLowRow) =>
+    int rowSpan = topRowIdx - botRowIdx + 1
+    int colSpan = toCol - fromCol + 1
+    int rowStep = math.max(1, math.ceil(rowSpan * 1.0 / MAX_ROW_SAMPLES))
+    int colStep = math.max(1, math.ceil(colSpan * 1.0 / MAX_COL_SAMPLES))
+    int bestRow     = botRowIdx
+    int bestCrossed = -1
+    for rowIdx = botRowIdx to topRowIdx by rowStep
+        int crossed = 0
+        for colIdx = fromCol to toCol by colStep
+            if array.get(colBotArr, colIdx) <= rowIdx and array.get(colTopArr, colIdx) >= rowIdx
+                crossed += 1
+        if preferLowRow ? crossed > bestCrossed : crossed >= bestCrossed
+            bestRow     := rowIdx
+            bestCrossed := crossed
+    int sampledCols = (toCol - fromCol) / colStep + 1
+    float fillPct = sampledCols > 0 ? 100.0 * bestCrossed / sampledCols : 0.0
+    [bestRow, fillPct]
+
+//Dashboard row: key cell on the left, value cell with tooltip on the right
+dashCell(table tb, int rowIdx, string keyTxt, string valTxt, string tipTxt, color valColor) =>
+    table.cell(tb, 0, rowIdx, keyTxt, text_color = DASH_HEADER, text_halign = text.align_left, text_size = size.small)
+    table.cell(tb, 1, rowIdx, valTxt, text_color = valColor, text_halign = text.align_right, text_size = size.small, tooltip = tipTxt)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Data Collection
+//---------------------------------------------------------------------------------------------------------------------{
+
+//Volatility behind the automatic box size, evaluated on every bar; the latest value scales the grid
+float atrRaw = ta.atr(atrLenInput)
+
+//Confirmed bar history the point & figure chart is rebuilt from
+var array<float> barHiArray  = array.new_float()
+var array<float> barLoArray  = array.new_float()
+var array<float> barClArray  = array.new_float()
+var array<int>   barIdxArray = array.new_int()
+
+if barstate.isconfirmed
+    array.push(barHiArray, high)
+    array.push(barLoArray, low)
+    array.push(barClArray, close)
+    array.push(barIdxArray, bar_index)
+    if array.size(barHiArray) > histBarsInput
+        array.shift(barHiArray)
+        array.shift(barLoArray)
+        array.shift(barClArray)
+        array.shift(barIdxArray)
+
+//Per-update alert flags, true only when the event lands on the current bar
+bool evBullCount = false
+bool evBearCount = false
+bool evStepStone = false
+bool evObjective = false
+
+//Drawing stores, cleared and rebuilt on every update of the last bar
+var array<box>   drawBoxArray   = array.new<box>()
+var array<line>  drawLineArray  = array.new<line>()
+var array<label> drawLabelArray = array.new<label>()
+
+var table dashTable = showDashInput ? table.new(getTablePosition(dashPosInput), 2, 8, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1) : table(na)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Cause Counting Engine
+//---------------------------------------------------------------------------------------------------------------------{
+
+if barstate.islast
+    //Reset the visuals from the previous update
+    if array.size(drawBoxArray) > 0
+        for i = 0 to array.size(drawBoxArray) - 1
+            box.delete(array.get(drawBoxArray, i))
+        array.clear(drawBoxArray)
+    if array.size(drawLineArray) > 0
+        for i = 0 to array.size(drawLineArray) - 1
+            line.delete(array.get(drawLineArray, i))
+        array.clear(drawLineArray)
+    if array.size(drawLabelArray) > 0
+        for i = 0 to array.size(drawLabelArray) - 1
+            label.delete(array.get(drawLabelArray, i))
+        array.clear(drawLabelArray)
+
+    //Box size: the price value of one box, rounded to the symbol's tick grid
+    float rawBox = boxFixedInput
+    if boxMethodInput == BOX_ATR
+        rawBox := na(atrRaw) ? close * 0.01 : atrRaw
+    else if boxMethodInput == BOX_PCT
+        rawBox := close * boxPctInput / 100
+    float boxSize = math.max(math.round(rawBox / syminfo.mintick) * syminfo.mintick, syminfo.mintick)
+
+    //Point & figure columns, in integer box units (a column spans the rows bottom..top)
+    array<int> colDirArray   = array.new_int()
+    array<int> colTopArray   = array.new_int()
+    array<int> colBotArray   = array.new_int()
+    array<int> colStartArray = array.new_int()
+
+    //Active congestion - the candidate cause being built
+    int rangeStartCol = 0
+    int rangeTopIdx   = 0
+    int rangeBotIdx   = 0
+
+    //Campaign memory: the original base count later stepping-stone counts are compared with
+    int   campaignDir  = 0
+    float campaignLo   = na
+    float campaignHi   = na
+    float campaignProj = na
+
+    //Completed counts
+    array<int>   evDirArray      = array.new_int()
+    array<int>   evBarArray      = array.new_int()
+    array<int>   evStartBarArray = array.new_int()
+    array<float> evTopArray      = array.new_float()
+    array<float> evBotArray      = array.new_float()
+    array<float> evRowArray      = array.new_float()
+    array<int>   evColsArray     = array.new_int()
+    array<float> evProjArray     = array.new_float()
+    array<float> evConsArray     = array.new_float()
+    array<float> evAggrArray     = array.new_float()
+    array<int>   evConfArray     = array.new_int()
+    array<int>   evBaseArray     = array.new_int()
+    array<int>   evDoneBarArray  = array.new_int()
+
+    int storedBars = array.size(barIdxArray)
+    int totalSteps = storedBars + (barstate.isconfirmed ? 0 : 1)
+
+    if totalSteps > 0
+        for k = 0 to totalSteps - 1
+            bool  liveBar  = k >= storedBars
+            float barHigh  = liveBar ? high      : array.get(barHiArray, k)
+            float barLow   = liveBar ? low       : array.get(barLoArray, k)
+            float barClose = liveBar ? close     : array.get(barClArray, k)
+            int   barIdx   = liveBar ? bar_index : array.get(barIdxArray, k)
+
+            float srcHigh = sourceMethodInput == SRC_CLOSE ? barClose : barHigh
+            float srcLow  = sourceMethodInput == SRC_CLOSE ? barClose : barLow
+
+            if not (na(srcHigh) or na(srcLow))
+                int hiIdx = math.floor(srcHigh / boxSize)
+                int loIdx = math.ceil(srcLow / boxSize)
+
+                //Print the grid: extend the active column, or reverse into a new one
+                if array.size(colDirArray) == 0
+                    int firstTop = hiIdx
+                    int firstBot = math.min(loIdx, hiIdx)
+                    array.push(colDirArray, 1)
+                    array.push(colTopArray, firstTop)
+                    array.push(colBotArray, firstBot)
+                    array.push(colStartArray, barIdx)
+                    rangeStartCol := 0
+                    rangeTopIdx   := firstTop
+                    rangeBotIdx   := firstBot
+                else
+                    int lastCol = array.size(colDirArray) - 1
+                    int curDir  = array.get(colDirArray, lastCol)
+                    int curTop  = array.get(colTopArray, lastCol)
+                    int curBot  = array.get(colBotArray, lastCol)
+                    if curDir == 1
+                        if hiIdx > curTop
+                            array.set(colTopArray, lastCol, hiIdx)
+                        else if loIdx <= curTop - reversalInput
+                            array.push(colDirArray, -1)
+                            array.push(colTopArray, curTop - 1)
+                            array.push(colBotArray, math.min(loIdx, curTop - 1))
+                            array.push(colStartArray, barIdx)
+                    else
+                        if loIdx < curBot
+                            array.set(colBotArray, lastCol, loIdx)
+                        else if hiIdx >= curBot + reversalInput
+                            array.push(colDirArray, 1)
+                            array.push(colTopArray, math.max(hiIdx, curBot + 1))
+                            array.push(colBotArray, curBot + 1)
+                            array.push(colStartArray, barIdx)
+
+                //Congestion tracking: absorb columns until one clears the extreme by the breakout threshold
+                int lastColIdx  = array.size(colDirArray) - 1
+                int newTopIdx   = array.get(colTopArray, lastColIdx)
+                int newBotIdx   = array.get(colBotArray, lastColIdx)
+                int colsInRange = lastColIdx - rangeStartCol + 1
+
+                bool resolvedUp = false
+                bool resolvedDn = false
+                if colsInRange >= minColsInput
+                    int excessUp = newTopIdx - rangeTopIdx
+                    int excessDn = rangeBotIdx - newBotIdx
+                    if excessUp >= breakBoxesInput and excessUp >= excessDn
+                        resolvedUp := true
+                    else if excessDn >= breakBoxesInput
+                        resolvedDn := true
+
+                if resolvedUp or resolvedDn
+                    //The range is complete: take the horizontal count across it
+                    [countRowIdx, countFillPct] = findCountLine(colTopArray, colBotArray, rangeStartCol, lastColIdx, rangeBotIdx, rangeTopIdx, resolvedUp)
+                    if countFillPct >= fillMinInput
+                        int   countCols      = colsInRange
+                        float projection     = countCols * boxSize * reversalInput
+                        float rangeLowPrice  = rangeBotIdx * boxSize
+                        float rangeHighPrice = rangeTopIdx * boxSize
+                        float countLinePrice = countRowIdx * boxSize
+                        float consObj = resolvedUp ? rangeLowPrice + projection : rangeHighPrice - projection
+                        float aggrObj = resolvedUp ? countLinePrice + projection : countLinePrice - projection
+                        int   newDir  = resolvedUp ? 1 : -1
+
+                        //Stepping-stone check: does this count converge with the campaign base zone?
+                        bool stoneMatch = false
+                        bool baseCount  = false
+                        if newDir == campaignDir and not na(campaignLo)
+                            float tolValue = tolPctInput / 100 * campaignProj
+                            float zoneLo   = math.min(consObj, aggrObj)
+                            float zoneHi   = math.max(consObj, aggrObj)
+                            stoneMatch := zoneLo <= campaignHi + tolValue and zoneHi >= campaignLo - tolValue
+                        else
+                            baseCount    := true
+                            campaignDir  := newDir
+                            campaignLo   := math.min(consObj, aggrObj)
+                            campaignHi   := math.max(consObj, aggrObj)
+                            campaignProj := projection
+
+                        array.push(evDirArray, newDir)
+                        array.push(evBarArray, barIdx)
+                        array.push(evStartBarArray, array.get(colStartArray, rangeStartCol))
+                        array.push(evTopArray, rangeHighPrice)
+                        array.push(evBotArray, rangeLowPrice)
+                        array.push(evRowArray, countLinePrice)
+                        array.push(evColsArray, countCols)
+                        array.push(evProjArray, projection)
+                        array.push(evConsArray, consObj)
+                        array.push(evAggrArray, aggrObj)
+                        array.push(evConfArray, stoneMatch ? 1 : 0)
+                        array.push(evBaseArray, baseCount ? 1 : 0)
+                        array.push(evDoneBarArray, -1)
+
+                        if barIdx == bar_index
+                            if resolvedUp
+                                evBullCount := true
+                            else
+                                evBearCount := true
+                            if stoneMatch
+                                evStepStone := true
+
+                    //Whether counted or not, the congestion is resolved: the breakout column seeds the next one
+                    rangeStartCol := lastColIdx
+                    rangeTopIdx   := newTopIdx
+                    rangeBotIdx   := newBotIdx
+                else
+                    rangeTopIdx := math.max(rangeTopIdx, newTopIdx)
+                    rangeBotIdx := math.min(rangeBotIdx, newBotIdx)
+
+                //Objective fulfillment: price reaching the conservative edge of an open zone
+                int evTotal = array.size(evDirArray)
+                if evTotal > 0
+                    for evIdx = 0 to evTotal - 1
+                        if array.get(evDoneBarArray, evIdx) == -1
+                            bool  upWard    = array.get(evDirArray, evIdx) == 1
+                            float consLevel = array.get(evConsArray, evIdx)
+                            if (upWard and barHigh >= consLevel) or (not upWard and barLow <= consLevel)
+                                array.set(evDoneBarArray, evIdx, barIdx)
+                                if barIdx == bar_index
+                                    evObjective := true
+
+    //Developing congestion and its pending count - the pre-entry sizing check
+    int   endColIdx   = array.size(colDirArray) - 1
+    int   liveColsNow = endColIdx >= 0 ? endColIdx - rangeStartCol + 1 : 0
+    bool  pendValid   = false
+    int   pendRowIdx  = 0
+    float pendProj    = liveColsNow * boxSize * reversalInput
+    if liveColsNow >= minColsInput
+        [bestPendRow, bestPendFill] = findCountLine(colTopArray, colBotArray, rangeStartCol, endColIdx, rangeBotIdx, rangeTopIdx, true)
+        pendRowIdx := bestPendRow
+        pendValid  := bestPendFill >= fillMinInput
+
+    //-------------------------------------------------------------------------
+    // Visuals
+    //-------------------------------------------------------------------------
+
+    int totalCounts = array.size(evDirArray)
+    if totalCounts > 0
+        for evIdx = math.max(0, totalCounts - keepCountsInput) to totalCounts - 1
+            int   evDir      = array.get(evDirArray, evIdx)
+            int   evBar      = array.get(evBarArray, evIdx)
+            int   evStartBar = array.get(evStartBarArray, evIdx)
+            float evTop      = array.get(evTopArray, evIdx)
+            float evBot      = array.get(evBotArray, evIdx)
+            float evRow      = array.get(evRowArray, evIdx)
+            int   evCols     = array.get(evColsArray, evIdx)
+            float evProj     = array.get(evProjArray, evIdx)
+            float evCons     = array.get(evConsArray, evIdx)
+            float evAggr     = array.get(evAggrArray, evIdx)
+            bool  evConf     = array.get(evConfArray, evIdx) == 1
+            bool  evIsBase   = array.get(evBaseArray, evIdx) == 1
+            int   evDone     = array.get(evDoneBarArray, evIdx)
+            color dirColor   = evDir > 0 ? bullColorInput : bearColorInput
+
+            if showRangesInput
+                array.push(drawBoxArray, box.new(evStartBar, evTop, evBar, evBot
+                  , border_color = color.new(dirColor, RANGE_BORDER_TRANSP)
+                  , bgcolor      = color.new(dirColor, RANGE_FILL_TRANSP)))
+
+            if showCountLineInput
+                string countTip = "Horizontal count across the cause: " + str.tostring(evCols) + " columns x " + fmtPrice(boxSize) + " box x " + str.tostring(reversalInput) + " reversal = " + fmtPrice(evProj) + " of projected effect."
+                countTip := countTip + "\nConservative objective, anchored at the range " + (evDir > 0 ? "low " : "high ") + fmtPrice(evDir > 0 ? evBot : evTop) + ": " + fmtPrice(evCons) + "."
+                countTip := countTip + "\nAggressive objective, anchored at the count line " + fmtPrice(evRow) + ": " + fmtPrice(evAggr) + "."
+                countTip := countTip + (evIsBase ? "\nThis count sets the campaign base that later stepping-stone counts are compared with." : evConf ? "\nStepping-stone: this count converges with the campaign base zone - agreement between counts raises confidence in the target." : "\nThis count does not converge with the campaign base zone - treat the campaign objective with caution.")
+                countTip := countTip + "\nCounts are estimates of potential, not promises, and say nothing about timing."
+                array.push(drawLineArray, line.new(evStartBar, evRow, evBar, evRow
+                  , color = color.new(dirColor, COUNT_LINE_TRANSP)
+                  , width = 1))
+                array.push(drawLabelArray, label.new((evStartBar + evBar) / 2, evRow, "count " + str.tostring(evCols)
+                  , style     = label.style_label_center
+                  , color     = TRANSP_COLOR
+                  , textcolor = color.new(dirColor, COUNT_TEXT_TRANSP)
+                  , size      = size.small
+                  , tooltip   = countTip))
+
+            if showObjInput
+                int rightBar = evDone >= 0 ? math.max(evDone, evBar + 1) : bar_index + FUTURE_OFFSET
+                string zoneTxt = "objective " + fmtPrice(evCons) + " - " + fmtPrice(evAggr) + (evConf ? " | stepping-stone" : "") + (evDone >= 0 ? " | reached" : "")
+                array.push(drawBoxArray, box.new(evBar, math.max(evCons, evAggr), rightBar, math.min(evCons, evAggr)
+                  , border_color = color.new(dirColor, ZONE_BORDER_TRANSP)
+                  , border_style = line.style_dashed
+                  , bgcolor      = color.new(dirColor, ZONE_FILL_TRANSP)
+                  , text         = zoneTxt
+                  , text_size    = size.tiny
+                  , text_color   = color.new(dirColor, ZONE_TEXT_TRANSP)
+                  , text_halign  = text.align_right))
+
+    if showPreviewInput and pendValid
+        int   pendStartBar = array.get(colStartArray, rangeStartCol)
+        float pendTop = rangeTopIdx * boxSize
+        float pendBot = rangeBotIdx * boxSize
+        float pendRow = pendRowIdx * boxSize
+        float pendUp  = pendBot + pendProj
+        float pendDn  = pendTop - pendProj
+        string pendTxt = "developing cause: " + str.tostring(liveColsNow) + " cols -> " + fmtPrice(pendProj)
+        string pendTip = "A congestion wide enough to count is still forming: " + str.tostring(liveColsNow) + " columns x " + fmtPrice(boxSize) + " box x " + str.tostring(reversalInput) + " reversal = " + fmtPrice(pendProj) + " of potential."
+        pendTip := pendTip + "\nResolved upward it would project a conservative objective of " + fmtPrice(pendUp) + "; downward, " + fmtPrice(pendDn) + "."
+        pendTip := pendTip + "\nThe pre-entry sizing check: does the base project far enough to make the trade's reward-to-risk acceptable?"
+        array.push(drawBoxArray, box.new(pendStartBar, pendTop, bar_index, pendBot
+          , border_color = color.new(neutralColorInput, PREVIEW_TRANSP)
+          , border_style = line.style_dotted
+          , bgcolor      = color.new(neutralColorInput, PREVIEW_FILL_TRANSP)))
+        array.push(drawLineArray, line.new(pendStartBar, pendRow, bar_index, pendRow
+          , color = color.new(neutralColorInput, PREVIEW_TRANSP)
+          , style = line.style_dotted))
+        array.push(drawLabelArray, label.new(bar_index, pendRow, pendTxt
+          , style     = label.style_label_left
+          , color     = TRANSP_COLOR
+          , textcolor = color.new(neutralColorInput, PREVIEW_TEXT_TRANSP)
+          , size      = size.small
+          , tooltip   = pendTip))
+
+    //-------------------------------------------------------------------------
+    // Dashboard
+    //-------------------------------------------------------------------------
+
+    if showDashInput and not na(dashTable)
+        string gridTxt = fmtPrice(boxSize) + " x " + str.tostring(reversalInput)
+
+        string colTxt = "-"
+        if endColIdx >= 0
+            int lastDir   = array.get(colDirArray, endColIdx)
+            int lastBoxes = array.get(colTopArray, endColIdx) - array.get(colBotArray, endColIdx) + 1
+            colTxt := (lastDir > 0 ? "X (" : "O (") + str.tostring(lastBoxes) + " boxes)"
+
+        string congTxt = "-"
+        if endColIdx >= 0
+            congTxt := str.tostring(liveColsNow) + " cols, " + fmtPrice(rangeBotIdx * boxSize) + " - " + fmtPrice(rangeTopIdx * boxSize)
+
+        string pendTxt = pendValid ? str.tostring(liveColsNow) + " cols -> " + fmtPrice(pendProj) : "-"
+
+        string lastTxt  = "-"
+        string zoneTxt  = "-"
+        string stoneTxt = "-"
+        color  lastColor  = DASH_TEXT
+        color  stoneColor = DASH_TEXT
+        if totalCounts > 0
+            int lastIdx = totalCounts - 1
+            bool lastUp = array.get(evDirArray, lastIdx) == 1
+            lastColor := lastUp ? bullColorInput : bearColorInput
+            lastTxt   := str.tostring(array.get(evColsArray, lastIdx)) + " cols -> " + fmtPrice(array.get(evProjArray, lastIdx)) + (lastUp ? " (up)" : " (down)")
+            zoneTxt   := fmtPrice(array.get(evConsArray, lastIdx)) + " - " + fmtPrice(array.get(evAggrArray, lastIdx)) + (array.get(evDoneBarArray, lastIdx) >= 0 ? ", reached" : ", open")
+            bool lastConf = array.get(evConfArray, lastIdx) == 1
+            bool lastBase = array.get(evBaseArray, lastIdx) == 1
+            stoneTxt   := lastConf ? "confirmed" : lastBase ? "campaign base" : "divergent"
+            stoneColor := lastConf ? lastColor : lastBase ? DASH_TEXT : bearColorInput
+
+        table.cell(dashTable, 0, 0, "cause counting", text_color = DASH_TEXT, text_halign = text.align_left, text_size = size.small, bgcolor = color.new(neutralColorInput, HEADER_BG_TRANSP))
+        table.cell(dashTable, 1, 0, "", bgcolor = color.new(neutralColorInput, HEADER_BG_TRANSP))
+
+        dashCell(dashTable, 1, "box x reversal", gridTxt, "The price value of one box on the grid and the reversal setting. The projection multiplies the column count by both: count x box size x reversal.", DASH_TEXT)
+        dashCell(dashTable, 2, "column", colTxt, "Direction and height of the column currently printing. Columns print only when price moves, never on time alone - which is why the width of a range approximates the two-sided trade needed to complete a campaign.", DASH_TEXT)
+        dashCell(dashTable, 3, "congestion", congTxt, "Width in columns (walls included) and price span of the congestion currently building - the candidate cause.", DASH_TEXT)
+        dashCell(dashTable, 4, "pending count", pendTxt, "The count the developing range would post if it resolved here - the pre-entry check of whether the base projects far enough to make the trade's reward-to-risk acceptable. Requires the minimum width and a count line crossing enough filled columns.", color.new(neutralColorInput, 0))
+        dashCell(dashTable, 5, "last count", lastTxt, "The most recent completed horizontal count: columns across the resolved range and the effect they project.", lastColor)
+        dashCell(dashTable, 6, "objective zone", zoneTxt, "Objective zone of the last count, from the conservative target (range low or high plus/minus the projection) to the aggressive target (count line plus/minus the projection). A zone that markets overshoot and undershoot, not a precise level.", lastColor)
+        dashCell(dashTable, 7, "stepping-stone", stoneTxt, "Whether the last count converges with the campaign base count. Counts taken across pauses within the trend that project to roughly the same objective as the original base support staying with the position.", stoneColor)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(evBullCount, "Bullish Count Posted", "point & figure cause counting: an accumulation range on {{ticker}} ({{interval}}) resolved upward - a horizontal count was taken across the cause and an upside objective zone is posted")
+
+alertcondition(evBearCount, "Bearish Count Posted", "point & figure cause counting: a distribution range on {{ticker}} ({{interval}}) resolved downward - a horizontal count was taken across the cause and a downside objective zone is posted")
+
+alertcondition(evStepStone, "Stepping-Stone Confirmation", "point & figure cause counting: a fresh count on {{ticker}} ({{interval}}) projects into the campaign base objective zone - stepping-stone confirmation that the campaign is still on plan")
+
+alertcondition(evObjective, "Objective Zone Reached", "point & figure cause counting: price on {{ticker}} ({{interval}}) reached the conservative edge of a count objective zone - counts are estimates of potential, and this is a rational area to begin scaling out")
+
+//---------------------------------------------------------------------------------------------------------------------}

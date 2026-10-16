@@ -1,0 +1,279 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Naked POC"
+  , shorttitle       = "Naked POC"
+  , overlay          = true
+  , max_lines_count  = 500
+  , max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+NPOC_COLOR     = #ff9800 // the untested level is the one highlight - the open magnet to watch
+TESTED_COLOR   = #787b86 // tested levels are retired structure
+LABEL_BG_COLOR = #00000000
+
+DASH_BG   = #161616
+DASH_TEXT = #DBDBDB
+
+BASIS_VOLUME = "Volume"
+BASIS_TPO    = "Time (TPO)"
+
+STYLE_SOLID  = "Solid"
+STYLE_DASHED = "Dashed"
+STYLE_DOTTED = "Dotted"
+
+SIZE_TINY  = "Tiny"
+SIZE_SMALL = "Small"
+
+STALE_TRANSPARENCY  = 80
+TESTED_TRANSPARENCY = 40
+MARKER_TRANSPARENCY = 30
+
+DATE_FORMAT = "d MMM"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+PROFILE_GROUP = "Profile"
+NPOC_GROUP    = "Naked POCs"
+STYLE_GROUP   = "Style"
+
+periodInput = input.timeframe("D", "Profile Period", group = PROFILE_GROUP
+  , tooltip = "Timeframe of the sessions the profiles are built from. Each completed period builds its own profile, and the period's point of control is then tracked forward as a naked POC until price trades back through it. Keep the chart timeframe well below this period so every profile is built from enough bars.")
+
+rowsInput = input.int(24, "Profile Rows", minval = 2, maxval = 100, group = PROFILE_GROUP
+  , tooltip = "Number of equal price rows the period's range is split into when building its profile. More rows locate the point of control more precisely, while fewer rows smooth the profile when data is thin.")
+
+basisInput = input.string(BASIS_VOLUME, "POC Basis", options = [BASIS_VOLUME, BASIS_TPO], group = PROFILE_GROUP
+  , tooltip = "Weighting used to build each profile. 'Volume' marks the point of control at the row where the most volume traded, as in a volume profile; 'Time (TPO)' uses the row visited by the most bars, as in a TPO profile. Use Time (TPO) on symbols without volume data.")
+
+maxNpocInput = input.int(50, "Maximum Naked POCs", minval = 1, maxval = 150, group = NPOC_GROUP
+  , tooltip = "Most recent naked POC levels kept on the chart. Once the count is exceeded the oldest levels are removed first - recent naked POCs usually carry more weight than stale ones.")
+
+npocColorInput = input.color(NPOC_COLOR, "Naked POC", inline = "npoc", group = STYLE_GROUP)
+
+npocStyleInput = input.string(STYLE_SOLID, "", options = [STYLE_SOLID, STYLE_DASHED, STYLE_DOTTED], inline = "npoc", group = STYLE_GROUP
+  , tooltip = "Color and line style of naked POC levels. Each level extends right from the close of the period that built it and keeps extending for as long as it remains untested.")
+
+fadeInput = input.bool(true, "Fade With Age", inline = "fade", group = STYLE_GROUP)
+
+fadeAfterInput = input.int(20, "", minval = 1, maxval = 500, inline = "fade", group = STYLE_GROUP
+  , tooltip = "Fade naked POC levels as they age so fresher levels keep more visual weight. A level reaches its full fade once this many profile periods have completed since it was built.")
+
+showLabelsInput = input.bool(true, "Date Labels", inline = "labels", group = STYLE_GROUP)
+
+labelSizeInput = input.string(SIZE_TINY, "", options = [SIZE_TINY, SIZE_SMALL], inline = "labels", group = STYLE_GROUP
+  , tooltip = "Tag each naked POC with the date of the period that built it, making recent levels easy to tell from stale ones. The dropdown sets the label size.")
+
+showTestedInput = input.bool(false, "Show Tested POCs", inline = "tested", group = STYLE_GROUP)
+
+testedColorInput = input.color(TESTED_COLOR, "", inline = "tested", group = STYLE_GROUP
+  , tooltip = "Keep levels on the chart after price trades back through them, recolored, dashed and frozen at the testing bar. A tested POC is no longer naked and most traders retire it, though some keep it as an old reference.")
+
+testMarkerInput = input.bool(false, "Test Markers", group = STYLE_GROUP
+  , tooltip = "Draw a small marker on the bar that first trades back through a naked POC. The first return to the level is commonly watched for responsive trade, a bounce or a fade.")
+
+//Option strings to drawing constants
+npocLineStyle = switch npocStyleInput
+    STYLE_DASHED => line.style_dashed
+    STYLE_DOTTED => line.style_dotted
+    => line.style_solid
+
+npocLabelSize = labelSizeInput == SIZE_SMALL ? size.small : size.tiny
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types & Variables
+//---------------------------------------------------------------------------------------------------------------------{
+//One naked point of control being tracked for its first test
+type Npoc
+    line  levelLine
+    label levelLabel
+    float pocPrice
+    int   bornPeriod
+
+var array<Npoc> npocArray = array.new<Npoc>()
+
+//Frozen drawings kept after a level is tested, capped so the most recent references stay visible
+var array<line>  testedLineArray  = array.new<line>()
+var array<label> testedLabelArray = array.new<label>()
+var array<label> markerLabelArray = array.new<label>()
+
+//Bars of the profile period currently building
+var array<float> periodHighArray   = array.new_float()
+var array<float> periodLowArray    = array.new_float()
+var array<float> periodVolumeArray = array.new_float()
+
+var int   periodStartTime  = na
+var int   completedPeriods = 0
+var float cumulativeVolume = 0.
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+//Level color for a given age in completed periods, fading stale levels when enabled
+agedColor(int age) =>
+    fadeInput ? color.from_gradient(age, 0, fadeAfterInput, npocColorInput, color.new(npocColorInput, STALE_TRANSPARENCY)) : npocColorInput
+
+//Point of control of the completed period: mid-price of the heaviest profile row, ties resolving toward the middle of the range
+computePeriodPoc() =>
+    float pocPrice = na
+    int   barCount = periodHighArray.size()
+    if barCount > 0
+        float profileHigh = periodHighArray.max()
+        float profileLow  = periodLowArray.min()
+        float rowHeight   = (profileHigh - profileLow) / rowsInput
+        if rowHeight > 0
+            array<float> rowWeightArray = array.new_float(rowsInput, 0.)
+            for i = 0 to barCount - 1
+                float barHigh   = periodHighArray.get(i)
+                float barLow    = periodLowArray.get(i)
+                float barVolume = periodVolumeArray.get(i)
+                float barRange  = barHigh - barLow
+                int   firstRow  = math.max(0, math.min(rowsInput - 1, int(math.floor((barLow - profileLow) / rowHeight))))
+                int   lastRow   = math.max(firstRow, math.min(rowsInput - 1, int(math.floor((barHigh - profileLow) / rowHeight))))
+                for row = firstRow to lastRow
+                    float rowBottom = profileLow + row * rowHeight
+                    float rowTop    = rowBottom + rowHeight
+                    float rowWeight = switch
+                        basisInput == BASIS_TPO => 1.
+                        barRange > 0            => barVolume * math.max(math.min(barHigh, rowTop) - math.max(barLow, rowBottom), 0.) / barRange
+                        =>                         barVolume
+                    rowWeightArray.set(row, rowWeightArray.get(row) + rowWeight)
+            float bestWeight = 0.
+            int   bestRow    = -1
+            float middleRow  = (rowsInput - 1) / 2.
+            for row = 0 to rowsInput - 1
+                float rowWeight = rowWeightArray.get(row)
+                if rowWeight > bestWeight or (bestRow >= 0 and rowWeight == bestWeight and math.abs(row - middleRow) < math.abs(bestRow - middleRow))
+                    bestWeight := rowWeight
+                    bestRow    := row
+            if bestRow >= 0
+                pocPrice := profileLow + (bestRow + 0.5) * rowHeight
+        else
+            //Flat period: every print sat on one price, which is its point of control by definition
+            pocPrice := profileLow
+    pocPrice
+
+//Repaint level colors so fresher naked POCs keep more visual weight than stale ones
+refreshLevelColors() =>
+    int levelCount = npocArray.size()
+    if levelCount > 0
+        for i = 0 to levelCount - 1
+            Npoc  level      = npocArray.get(i)
+            color levelColor = agedColor(completedPeriods - level.bornPeriod)
+            line.set_color(level.levelLine, levelColor)
+            if not na(level.levelLabel)
+                label.set_textcolor(level.levelLabel, levelColor)
+
+//Register the completed period's POC as naked and start extending it to the right
+createNpoc(float pocPrice, int builtTime) =>
+    color levelColor = agedColor(0)
+    line  levelLine  = line.new(bar_index - 1, pocPrice, bar_index, pocPrice, xloc.bar_index, extend.right, levelColor, npocLineStyle)
+    label levelLabel = label(na)
+    if showLabelsInput
+        levelLabel := label.new(bar_index - 1, pocPrice, "NPOC " + str.format_time(builtTime, DATE_FORMAT, syminfo.timezone)
+          , xloc.bar_index, yloc.price, LABEL_BG_COLOR, label.style_label_lower_left, levelColor, npocLabelSize)
+    npocArray.push(Npoc.new(levelLine, levelLabel, pocPrice, completedPeriods))
+    while npocArray.size() > maxNpocInput
+        Npoc oldest = npocArray.shift()
+        line.delete(oldest.levelLine)
+        if not na(oldest.levelLabel)
+            label.delete(oldest.levelLabel)
+
+//Freeze a tested level at the testing bar, or remove it when tested levels are hidden
+retireNpoc(Npoc level) =>
+    if showTestedInput
+        line.set_x2(level.levelLine, bar_index)
+        line.set_extend(level.levelLine, extend.none)
+        line.set_style(level.levelLine, line.style_dashed)
+        line.set_color(level.levelLine, color.new(testedColorInput, TESTED_TRANSPARENCY))
+        testedLineArray.push(level.levelLine)
+        while testedLineArray.size() > maxNpocInput
+            line.delete(testedLineArray.shift())
+        if not na(level.levelLabel)
+            label.set_textcolor(level.levelLabel, color.new(testedColorInput, TESTED_TRANSPARENCY))
+            testedLabelArray.push(level.levelLabel)
+            while testedLabelArray.size() > maxNpocInput
+                label.delete(testedLabelArray.shift())
+    else
+        line.delete(level.levelLine)
+        if not na(level.levelLabel)
+            label.delete(level.levelLabel)
+    if testMarkerInput
+        markerLabelArray.push(label.new(bar_index, level.pocPrice, "", xloc.bar_index, yloc.price
+          , color.new(testedColorInput, MARKER_TRANSPARENCY), label.style_circle, chart.fg_color, size.tiny))
+        while markerLabelArray.size() > maxNpocInput
+            label.delete(markerLabelArray.shift())
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Profile Construction & Naked POC Detection
+//---------------------------------------------------------------------------------------------------------------------{
+bool newNpocEvent    = false
+bool npocTestedEvent = false
+
+bool newPeriod = timeframe.change(periodInput)
+
+cumulativeVolume += nz(volume)
+
+if na(periodStartTime)
+    periodStartTime := time
+
+//A completed period leaves its point of control behind as a naked POC
+if newPeriod
+    if periodHighArray.size() > 0
+        completedPeriods += 1
+        float pocPrice = computePeriodPoc()
+        if not na(pocPrice)
+            createNpoc(pocPrice, periodStartTime)
+            newNpocEvent := true
+        refreshLevelColors()
+        periodHighArray.clear()
+        periodLowArray.clear()
+        periodVolumeArray.clear()
+    periodStartTime := time
+
+if not (na(high) or na(low))
+    periodHighArray.push(high)
+    periodLowArray.push(low)
+    periodVolumeArray.push(nz(volume))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Naked POC Tracking
+//---------------------------------------------------------------------------------------------------------------------{
+//The first trade back through a level since its period closed tests it and removes its naked status
+int levelIndex = 0
+while levelIndex < npocArray.size()
+    Npoc level = npocArray.get(levelIndex)
+    if high >= level.pocPrice and low <= level.pocPrice
+        npocTestedEvent := true
+        retireNpoc(level)
+        npocArray.remove(levelIndex)
+    else
+        levelIndex += 1
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Notices
+//---------------------------------------------------------------------------------------------------------------------{
+var table noticeTable = table.new(position.top_right, 1, 1, border_width = 0)
+
+string noticeText = switch
+    timeframe.in_seconds() >= timeframe.in_seconds(periodInput) => "Chart timeframe must be lower than the profile period"
+    basisInput == BASIS_VOLUME and cumulativeVolume == 0        => "No volume data - set POC Basis to Time (TPO)"
+    => string(na)
+
+if barstate.islast
+    table.cell(noticeTable, 0, 0, na(noticeText) ? "" : noticeText
+      , text_color = DASH_TEXT
+      , text_size  = size.small
+      , bgcolor    = na(noticeText) ? color(na) : DASH_BG)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(newNpocEvent, "New Naked POC", "A profile period completed and left a new naked POC - its point of control starts untested. Open naked POCs above and below current price act as natural destinations when the market leaves balance.")
+alertcondition(npocTestedEvent, "Naked POC Tested", "Price traded back through a naked POC for the first time since its period ended - the first touch is watched for responsive trade, a bounce or a fade, and the level is no longer naked.")
+
+//---------------------------------------------------------------------------------------------------------------------}

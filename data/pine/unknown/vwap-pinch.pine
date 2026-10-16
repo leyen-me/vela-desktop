@@ -1,0 +1,343 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("VWAP Pinch", shorttitle = "VWAP Pinch", overlay = true, format = format.price, max_labels_count = 500, max_lines_count = 500, max_polylines_count = 100)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+AUTO_MODE   = "Auto (Swing High & Swing Low)"
+MANUAL_MODE = "Manual (Anchor Times)"
+
+ST_IDLE          = 0 // no active pinch - the anchored VWAPs are apart or not converging
+ST_PINCH         = 1 // pinch active - converging VWAPs with price compressed between them
+ST_RESOLVED_UP   = 2 // bullish resolution - acceptance above the pinch, the low anchor is the working support
+ST_RESOLVED_DOWN = 3 // bearish resolution - acceptance below the pinch, the high anchor is the working resistance
+
+HIGH_COLOR    = #f23645 // VWAP anchored at the swing high - average price of everyone trading since that high
+LOW_COLOR     = #089981 // VWAP anchored at the swing low - average price of everyone trading since that low
+NEUTRAL_COLOR = #ff9800 // pinch zone - a coiled, decision-pending state, direction unknown - the one accent of the script
+LABEL_BG      = #00000000
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+TOP_RIGHT    = "Top Right"
+TOP_LEFT     = "Top Left"
+BOTTOM_RIGHT = "Bottom Right"
+BOTTOM_LEFT  = "Bottom Left"
+
+ZONE_TIGHT_TRANSP = 45  // pinch fill transparency as the width approaches zero
+ZONE_WIDE_TRANSP  = 88  // pinch fill transparency at the pinch threshold
+FADE_TRANSP       = 70  // abandoned VWAP transparency after a resolution
+HISTORY_BUFFER    = 350 // guaranteed lookback on the running sums, covers the largest swing length
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+anchorModeInput = input.string(AUTO_MODE, "Anchor Mode", options = [AUTO_MODE, MANUAL_MODE]
+  , group   = "Anchors"
+  , tooltip = "How the two anchored VWAPs get their anchors. Auto re-anchors the pair at each newly confirmed swing high and swing low, keeping the classic pinch pair current. Manual anchors each VWAP at the time set below - useful for anchors other participants plausibly watch: major swings, earnings or news gaps, highest-volume sessions, year or quarter opens.")
+
+swingLengthInput = input.int(20, "Swing Length", minval = 2, maxval = 300
+  , group   = "Anchors"
+  , tooltip = "Auto mode only. Bars required on each side of a bar for it to confirm as the swing high or swing low anchor. Larger values select more significant swings and re-anchor less often. A swing confirms this many bars after it forms, and the VWAP is back-drawn from the swing bar itself.")
+
+srcInput = input.source(hlc3, "Source"
+  , group   = "Anchors"
+  , tooltip = "Price series fed into the volume weighting of both anchored VWAPs. HLC3 (typical price) is the standard VWAP source.")
+
+manualHighTimeInput = input.time(timestamp("01 Jan 2024 00:00 +0000"), "High Anchor Time"
+  , group   = "Anchors"
+  , tooltip = "Manual mode only. The high-anchored VWAP starts from the first bar at or after this time - place it on the significant swing high or reference event whose cohort you want to track.")
+
+manualLowTimeInput = input.time(timestamp("01 Feb 2024 00:00 +0000"), "Low Anchor Time"
+  , group   = "Anchors"
+  , tooltip = "Manual mode only. The low-anchored VWAP starts from the first bar at or after this time - place it on the significant swing low or reference event whose cohort you want to track.")
+
+atrLengthInput = input.int(14, "ATR Length", minval = 1
+  , group   = "Pinch Detection"
+  , tooltip = "Averaging length of the ATR used to normalize the distance between the two VWAPs, so the pinch thresholds adapt to each symbol and timeframe. Wilder's default is 14.")
+
+pinchThresholdInput = input.float(1.0, "Pinch Threshold", minval = 0.1, step = 0.1
+  , group   = "Pinch Detection"
+  , tooltip = "Width, in ATR multiples, at or below which the two anchored VWAPs count as pinched. A pinch forms when the width is at or below this level, the lines are converging, and price closes between them - the market trading at both cohorts' average cost at once.")
+
+tightThresholdInput = input.float(0.5, "Tightening Threshold", minval = 0.05, step = 0.05
+  , group   = "Pinch Detection"
+  , tooltip = "Deeper compression level in ATR multiples. The first time an active pinch narrows to or below this width, the tightening event fires - neither side holds a profit cushion and the coil is at its most decision-pending.")
+
+convergeLookbackInput = input.int(5, "Convergence Lookback", minval = 1, maxval = 50
+  , group   = "Pinch Detection"
+  , tooltip = "The VWAP-to-VWAP width must be smaller than it was this many bars ago for the lines to count as converging. Filters out VWAPs that merely run parallel near each other without actually pinching.")
+
+confirmClosesInput = input.int(2, "Acceptance Closes", minval = 1, maxval = 10
+  , group   = "Resolution"
+  , tooltip = "Consecutive closes beyond the outer edge of the pinch required to confirm acceptance and resolve it in that direction. One close is the fastest read; more closes demand a held break, since first breaks can fail. The same count read back through the pair later marks a failed handoff.")
+
+showDashboardInput = input.bool(true, "Show Dashboard"
+  , group   = "Dashboard"
+  , tooltip = "Summary panel: the pinch state, the live VWAP-to-VWAP width in ATR multiples, the tightest width of the current or latest pinch, and the working reference after a handoff.")
+
+dashboardPositionInput = input.string(TOP_RIGHT, "Position", options = [TOP_RIGHT, TOP_LEFT, BOTTOM_RIGHT, BOTTOM_LEFT]
+  , group   = "Dashboard"
+  , tooltip = "Chart corner the dashboard is anchored to.")
+
+highColorInput = input.color(HIGH_COLOR, "High Anchor", inline = "anchors"
+  , group   = "Style"
+  , tooltip = "Color of the VWAP anchored at the swing high - the average price paid by everyone who has traded since that high.")
+
+lowColorInput = input.color(LOW_COLOR, "Low Anchor", inline = "anchors"
+  , group   = "Style"
+  , tooltip = "Color of the VWAP anchored at the swing low - the average price paid by everyone who has traded since that low.")
+
+showZoneInput = input.bool(true, "Pinch Zone", inline = "zone"
+  , group   = "Style"
+  , tooltip = "Fills the area between the two VWAPs while a pinch is active. The fill turns more opaque as the pinch tightens.")
+
+zoneColorInput = input.color(NEUTRAL_COLOR, "", inline = "zone"
+  , group   = "Style"
+  , tooltip = "Pinch zone color.")
+
+showAnchorMarksInput = input.bool(true, "Anchor Markers"
+  , group   = "Style"
+  , tooltip = "Marks the bar each VWAP is currently anchored to with an anchor glyph.")
+
+showEscapeMarksInput = input.bool(true, "Escape Markers"
+  , group   = "Style"
+  , tooltip = "Plots a triangle on the bar where acceptance beyond one side of the pinch confirms - the resolution bar. Breaks fail, so combine the escape with structure and volume before acting.")
+
+fadeAbandonedInput = input.bool(true, "Fade Abandoned VWAP"
+  , group   = "Style"
+  , tooltip = "After a resolution, dims the VWAP whose cohort was put underwater so the surviving working reference stands out - the handoff.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Anchored VWAP Engine
+//---------------------------------------------------------------------------------------------------------------------{
+// running sums from the first chart bar - a VWAP anchored at any past bar is a ratio of sum differences
+vol   = nz(volume)
+cumPV = ta.cum(srcInput * vol)
+cumV  = ta.cum(vol)
+
+// anchor bases are captured retroactively when a swing confirms, so the sums need a guaranteed lookback
+max_bars_back(cumPV, HISTORY_BUFFER)
+max_bars_back(cumV, HISTORY_BUFFER)
+
+// anchored VWAP from the stored bases - the average price paid since the anchor bar, volume weighted
+anchoredVwap(float basePV, float baseV) =>
+    segmentV = cumV - baseV
+    not na(baseV) and segmentV > 0 ? (cumPV - basePV) / segmentV : na
+
+// back-drawn path of a freshly confirmed anchor, from the swing bar up to the confirmation bar
+backfillPath(float basePV, float baseV, int spanBars, color pathColor) =>
+    points = array.new<chart.point>()
+    for i = 0 to spanBars
+        backOffset = spanBars - i
+        segmentV   = cumV[backOffset] - baseV
+        pathValue  = segmentV > 0 ? (cumPV[backOffset] - basePV) / segmentV : na
+        if not na(pathValue)
+            points.push(chart.point.from_index(bar_index - backOffset, pathValue))
+    polyline pathLine = na
+    if points.size() >= 2
+        pathLine := polyline.new(points, curved = false, closed = false, line_color = pathColor, line_width = 1)
+    pathLine
+
+pivotHighPrice = ta.pivothigh(high, swingLengthInput, swingLengthInput)
+pivotLowPrice  = ta.pivotlow(low, swingLengthInput, swingLengthInput)
+
+autoAnchors = anchorModeInput == AUTO_MODE
+
+var float highBasePV = na
+var float highBaseV  = na
+var float lowBasePV  = na
+var float lowBaseV   = na
+
+var label    highAnchorLabel = na
+var label    lowAnchorLabel  = na
+var polyline highPath        = na
+var polyline lowPath         = na
+
+// auto anchors re-anchor at each newly confirmed swing, manual anchors start at the chosen times
+highReanchor    = autoAnchors and not na(pivotHighPrice)
+lowReanchor     = autoAnchors and not na(pivotLowPrice)
+highManualStart = not autoAnchors and time >= manualHighTimeInput and (bar_index == 0 or time[1] < manualHighTimeInput)
+lowManualStart  = not autoAnchors and time >= manualLowTimeInput and (bar_index == 0 or time[1] < manualLowTimeInput)
+
+if highReanchor
+    highBasePV := nz(cumPV[swingLengthInput + 1])
+    highBaseV  := nz(cumV[swingLengthInput + 1])
+    if not na(highPath)
+        polyline.delete(highPath)
+    highPath := backfillPath(highBasePV, highBaseV, swingLengthInput, highColorInput)
+    if not na(highAnchorLabel)
+        label.delete(highAnchorLabel)
+    if showAnchorMarksInput
+        highAnchorLabel := label.new(bar_index - swingLengthInput, pivotHighPrice, "⚓", style = label.style_label_down, color = LABEL_BG, textcolor = highColorInput, size = size.small, tooltip = "High anchor - confirmed swing high")
+
+if highManualStart
+    highBasePV := nz(cumPV[1])
+    highBaseV  := nz(cumV[1])
+    if not na(highAnchorLabel)
+        label.delete(highAnchorLabel)
+    if showAnchorMarksInput
+        highAnchorLabel := label.new(bar_index, high, "⚓", style = label.style_label_down, color = LABEL_BG, textcolor = highColorInput, size = size.small, tooltip = "High anchor - manual time")
+
+if lowReanchor
+    lowBasePV := nz(cumPV[swingLengthInput + 1])
+    lowBaseV  := nz(cumV[swingLengthInput + 1])
+    if not na(lowPath)
+        polyline.delete(lowPath)
+    lowPath := backfillPath(lowBasePV, lowBaseV, swingLengthInput, lowColorInput)
+    if not na(lowAnchorLabel)
+        label.delete(lowAnchorLabel)
+    if showAnchorMarksInput
+        lowAnchorLabel := label.new(bar_index - swingLengthInput, pivotLowPrice, "⚓", style = label.style_label_up, color = LABEL_BG, textcolor = lowColorInput, size = size.small, tooltip = "Low anchor - confirmed swing low")
+
+if lowManualStart
+    lowBasePV := nz(cumPV[1])
+    lowBaseV  := nz(cumV[1])
+    if not na(lowAnchorLabel)
+        label.delete(lowAnchorLabel)
+    if showAnchorMarksInput
+        lowAnchorLabel := label.new(bar_index, low, "⚓", style = label.style_label_up, color = LABEL_BG, textcolor = lowColorInput, size = size.small, tooltip = "Low anchor - manual time")
+
+vwapHigh = anchoredVwap(highBasePV, highBaseV)
+vwapLow  = anchoredVwap(lowBasePV, lowBaseV)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Pinch Detection & Resolution
+//---------------------------------------------------------------------------------------------------------------------{
+atrValue = ta.atr(atrLengthInput)
+
+bothReady = not na(vwapHigh) and not na(vwapLow) and not na(atrValue) and atrValue > 0
+
+upperVwap = math.max(vwapHigh, vwapLow)
+lowerVwap = math.min(vwapHigh, vwapLow)
+
+// pinch width - the distance between the two cohorts' average costs, in ATR multiples
+widthAtr  = bothReady ? (upperVwap - lowerVwap) / atrValue : na
+pastWidth = widthAtr[convergeLookbackInput]
+
+converging  = bothReady and not na(pastWidth) and widthAtr < pastWidth
+priceInside = bothReady and close <= upperVwap and close >= lowerVwap
+pinchSetup  = bothReady and widthAtr <= pinchThresholdInput and converging and priceInside
+
+// acceptance beyond one side - consecutive closes beyond the outer edge of the pair
+var int aboveCloses = 0
+var int belowCloses = 0
+aboveCloses := bothReady and close > upperVwap ? aboveCloses + 1 : 0
+belowCloses := bothReady and close < lowerVwap ? belowCloses + 1 : 0
+
+var int   pinchState    = ST_IDLE
+var bool  tightFired    = false
+var float tightestWidth = na
+
+bool pinchFormed  = false
+bool pinchTighten = false
+bool escapeUp     = false
+bool escapeDown   = false
+
+// a re-anchor changes the geometry - drop any active pinch and let it re-qualify against the new pair
+if pinchState == ST_PINCH and (highReanchor or lowReanchor or highManualStart or lowManualStart)
+    pinchState := ST_IDLE
+
+if pinchState == ST_PINCH
+    if aboveCloses >= confirmClosesInput
+        // held break above the pair puts the high-anchor cohort underwater - bullish resolution
+        pinchState := ST_RESOLVED_UP
+        escapeUp   := true
+    else if belowCloses >= confirmClosesInput
+        // held break below the pair puts the low-anchor cohort underwater - bearish resolution
+        pinchState := ST_RESOLVED_DOWN
+        escapeDown := true
+    else if bothReady and widthAtr > pinchThresholdInput and priceInside
+        // the lines let go without a resolution - pinch dissolved
+        pinchState := ST_IDLE
+    else if bothReady
+        tightestWidth := math.min(nz(tightestWidth, widthAtr), widthAtr)
+        if not tightFired and widthAtr <= tightThresholdInput
+            pinchTighten := true
+            tightFired   := true
+else if pinchSetup
+    pinchState    := ST_PINCH
+    pinchFormed   := true
+    tightFired    := widthAtr <= tightThresholdInput
+    tightestWidth := widthAtr
+else if pinchState == ST_RESOLVED_UP and belowCloses >= confirmClosesInput
+    // acceptance back below the pair - the bullish handoff failed
+    pinchState := ST_IDLE
+else if pinchState == ST_RESOLVED_DOWN and aboveCloses >= confirmClosesInput
+    // acceptance back above the pair - the bearish handoff failed
+    pinchState := ST_IDLE
+
+// handoff - after a resolution the abandoned anchor loses relevance and the survivor is the working reference
+wasResolvedUp   = nz(pinchState[1], ST_IDLE) == ST_RESOLVED_UP
+wasResolvedDown = nz(pinchState[1], ST_IDLE) == ST_RESOLVED_DOWN
+
+retestSupport    = pinchState == ST_RESOLVED_UP and wasResolvedUp and not na(vwapLow) and not na(vwapLow[1]) and low <= vwapLow and low[1] > vwapLow[1]
+retestResistance = pinchState == ST_RESOLVED_DOWN and wasResolvedDown and not na(vwapHigh) and not na(vwapHigh[1]) and high >= vwapHigh and high[1] < vwapHigh[1]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+// a re-anchor jumps the plotted value - hide the connecting segment on that bar
+highJump = highReanchor or highManualStart
+lowJump  = lowReanchor or lowManualStart
+
+highLineColor = highJump ? color(na) : fadeAbandonedInput and pinchState == ST_RESOLVED_UP ? color.new(highColorInput, FADE_TRANSP) : highColorInput
+lowLineColor  = lowJump ? color(na) : fadeAbandonedInput and pinchState == ST_RESOLVED_DOWN ? color.new(lowColorInput, FADE_TRANSP) : lowColorInput
+
+highPlotId = plot(vwapHigh, "High Anchor VWAP", highLineColor, 2, plot.style_linebr)
+lowPlotId  = plot(vwapLow, "Low Anchor VWAP", lowLineColor, 2, plot.style_linebr)
+
+// pinch zone - the space between the two average costs, more opaque as the coil tightens
+zoneFillColor = showZoneInput and pinchState == ST_PINCH and bothReady ? color.from_gradient(widthAtr, 0, pinchThresholdInput, color.new(zoneColorInput, ZONE_TIGHT_TRANSP), color.new(zoneColorInput, ZONE_WIDE_TRANSP)) : na
+fill(highPlotId, lowPlotId, zoneFillColor, "Pinch Zone")
+
+plotshape(showEscapeMarksInput and escapeUp, "Bullish Escape", shape.triangleup, location.belowbar, lowColorInput, size = size.tiny)
+plotshape(showEscapeMarksInput and escapeDown, "Bearish Escape", shape.triangledown, location.abovebar, highColorInput, size = size.tiny)
+
+plot(widthAtr, "Pinch Width (ATR)", zoneColorInput, display = display.data_window, precision = 2)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+dashboardPosition = switch dashboardPositionInput
+    TOP_RIGHT    => position.top_right
+    TOP_LEFT     => position.top_left
+    BOTTOM_RIGHT => position.bottom_right
+    =>              position.bottom_left
+
+var table dashboardTable = showDashboardInput ? table.new(dashboardPosition, 2, 4, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1) : na
+
+if showDashboardInput and barstate.islast and not na(dashboardTable)
+    stateText  = pinchState == ST_PINCH ? "Pinch active" : pinchState == ST_RESOLVED_UP ? "Resolved up" : pinchState == ST_RESOLVED_DOWN ? "Resolved down" : "No pinch"
+    stateColor = pinchState == ST_PINCH ? zoneColorInput : pinchState == ST_RESOLVED_UP ? lowColorInput : pinchState == ST_RESOLVED_DOWN ? highColorInput : DASH_TEXT
+    widthText  = bothReady ? str.tostring(widthAtr, "0.00") + " ATR" : "n/a"
+    widthColor = bothReady and widthAtr <= pinchThresholdInput ? zoneColorInput : DASH_TEXT
+    tightText  = not na(tightestWidth) ? str.tostring(tightestWidth, "0.00") + " ATR" : "n/a"
+    referenceText = pinchState == ST_RESOLVED_UP ? "Low AVWAP support" : pinchState == ST_RESOLVED_DOWN ? "High AVWAP resistance" : pinchState == ST_PINCH ? "Pinch boundaries" : "None"
+    table.cell(dashboardTable, 0, 0, "State", text_color = DASH_HEADER, text_size = size.small, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 0, stateText, text_color = stateColor, text_size = size.small, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 1, "Width", text_color = DASH_HEADER, text_size = size.small, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 1, widthText, text_color = widthColor, text_size = size.small, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 2, "Tightest", text_color = DASH_HEADER, text_size = size.small, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 2, tightText, text_color = DASH_TEXT, text_size = size.small, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 3, "Reference", text_color = DASH_HEADER, text_size = size.small, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 3, referenceText, text_color = stateColor, text_size = size.small, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(pinchFormed, "Pinch Forming", "VWAP Pinch: {{ticker}} pinch forming - the high and low anchored VWAPs are converging with price compressed between them; the market is trading at both cohorts' average cost, a coiled, decision-pending state ({{interval}})")
+alertcondition(pinchTighten, "Pinch Tightening", "VWAP Pinch: {{ticker}} pinch tightening - the VWAP-to-VWAP width narrowed through the tightening threshold; neither side holds a profit cushion and a resolution is nearing ({{interval}})")
+alertcondition(escapeUp or escapeDown, "Pinch Resolved (Any Direction)", "VWAP Pinch: {{ticker}} pinch resolved - price accepted beyond one side of the converging VWAPs; watch for range expansion in the break direction and the handoff to the surviving VWAP ({{interval}})")
+alertcondition(escapeUp, "Bullish Escape", "VWAP Pinch: {{ticker}} bullish escape - acceptance above the pinch put the high-anchor cohort underwater; the low anchored VWAP takes over as the working trailing support - breaks can fail, confirm with structure and volume ({{interval}})")
+alertcondition(escapeDown, "Bearish Escape", "VWAP Pinch: {{ticker}} bearish escape - acceptance below the pinch put the low-anchor cohort underwater; the high anchored VWAP takes over as the working trailing resistance - breaks can fail, confirm with structure and volume ({{interval}})")
+alertcondition(retestSupport, "Handoff Retest (Support)", "VWAP Pinch: {{ticker}} pullback into the surviving low anchored VWAP after the bullish resolution - the handoff reference is being tested as trailing support ({{interval}})")
+alertcondition(retestResistance, "Handoff Retest (Resistance)", "VWAP Pinch: {{ticker}} rally into the surviving high anchored VWAP after the bearish resolution - the handoff reference is being tested as trailing resistance ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

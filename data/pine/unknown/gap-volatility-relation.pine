@@ -1,0 +1,350 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Gap-volatility Relation"
+  , shorttitle = "Gap-volatility Relation"
+  , overlay    = false
+  , format     = format.percent
+  , precision  = 2)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+int TRANSP_VALUE  = 50   //Gradient fill opacity at the share value
+int TRANSP_HIDDEN = 100  //Gradient fill opacity at the zero baseline
+int TRANSP_SOFT   = 90   //Background highlight opacity
+
+string REGIME_QUIET    = "Quiet"
+string REGIME_NORMAL   = "Normal"
+string REGIME_STRESSED = "Stressed"
+
+string GRP_DECOMP = "Variance Decomposition"
+string GRP_GAP    = "Gap Character"
+string GRP_REGIME = "Regime Read"
+string GRP_DASH   = "Dashboard"
+string GRP_STYLE  = "Style"
+
+color COLOR_MAIN = #787b86   // overnight share while gaps are a minor part of variance
+color COLOR_HIGH = #f23645   // overnight share at and above the high-share threshold - gaps dominate variance
+color COLOR_GRAY = #787b86
+color COLOR_WARN = #ff9800   // the one accent - the overnight component volatility
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+int ZONE_TRANSP = 92   //High-share zone shading opacity
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+windowInput = input.int(20, "Estimation Window", minval = 2, group = GRP_DECOMP
+  , tooltip = "Lookback n, in sessions, for the overnight and intraday sample variances of the decomposition. 20 to 30 daily bars is common for tactical work; longer windows give steadier shares at the cost of responsiveness.")
+
+ppyInput = input.int(252, "Periods Per Year", minval = 1, group = GRP_DECOMP
+  , tooltip = "Annualization factor for the volatility readings: per-session volatility is multiplied by the square root of this value. Use 252 for daily bars on most equity calendars and 365 for markets that trade every day.")
+
+highShareInput = input.float(50, "High Share Threshold %", minval = 0, maxval = 100, step = 5, group = GRP_DECOMP
+  , tooltip = "Dashed reference for the overnight variance share. Above it, gaps carry more variance than the sessions themselves: range-based estimators such as Parkinson understate risk there, arguing for close-inclusive or Yang-Zhang estimates and for scaling overnight position sizes to gap risk.")
+
+minGapInput = input.float(0.2, "Minimum Gap Size %", minval = 0, step = 0.05, group = GRP_GAP
+  , tooltip = "Opening gaps of at least this size, as a percent of the prior close, count as significant for the frequency, size and fill statistics. Gap behavior differs sharply between asset types, so re-measure this per instrument rather than carrying it across markets.")
+
+fillWindowInput = input.int(1, "Fill Window (Sessions)", minval = 1, maxval = 20, group = GRP_GAP
+  , tooltip = "A significant gap counts as filled once price trades back to the prior close within this many sessions, counting the gap session itself.")
+
+gapSampleInput = input.int(10, "Gap Sample Size", minval = 1, maxval = 50, group = GRP_GAP
+  , tooltip = "Number of most recent significant gaps kept for the average significant-gap size and the fill-rate statistics.")
+
+shortWinInput = input.int(10, "Short Gap Window", minval = 1, group = GRP_REGIME
+  , tooltip = "Sessions in the short-run readings: the recent mean absolute opening gap (numerator of the gap expansion ratio) and the gap-frequency reading.")
+
+longWinInput = input.int(63, "Baseline Gap Window", minval = 2, group = GRP_REGIME
+  , tooltip = "Sessions in the baseline mean absolute opening gap, the denominator of the gap expansion ratio. Around a quarter of daily bars gives a stable reference.")
+
+escRatioInput = input.float(1.5, "Expansion Ratio", minval = 1, step = 0.1, group = GRP_REGIME
+  , tooltip = "The regime reads Stressed when the gap expansion ratio is at or above this level while recent significant gaps mostly go unfilled: a run of larger, unfilled gaps is evidence of regime escalation.")
+
+quietRatioInput = input.float(0.75, "Contraction Ratio", minval = 0, step = 0.05, group = GRP_REGIME
+  , tooltip = "The regime reads Quiet when the gap expansion ratio is at or below this level, marking small recent gaps against the baseline.")
+
+lowFillInput = input.float(50, "Unfilled Threshold %", minval = 0, maxval = 100, step = 5, group = GRP_REGIME
+  , tooltip = "Fill rate at or below this share of recent significant gaps supports the Stressed read: large gaps that extend rather than fill are the signature of a stressed regime, where gap fades are typically throttled.")
+
+largeGapInput = input.float(2, "Large Gap Multiple", minval = 1, step = 0.25, group = GRP_REGIME
+  , tooltip = "The large-gap alert fires when a session opens with a significant gap at least this multiple of the baseline mean absolute gap.")
+
+showDashInput = input.bool(true, "Show Dashboard", group = GRP_DASH
+  , tooltip = "Display the decomposition and gap-character statistics: overnight share, component volatilities, gap expansion, frequency, fill rate and the regime read.")
+
+dashLocInput = input.string("Top Right", "Location", options = ["Top Right", "Top Left", "Middle Right", "Middle Left", "Bottom Right", "Bottom Left"], group = GRP_DASH
+  , tooltip = "Dashboard position on the pane.")
+
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = GRP_DASH
+  , tooltip = "Dashboard text size.")
+
+shareColorInput = input.color(COLOR_MAIN, "Overnight Share", inline = "share", group = GRP_STYLE)
+
+highShareColorInput = input.color(COLOR_HIGH, "High Share", inline = "share", group = GRP_STYLE
+  , tooltip = "Line, fill and zone color once the overnight share approaches and exceeds the high-share threshold, where gaps dominate variance.")
+
+showCompInput = input.bool(false, "Component Volatilities", group = GRP_STYLE
+  , tooltip = "Plot the annualized overnight and intraday volatilities next to the share, revealing which side of the split drives its changes.")
+
+overnightColorInput = input.color(COLOR_WARN, "Overnight", inline = "comp", group = GRP_STYLE)
+intradayColorInput  = input.color(COLOR_GRAY, "Intraday", inline = "comp", group = GRP_STYLE)
+
+showMarksInput = input.bool(false, "Mark Significant Gaps", group = GRP_STYLE
+  , tooltip = "Displays a circle on the zero baseline for sessions that open with a significant gap, colored by gap direction.")
+
+gapUpColorInput   = input.color(#089981, "Gap Up", inline = "gap", group = GRP_STYLE)
+gapDownColorInput = input.color(#f23645, "Gap Down", inline = "gap", group = GRP_STYLE)
+
+showBgInput = input.bool(false, "Highlight Stressed Regime", group = GRP_STYLE
+  , tooltip = "Shades the pane background while the regime read is Stressed.")
+
+stressColorInput = input.color(#f23645, "Stressed", inline = "regime", group = GRP_STYLE)
+quietColorInput  = input.color(#089981, "Quiet", inline = "regime", group = GRP_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Sample standard deviation: sigma^2 = (1 / (n - 1)) * sum((r - r_mean)^2) with the window mean
+sampleSigma(float src, int len) =>
+    ta.stdev(src, len, false)
+
+// Format a percent value for the dashboard
+formatPercent(float valueIn) =>
+    na(valueIn) ? "n/a" : str.tostring(valueIn, "#.##") + "%"
+
+// Format a ratio value for the dashboard
+formatRatio(float valueIn) =>
+    na(valueIn) ? "n/a" : str.tostring(valueIn, "#.##") + "x"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+// Decomposition: r_overnight = ln(open_t / close_(t-1)), r_intraday = ln(close_t / open_t)
+rOvernight = math.log(open / close[1])
+rIntraday  = math.log(close / open)
+
+sigmaOvernight = sampleSigma(rOvernight, windowInput)
+sigmaIntraday  = sampleSigma(rIntraday, windowInput)
+
+varOvernight = sigmaOvernight * sigmaOvernight
+varIntraday  = sigmaIntraday * sigmaIntraday
+
+//Additive variance split, ignores any overnight/intraday covariance
+varTotal = varOvernight + varIntraday
+
+//Overnight share of total variance, the headline metric, in percent
+overnightShare = varTotal > 0 ? varOvernight / varTotal * 100 : na
+
+//Annualized component volatilities for the dashboard, in percent
+annFactor = math.sqrt(ppyInput)
+
+overnightVol = sigmaOvernight * annFactor * 100
+intradayVol  = sigmaIntraday * annFactor * 100
+totalVol     = math.sqrt(varTotal) * annFactor * 100
+
+//Gap character: opening gap as a percent of the prior close
+gapPct    = (open - close[1]) / close[1] * 100
+absGapPct = math.abs(gapPct)
+sigGap    = not na(absGapPct) and absGapPct >= minGapInput
+
+avgGapShort  = ta.sma(absGapPct, shortWinInput)
+avgGapLong   = ta.sma(absGapPct, longWinInput)
+gapFrequency = ta.sma(sigGap ? 100.0 : 0.0, shortWinInput)
+
+//Gap expansion ratio, short-run mean absolute gap against the baseline
+gapRatio = avgGapLong > 0 ? avgGapShort / avgGapLong : na
+
+//Large gap: significant gap well beyond the baseline established before this session
+baselineGap   = avgGapLong[1]
+largeGapEvent = sigGap and not na(baselineGap) and baselineGap > 0 and absGapPct >= largeGapInput * baselineGap
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Gap fill tracking
+//---------------------------------------------------------------------------------------------------------------------{
+var array<float> pendingLevelArray = array.new_float()
+var array<int>   pendingDirArray   = array.new_int()
+var array<int>   pendingAgeArray   = array.new_int()
+var array<float> fillOutcomeArray  = array.new_float()
+var array<float> gapSizeArray      = array.new_float()
+
+//Resolve pending gaps against this session's range, oldest first
+int pendingCount = array.size(pendingLevelArray)
+
+if pendingCount > 0
+    array<float> keepLevelArray = array.new_float()
+    array<int>   keepDirArray   = array.new_int()
+    array<int>   keepAgeArray   = array.new_int()
+
+    for pendingIndex = 0 to pendingCount - 1
+        float pendingLevel = array.get(pendingLevelArray, pendingIndex)
+        int   pendingDir   = array.get(pendingDirArray, pendingIndex)
+        int   pendingAge   = array.get(pendingAgeArray, pendingIndex) + 1
+
+        bool pendingFilled = pendingDir > 0 ? low <= pendingLevel : high >= pendingLevel
+
+        if pendingFilled
+            array.push(fillOutcomeArray, 1.0)
+        else if pendingAge >= fillWindowInput
+            array.push(fillOutcomeArray, 0.0)
+        else
+            array.push(keepLevelArray, pendingLevel)
+            array.push(keepDirArray, pendingDir)
+            array.push(keepAgeArray, pendingAge)
+
+    pendingLevelArray := keepLevelArray
+    pendingDirArray   := keepDirArray
+    pendingAgeArray   := keepAgeArray
+
+//Register a new significant gap and check for a same-session fill back to the prior close
+if sigGap
+    array.push(gapSizeArray, absGapPct)
+
+    if array.size(gapSizeArray) > gapSampleInput
+        array.shift(gapSizeArray)
+
+    float gapLevel = close[1]
+    int   gapDir   = gapPct > 0 ? 1 : -1
+
+    bool filledSameBar = gapDir > 0 ? low <= gapLevel : high >= gapLevel
+
+    if filledSameBar
+        array.push(fillOutcomeArray, 1.0)
+    else if fillWindowInput <= 1
+        array.push(fillOutcomeArray, 0.0)
+    else
+        array.push(pendingLevelArray, gapLevel)
+        array.push(pendingDirArray, gapDir)
+        array.push(pendingAgeArray, 1)
+
+//Keep only the most recent outcomes
+while array.size(fillOutcomeArray) > gapSampleInput
+    array.shift(fillOutcomeArray)
+
+fillRate  = array.size(fillOutcomeArray) > 0 ? array.avg(fillOutcomeArray) * 100 : na
+avgSigGap = array.size(gapSizeArray) > 0 ? array.avg(gapSizeArray) : na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Regime read
+//---------------------------------------------------------------------------------------------------------------------{
+regimeReady = not na(gapRatio)
+
+//Stressed: expanded gap sizes with recent gaps mostly extending rather than filling
+stressedRegime = regimeReady and gapRatio >= escRatioInput and not na(fillRate) and fillRate <= lowFillInput
+
+//Quiet: contracted gap sizes against the baseline
+quietRegime = regimeReady and not stressedRegime and gapRatio <= quietRatioInput
+
+stressedStart = stressedRegime and not stressedRegime[1]
+quietStart    = quietRegime and not quietRegime[1]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Plots
+//---------------------------------------------------------------------------------------------------------------------{
+//State coloring - neutral while gaps are a minor part of variance, blending into the high-share color toward the threshold
+shareColor = na(overnightShare) ? shareColorInput : color.from_gradient(overnightShare, highShareInput / 2, highShareInput, shareColorInput, highShareColorInput)
+
+sharePlotId = plot(overnightShare, "Overnight Variance Share", shareColor, 2)
+zeroPlotId  = plot(0, "Zero Baseline", color(na), editable = false)
+
+//Gradient fill, transparent at zero and opaque toward the share value
+fill(zeroPlotId, sharePlotId, overnightShare, 0, color.new(shareColor, TRANSP_VALUE), color.new(shareColor, TRANSP_HIDDEN), title = "Share Gradient")
+
+//Dashed reference above which gaps dominate total variance
+hline(highShareInput, "High Share Threshold", color.new(COLOR_GRAY, 30), hline.style_dashed)
+
+//Soft shading of the band where gaps dominate variance
+highZoneId = plot(highShareInput, "High Share Zone Anchor", color(na), editable = false, display = display.none)
+topZoneId  = plot(100, "Top Anchor", color(na), editable = false, display = display.none)
+
+fill(highZoneId, topZoneId, color.new(highShareColorInput, ZONE_TRANSP), title = "High Share Zone")
+
+//Optional annualized component volatilities, in percent
+plot(showCompInput ? overnightVol : na, "Overnight Volatility", overnightColorInput, 1)
+plot(showCompInput ? intradayVol : na, "Intraday Volatility", intradayColorInput, 1)
+
+//Optional significant-gap markers, off by default
+plotshape(showMarksInput and sigGap ? 0.0 : na, "Significant Gap", shape.circle, location.absolute, gapPct > 0 ? gapUpColorInput : gapDownColorInput, size = size.tiny)
+
+//Optional stressed-regime background highlight, off by default
+bgcolor(showBgInput and stressedRegime ? color.new(stressColorInput, TRANSP_SOFT) : na, title = "Stressed Regime Background")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+dashLocation = switch dashLocInput
+    "Top Right"    => position.top_right
+    "Top Left"     => position.top_left
+    "Middle Right" => position.middle_right
+    "Middle Left"  => position.middle_left
+    "Bottom Right" => position.bottom_right
+    => position.bottom_left
+
+dashTextSize = switch dashSizeInput
+    "Tiny"  => size.tiny
+    "Small" => size.small
+    => size.normal
+
+if barstate.islast and showDashInput
+    var table dashTable = table.new(dashLocation, 2, 11, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+    string regimeText  = "Loading..."
+    color  regimeColor = DASH_HEADER
+
+    if regimeReady
+        regimeText  := stressedRegime ? REGIME_STRESSED : quietRegime ? REGIME_QUIET : REGIME_NORMAL
+        regimeColor := stressedRegime ? stressColorInput : quietRegime ? quietColorInput : DASH_TEXT
+
+    table.cell(dashTable, 0, 0, "Gap-Volatility Relation",        text_color = DASH_TEXT,                text_halign = text.align_left,  text_size = dashTextSize)
+    table.cell(dashTable, 1, 0, "n = " + str.tostring(windowInput), text_color = DASH_HEADER, text_halign = text.align_right, text_size = dashTextSize)
+
+    table.cell(dashTable, 0, 1, "Overnight Share",               text_color = DASH_HEADER, text_halign = text.align_left,  text_size = dashTextSize)
+    table.cell(dashTable, 1, 1, formatPercent(overnightShare),   text_color = shareColor,  text_halign = text.align_right, text_size = dashTextSize)
+
+    table.cell(dashTable, 0, 2, "Overnight Vol (ann.)",          text_color = DASH_HEADER, text_halign = text.align_left,  text_size = dashTextSize)
+    table.cell(dashTable, 1, 2, formatPercent(overnightVol),     text_color = DASH_TEXT,      text_halign = text.align_right, text_size = dashTextSize)
+
+    table.cell(dashTable, 0, 3, "Intraday Vol (ann.)",           text_color = DASH_HEADER, text_halign = text.align_left,  text_size = dashTextSize)
+    table.cell(dashTable, 1, 3, formatPercent(intradayVol),      text_color = DASH_TEXT,     text_halign = text.align_right, text_size = dashTextSize)
+
+    table.cell(dashTable, 0, 4, "Total Vol (additive)",          text_color = DASH_HEADER, text_halign = text.align_left,  text_size = dashTextSize)
+    table.cell(dashTable, 1, 4, formatPercent(totalVol),         text_color = DASH_TEXT, text_halign = text.align_right, text_size = dashTextSize)
+
+    table.cell(dashTable, 0, 5, "Gap Expansion",                 text_color = DASH_HEADER, text_halign = text.align_left,  text_size = dashTextSize)
+    table.cell(dashTable, 1, 5, formatRatio(gapRatio),           text_color = DASH_TEXT, text_halign = text.align_right, text_size = dashTextSize)
+
+    table.cell(dashTable, 0, 6, "Gap Frequency",                 text_color = DASH_HEADER, text_halign = text.align_left,  text_size = dashTextSize)
+    table.cell(dashTable, 1, 6, formatPercent(gapFrequency),     text_color = DASH_TEXT, text_halign = text.align_right, text_size = dashTextSize)
+
+    table.cell(dashTable, 0, 7, "Avg Significant Gap",           text_color = DASH_HEADER, text_halign = text.align_left,  text_size = dashTextSize)
+    table.cell(dashTable, 1, 7, formatPercent(avgSigGap),        text_color = DASH_TEXT, text_halign = text.align_right, text_size = dashTextSize)
+
+    table.cell(dashTable, 0, 8, "Fill Rate",                     text_color = DASH_HEADER, text_halign = text.align_left,  text_size = dashTextSize)
+    table.cell(dashTable, 1, 8, formatPercent(fillRate),         text_color = DASH_TEXT, text_halign = text.align_right, text_size = dashTextSize)
+
+    table.cell(dashTable, 0, 9, "Regime",                        text_color = DASH_HEADER, text_halign = text.align_left,  text_size = dashTextSize)
+    table.cell(dashTable, 1, 9, regimeText,                      text_color = regimeColor,    text_halign = text.align_right, text_size = dashTextSize)
+
+    if timeframe.isintraday
+        table.cell(dashTable, 0, 10, "Chart TF",                 text_color = DASH_HEADER, text_halign = text.align_left,  text_size = dashTextSize)
+        table.cell(dashTable, 1, 10, "Intraday: use 1D+",        text_color = COLOR_HIGH, text_halign = text.align_right, text_size = dashTextSize)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+shareCrossAbove = ta.crossover(overnightShare, highShareInput)
+shareCrossBelow = ta.crossunder(overnightShare, highShareInput)
+
+alertcondition(shareCrossAbove, "High Overnight Share", "gap-volatility relation: overnight variance share crossed above the high-share threshold on {{ticker}} {{interval}}, gaps dominate variance and range-based estimators understate risk")
+alertcondition(shareCrossBelow, "Overnight Share Normalized", "gap-volatility relation: overnight variance share crossed back below the high-share threshold on {{ticker}} {{interval}}")
+alertcondition(largeGapEvent, "Large Opening Gap", "gap-volatility relation: session opened with a gap at least the large-gap multiple of the baseline average gap on {{ticker}} {{interval}}")
+alertcondition(stressedStart, "Gap Regime Escalation", "gap-volatility relation: run of larger, mostly unfilled gaps on {{ticker}} {{interval}}, volatility regime escalation")
+alertcondition(quietStart, "Gap Regime Contraction", "gap-volatility relation: short-run gap sizes contracted below the baseline on {{ticker}} {{interval}}, quiet gap regime")
+
+//---------------------------------------------------------------------------------------------------------------------}

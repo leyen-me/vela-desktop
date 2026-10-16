@@ -1,0 +1,332 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Andrews' Pitchfork", "Andrews' Pitchfork", overlay = true, format = format.price, max_lines_count = 32, max_labels_count = 8)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+MAX_PIVOTS  = 8
+WARN_TRANSP = 40
+FILL_TRANSP = 94
+
+BULL_COLOR = #089981
+BEAR_COLOR = #f23645
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+variantInput = input.string("Standard", "Variant", options = ["Standard", "Schiff", "Modified Schiff"], group = "Pitchfork"
+  , tooltip = "Where the fork's handle sits. Standard anchors the median line at pivot A itself. Schiff slides the anchor halfway from A toward B in price only, and Modified Schiff slides it to the midpoint of A-B in both price and time. Both variants flatten the fork — useful when the initial leg is so steep that the standard median line rises or falls faster than any realistic trend.")
+
+anchorModeInput = input.string("Auto", "Anchor Mode", options = ["Auto", "Manual"], group = "Pitchfork"
+  , tooltip = "Auto re-anchors the fork on the three most recent confirmed swing pivots — A at the start of the move, then B and C alternating — and redraws as fresh pivots print. Manual builds one fixed fork from the three timestamps in the Manual Anchors group, for when you want to frame a specific move yourself.")
+
+swingLenInput = input.int(14, "Swing Length", minval = 2, group = "Pitchfork"
+  , tooltip = "Bars required on each side of an extreme for a swing pivot to confirm in Auto mode. Larger values anchor the fork on bigger, more stable swings; smaller values track faster rotations but redraw more often. A pivot confirms this many bars after its extreme, so the fork updates with that delay.")
+
+warnCountInput = input.int(1, "Warning Lines", minval = 0, maxval = 4, group = "Pitchfork"
+  , tooltip = "Extra parallels beyond each tine, spaced at the median-to-tine width. They keep the fork's slope as the frame of reference when price runs beyond the channel. Set 0 to hide them.")
+
+aTimeInput = input.time(timestamp("01 Jan 2024 00:00 +0000"), "Pivot A Time", group = "Manual Anchors"
+  , tooltip = "Manual mode — time of pivot A, the origin of the move: a significant swing low for an up fork or swing high for a down fork. The anchor snaps to that bar's low or high automatically once the fork's direction is inferred from A and B.")
+
+bTimeInput = input.time(timestamp("01 Mar 2024 00:00 +0000"), "Pivot B Time", group = "Manual Anchors"
+  , tooltip = "Manual mode — time of pivot B, the first swing after A: the next swing high when A is a low, or the next swing low when A is a high.")
+
+cTimeInput = input.time(timestamp("01 May 2024 00:00 +0000"), "Pivot C Time", group = "Manual Anchors"
+  , tooltip = "Manual mode — time of pivot C, the swing after B back in A's direction. A, B and C must alternate and sit in time order, otherwise no fork is drawn.")
+
+upColorInput = input.color(BULL_COLOR, "Up Fork", inline = "fork", group = "Style"
+  , tooltip = "Fork color when anchored at a swing low (up fork).")
+
+dnColorInput = input.color(BEAR_COLOR, "Down Fork", inline = "fork", group = "Style"
+  , tooltip = "Fork color when anchored at a swing high (down fork). The median line draws thicker as the fork's center of gravity, tines draw solid, and warning lines draw dotted and lighter.")
+
+fillInput = input.bool(true, "Fork Fill", group = "Style"
+  , tooltip = "Shades the fork interior between the median line and each tine.")
+
+showPivotsInput = input.bool(true, "Pivot Labels", group = "Style"
+  , tooltip = "Marks the three anchoring pivots A, B and C on the chart.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Append a confirmed pivot to the zigzag state, keeping strict alternation: a same-direction pivot
+// only replaces the previous one when it is more extreme. Returns true when the state changed.
+addPivot(array<float> pricesArr, array<int> barsArr, array<int> dirsArr, float pivotPrice, int pivotBar, int pivotDir) =>
+    bool changed = false
+    int n = array.size(dirsArr)
+    if n > 0 and array.get(dirsArr, n - 1) == pivotDir
+        if (pivotDir == 1 and pivotPrice > array.get(pricesArr, n - 1)) or (pivotDir == -1 and pivotPrice < array.get(pricesArr, n - 1))
+            array.set(pricesArr, n - 1, pivotPrice)
+            array.set(barsArr, n - 1, pivotBar)
+            changed := true
+    else
+        array.push(pricesArr, pivotPrice)
+        array.push(barsArr, pivotBar)
+        array.push(dirsArr, pivotDir)
+        if array.size(dirsArr) > MAX_PIVOTS
+            array.shift(pricesArr)
+            array.shift(barsArr)
+            array.shift(dirsArr)
+        changed := true
+    changed
+
+// Median-line anchor and slope for the selected fork variant: the median runs from the (possibly
+// shifted) handle through the midpoint of segment B-C
+forkGeometry(int aBar, float aPrice, int bBar, float bPrice, int cBar, float cPrice) =>
+    float anchorPrice = variantInput == "Standard" ? aPrice : (aPrice + bPrice) / 2
+    int   anchorBar   = variantInput == "Modified Schiff" ? math.floor((aBar + bBar) / 2.0) : aBar
+    float runBars     = (bBar + cBar) / 2.0 - anchorBar
+    float slopeVal    = runBars > 0 ? ((bPrice + cPrice) / 2 - anchorPrice) / runBars : na
+    [anchorBar, anchorPrice, slopeVal]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Swing Detection (Auto anchors)
+//---------------------------------------------------------------------------------------------------------------------{
+var array<float> pivPriceArr = array.new<float>()
+var array<int>   pivBarArr   = array.new<int>()
+var array<int>   pivDirArr   = array.new<int>()
+
+autoAnchors = anchorModeInput == "Auto"
+
+float pivotHigh  = ta.pivothigh(swingLenInput, swingLenInput)
+float pivotLow   = ta.pivotlow(swingLenInput, swingLenInput)
+int   confirmBar = bar_index - swingLenInput
+
+bool pivotChanged = false
+if not na(pivotHigh) and not na(pivotLow)
+    // both extremes confirm on the same bar — insert in the order that preserves alternation
+    int lastDir = array.size(pivDirArr) > 0 ? array.get(pivDirArr, array.size(pivDirArr) - 1) : 0
+    if lastDir == 1
+        bool lowChanged  = addPivot(pivPriceArr, pivBarArr, pivDirArr, pivotLow, confirmBar, -1)
+        bool highChanged = addPivot(pivPriceArr, pivBarArr, pivDirArr, pivotHigh, confirmBar, 1)
+        pivotChanged := lowChanged or highChanged
+    else
+        bool highChanged = addPivot(pivPriceArr, pivBarArr, pivDirArr, pivotHigh, confirmBar, 1)
+        bool lowChanged  = addPivot(pivPriceArr, pivBarArr, pivDirArr, pivotLow, confirmBar, -1)
+        pivotChanged := highChanged or lowChanged
+else if not na(pivotHigh)
+    pivotChanged := addPivot(pivPriceArr, pivBarArr, pivDirArr, pivotHigh, confirmBar, 1)
+else if not na(pivotLow)
+    pivotChanged := addPivot(pivPriceArr, pivBarArr, pivDirArr, pivotLow, confirmBar, -1)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Manual Anchors
+//---------------------------------------------------------------------------------------------------------------------{
+var int   manualABar  = na
+var float manualAHigh = na
+var float manualALow  = na
+var int   manualBBar  = na
+var float manualBHigh = na
+var float manualBLow  = na
+var int   manualCBar  = na
+var float manualCHigh = na
+var float manualCLow  = na
+
+if na(manualABar) and time >= aTimeInput
+    manualABar  := bar_index
+    manualAHigh := high
+    manualALow  := low
+if na(manualBBar) and time >= bTimeInput
+    manualBBar  := bar_index
+    manualBHigh := high
+    manualBLow  := low
+if na(manualCBar) and time >= cTimeInput
+    manualCBar  := bar_index
+    manualCHigh := high
+    manualCLow  := low
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Fork Geometry
+//---------------------------------------------------------------------------------------------------------------------{
+var int   pivABar   = na
+var float pivAPrice = na
+var int   pivBBar   = na
+var float pivBPrice = na
+var int   pivCBar   = na
+var float pivCPrice = na
+
+var int   forkDir         = 0
+var int   forkAnchorBar   = na
+var float forkAnchorPrice = na
+var float forkSlope       = na
+var float forkUpOff       = na
+var float forkLoOff       = na
+var bool  manualHandled   = false
+
+bool buildNow     = false
+int  dirCandidate = 0
+
+// Auto mode: re-anchor on the three most recent confirmed alternating pivots (A, B, C)
+if autoAnchors and pivotChanged and array.size(pivDirArr) >= 3
+    int n = array.size(pivDirArr)
+    pivABar   := array.get(pivBarArr, n - 3)
+    pivAPrice := array.get(pivPriceArr, n - 3)
+    pivBBar   := array.get(pivBarArr, n - 2)
+    pivBPrice := array.get(pivPriceArr, n - 2)
+    pivCBar   := array.get(pivBarArr, n - 1)
+    pivCPrice := array.get(pivPriceArr, n - 1)
+    dirCandidate := array.get(pivDirArr, n - 1) == -1 ? 1 : -1
+    buildNow := true
+
+// Manual mode: build once from the three timestamps, snapping each pivot to its bar's extreme
+if not autoAnchors and not manualHandled and not na(manualABar) and not na(manualBBar) and not na(manualCBar)
+    manualHandled := true
+    if manualABar < manualBBar and manualBBar < manualCBar
+        bool manualUp = (manualBHigh + manualBLow) / 2 > (manualAHigh + manualALow) / 2
+        pivABar   := manualABar
+        pivAPrice := manualUp ? manualALow : manualAHigh
+        pivBBar   := manualBBar
+        pivBPrice := manualUp ? manualBHigh : manualBLow
+        pivCBar   := manualCBar
+        pivCPrice := manualUp ? manualCLow : manualCHigh
+        dirCandidate := manualUp ? 1 : -1
+        buildNow := true
+
+if buildNow
+    [gAnchorBar, gAnchorPrice, gSlope] = forkGeometry(pivABar, pivAPrice, pivBBar, pivBPrice, pivCBar, pivCPrice)
+    if not na(gSlope)
+        forkAnchorBar   := gAnchorBar
+        forkAnchorPrice := gAnchorPrice
+        forkSlope       := gSlope
+        int   tineUpBar   = dirCandidate == 1 ? pivBBar : pivCBar
+        float tineUpPrice = dirCandidate == 1 ? pivBPrice : pivCPrice
+        int   tineDnBar   = dirCandidate == 1 ? pivCBar : pivBBar
+        float tineDnPrice = dirCandidate == 1 ? pivCPrice : pivBPrice
+        forkUpOff := tineUpPrice - (gAnchorPrice + gSlope * (tineUpBar - gAnchorBar))
+        forkLoOff := tineDnPrice - (gAnchorPrice + gSlope * (tineDnBar - gAnchorBar))
+        forkDir   := dirCandidate
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Median & Tine Levels
+//---------------------------------------------------------------------------------------------------------------------{
+float medianNow = forkDir != 0 ? forkAnchorPrice + forkSlope * (bar_index - forkAnchorBar) : na
+float upperNow  = forkDir != 0 ? medianNow + forkUpOff : na
+float lowerNow  = forkDir != 0 ? medianNow + forkLoOff : na
+
+// Events are only evaluated while the fork geometry is unchanged from the previous bar
+bool sameFork = forkDir != 0 and nz(forkDir[1]) == forkDir and nz(forkAnchorBar[1], -1) == forkAnchorBar
+  and nz(pivCBar[1], -1) == pivCBar and nz(forkSlope[1]) == forkSlope and nz(forkUpOff[1]) == forkUpOff
+
+bool medianTouch      = sameFork and high >= medianNow and low <= medianNow
+bool medianTouchAlert = medianTouch and not medianTouch[1]
+
+bool upperTouch      = sameFork and high >= upperNow and close <= upperNow
+bool upperTouchAlert = upperTouch and not upperTouch[1]
+
+bool lowerTouch      = sameFork and low <= lowerNow and close >= lowerNow
+bool lowerTouchAlert = lowerTouch and not lowerTouch[1]
+
+bool breakAbove = sameFork and not na(upperNow[1]) and not na(close[1]) and close[1] <= upperNow[1] and close > upperNow
+bool breakBelow = sameFork and not na(lowerNow[1]) and not na(close[1]) and close[1] >= lowerNow[1] and close < lowerNow
+
+plot(medianNow, "Median Line", forkDir == 1 ? upColorInput : dnColorInput, 1, display = display.data_window)
+plot(upperNow, "Upper Tine", forkDir == 1 ? upColorInput : dnColorInput, 1, display = display.data_window)
+plot(lowerNow, "Lower Tine", forkDir == 1 ? upColorInput : dnColorInput, 1, display = display.data_window)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Fork Drawing
+//---------------------------------------------------------------------------------------------------------------------{
+var line medianLineId = na
+var line upperTineId  = na
+var line lowerTineId  = na
+var linefill upperFillId = na
+var linefill lowerFillId = na
+var array<line> warnLinesArr = array.new<line>(warnCountInput * 2)
+var label aLabelId = na
+var label bLabelId = na
+var label cLabelId = na
+
+color forkColor = forkDir == 1 ? upColorInput : dnColorInput
+
+if barstate.islast and forkDir != 0
+    int   tineUpBar   = forkDir == 1 ? pivBBar : pivCBar
+    float tineUpPrice = forkDir == 1 ? pivBPrice : pivCPrice
+    int   tineDnBar   = forkDir == 1 ? pivCBar : pivBBar
+    float tineDnPrice = forkDir == 1 ? pivCPrice : pivBPrice
+
+    int   medianX2 = math.max(bar_index, forkAnchorBar + 1)
+    float medianY2 = forkAnchorPrice + forkSlope * (medianX2 - forkAnchorBar)
+    int   upX2     = math.max(bar_index, tineUpBar + 1)
+    float upY2     = tineUpPrice + forkSlope * (upX2 - tineUpBar)
+    int   dnX2     = math.max(bar_index, tineDnBar + 1)
+    float dnY2     = tineDnPrice + forkSlope * (dnX2 - tineDnBar)
+
+    // median line — the fork's center of gravity, drawn from the (variant-shifted) handle
+    if na(medianLineId)
+        medianLineId := line.new(forkAnchorBar, forkAnchorPrice, medianX2, medianY2, xloc.bar_index, extend.right, forkColor, line.style_solid, 2)
+    line.set_xy1(medianLineId, forkAnchorBar, forkAnchorPrice)
+    line.set_xy2(medianLineId, medianX2, medianY2)
+    line.set_color(medianLineId, forkColor)
+
+    // tines — parallels through B and C
+    if na(upperTineId)
+        upperTineId := line.new(tineUpBar, tineUpPrice, upX2, upY2, xloc.bar_index, extend.right, forkColor, line.style_solid, 1)
+    line.set_xy1(upperTineId, tineUpBar, tineUpPrice)
+    line.set_xy2(upperTineId, upX2, upY2)
+    line.set_color(upperTineId, forkColor)
+
+    if na(lowerTineId)
+        lowerTineId := line.new(tineDnBar, tineDnPrice, dnX2, dnY2, xloc.bar_index, extend.right, forkColor, line.style_solid, 1)
+    line.set_xy1(lowerTineId, tineDnBar, tineDnPrice)
+    line.set_xy2(lowerTineId, dnX2, dnY2)
+    line.set_color(lowerTineId, forkColor)
+
+    if fillInput
+        if na(upperFillId)
+            upperFillId := linefill.new(medianLineId, upperTineId, color.new(forkColor, FILL_TRANSP))
+        linefill.set_color(upperFillId, color.new(forkColor, FILL_TRANSP))
+        if na(lowerFillId)
+            lowerFillId := linefill.new(medianLineId, lowerTineId, color.new(forkColor, FILL_TRANSP))
+        linefill.set_color(lowerFillId, color.new(forkColor, FILL_TRANSP))
+
+    // warning lines — extra parallels beyond the tines, spaced at the median-to-tine width
+    if warnCountInput > 0
+        color warnColor = color.new(forkColor, WARN_TRANSP)
+        for i = 1 to warnCountInput
+            float upShift = i * forkUpOff
+            float dnShift = i * forkLoOff
+            line wUp = array.get(warnLinesArr, (i - 1) * 2)
+            if na(wUp)
+                wUp := line.new(tineUpBar, tineUpPrice + upShift, upX2, upY2 + upShift, xloc.bar_index, extend.right, warnColor, line.style_dotted, 1)
+                array.set(warnLinesArr, (i - 1) * 2, wUp)
+            line.set_xy1(wUp, tineUpBar, tineUpPrice + upShift)
+            line.set_xy2(wUp, upX2, upY2 + upShift)
+            line.set_color(wUp, warnColor)
+            line wDn = array.get(warnLinesArr, (i - 1) * 2 + 1)
+            if na(wDn)
+                wDn := line.new(tineDnBar, tineDnPrice + dnShift, dnX2, dnY2 + dnShift, xloc.bar_index, extend.right, warnColor, line.style_dotted, 1)
+                array.set(warnLinesArr, (i - 1) * 2 + 1, wDn)
+            line.set_xy1(wDn, tineDnBar, tineDnPrice + dnShift)
+            line.set_xy2(wDn, dnX2, dnY2 + dnShift)
+            line.set_color(wDn, warnColor)
+
+    if showPivotsInput
+        if na(aLabelId)
+            aLabelId := label.new(pivABar, pivAPrice, "A", xloc.bar_index, yloc.price, #00000000, label.style_label_up, forkColor, size.small, tooltip = "Pivot A — origin of the move (fork handle)")
+        label.set_xy(aLabelId, pivABar, pivAPrice)
+        label.set_style(aLabelId, forkDir == 1 ? label.style_label_up : label.style_label_down)
+        label.set_textcolor(aLabelId, forkColor)
+        if na(bLabelId)
+            bLabelId := label.new(pivBBar, pivBPrice, "B", xloc.bar_index, yloc.price, #00000000, label.style_label_down, forkColor, size.small, tooltip = "Pivot B — first swing after A, tine anchor")
+        label.set_xy(bLabelId, pivBBar, pivBPrice)
+        label.set_style(bLabelId, forkDir == 1 ? label.style_label_down : label.style_label_up)
+        label.set_textcolor(bLabelId, forkColor)
+        if na(cLabelId)
+            cLabelId := label.new(pivCBar, pivCPrice, "C", xloc.bar_index, yloc.price, #00000000, label.style_label_up, forkColor, size.small, tooltip = "Pivot C — swing after B, tine anchor; the median crosses the B-C midpoint")
+        label.set_xy(cLabelId, pivCBar, pivCPrice)
+        label.set_style(cLabelId, forkDir == 1 ? label.style_label_up : label.style_label_down)
+        label.set_textcolor(cLabelId, forkColor)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(medianTouchAlert, "Median Line Touch", "Andrews' Pitchfork: price tagged the median line — the rotation objective at the fork's center of gravity")
+alertcondition(upperTouchAlert, "Upper Tine Touch", "Andrews' Pitchfork: price tested the upper tine and closed back inside the fork — potential reaction point")
+alertcondition(lowerTouchAlert, "Lower Tine Touch", "Andrews' Pitchfork: price tested the lower tine and closed back inside the fork — potential reaction point")
+alertcondition(breakAbove, "Break Above Upper Tine", "Andrews' Pitchfork: close broke above the upper tine — a break that holds on retest suggests the trend is accelerating or changing character")
+alertcondition(breakBelow, "Break Below Lower Tine", "Andrews' Pitchfork: close broke below the lower tine — a break that holds on retest suggests the trend is accelerating or changing character")
+
+//---------------------------------------------------------------------------------------------------------------------}

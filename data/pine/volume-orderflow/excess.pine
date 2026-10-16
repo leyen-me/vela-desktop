@@ -1,0 +1,243 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Excess", "Excess", overlay = true, max_boxes_count = 500, max_labels_count = 500, precision = 0)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+color BEAR_COLOR = #f23645
+color BULL_COLOR = #089981
+color LABEL_BG   = #00000000
+
+string PROFILE_GROUP = "Profile"
+string EXCESS_GROUP  = "Excess Detection"
+string STYLE_GROUP   = "Style"
+
+string BASIS_CLOSE = "Close"
+string BASIS_WICK  = "Wick"
+
+int MAX_ACTIVE_REFERENCES = 250
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Inputs
+//---------------------------------------------------------------------------------------------------------------------{
+anchorInput = input.timeframe("D", "Profile Session", group = PROFILE_GROUP, tooltip = "Timeframe of the distribution whose extremes are inspected for excess. Each period of this timeframe builds one TPO count map; the chart timeframe must be lower than this value.")
+
+tpoTfInput = input.timeframe("30", "TPO Period", group = PROFILE_GROUP, tooltip = "Duration of one TPO. 30-minute periods are the classic Market Profile convention. Price rows touched during only one period are single prints.")
+
+rowsInput = input.int(25, "Profile Rows", minval = 5, maxval = 100, group = PROFILE_GROUP, tooltip = "Number of price rows the session range is divided into when counting TPOs per level.")
+
+minTailInput = input.int(2, "Minimum Tail Rows", minval = 1, maxval = 50, group = EXCESS_GROUP, tooltip = "Minimum amount of consecutive single-print rows at a session extreme for the tail to qualify as excess. The classic teaching threshold is 2, since a single-period extreme may simply be the last print of the day rather than a genuine rejection.")
+
+breakBasisInput = input.string(BASIS_CLOSE, "Reference Break Basis", options = [BASIS_CLOSE, BASIS_WICK], group = EXCESS_GROUP, tooltip = "Price used to detect initiative activity trading through an excess extreme. Close requires a bar to settle beyond the extreme, Wick reacts to any excursion beyond it.")
+
+extendInput = input.bool(true, "Extend References Until Broken", group = EXCESS_GROUP, tooltip = "Extend each excess tail to the right as a support/resistance reference until price trades through the extreme carrying it. Extremes with excess are expected to hold on retest.")
+
+showDevelopingInput = input.bool(true, "Show Developing Excess", group = EXCESS_GROUP, tooltip = "Highlight a forming tail on the current, incomplete session. A developing tail is provisional, prices revisited before the session completes stop being single prints.")
+
+excessHighColorInput = input.color(BEAR_COLOR, "Excess High", group = STYLE_GROUP)
+
+excessLowColorInput = input.color(BULL_COLOR, "Excess Low", group = STYLE_GROUP)
+
+showLabelsInput = input.bool(true, "Show Labels", group = STYLE_GROUP)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Builds the TPO counts of the stored session and measures the consecutive single-print tails at both extremes.
+// Returns [high tail rows, high tail inner price, high tail anchor time, low tail rows, low tail inner price, low tail anchor time].
+computeTails(array<float> hiArray, array<float> loArray, array<int> tmArray, float sesHi, float sesLo) =>
+    int   hiRows  = 0
+    int   loRows  = 0
+    float hiInner = na
+    float loInner = na
+    int   hiTime  = na
+    int   loTime  = na
+    int n = array.size(hiArray)
+    if n > 1 and not na(sesHi) and not na(sesLo) and sesHi > sesLo
+        float rowSize = (sesHi - sesLo + syminfo.mintick) / rowsInput
+        array<int> countsArray = array.new_int(rowsInput, 0)
+        array<int> touchArray  = array.new_int(rowsInput, -1)
+        for k = 0 to n - 1
+            int r0 = math.max(0, int(math.floor((array.get(loArray, k) - sesLo) / rowSize)))
+            int r1 = math.min(rowsInput - 1, int(math.floor((array.get(hiArray, k) - sesLo) / rowSize)))
+            if r1 >= r0
+                for r = r0 to r1
+                    array.set(countsArray, r, array.get(countsArray, r) + 1)
+                    if array.get(touchArray, r) == -1
+                        array.set(touchArray, r, k)
+        int topRow = -1
+        int botRow = -1
+        for r = 0 to rowsInput - 1
+            if array.get(countsArray, r) > 0
+                topRow := r
+                if botRow == -1
+                    botRow := r
+        if topRow >= 0
+            int scanHigh = topRow
+            while scanHigh >= 0
+                if array.get(countsArray, scanHigh) != 1
+                    break
+                hiRows += 1
+                scanHigh -= 1
+            if hiRows > 0
+                hiInner := sesLo + (topRow - hiRows + 1) * rowSize
+                hiTime  := array.get(tmArray, array.get(touchArray, topRow))
+        if botRow >= 0
+            int scanLow = botRow
+            while scanLow < rowsInput
+                if array.get(countsArray, scanLow) != 1
+                    break
+                loRows += 1
+                scanLow += 1
+            if loRows > 0
+                loInner := sesLo + (botRow + loRows) * rowSize
+                loTime  := array.get(tmArray, array.get(touchArray, botRow))
+    [hiRows, hiInner, hiTime, loRows, loInner, loTime]
+
+// Draws one confirmed excess tail zone with its label and returns the zone box.
+createExcessZone(int direction, float extreme, float inner, int leftTime, int rightTime) =>
+    color excessColor = direction == 1 ? excessHighColorInput : excessLowColorInput
+    float zoneTop     = direction == 1 ? extreme : inner
+    float zoneBottom  = direction == 1 ? inner : extreme
+    box tailBox = box.new(leftTime, zoneTop, rightTime, zoneBottom, xloc = xloc.bar_time, border_color = excessColor, border_width = 1, border_style = line.style_solid, bgcolor = color.new(excessColor, 80))
+    if showLabelsInput
+        label.new(leftTime, extreme, "Excess", xloc = xloc.bar_time, color = LABEL_BG, style = direction == 1 ? label.style_label_down : label.style_label_up, textcolor = excessColor, size = size.small)
+    tailBox
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+bool tfOk = timeframe.in_seconds() < timeframe.in_seconds(anchorInput)
+
+var array<float> periodHighArray = array.new_float()
+var array<float> periodLowArray  = array.new_float()
+var array<int>   periodTimeArray = array.new_int()
+
+var array<box>   activeBoxArray   = array.new<box>()
+var array<float> activeLevelArray = array.new_float()
+var array<int>   activeDirArray   = array.new_int()
+
+var float sesHigh = na
+var float sesLow  = na
+
+var int lastHighTailRows = 0
+var int lastLowTailRows  = 0
+
+bool newSession = tfOk and (timeframe.change(anchorInput) or barstate.isfirst)
+bool newPeriod  = timeframe.change(tpoTfInput)
+
+bool excessHighFormed = false
+bool excessLowFormed  = false
+
+if newSession
+    [hiRows, hiInner, hiTime, loRows, loInner, loTime] = computeTails(periodHighArray, periodLowArray, periodTimeArray, sesHigh, sesLow)
+    lastHighTailRows := hiRows
+    lastLowTailRows  := loRows
+    if hiRows >= minTailInput
+        excessHighFormed := true
+        array.push(activeBoxArray, createExcessZone(1, sesHigh, hiInner, hiTime, time))
+        array.push(activeLevelArray, sesHigh)
+        array.push(activeDirArray, 1)
+    if loRows >= minTailInput
+        excessLowFormed := true
+        array.push(activeBoxArray, createExcessZone(-1, sesLow, loInner, loTime, time))
+        array.push(activeLevelArray, sesLow)
+        array.push(activeDirArray, -1)
+    array.clear(periodHighArray)
+    array.clear(periodLowArray)
+    array.clear(periodTimeArray)
+    array.push(periodHighArray, high)
+    array.push(periodLowArray, low)
+    array.push(periodTimeArray, time)
+    sesHigh := high
+    sesLow  := low
+else if tfOk
+    if newPeriod
+        array.push(periodHighArray, high)
+        array.push(periodLowArray, low)
+        array.push(periodTimeArray, time)
+    else if array.size(periodHighArray) > 0
+        int lastIndex = array.size(periodHighArray) - 1
+        array.set(periodHighArray, lastIndex, math.max(array.get(periodHighArray, lastIndex), high))
+        array.set(periodLowArray, lastIndex, math.min(array.get(periodLowArray, lastIndex), low))
+    sesHigh := math.max(nz(sesHigh, high), high)
+    sesLow  := math.min(nz(sesLow, low), low)
+
+// Maintain stored excess references, extending them and detecting initiative trade-through.
+bool excessHighBroken = false
+bool excessLowBroken  = false
+
+int index = 0
+while index < array.size(activeBoxArray)
+    box tailBox     = array.get(activeBoxArray, index)
+    int direction   = array.get(activeDirArray, index)
+    float refLevel  = array.get(activeLevelArray, index)
+    float testPrice = breakBasisInput == BASIS_WICK ? (direction == 1 ? high : low) : close
+    bool broken     = direction == 1 ? testPrice > refLevel : testPrice < refLevel
+    if broken
+        if extendInput
+            box.set_right(tailBox, time)
+        if direction == 1
+            excessHighBroken := true
+        else
+            excessLowBroken := true
+        array.remove(activeBoxArray, index)
+        array.remove(activeLevelArray, index)
+        array.remove(activeDirArray, index)
+    else
+        if extendInput
+            box.set_right(tailBox, time)
+        index += 1
+
+if array.size(activeBoxArray) > MAX_ACTIVE_REFERENCES
+    array.shift(activeBoxArray)
+    array.shift(activeLevelArray)
+    array.shift(activeDirArray)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+var box devHighBox     = na
+var box devLowBox      = na
+var label devHighLabel = na
+var label devLowLabel  = na
+
+if barstate.islast and tfOk and showDevelopingInput
+    box.delete(devHighBox)
+    box.delete(devLowBox)
+    label.delete(devHighLabel)
+    label.delete(devLowLabel)
+    devHighBox     := na
+    devLowBox      := na
+    devHighLabel   := na
+    devLowLabel    := na
+    [hiRows, hiInner, hiTime, loRows, loInner, loTime] = computeTails(periodHighArray, periodLowArray, periodTimeArray, sesHigh, sesLow)
+    if hiRows >= minTailInput
+        devHighBox := box.new(hiTime, sesHigh, time, hiInner, xloc = xloc.bar_time, border_color = excessHighColorInput, border_width = 1, border_style = line.style_dashed, bgcolor = color.new(excessHighColorInput, 90))
+        if showLabelsInput
+            devHighLabel := label.new(time, sesHigh, "Excess (forming)", xloc = xloc.bar_time, color = LABEL_BG, style = label.style_label_down, textcolor = excessHighColorInput, size = size.small)
+    if loRows >= minTailInput
+        devLowBox := box.new(loTime, loInner, time, sesLow, xloc = xloc.bar_time, border_color = excessLowColorInput, border_width = 1, border_style = line.style_dashed, bgcolor = color.new(excessLowColorInput, 90))
+        if showLabelsInput
+            devLowLabel := label.new(time, sesLow, "Excess (forming)", xloc = xloc.bar_time, color = LABEL_BG, style = label.style_label_up, textcolor = excessLowColorInput, size = size.small)
+
+var table warningTable = table.new(position.top_right, 1, 1)
+
+if barstate.islast and not tfOk
+    table.cell(warningTable, 0, 0, "excess: chart timeframe must be lower than the profile session", text_color = chart.fg_color, text_size = size.small, bgcolor = color.new(chart.fg_color, 90))
+
+plot(lastHighTailRows, "High Tail Single-Print Rows", excessHighColorInput, display = display.data_window)
+plot(lastLowTailRows, "Low Tail Single-Print Rows", excessLowColorInput, display = display.data_window)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(excessHighFormed, "Excess High", "The completed session left excess at its high, a single-print tail meeting the minimum rows.")
+alertcondition(excessLowFormed, "Excess Low", "The completed session left excess at its low, a single-print tail meeting the minimum rows.")
+alertcondition(excessHighBroken, "Excess High Broken", "Price traded through a stored excess high reference.")
+alertcondition(excessLowBroken, "Excess Low Broken", "Price traded through a stored excess low reference.")
+
+//---------------------------------------------------------------------------------------------------------------------}

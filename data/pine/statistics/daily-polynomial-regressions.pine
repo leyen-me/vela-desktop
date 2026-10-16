@@ -1,0 +1,162 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Daily Polynomial Regressions", "Daily Polynomial Regressions", overlay = true)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+color BULL_COLOR = #089981
+color BEAR_COLOR = #f23645
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Inputs
+//---------------------------------------------------------------------------------------------------------------------{
+degreeInput      = input.int(2,    "Polynomial Degree", minval = 1, maxval = 4, tooltip = "1: Linear, 2: Quadratic, 3: Cubic, 4: Quartic")
+showMedianInput  = input.bool(true, "Show Median Line")
+showR2Input      = input.bool(true, "Show R² Label")
+
+bullColorInput   = input.color(BULL_COLOR, "Bullish Color", inline = "Colors")
+bearColorInput   = input.color(BEAR_COLOR, "Bearish Color", inline = "Colors")
+transpInput      = input.int(92, "Fill Transparency", minval = 0, maxval = 100)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Variables
+//---------------------------------------------------------------------------------------------------------------------{
+var float dayHigh   = na
+var float dayLow    = na
+var int   dayStart  = na
+var box   dayBoxId  = na
+var line  medianId  = na
+var polyline regId  = na
+var label r2LabelId = na
+
+// Power Sums for Matrix construction (degree 4 needs up to power 8)
+var float[] xSumsArray  = array.new_float(9, 0.0)
+var float[] xySumsArray = array.new_float(5, 0.0)
+var float   y2Sum       = 0.0
+var int     n           = 0
+
+bool isNewDay = ta.change(time("D")) != 0
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+if isNewDay
+    dayHigh  := high
+    dayLow   := low
+    dayStart := bar_index
+    n        := 1
+    
+    // Reset Accumulators
+    array.fill(xSumsArray, 0.0)
+    array.fill(xySumsArray, 0.0)
+    y2Sum := math.pow(close, 2)
+    
+    // Initialize power 0
+    array.set(xSumsArray, 0, 1.0)
+    array.set(xySumsArray, 0, close)
+    
+    // Create new daily drawings
+    dayBoxId := box.new(bar_index, dayHigh, bar_index, dayLow
+      , bgcolor      = color.new(chart.fg_color, transpInput)
+      , border_color = na)
+
+    medianId := showMedianInput ? line.new(bar_index, hl2, bar_index, hl2
+      , color = color.new(chart.fg_color, 50)
+      , style = line.style_dashed) : na
+
+    r2LabelId := showR2Input ? label.new(bar_index, dayHigh, ""
+      , style     = label.style_label_down
+      , color     = color.new(chart.fg_color, 100)
+      , textcolor = chart.fg_color
+      , size      = size.small) : na
+
+    regId := na 
+else
+    dayHigh := math.max(dayHigh, high)
+    dayLow  := math.min(dayLow, low)
+    n += 1
+
+    float x = n - 1
+    float y = close
+    
+    // Update Power Sums for the day
+    for p = 0 to degreeInput * 2
+        array.set(xSumsArray, p, array.get(xSumsArray, p) + math.pow(x, p))
+
+    for p = 0 to degreeInput
+        array.set(xySumsArray, p, array.get(xySumsArray, p) + math.pow(x, p) * y)
+
+    y2Sum += math.pow(y, 2)
+    
+    // Construct and Solve Regression Matrix: (X'X)B = X'Y
+    matrix<float> matA = matrix.new<float>(degreeInput + 1, degreeInput + 1, 0.0)
+    matrix<float> matB = matrix.new<float>(degreeInput + 1, 1, 0.0)
+    
+    for r = 0 to degreeInput
+        matB.set(r, 0, array.get(xySumsArray, r))
+        for c = 0 to degreeInput
+            matA.set(r, c, array.get(xSumsArray, r + c))
+            
+    if matA.det() != 0 and n > degreeInput
+        matrix<float> beta = matA.inv().mult(matB)
+        
+        // Calculate Trend Direction (Start point vs current End point of curve)
+        float startY = beta.get(0, 0)
+        float endY   = 0.0
+
+        for p = 0 to degreeInput
+            endY += beta.get(p, 0) * math.pow(x, p)
+            
+        color trendColor = endY > startY ? bullColorInput : bearColorInput
+        
+        //-------------------------------------------------------------------------------------------------------------}
+        // Visuals
+        //-------------------------------------------------------------------------------------------------------------{
+        dayBoxId.set_top(dayHigh)
+        dayBoxId.set_bottom(dayLow)
+        dayBoxId.set_right(bar_index)
+        dayBoxId.set_bgcolor(color.new(trendColor, transpInput))
+        dayBoxId.set_border_color(trendColor)
+        
+        if showMedianInput
+            medianId.set_xy1(dayStart, (dayHigh + dayLow) / 2)
+            medianId.set_xy2(bar_index, (dayHigh + dayLow) / 2)
+            medianId.set_color(color.new(trendColor, 50))
+            
+        // R² Calculation: 1 - (SSres / SStot)
+        // SSres = Sum(y^2) - Beta' * (X'Y)
+        float ssRes = y2Sum
+        for p = 0 to degreeInput
+            ssRes -= beta.get(p, 0) * array.get(xySumsArray, p)
+            
+        float ssTot = y2Sum - math.pow(array.get(xySumsArray, 0), 2) / n
+        float r2 = ssTot != 0 ? math.max(0, 1 - (ssRes / ssTot)) : 0.0
+        
+        if showR2Input
+            r2LabelId.set_xy(dayStart + int(n / 2), dayHigh)
+            r2LabelId.set_text("R²: " + str.tostring(r2, "#.###"))
+            r2LabelId.set_textcolor(trendColor)
+            
+        // Draw/Update Regression Curve
+        polyline.delete(regId)
+        array<chart.point> pts = array.new<chart.point>()
+        int step = math.max(1, int(n / 15)) 
+
+        for i = 0 to n - 1 by step
+            float val = 0.0
+            for p = 0 to degreeInput
+                val += beta.get(p, 0) * math.pow(i, p)
+            pts.push(chart.point.from_index(dayStart + i, val))
+        
+        // Final point
+        float currentCurveVal = 0.0
+        for p = 0 to degreeInput
+            currentCurveVal += beta.get(p, 0) * math.pow(n - 1, p)
+        pts.push(chart.point.from_index(bar_index, currentCurveVal))
+        
+        regId := polyline.new(pts, line_color = trendColor, line_width = 2)
+
+//---------------------------------------------------------------------------------------------------------------------}

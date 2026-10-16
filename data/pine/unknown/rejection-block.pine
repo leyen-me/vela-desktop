@@ -1,0 +1,209 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Rejection Block"
+  , shorttitle      = "Rejection Block"
+  , overlay         = true
+  , max_boxes_count = 500
+  , max_lines_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+INVALID_COLOR = #787b86
+
+ZONE_FILL_TRANSPARENCY   = 85
+ZONE_BORDER_TRANSPARENCY = 60
+MIDLINE_TRANSPARENCY     = 30
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+RB_GROUP    = "Rejection Blocks"
+STYLE_GROUP = "Style"
+
+swingLengthInput = input.int(10, "Swing Length", minval = 1, maxval = 100, group = RB_GROUP
+  , tooltip = "Number of bars on each side that must hold lower highs (higher lows) to confirm a swing high (swing low). Larger values keep only the more prominent extremes - the concept is reserved for genuine swings rather than mid-range noise.")
+
+minWickPctInput = input.float(50, "Minimum Wick %", minval = 0, maxval = 100, step = 5, group = RB_GROUP
+  , tooltip = "Minimum share of the swing candle's full range taken by the rejecting wick. A rejection block keys on candles whose wick, not body, dominates - the record of late participants filled at the extreme and immediately stranded.")
+
+wickAtrMultInput = input.float(0.5, "Minimum Wick Size", minval = 0, step = 0.25, inline = "wickAtr", group = RB_GROUP)
+
+atrLengthInput = input.int(14, "× ATR", minval = 1, inline = "wickAtr", group = RB_GROUP
+  , tooltip = "The wick must also measure at least this many ATRs, keeping it conspicuous against recent bars rather than large only relative to its own candle. Set the multiplier to 0 to disable this filter.")
+
+sweepFilterInput = input.bool(false, "Require Liquidity Sweep", group = RB_GROUP
+  , tooltip = "Only keep blocks whose wick traded beyond the previous swing point on the same side and closed back through it - the raid on resting stops that classically leaves a rejection block behind. Disable to mark every qualifying wick at a confirmed swing.")
+
+showLastInput = input.int(10, "Show Last", minval = 1, maxval = 100, group = RB_GROUP
+  , tooltip = "Maximum number of rejection blocks kept on the chart, counting both active and invalidated zones. Older zones are removed first.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "direction", group = STYLE_GROUP
+  , tooltip = "Color of bullish rejection blocks: the lower wick span of a swing low, from the bottom of the candle body down to the low, watched as support on a return.")
+
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "direction", group = STYLE_GROUP
+  , tooltip = "Color of bearish rejection blocks: the upper wick span of a swing high, from the top of the candle body up to the high, watched as resistance on a return.")
+
+showMidlineInput = input.bool(true, "Zone Midline", inline = "midline", group = STYLE_GROUP)
+
+midlineStyleInput = input.string("Dotted", "", options = ["Solid", "Dashed", "Dotted"], inline = "midline", group = STYLE_GROUP
+  , tooltip = "Display the midpoint of each wick span and set its line style. Entries are commonly staged at the zone's near edge or midpoint, with the stop just beyond the wick's extreme - the zone's natural invalidation.")
+
+showInvalidatedInput = input.bool(true, "Show Invalidated Zones", inline = "invalidated", group = STYLE_GROUP)
+
+invalidatedColorInput = input.color(INVALID_COLOR, "", inline = "invalidated", group = STYLE_GROUP
+  , tooltip = "Keep invalidated zones on the chart, recolored and frozen where a candle body closed beyond the wick's extreme. Body acceptance beyond the extreme reads as the zone spent, with the old extreme's role likely flipped.")
+
+//Midline style option to drawing constant
+midlineStyle = switch midlineStyleInput
+    "Solid"  => line.style_solid
+    "Dashed" => line.style_dashed
+    => line.style_dotted
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types & Variables
+//---------------------------------------------------------------------------------------------------------------------{
+//One rejection block: the tracked wick span of a confirmed swing extreme
+type Rblock
+    box   zoneBox
+    line  midLine
+    float top
+    float bottom
+    bool  isBull
+    int   formIndex
+    bool  armed
+    bool  touched
+    bool  invalidated
+
+var array<Rblock> blockArray = array.new<Rblock>()
+
+//Most recent confirmed swing levels, the reference a sweep is measured against
+var float lastSwingHigh = na
+var float lastSwingLow  = na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+//Draw the wick span from the swing candle onward and register it for tracking
+createBlock(float zoneTop, float zoneBottom, bool isBull) =>
+    color baseColor = isBull ? bullColorInput : bearColorInput
+    int   leftIndex = bar_index - swingLengthInput
+    float zoneMid   = math.avg(zoneTop, zoneBottom)
+    box zoneBox = box.new(leftIndex, zoneTop, bar_index, zoneBottom
+      , border_color = color.new(baseColor, ZONE_BORDER_TRANSPARENCY)
+      , bgcolor      = color.new(baseColor, ZONE_FILL_TRANSPARENCY))
+    line midLine = line.new(leftIndex, zoneMid, bar_index, zoneMid
+      , color = showMidlineInput ? color.new(baseColor, MIDLINE_TRANSPARENCY) : color(na)
+      , style = midlineStyle)
+    blockArray.push(Rblock.new(zoneBox, midLine, zoneTop, zoneBottom, isBull, bar_index, false, false, false))
+    if blockArray.size() > showLastInput
+        Rblock oldest = blockArray.shift()
+        oldest.zoneBox.delete()
+        oldest.midLine.delete()
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Rejection Block Detection
+//---------------------------------------------------------------------------------------------------------------------{
+bool bullFormedEvent      = false
+bool bearFormedEvent      = false
+bool bullRetestEvent      = false
+bool bearRetestEvent      = false
+bool bullInvalidatedEvent = false
+bool bearInvalidatedEvent = false
+
+float pivotHighPrice = ta.pivothigh(swingLengthInput, swingLengthInput)
+float pivotLowPrice  = ta.pivotlow(swingLengthInput, swingLengthInput)
+float atrValue       = ta.atr(atrLengthInput)
+
+//Anatomy of the swing candle, evaluated at pivot confirmation
+float pivotRange      = high[swingLengthInput] - low[swingLengthInput]
+float pivotBodyTop    = math.max(open[swingLengthInput], close[swingLengthInput])
+float pivotBodyBottom = math.min(open[swingLengthInput], close[swingLengthInput])
+float upperWick       = high[swingLengthInput] - pivotBodyTop
+float lowerWick       = pivotBodyBottom - low[swingLengthInput]
+float pivotAtr        = atrValue[swingLengthInput]
+
+if barstate.isconfirmed
+    //A swing high on a long upper wick leaves a bearish rejection block, from the top of the body to the high
+    if not na(pivotHighPrice)
+        bool wickShareOk = upperWick > 0 and pivotRange > 0 and upperWick / pivotRange * 100 >= minWickPctInput
+        bool wickSizeOk  = wickAtrMultInput == 0 or (not na(pivotAtr) and upperWick >= wickAtrMultInput * pivotAtr)
+        bool sweepOk     = not sweepFilterInput or (not na(lastSwingHigh) and high[swingLengthInput] > lastSwingHigh and close[swingLengthInput] < lastSwingHigh)
+        if wickShareOk and wickSizeOk and sweepOk
+            createBlock(high[swingLengthInput], pivotBodyTop, false)
+            bearFormedEvent := true
+        lastSwingHigh := pivotHighPrice
+
+    //A swing low on a long lower wick leaves a bullish rejection block, from the bottom of the body to the low
+    if not na(pivotLowPrice)
+        bool wickShareOk = lowerWick > 0 and pivotRange > 0 and lowerWick / pivotRange * 100 >= minWickPctInput
+        bool wickSizeOk  = wickAtrMultInput == 0 or (not na(pivotAtr) and lowerWick >= wickAtrMultInput * pivotAtr)
+        bool sweepOk     = not sweepFilterInput or (not na(lastSwingLow) and low[swingLengthInput] < lastSwingLow and close[swingLengthInput] > lastSwingLow)
+        if wickShareOk and wickSizeOk and sweepOk
+            createBlock(pivotBodyBottom, low[swingLengthInput], true)
+            bullFormedEvent := true
+        lastSwingLow := pivotLowPrice
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Zone Tracking
+//---------------------------------------------------------------------------------------------------------------------{
+int blockIndex = 0
+while blockIndex < blockArray.size()
+    Rblock block = blockArray.get(blockIndex)
+    bool removeBlock = false
+
+    if not block.invalidated
+        //Active wick spans keep extending as candidate reaction zones
+        block.zoneBox.set_right(bar_index)
+        block.midLine.set_x2(bar_index)
+
+        if barstate.isconfirmed and bar_index > block.formIndex
+            //Body acceptance beyond the wick's extreme is the failure case: the zone is spent
+            bool bodyBeyond = block.isBull ? close < block.bottom : close > block.top
+            if bodyBeyond
+                block.invalidated := true
+                if showInvalidatedInput
+                    block.zoneBox.set_bgcolor(color.new(invalidatedColorInput, ZONE_FILL_TRANSPARENCY))
+                    block.zoneBox.set_border_color(color.new(invalidatedColorInput, ZONE_BORDER_TRANSPARENCY))
+                    block.midLine.set_color(showMidlineInput ? color.new(invalidatedColorInput, MIDLINE_TRANSPARENCY) : color(na))
+                else
+                    block.zoneBox.delete()
+                    block.midLine.delete()
+                    removeBlock := true
+                if block.isBull
+                    bullInvalidatedEvent := true
+                else
+                    bearInvalidatedEvent := true
+            else if not block.armed
+                //The zone is traded on return, not on formation: wait for the market to leave the area first
+                block.armed := block.isBull ? low > block.top : high < block.bottom
+            else if not block.touched
+                //First return into the wick span since price left it - the staging area for entries
+                bool backInside = block.isBull ? low <= block.top : high >= block.bottom
+                if backInside
+                    block.touched := true
+                    if block.isBull
+                        bullRetestEvent := true
+                    else
+                        bearRetestEvent := true
+
+    if removeBlock
+        blockArray.remove(blockIndex)
+    else
+        blockIndex += 1
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(bullFormedEvent, "Bullish Rejection Block Formed", "A swing low printed a long lower wick - the span from the bottom of the body to the low is marked as a bullish Rejection Block, watched as support on a return.")
+alertcondition(bearFormedEvent, "Bearish Rejection Block Formed", "A swing high printed a long upper wick - the span from the top of the body to the high is marked as a bearish Rejection Block, watched as resistance on a return.")
+alertcondition(bullRetestEvent, "Bullish Rejection Block Retest", "Price returned into a bullish Rejection Block's wick span for the first time since leaving it - entries are staged inside the zone with the stop just beyond the low.")
+alertcondition(bearRetestEvent, "Bearish Rejection Block Retest", "Price returned into a bearish Rejection Block's wick span for the first time since leaving it - entries are staged inside the zone with the stop just beyond the high.")
+alertcondition(bullInvalidatedEvent, "Bullish Rejection Block Invalidated", "A candle body closed below a bullish Rejection Block's low - the zone reads as spent and the old extreme's role likely flipped.")
+alertcondition(bearInvalidatedEvent, "Bearish Rejection Block Invalidated", "A candle body closed above a bearish Rejection Block's high - the zone reads as spent and the old extreme's role likely flipped.")
+
+//---------------------------------------------------------------------------------------------------------------------}

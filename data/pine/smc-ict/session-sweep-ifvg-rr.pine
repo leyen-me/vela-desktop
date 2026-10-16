@@ -1,0 +1,392 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Quant
+
+//@version=6
+indicator("Session Sweep & iFVG RR", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, max_bars_back = 4000)
+
+// --- Inputs ---
+sessionType = input.string("London", "Session to Monitor", options = ["Sydney", "Tokyo", "London", "New York"])
+sweepBarsLimit = input.int(10, "Max Bars to Return to Range", minval = 1)
+atrLength = input.int(14, "ATR Length")
+maxSweepAtrMult = input.float(5.0, "Max Sweep ATR Multiple")
+stopType = input.string("iFVG", "Stop Loss Type", options = ["iFVG", "ATR"])
+strictMode = input.bool(false, "Strict Mode (Hide incomplete setups)")
+rrAtrMult = input.float(2.0, "RR Target ATR Multiple")
+sessionColor = input.color(color.new(color.blue, 90), "Session Background")
+
+// Determine session string based on choice
+sessionTime = switch sessionType
+    "Sydney" => "2200-0700"
+    "Tokyo" => "0000-0900"
+    "London" => "0800-1600"
+    "New York" => "1300-2200"
+
+// --- Variables ---
+var float sessionHigh = na
+var float sessionLow = na
+var int sessionStartBar = na
+var int sessionEndBar = na
+
+var int sweepDir = 0
+var bool sweepValid = false
+var int breakoutBar = na
+var int sweepReturnBar = na
+var line breakLine = na
+
+var bool inSession = false
+var bool prevInSession = false
+
+var int setupsThisSession = 0
+var int validSweepsThisSession = 0
+var bool readyForBreak = true 
+
+// Drawing Cleanup Arrays for Strict Mode
+var box[] pendingBoxes = array.new_box()
+var line[] pendingLines = array.new_line()
+var label[] pendingLabels = array.new_label()
+
+clearPendingDrawings(bool deleteObjects) =>
+    if deleteObjects
+        for b in pendingBoxes
+            box.delete(b)
+        for l in pendingLines
+            line.delete(l)
+        for lbl in pendingLabels
+            label.delete(lbl)
+    array.clear(pendingBoxes)
+    array.clear(pendingLines)
+    array.clear(pendingLabels)
+
+// Time checking
+inSession := not na(time(timeframe.period, sessionTime, "UTC"))
+prevInSession := inSession[1]
+
+// Lines for Session High/Low
+var line highLine = na
+var line lowLine = na
+
+// Trendline State Variables
+var int tlPoint1Bar = na
+var float tlPoint1Val = na
+var int tlPoint2Bar = na
+var float tlPoint2Val = na
+var bool lookingForBreak = false
+var int currentSetupDir = 0
+
+// Alert event flags
+var bool sweepBreakEvent = false
+var bool validSweepEvent = false
+var bool invalidSweepEvent = false
+var bool setupEvent = false
+
+// Session logic
+if inSession and not prevInSession
+    sessionHigh := high
+    sessionLow := low
+    sessionStartBar := bar_index
+    sessionEndBar := bar_index
+    highLine := line.new(bar_index, sessionHigh, bar_index, sessionHigh, color = color.new(color.blue, 50), style = line.style_dashed)
+    lowLine := line.new(bar_index, sessionLow, bar_index, sessionLow, color = color.new(color.blue, 50), style = line.style_dashed)
+    
+    lookingForBreak := false
+    sweepDir := 0
+    sweepValid := false
+    breakoutBar := na
+    sweepReturnBar := na
+    setupsThisSession := 0
+    validSweepsThisSession := 0
+    readyForBreak := true
+    clearPendingDrawings(true)
+    
+else if inSession
+    sessionHigh := math.max(sessionHigh, high)
+    sessionLow := math.min(sessionLow, low)
+    sessionEndBar := bar_index
+    if not na(highLine)
+        line.set_y1(highLine, sessionHigh)
+        line.set_y2(highLine, sessionHigh)
+        line.set_x2(highLine, bar_index)
+    if not na(lowLine)
+        line.set_y1(lowLine, sessionLow)
+        line.set_y2(lowLine, sessionLow)
+        line.set_x2(lowLine, bar_index)
+
+// Session Box highlighting
+var box sessionBox = na
+if inSession and not prevInSession
+    sessionBox := box.new(bar_index, sessionHigh, bar_index, sessionLow, border_color = na, bgcolor = sessionColor)
+else if inSession
+    box.set_right(sessionBox, bar_index)
+    box.set_top(sessionBox, sessionHigh)
+    box.set_bottom(sessionBox, sessionLow)
+
+if not inSession and not na(highLine)
+    line.set_x2(highLine, bar_index)
+if not inSession and not na(lowLine)
+    line.set_x2(lowLine, bar_index)
+
+atr = ta.atr(atrLength)
+
+// Reset one-bar alert events
+sweepBreakEvent := false
+validSweepEvent := false
+invalidSweepEvent := false
+setupEvent := false
+
+bool closedInside = close <= sessionHigh and close >= sessionLow
+
+if closedInside and sweepDir == 0 and not lookingForBreak
+    readyForBreak := true
+
+bool limitReached = strictMode ? validSweepsThisSession >= 1 : setupsThisSession >= 2
+
+if sweepDir == 0 and not inSession and not limitReached and readyForBreak and not lookingForBreak
+    if high > sessionHigh and (high - sessionHigh) <= atr * maxSweepAtrMult and closedInside[1]
+        sweepDir := 1
+        breakoutBar := bar_index
+        readyForBreak := false
+        breakLine := line.new(bar_index, sessionHigh, bar_index + sweepBarsLimit, sessionHigh, color = color.red)
+        l2 = line.new(bar_index, high, bar_index, high + atr * 2.0, color = color.red)
+        lbl = label.new(bar_index, high + atr * 2.0, "Break", style = label.style_label_down, color = color.red, textcolor = color.white, size = size.small)
+        
+        array.push(pendingLines, breakLine)
+        array.push(pendingLines, l2)
+        array.push(pendingLabels, lbl)
+        
+    else if low < sessionLow and (sessionLow - low) <= atr * maxSweepAtrMult and closedInside[1]
+        sweepDir := -1
+        breakoutBar := bar_index
+        readyForBreak := false
+        breakLine := line.new(bar_index, sessionLow, bar_index + sweepBarsLimit, sessionLow, color = color.green)
+        l2 = line.new(bar_index, low, bar_index, low - atr * 2.0, color = color.green)
+        lbl = label.new(bar_index, low - atr * 2.0, "Break", style = label.style_label_up, color = color.green, textcolor = color.white, size = size.small)
+        
+        array.push(pendingLines, breakLine)
+        array.push(pendingLines, l2)
+        array.push(pendingLabels, lbl)
+
+if sweepDir != 0 and sweepValid == false
+    if (bar_index - breakoutBar) <= sweepBarsLimit
+        if closedInside
+            sweepValid := true
+            sweepReturnBar := bar_index
+            validSweepsThisSession += 1
+            
+            if not na(breakLine)
+                line.set_x2(breakLine, bar_index)
+            
+            float yPos = sweepDir == 1 ? high : low
+            string lblStyle = sweepDir == 1 ? label.style_label_down : label.style_label_up
+            lbl = label.new(bar_index, yPos, "Valid", style = lblStyle, color = color.new(color.green, 50), textcolor = color.white, size = size.small)
+            array.push(pendingLabels, lbl)
+            
+            for i = 0 to (bar_index - breakoutBar)
+                bx = box.new(bar_index - i, high[i], bar_index - i, low[i], border_color = na, bgcolor = color.new(color.red, 50))
+                array.push(pendingBoxes, bx)
+            
+            if sweepDir == 1 and not na(lowLine)
+                line.set_x2(lowLine, breakoutBar)
+            else if sweepDir == -1 and not na(highLine)
+                line.set_x2(highLine, breakoutBar)
+                
+            if sweepDir == 1
+                float min1 = 999999.0
+                int b1 = na
+                for i = sessionStartBar to breakoutBar
+                    int barsBack = bar_index - i
+                    if low[barsBack] < min1
+                        min1 := low[barsBack]
+                        b1 := i
+                
+                int b2 = na
+                float min2 = na
+                
+                if not na(b1) and breakoutBar > b1
+                    float minSlope = 999999.0
+                    int bestB2 = na
+                    float bestMin2 = na
+                    for i = b1 + 1 to breakoutBar
+                        int barsBack = bar_index - i
+                        float currSlope = (low[barsBack] - min1) / (i - b1)
+                        if currSlope < minSlope
+                            minSlope := currSlope
+                            bestB2 := i
+                            bestMin2 := low[barsBack]
+                    
+                    if not na(bestB2)
+                        b2 := bestB2
+                        min2 := bestMin2
+                
+                if not na(b2) and min2 > min1
+                    tlPoint1Bar := b1
+                    tlPoint1Val := min1
+                    tlPoint2Bar := b2
+                    tlPoint2Val := min2
+                    lookingForBreak := true
+                    currentSetupDir := 1
+                    sweepDir := 0 
+            
+            else if sweepDir == -1
+                float max1 = -999999.0
+                int b1 = na
+                for i = sessionStartBar to breakoutBar
+                    int barsBack = bar_index - i
+                    if high[barsBack] > max1
+                        max1 := high[barsBack]
+                        b1 := i
+                
+                int b2 = na
+                float max2 = na
+                
+                if not na(b1) and breakoutBar > b1
+                    float maxSlope = -999999.0
+                    int bestB2 = na
+                    float bestMax2 = na
+                    for i = b1 + 1 to breakoutBar
+                        int barsBack = bar_index - i
+                        float currSlope = (high[barsBack] - max1) / (i - b1)
+                        if currSlope > maxSlope
+                            maxSlope := currSlope
+                            bestB2 := i
+                            bestMax2 := high[barsBack]
+                    
+                    if not na(bestB2)
+                        b2 := bestB2
+                        max2 := bestMax2
+                            
+                if not na(b2) and max2 < max1
+                    tlPoint1Bar := b1
+                    tlPoint1Val := max1
+                    tlPoint2Bar := b2
+                    tlPoint2Val := max2
+                    lookingForBreak := true
+                    currentSetupDir := -1
+                    sweepDir := 0
+
+    else
+        invalidSweepEvent := true
+        float yPos = sweepDir == 1 ? high : low
+        string lblStyle = sweepDir == 1 ? label.style_label_down : label.style_label_up
+        lbl = label.new(bar_index, yPos, "Not Valid", style = lblStyle, color = color.new(color.gray, 50), textcolor = color.white, size = size.small)
+        array.push(pendingLabels, lbl)
+        
+        sweepDir := 0
+        breakoutBar := na
+        readyForBreak := false
+        clearPendingDrawings(strictMode)
+
+if lookingForBreak
+    if strictMode and (close > sessionHigh or close < sessionLow)
+        lookingForBreak := false 
+        sweepDir := 0
+        sweepValid := false
+        readyForBreak := false
+        clearPendingDrawings(true)
+        
+if lookingForBreak
+    float slope = (tlPoint2Val - tlPoint1Val) / (tlPoint2Bar - tlPoint1Bar)
+    float tlYInt = tlPoint1Val - (slope * tlPoint1Bar)
+    float currentTlVal = slope * bar_index + tlYInt
+    
+    bool isBreak = false
+    if currentSetupDir == 1 and close < currentTlVal and closedInside
+        isBreak := true
+    else if currentSetupDir == -1 and close > currentTlVal and closedInside
+        isBreak := true
+        
+    if isBreak
+        // Setup confirmed! Lock in the pending drawings.
+        clearPendingDrawings(false)
+        
+        float yAtBreak = slope * bar_index + tlYInt
+        line.new(tlPoint1Bar, tlPoint1Val, bar_index, yAtBreak, color = color.white, style = line.style_dashed, width = 2)
+        
+        lookingForBreak := false
+        sweepDir := 0
+        sweepValid := false
+        readyForBreak := false
+        
+        box.new(bar_index, currentTlVal + atr, bar_index, currentTlVal - atr, border_color = color.yellow, bgcolor = color.new(color.yellow, 80))
+        
+        float bestIfvgTop = na
+        float bestIfvgBot = na
+        float maxIfvgSize = -1.0
+        int bestIfvgStart = na
+        
+        int searchStart = math.max(1, breakoutBar)
+        
+        for i = 0 to (bar_index - searchStart)
+            int bIdx = bar_index - i 
+            int lookback = i
+            
+            if currentSetupDir == 1 
+                float fvgTop = low[lookback + 2]
+                float fvgBot = high[lookback]
+                if fvgBot < fvgTop 
+                    bool inverted = false
+                    for j = 0 to lookback
+                        if close[j] < fvgBot
+                            inverted := true
+                            break
+                    if inverted
+                        float size = fvgTop - fvgBot
+                        if size > maxIfvgSize
+                            maxIfvgSize := size
+                            bestIfvgTop := fvgTop
+                            bestIfvgBot := fvgBot
+                            bestIfvgStart := bar_index - lookback - 2
+                            
+            else if currentSetupDir == -1 
+                float fvgBot = high[lookback + 2]
+                float fvgTop = low[lookback]
+                if fvgTop > fvgBot 
+                    bool inverted = false
+                    for j = 0 to lookback
+                        if close[j] > fvgTop
+                            inverted := true
+                            break
+                    if inverted
+                        float size = fvgTop - fvgBot
+                        if size > maxIfvgSize
+                            maxIfvgSize := size
+                            bestIfvgTop := fvgTop
+                            bestIfvgBot := fvgBot
+                            bestIfvgStart := bar_index - lookback - 2
+        
+        float sl = na
+        float tp = na
+        
+        bool usedIfvg = false
+        
+        if stopType == "iFVG" 
+            if not na(bestIfvgTop)
+                if currentSetupDir == 1
+                    sl := bestIfvgTop > close ? bestIfvgTop : high + atr
+                    if sl == bestIfvgTop
+                        usedIfvg := true
+                else
+                    sl := bestIfvgBot < close ? bestIfvgBot : low - atr
+                    if sl == bestIfvgBot
+                        usedIfvg := true
+            else
+                sl := currentSetupDir == 1 ? high + atr : low - atr
+        else
+            sl := currentSetupDir == 1 ? high + atr : low - atr
+            
+        tp := close + (currentSetupDir == 1 ? -atr * rrAtrMult : atr * rrAtrMult)
+        
+        if usedIfvg
+            color ifvgColor = currentSetupDir == 1 ? color.new(color.red, 80) : color.new(color.green, 80)
+            color ifvgBorder = currentSetupDir == 1 ? color.red : color.green
+            box.new(bestIfvgStart, bestIfvgTop, bar_index + 10, bestIfvgBot, border_color = ifvgBorder, bgcolor = ifvgColor, border_style = line.style_dashed)
+        else if stopType == "iFVG"
+            label.new(bar_index, currentSetupDir == 1 ? high + atr*1.5 : low - atr*1.5, "No valid iFVG detected.\nUsing ATR.", color = color.new(color.gray, 50), textcolor = color.white, style = currentSetupDir == 1 ? label.style_label_down : label.style_label_up, size = size.small)
+        
+        box.new(bar_index, tp, bar_index + 10, close, border_color = color.green, bgcolor = color.new(color.green, 80))
+        box.new(bar_index, close, bar_index + 10, sl, border_color = color.red, bgcolor = color.new(color.red, 80))
+
+// --- Alerts ---
+alertcondition(sweepBreakEvent, "Sweep Break", "A session high/low sweep break was detected.")
+alertcondition(validSweepEvent, "Valid Sweep", "Price returned inside the monitored session range and confirmed a valid sweep.")
+alertcondition(invalidSweepEvent, "Invalid Sweep", "A sweep did not return inside the monitored session range within the allowed bars.")
+alertcondition(setupEvent, "Confirmed Trendline Setup", "A valid sweep setup has broken its trendline inside the session range.")

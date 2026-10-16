@@ -1,0 +1,413 @@
+// This work is licensed under Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Abandoned Baby"
+  , shorttitle       = "Abandoned Baby"
+  , overlay          = true
+  , format           = format.price
+  , max_lines_count  = 500
+  , max_labels_count = 500
+  , max_boxes_count  = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+color BULL_COLOR    = #089981
+color BEAR_COLOR    = #f23645
+color NEUTRAL_COLOR = #787b86
+color LABEL_BG      = #00000000
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+int PATTERN_BG_TRANSP     = 90
+int PATTERN_BORDER_TRANSP = 60
+int GAP_BG_TRANSP         = 55
+int POSITION_BG_TRANSP    = 88
+int FADED_TRANSP          = 70
+
+string GAP_STRICT  = "Shadows (Strict)"
+string GAP_RELAXED = "Bodies (Relaxed)"
+
+string ENTRY_CLOSE = "Third Close"
+string ENTRY_BREAK = "Third Candle Break"
+
+string GROUP_PATTERN = "Pattern Rules"
+string GROUP_CONTEXT = "Trend Context"
+string GROUP_TRADE   = "Trade Plan"
+string GROUP_DASH    = "Dashboard"
+string GROUP_STYLE   = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+gapRuleInput = input.string(GAP_STRICT, "Gap Rule", options = [GAP_STRICT, GAP_RELAXED], group = GROUP_PATTERN
+  , tooltip = "Shadows (Strict): the doji's whole range, shadows included, must gap clear of both neighbors, the defining requirement of the abandoned baby. Bodies (Relaxed): only the real bodies must gap, which admits doji star variants; those print with a separate Body Gap label because they are a weaker specification. Strict babies are genuinely rare and almost never print on markets that trade around the clock.")
+
+dojiPctInput = input.float(15, "Doji Body % of Range", minval = 1, maxval = 50, step = 1, group = GROUP_PATTERN
+  , tooltip = "The middle candle counts as a doji, or very close to one, when its real body is at most this percentage of its high-low range.")
+
+bodyLengthInput = input.int(14, "Body Average Length", minval = 2, maxval = 200, group = GROUP_PATTERN
+  , tooltip = "Bars, ending right before the pattern, used to average the real body. The first candle must be long against this average.")
+
+bodyMultInput = input.float(0.8, "First Candle Body Multiplier", minval = 0.1, maxval = 5, step = 0.1, group = GROUP_PATTERN
+  , tooltip = "Minimum real body of the first candle as a multiple of the average body: the trend candle has to carry the move the baby interrupts.")
+
+penetrationInput = input.float(30, "Third Candle Penetration %", minval = 0, maxval = 100, step = 5, group = GROUP_PATTERN
+  , tooltip = "How far into the first candle's real body the third candle must close, measured from the first close. The pattern asks for a close meaningfully into that body; 100% means back to the first candle's open.")
+
+trendInput = input.bool(true, "Require Prior Trend", group = GROUP_CONTEXT
+  , tooltip = "A bullish baby needs a preceding decline and a bearish one a preceding advance; the pattern has no meaning inside a range. The first candle must close below (bullish) or above (bearish) the trend average.")
+
+trendLengthInput = input.int(10, "Trend EMA Length", minval = 2, maxval = 200, group = GROUP_CONTEXT
+  , tooltip = "Exponential moving average used by the prior-trend test, read at the first candle. The 10-period average is the classical candlestick screener convention for the short-term trend.")
+
+extremeLengthInput = input.int(20, "Extreme Lookback", minval = 2, maxval = 500, group = GROUP_CONTEXT
+  , tooltip = "Location grade shown in each label's tooltip: whether the doji printed the lowest low (bullish) or highest high (bearish) of this many bars. Completions at fresh extremes are graded above ones appearing mid-move.")
+
+entryModeInput = input.string(ENTRY_CLOSE, "Entry", options = [ENTRY_CLOSE, ENTRY_BREAK], group = GROUP_TRADE
+  , tooltip = "'Third Close' enters on the completion bar. 'Third Candle Break' waits for price to trade beyond the third candle's extreme within the window below, a confirmation that costs entry price.")
+
+breakWindowInput = input.int(5, "Break Window", minval = 1, maxval = 50, group = GROUP_TRADE
+  , tooltip = "Bars after the pattern during which the third candle break is accepted. Ignored with the 'Third Close' entry.")
+
+targetRInput = input.float(2, "Target (R)", minval = 0.5, maxval = 10, step = 0.25, group = GROUP_TRADE
+  , tooltip = "Target as a multiple of the planned risk. Risk is measured from the entry to the doji's extreme, the natural invalidation: trade back through it puts price inside the abandoned zone and voids the isolation logic.")
+
+maxHoldInput = input.int(40, "Maximum Hold (Bars)", minval = 1, maxval = 500, group = GROUP_TRADE
+  , tooltip = "A position that reaches neither its target nor the doji's extreme within this many bars is closed at the bar's close and recorded as Timed Out.")
+
+showDashInput = input.bool(true, "Show Dashboard", group = GROUP_DASH
+  , tooltip = "Pattern count, how many body-gap star variants failed the strict shadow test, and how each traded pattern resolved.")
+
+dashPosInput = input.string("Top Right", "Position", options = ["Top Right", "Bottom Right", "Bottom Left", "Top Left"], group = GROUP_DASH)
+
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = GROUP_DASH)
+
+showLabelsInput = input.bool(true, "Pattern Labels", group = GROUP_STYLE
+  , tooltip = "Label each pattern; hover for the doji's gaps, the location grade and the trade levels.")
+
+showGapsInput = input.bool(true, "Highlight Gaps", group = GROUP_STYLE
+  , tooltip = "Shade the two gaps that strand the doji: the pattern's defining feature.")
+
+showTradeInput = input.bool(true, "Trade Levels", group = GROUP_STYLE
+  , tooltip = "Draw entry, stop and target of each pattern, the position while it is open, and the result where it resolves.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "colors", group = GROUP_STYLE)
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "colors", group = GROUP_STYLE)
+neutralColorInput = input.color(NEUTRAL_COLOR, "Neutral", inline = "colors", group = GROUP_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types
+//---------------------------------------------------------------------------------------------------------------------{
+// One traded pattern. state: 0 waiting for the break entry, 1 open position
+type Setup
+    int   dir
+    int   signalBar
+    int   fillBar
+    int   state
+    float entry
+    float stop
+    float target
+    float gapEdge
+    bool  gapFilled
+    line  entryLine
+    line  stopLine
+    line  targetLine
+    label entryTag
+    label stopTag
+    label targetTag
+    box   rewardBox
+    box   riskBox
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Move a level line and its tag to the given bar
+moveLevel(line ln, label tag, int x) =>
+    line.set_x2(ln, x)
+    if not na(tag)
+        label.set_x(tag, x)
+
+// Extend a setup's drawings to the given bar
+extendSetup(Setup s, int x) =>
+    moveLevel(s.entryLine, s.entryTag, x)
+    moveLevel(s.stopLine, s.stopTag, x)
+    moveLevel(s.targetLine, s.targetTag, x)
+    if not na(s.rewardBox)
+        box.set_right(s.rewardBox, x)
+        box.set_right(s.riskBox, x)
+
+// Open the position: the level tags give way to a reward box and a risk box labeled inside
+openPosition(Setup s) =>
+    color dirColor = s.dir == 1 ? bullColorInput : bearColorInput
+    color oppColor = s.dir == 1 ? bearColorInput : bullColorInput
+    label.delete(s.entryTag)
+    label.delete(s.stopTag)
+    label.delete(s.targetTag)
+    s.entryTag  := label(na)
+    s.stopTag   := label(na)
+    s.targetTag := label(na)
+    s.rewardBox := box.new(bar_index, s.target, bar_index, s.entry, border_color = LABEL_BG, bgcolor = color.new(bullColorInput, POSITION_BG_TRANSP)
+      , text = "Target " + str.tostring(targetRInput, "#.##") + "R", text_color = bullColorInput, text_size = size.small, text_halign = text.align_left, text_valign = s.dir == 1 ? text.align_top : text.align_bottom)
+    s.riskBox   := box.new(bar_index, s.entry, bar_index, s.stop, border_color = LABEL_BG, bgcolor = color.new(bearColorInput, POSITION_BG_TRANSP)
+      , text = "Stop", text_color = bearColorInput, text_size = size.small, text_halign = text.align_left, text_valign = s.dir == 1 ? text.align_bottom : text.align_top)
+
+// Retire a break setup that never triggered: fade its levels and keep a single note
+fadeSetup(Setup s, int x) =>
+    extendSetup(s, x)
+    line.set_color(s.entryLine, color.new(neutralColorInput, FADED_TRANSP))
+    line.set_color(s.stopLine, color.new(neutralColorInput, FADED_TRANSP))
+    line.set_color(s.targetLine, color.new(neutralColorInput, FADED_TRANSP))
+    label.delete(s.stopTag)
+    label.delete(s.targetTag)
+    if not na(s.entryTag)
+        label.set_textcolor(s.entryTag, neutralColorInput)
+        label.set_text(s.entryTag, "No Break")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Detection
+//---------------------------------------------------------------------------------------------------------------------{
+float bodySize = math.abs(close - open)
+float bodyAvg  = ta.sma(bodySize, bodyLengthInput)
+float trendEma = ta.ema(close, trendLengthInput)
+float lowestLow   = ta.lowest(low, extremeLengthInput)
+float highestHigh = ta.highest(high, extremeLengthInput)
+
+float refBody = bodyAvg[3]
+bool  refOk   = not na(refBody) and refBody > 0
+
+// First candle: a long trend candle
+float body1     = bodySize[2]
+bool  firstBear = close[2] < open[2] and body1 >= bodyMultInput * refBody
+bool  firstBull = close[2] > open[2] and body1 >= bodyMultInput * refBody
+
+// Middle candle: a doji, or very close to one
+float range2 = high[1] - low[1]
+bool  isDoji = range2 > 0 ? bodySize[1] <= range2 * dojiPctInput / 100 : true
+
+float dojiBodyTop    = math.max(open[1], close[1])
+float dojiBodyBottom = math.min(open[1], close[1])
+
+// Gaps around the doji: whole ranges (strict) and real bodies only (relaxed)
+bool bullShadowGaps = high[1] < low[2] and low > high[1]
+bool bearShadowGaps = low[1] > high[2] and high < low[1]
+bool bullBodyGaps   = dojiBodyTop < math.min(open[2], close[2]) and math.min(open, close) > dojiBodyTop
+bool bearBodyGaps   = dojiBodyBottom > math.max(open[2], close[2]) and math.max(open, close) < dojiBodyBottom
+
+// Third candle: reverses and closes meaningfully into the first body
+bool thirdBull = close > open and close >= close[2] + body1 * penetrationInput / 100
+bool thirdBear = close < open and close <= close[2] - body1 * penetrationInput / 100
+
+// Prior trend read at the first candle
+bool priorDecline = not trendInput or (not na(trendEma[2]) and close[2] < trendEma[2])
+bool priorAdvance = not trendInput or (not na(trendEma[2]) and close[2] > trendEma[2])
+
+bool bullCore = barstate.isconfirmed and refOk and firstBear and isDoji and thirdBull and priorDecline
+bool bearCore = barstate.isconfirmed and refOk and firstBull and isDoji and thirdBear and priorAdvance
+
+bool bullStrict = bullCore and bullShadowGaps
+bool bearStrict = bearCore and bearShadowGaps
+bool bullBodyOnly = bullCore and not bullShadowGaps and bullBodyGaps
+bool bearBodyOnly = bearCore and not bearShadowGaps and bearBodyGaps
+
+bool relaxed = gapRuleInput == GAP_RELAXED
+bool bullSignal = bullStrict or (relaxed and bullBodyOnly)
+bool bearSignal = bearStrict or (relaxed and bearBodyOnly)
+
+// Location grade: the doji at a fresh extreme of the lookback
+bool atLow  = not na(lowestLow[1]) and low[1] <= lowestLow[1]
+bool atHigh = not na(highestHigh[1]) and high[1] >= highestHigh[1]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Trade Tracking
+//---------------------------------------------------------------------------------------------------------------------{
+var array<Setup> setups = array.new<Setup>()
+
+var int countBull     = 0
+var int countBear     = 0
+var int countBodyOnly = 0
+var int countEntries  = 0
+var int countTarget   = 0
+var int countStop     = 0
+var int countTimed    = 0
+var int countGapFill  = 0
+
+bool entryEvent   = false
+bool targetEvent  = false
+bool stopEvent    = false
+bool gapFillEvent = false
+
+if bullBodyOnly or bearBodyOnly
+    countBodyOnly += 1
+
+if barstate.isconfirmed and array.size(setups) > 0
+    for i = array.size(setups) - 1 to 0
+        Setup s = array.get(setups, i)
+        bool remove = false
+        if s.state == 0
+            bool broke = s.dir == 1 ? high > s.entry : low < s.entry
+            if broke
+                s.state   := 1
+                s.fillBar := bar_index
+                countEntries += 1
+                entryEvent := true
+                if showTradeInput
+                    openPosition(s)
+            else if bar_index - s.signalBar >= breakWindowInput
+                if showTradeInput
+                    fadeSetup(s, bar_index)
+                remove := true
+        if s.state == 1 and not remove
+            float risk     = math.abs(s.entry - s.stop)
+            bool hitStop   = s.dir == 1 ? low <= s.stop : high >= s.stop
+            bool hitTarget = not hitStop and bar_index > s.fillBar and (s.dir == 1 ? high >= s.target : low <= s.target)
+            bool timedOut  = not hitStop and not hitTarget and bar_index - s.fillBar >= maxHoldInput
+            // A close back inside the second gap: a warning, not an invalidation
+            if not s.gapFilled and bar_index > s.signalBar and (s.dir == 1 ? close < s.gapEdge : close > s.gapEdge)
+                s.gapFilled := true
+                countGapFill += 1
+                gapFillEvent := true
+            if hitStop or hitTarget or timedOut
+                float r = hitStop ? -1.0 : hitTarget ? targetRInput : (close - s.entry) * s.dir / risk
+                string rText = (r >= 0 ? "+" : "") + str.tostring(r, "#.#") + "R"
+                if hitStop
+                    countStop += 1
+                    stopEvent := true
+                else if hitTarget
+                    countTarget += 1
+                    targetEvent := true
+                else
+                    countTimed += 1
+                if showTradeInput
+                    extendSetup(s, bar_index)
+                    bool above = (s.dir == 1) == (r >= 0)
+                    color resultColor = hitStop ? (s.dir == 1 ? bearColorInput : bullColorInput) : hitTarget ? (s.dir == 1 ? bullColorInput : bearColorInput) : neutralColorInput
+                    label.new(bar_index, na, rText
+                      , yloc      = above ? yloc.abovebar : yloc.belowbar
+                      , style     = above ? label.style_label_down : label.style_label_up
+                      , color     = resultColor
+                      , textcolor = color.white
+                      , size      = size.small
+                      , tooltip   = hitStop ? "Stopped: price traded back through the doji's extreme" : hitTarget ? "Target reached" : "Closed at the maximum hold")
+                remove := true
+        if showTradeInput and not remove
+            extendSetup(s, bar_index)
+        if remove
+            array.remove(setups, i)
+
+if bullSignal or bearSignal
+    int   dir         = bullSignal ? 1 : -1
+    bool  isStrict    = bullSignal ? bullStrict : bearStrict
+    color dirColor    = dir == 1 ? bullColorInput : bearColorInput
+    color oppColor    = dir == 1 ? bearColorInput : bullColorInput
+    float patternHigh = math.max(high, high[1], high[2])
+    float patternLow  = math.min(low, low[1], low[2])
+    float stopLevel   = dir == 1 ? low[1] : high[1]
+    float entryLevel  = entryModeInput == ENTRY_CLOSE ? close : dir == 1 ? high : low
+    float riskSize    = math.abs(entryLevel - stopLevel)
+    float targetLevel = entryLevel + dir * riskSize * targetRInput
+    bool  filledNow   = entryModeInput == ENTRY_CLOSE
+    bool  atExtreme   = dir == 1 ? atLow : atHigh
+
+    if dir == 1
+        countBull += 1
+    else
+        countBear += 1
+
+    // Pattern frame and the two gaps stranding the doji
+    box.new(bar_index - 2, patternHigh, bar_index, patternLow, border_color = color.new(dirColor, PATTERN_BORDER_TRANSP), bgcolor = color.new(dirColor, PATTERN_BG_TRANSP))
+    if showGapsInput
+        float gap1Top    = dir == 1 ? (isStrict ? low[2] : math.min(open[2], close[2])) : (isStrict ? low[1] : dojiBodyBottom)
+        float gap1Bottom = dir == 1 ? (isStrict ? high[1] : dojiBodyTop) : (isStrict ? high[2] : math.max(open[2], close[2]))
+        float gap2Top    = dir == 1 ? (isStrict ? low : math.min(open, close)) : (isStrict ? low[1] : dojiBodyBottom)
+        float gap2Bottom = dir == 1 ? (isStrict ? high[1] : dojiBodyTop) : (isStrict ? high : math.max(open, close))
+        box.new(bar_index - 2, gap1Top, bar_index - 1, gap1Bottom, border_color = LABEL_BG, bgcolor = color.new(dirColor, GAP_BG_TRANSP))
+        box.new(bar_index - 1, gap2Top, bar_index, gap2Bottom, border_color = LABEL_BG, bgcolor = color.new(dirColor, GAP_BG_TRANSP))
+
+    // The second gap's near edge: a close back beyond it fills the gap
+    float gapEdge = dir == 1 ? (isStrict ? high[1] : dojiBodyTop) : (isStrict ? low[1] : dojiBodyBottom)
+
+    line entryLn  = na
+    line stopLn   = na
+    line targetLn = na
+    label entryLb  = na
+    label stopLb   = na
+    label targetLb = na
+
+    if showTradeInput and riskSize > 0
+        entryLn  := line.new(bar_index, entryLevel, bar_index + 1, entryLevel, color = dirColor, width = 2)
+        stopLn   := line.new(bar_index - 1, stopLevel, bar_index + 1, stopLevel, color = bearColorInput, style = line.style_dashed)
+        targetLn := line.new(bar_index, targetLevel, bar_index + 1, targetLevel, color = bullColorInput, style = line.style_dashed)
+        entryLb  := label.new(bar_index + 1, entryLevel, "Entry", style = label.style_label_left, color = LABEL_BG, textcolor = dirColor, size = size.small)
+        stopLb   := label.new(bar_index + 1, stopLevel, "Stop", style = label.style_label_left, color = LABEL_BG, textcolor = bearColorInput, size = size.small)
+        targetLb := label.new(bar_index + 1, targetLevel, "Target " + str.tostring(targetRInput, "#.##") + "R", style = label.style_label_left, color = LABEL_BG, textcolor = bullColorInput, size = size.small)
+
+    if riskSize > 0
+        Setup s = Setup.new(dir, bar_index, filledNow ? bar_index : na, filledNow ? 1 : 0, entryLevel, stopLevel, targetLevel, gapEdge, false, entryLn, stopLn, targetLn, entryLb, stopLb, targetLb, box(na), box(na))
+        if filledNow
+            countEntries += 1
+            if showTradeInput
+                openPosition(s)
+        array.push(setups, s)
+
+    if showLabelsInput
+        string name = isStrict ? "Abandoned Baby" : "Baby (Body Gap)"
+        string tip  = (dir == 1 ? "Bullish " : "Bearish ") + (isStrict ? "abandoned baby: the doji's whole range gapped clear of both neighbors." : "body-gap variant: only the real bodies gapped around the doji, a doji star rather than a strict abandoned baby.")
+          + "\nDoji body: " + str.tostring(bodySize[1] / math.max(range2, syminfo.mintick) * 100, "#") + "% of its range"
+          + "\nThird close: " + str.tostring(math.abs(close - close[2]) / body1 * 100, "#") + "% into the first body"
+          + "\nLocation: " + (atExtreme ? "doji at a fresh " + str.tostring(extremeLengthInput) + "-bar " + (dir == 1 ? "low" : "high") : "doji inside the " + str.tostring(extremeLengthInput) + "-bar range")
+          + "\nEntry " + str.tostring(entryLevel, format.mintick) + ", stop " + str.tostring(stopLevel, format.mintick) + " (doji extreme), target " + str.tostring(targetLevel, format.mintick)
+        label.new(bar_index - 1, na, name
+          , yloc      = dir == 1 ? yloc.belowbar : yloc.abovebar
+          , style     = dir == 1 ? label.style_label_up : label.style_label_down
+          , color     = isStrict ? dirColor : LABEL_BG
+          , textcolor = isStrict ? color.white : dirColor
+          , size      = size.small
+          , tooltip   = tip)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var string dashPos = switch dashPosInput
+    "Bottom Right" => position.bottom_right
+    "Bottom Left"  => position.bottom_left
+    "Top Left"     => position.top_left
+    => position.top_right
+
+var string dashSize = switch dashSizeInput
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    => size.small
+
+var table dash = table.new(dashPos, 2, 8, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+dashRow(int row, string name, string value, color nameColor) =>
+    table.cell(dash, 0, row, name, text_color = nameColor, text_size = dashSize, text_halign = text.align_left)
+    table.cell(dash, 1, row, value, text_color = DASH_TEXT, text_size = dashSize, text_halign = text.align_right)
+
+if showDashInput and barstate.islast
+    table.cell(dash, 0, 0, "Abandoned Baby", text_color = DASH_HEADER, text_size = dashSize, text_halign = text.align_left)
+    table.cell(dash, 1, 0, "Count", text_color = DASH_HEADER, text_size = dashSize, text_halign = text.align_right)
+    dashRow(1, "Bullish / Bearish", str.tostring(countBull) + " / " + str.tostring(countBear), DASH_TEXT)
+    dashRow(2, relaxed ? "Body-Gap Variants" : "Body-Gap Only (Rejected)", str.tostring(countBodyOnly), neutralColorInput)
+    dashRow(3, "Entries", str.tostring(countEntries), DASH_TEXT)
+    dashRow(4, "Target Reached", str.tostring(countTarget), bullColorInput)
+    dashRow(5, "Stopped", str.tostring(countStop), bearColorInput)
+    dashRow(6, "Timed Out", str.tostring(countTimed), DASH_TEXT)
+    dashRow(7, "Gap Filled", str.tostring(countGapFill), neutralColorInput)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(bullSignal, "Bullish Abandoned Baby", "Bullish abandoned baby on {{ticker}} ({{interval}}): a doji isolated by gaps below a long down candle, then a gap back up closing into the first body")
+alertcondition(bearSignal, "Bearish Abandoned Baby", "Bearish abandoned baby on {{ticker}} ({{interval}}): a doji isolated by gaps above a long up candle, then a gap back down closing into the first body")
+alertcondition(entryEvent, "Break Entry", "Abandoned baby break entry on {{ticker}} ({{interval}}): price traded beyond the third candle")
+alertcondition(targetEvent, "Target Reached", "An abandoned baby position on {{ticker}} ({{interval}}) reached its target")
+alertcondition(stopEvent, "Doji Extreme Broken", "An abandoned baby on {{ticker}} ({{interval}}) failed: price traded back through the doji's extreme")
+alertcondition(gapFillEvent, "Gap Filled", "An abandoned baby gap on {{ticker}} ({{interval}}) filled on a close: the reversal is under test")
+
+//---------------------------------------------------------------------------------------------------------------------}

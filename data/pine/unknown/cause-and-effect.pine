@@ -1,0 +1,532 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Cause & Effect"
+  , shorttitle       = "Cause & Effect"
+  , overlay          = true
+  , format           = format.price
+  , max_lines_count  = 500
+  , max_labels_count = 500
+  , max_boxes_count  = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+//Campaign phases: no structure in play, a cause being built inside a trading range, an effect (trend) under way
+int PH_IDLE   = 0
+int PH_CAUSE  = 1
+int PH_EFFECT = 2
+
+//Bar-chart cause measures - the page's FAQ approximation of the classical count: range duration and width
+string M_DUR_HEIGHT = "Duration x Height"
+string M_DUR_ATR    = "Duration x ATR"
+string M_HEIGHT     = "Height Only"
+
+color BULL_COLOR    = #089981
+color BEAR_COLOR    = #f23645
+color NEUTRAL_COLOR = #787b86
+color ACCENT_COLOR  = #ff9800   // the cause being built - the one structure to watch while it is still undecided
+color TRANSP_COLOR  = #00000000
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+int RANGE_FILL_TRANSP   = 90
+int RANGE_BORDER_TRANSP = 60
+int DONE_FILL_TRANSP    = 92
+int DONE_BORDER_TRANSP  = 55
+int CAUSE_TEXT_TRANSP   = 30
+int DONE_TEXT_TRANSP    = 25
+int ZONE_FILL_TRANSP    = 88
+int ZONE_BORDER_TRANSP  = 65
+int ZONE_TEXT_TRANSP    = 45
+int MED_LINE_TRANSP     = 35
+int PEND_LINE_TRANSP    = 50
+int FX_LINE_TRANSP      = 25
+int FX_TEXT_FAR_TRANSP  = 45
+
+string GROUP_DETECT  = "Cause Detection"
+string GROUP_MEASURE = "Cause Measurement & Projection"
+string GROUP_DASH    = "Dashboard"
+string GROUP_STYLE   = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+minLenInput = input.int(20, "Minimum Cause Duration (Bars)"
+  , minval  = 5
+  , maxval  = 300
+  , group   = GROUP_DETECT
+  , tooltip = "Fewest consecutive bars price must spend inside a capped-height window before the consolidation qualifies as a cause. Wyckoff causes are built sideways, so a longer minimum restricts detection to better-developed bases and pauses.")
+
+widthMultInput = input.float(3.5, "Maximum Cause Height (xATR)"
+  , minval  = 0.5
+  , maxval  = 20
+  , step    = 0.25
+  , group   = GROUP_DETECT
+  , tooltip = "Height cap of a detected trading range, as a multiple of the volatility baseline. A window only qualifies as a cause while its total high-low span stays under this cap; once active the box may widen bar by bar, but never beyond it.")
+
+atrLenInput = input.int(200, "Volatility Baseline Length"
+  , minval  = 10
+  , maxval  = 1000
+  , group   = GROUP_DETECT
+  , tooltip = "ATR length of the volatility baseline behind the height cap (a cumulative average of true range fills in until enough history exists). A long baseline keeps the cap stable, so one campaign is measured with one yardstick.")
+
+causeMeasureInput = input.string(M_DUR_HEIGHT, "Cause Size Measure"
+  , options = [M_DUR_HEIGHT, M_DUR_ATR, M_HEIGHT]
+  , group   = GROUP_MEASURE
+  , tooltip = "How the size of the cause is measured on a bar chart - the duration-and-width approximation of the classical point & figure count: range duration times range height (default), duration times the volatility baseline, or height alone. Projected objectives scale with this measure.")
+
+memInput = input.int(20, "Calibration Memory (Episodes)"
+  , minval  = 2
+  , maxval  = 100
+  , group   = GROUP_MEASURE
+  , tooltip = "Number of most recent completed cause-to-effect episodes used to estimate this chart's effect/cause proportionality. The median observed ratio sets the objective, the interquartile spread sets the zone around it.")
+
+showRangesInput = input.bool(true, "Cause Ranges"
+  , group   = GROUP_STYLE
+  , tooltip = "Draws the trading range where inventory changes hands - the cause. Neutral while building, tinted with the resolution direction once complete.")
+
+showPendingInput = input.bool(true, "Pending Objectives While Cause Builds"
+  , group   = GROUP_STYLE
+  , tooltip = "While a cause is still building, projects dotted potential objectives on both sides of the range from the median observed proportionality. They travel away from the box as the cause grows - the law made visible.")
+
+showZoneInput = input.bool(true, "Objective Zone"
+  , group   = GROUP_STYLE
+  , tooltip = "Shades the objective zone projected when the cause resolves - the interquartile band of effects that causes of this size have funded on this chart, with the dotted median objective inside.")
+
+showEffectInput = input.bool(true, "Effect Path"
+  , group   = GROUP_STYLE
+  , tooltip = "Draws the effect from the breakout point to the farthest excursion reached so far.")
+
+showLabelsInput = input.bool(true, "Cause / Effect Labels"
+  , group   = GROUP_STYLE
+  , tooltip = "Annotates each cause and effect with a running readout and a detailed tooltip.")
+
+showHistoryInput = input.bool(true, "Keep Completed Episodes"
+  , group   = GROUP_STYLE
+  , tooltip = "Keeps completed cause-to-effect episodes on the chart so the proportionality between preparation and trend stays visible. Disable to only display the structure currently in play.")
+
+bullColorInput = input.color(BULL_COLOR, "Markup", inline = "dir", group = GROUP_STYLE)
+
+bearColorInput = input.color(BEAR_COLOR, "Markdown", inline = "dir", group = GROUP_STYLE)
+
+rangeColorInput = input.color(ACCENT_COLOR, "Cause", inline = "dir", group = GROUP_STYLE)
+
+showDashInput = input.bool(true, "Show Dashboard"
+  , group   = GROUP_DASH
+  , tooltip = "Dashboard summarizing the campaign phase, the cause built so far, the observed effect/cause proportionality, the projected objective zone and the effect-versus-risk sizing check.")
+
+dashPosInput = input.string("Top Right", "Dashboard Position"
+  , options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"]
+  , group   = GROUP_DASH
+  , tooltip = "Chart corner the dashboard is anchored to.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+//Maps the dashboard position setting to a table anchor
+getTablePosition(string positionTxt) =>
+    switch positionTxt
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        => position.bottom_left
+
+//Bar-chart cause size: preparation measured through range duration and width
+causeSizeOf(int durationBars, float rangeHeight, float volBase) =>
+    switch causeMeasureInput
+        M_DUR_HEIGHT => durationBars * rangeHeight
+        M_DUR_ATR    => durationBars * volBase
+        => rangeHeight
+
+fmtPct(float fraction) =>
+    str.tostring(fraction * 100, "#.##") + "%"
+
+fmtRatio(float ratioValue) =>
+    str.tostring(ratioValue, "#.##") + "x"
+
+fmtPrice(float priceValue) =>
+    str.tostring(priceValue, format.mintick)
+
+//Range height readout, relative where the price base allows it
+heightText(float rangeHeight, float rangeMid) =>
+    rangeMid > 0 ? fmtPct(rangeHeight / rangeMid) : fmtPrice(rangeHeight)
+
+//Running effect readout: excursion from the origin and its multiple of the cause
+effectText(float extentValue, float sizeValue, float originValue, int dirValue) =>
+    string moveTxt  = originValue > 0 ? fmtPct(extentValue / originValue) : fmtPrice(extentValue)
+    string ratioTxt = sizeValue > 0 ? " (" + fmtRatio(extentValue / sizeValue) + " cause)" : ""
+    "effect " + (dirValue > 0 ? "+" : "-") + moveTxt + ratioTxt
+
+//Detailed effect tooltip, including the projected objective when the chart is calibrated
+effectTooltip(float extentValue, float sizeValue, float originValue, int dirValue, float medTarget, float nearTarget, float farTarget, float medDist, int sampleCount) =>
+    string txt = (dirValue > 0 ? "Markup" : "Markdown") + " under way from " + fmtPrice(originValue) + " - the effect funded by the cause behind it."
+    txt := txt + "\nFarthest excursion: " + fmtPrice(dirValue > 0 ? originValue + extentValue : originValue - extentValue)
+    if sizeValue > 0
+        txt := txt + " = " + fmtRatio(extentValue / sizeValue) + " the cause size"
+    if not na(medTarget)
+        txt := txt + "\nMedian objective: " + fmtPrice(medTarget)
+        if medDist > 0
+            txt := txt + " (" + str.tostring(extentValue / medDist * 100, "#") + "% covered)"
+        txt := txt + "\nObjective zone: " + fmtPrice(math.min(nearTarget, farTarget)) + " - " + fmtPrice(math.max(nearTarget, farTarget)) + ", from the effect/cause proportionality of the last " + str.tostring(sampleCount) + " completed episodes on this chart"
+    else
+        txt := txt + "\nNo objective yet - the proportionality calibrates from this chart's first completed episode"
+    txt + "\nObjectives are zones, not levels: the proportionality is a tendency, not a rule."
+
+//Dashboard row: key cell on the left, value cell with tooltip on the right
+dashCell(table tb, int rowIdx, string keyTxt, string valTxt, string tipTxt, color valColor) =>
+    table.cell(tb, 0, rowIdx, keyTxt, text_color = DASH_HEADER, text_halign = text.align_left, text_size = size.small)
+    table.cell(tb, 1, rowIdx, valTxt, text_color = valColor, text_halign = text.align_right, text_size = size.small, tooltip = tipTxt)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Cause Detection & Effect Tracking
+//---------------------------------------------------------------------------------------------------------------------{
+
+//Volatility baseline with a cumulative true-range fallback so detection also works on short histories
+float atrRaw  = ta.atr(atrLenInput)
+float trValue = ta.tr(true)
+
+var float trSumTotal = 0.0
+trSumTotal += nz(trValue)
+
+float baseVol = na(atrRaw) ? trSumTotal / (bar_index + 1) : atrRaw
+
+//Formation window: the span the last minLenInput bars traded in
+float windowHi = ta.highest(high, minLenInput)
+float windowLo = ta.lowest(low, minLenInput)
+
+//Campaign state
+var int phase           = PH_IDLE
+var int lastResolvedBar = -1
+
+//Active (or last) cause - the trading range being built
+var int   rgStart     = -1
+var float rgTop       = na
+var float rgBot       = na
+var float rgMaxHeight = na
+var float rgAtr       = na
+var box   rgBoxId     = na
+var label rgLabelId   = na
+var line  pendUpId    = na
+var line  pendDnId    = na
+
+//Resolved cause and the effect it is funding
+var int   fxDir        = 0
+var float fxOrigin     = na
+var float fxFarSide    = na
+var int   fxStartBar   = -1
+var float fxExtreme    = na
+var int   fxExtremeBar = -1
+var float fxExtent     = na
+var int   causeDur     = 0
+var float causeHeight  = na
+var float causeSize    = na
+var bool  objHit       = false
+var bool  objExceeded  = false
+
+//Objective projection, frozen at each breakout
+var float projNear    = na
+var float projMed     = na
+var float projFar     = na
+var float projMedDist = na
+var box   zoneBoxId   = na
+var line  medLineId   = na
+var line  fxLineId    = na
+var label fxLabelId   = na
+
+//Observed effect/cause proportionality, one entry per completed episode
+var array<float> ratioArray = array.new<float>()
+
+//Per-bar events
+bool evForm      = false
+bool evBreakUp   = false
+bool evBreakDn   = false
+bool evObjHit    = false
+bool evObjExceed = false
+bool evEffectEnd = false
+
+//Raw formation condition: a capped-height window made entirely of bars after the last resolution
+bool formOk = bar_index >= minLenInput and not na(windowHi) and not na(windowLo) and baseVol > 0 and windowHi - windowLo <= widthMultInput * baseVol and bar_index - minLenInput + 1 > lastResolvedBar
+
+if phase == PH_CAUSE
+    bool upBreak = close > rgTop
+    bool dnBreak = close < rgBot
+
+    if upBreak or dnBreak
+        //The cause is complete: freeze its size and launch effect tracking in the resolution direction
+        fxDir        := upBreak ? 1 : -1
+        fxOrigin     := upBreak ? rgTop : rgBot
+        fxFarSide    := upBreak ? rgBot : rgTop
+        fxStartBar   := bar_index
+        fxExtreme    := upBreak ? high : low
+        fxExtremeBar := bar_index
+        fxExtent     := math.abs(fxExtreme - fxOrigin)
+        causeDur     := bar_index - rgStart
+        causeHeight  := rgTop - rgBot
+        causeSize    := causeSizeOf(causeDur, causeHeight, rgAtr)
+        objHit       := false
+        objExceeded  := false
+        phase        := PH_EFFECT
+        lastResolvedBar := bar_index
+        evBreakUp    := upBreak
+        evBreakDn    := dnBreak
+
+        //Objective zone from the observed proportionality: the cause size scaled by the median ratio,
+        //inside the interquartile band of realized ratios - a zone, not a level
+        int sampleCount = array.size(ratioArray)
+        if sampleCount > 0 and causeSize > 0
+            float medRatio = array.median(ratioArray)
+            float q1Ratio  = sampleCount > 1 ? array.percentile_linear_interpolation(ratioArray, 25) : medRatio
+            float q3Ratio  = sampleCount > 1 ? array.percentile_linear_interpolation(ratioArray, 75) : medRatio
+            projNear    := fxOrigin + fxDir * causeSize * q1Ratio
+            projMed     := fxOrigin + fxDir * causeSize * medRatio
+            projFar     := fxOrigin + fxDir * causeSize * q3Ratio
+            projMedDist := math.abs(projMed - fxOrigin)
+        else
+            projNear    := na
+            projMed     := na
+            projFar     := na
+            projMedDist := na
+
+        color dirColor = upBreak ? bullColorInput : bearColorInput
+
+        //Freeze and tint the cause box, retire the pending objectives
+        if not na(rgBoxId)
+            box.set_border_color(rgBoxId, color.new(dirColor, DONE_BORDER_TRANSP))
+            box.set_bgcolor(rgBoxId, color.new(dirColor, DONE_FILL_TRANSP))
+        if not na(rgLabelId)
+            float rgMid = (rgTop + rgBot) / 2
+            label.set_text(rgLabelId, "cause: " + str.tostring(causeDur) + " bars x " + heightText(causeHeight, rgMid))
+            label.set_textcolor(rgLabelId, color.new(dirColor, DONE_TEXT_TRANSP))
+            string causeTip = "Cause complete: " + str.tostring(causeDur) + " bars of preparation, " + heightText(causeHeight, rgMid) + " tall (size measure " + causeMeasureInput + " = " + str.tostring(causeSize, "#.##") + ")."
+            causeTip := causeTip + "\nResolved " + (upBreak ? "upward - accumulation, markup begins." : "downward - distribution, markdown begins.")
+            causeTip := causeTip + "\nWyckoff's law of cause and effect: the extent of the move that follows tends to be proportional to this preparation. Classically counted on a point & figure chart; approximated here from range duration and width."
+            label.set_tooltip(rgLabelId, causeTip)
+        if not na(pendUpId)
+            line.delete(pendUpId)
+            pendUpId := na
+        if not na(pendDnId)
+            line.delete(pendDnId)
+            pendDnId := na
+
+        //Objective zone and effect visuals
+        if showZoneInput and not na(projNear)
+            zoneBoxId := box.new(bar_index, math.max(projNear, projFar), bar_index, math.min(projNear, projFar)
+              , border_color = color.new(dirColor, ZONE_BORDER_TRANSP)
+              , border_style = line.style_dashed
+              , bgcolor      = color.new(dirColor, ZONE_FILL_TRANSP)
+              , text         = "objective zone"
+              , text_size    = size.tiny
+              , text_color   = color.new(dirColor, ZONE_TEXT_TRANSP)
+              , text_halign  = text.align_right)
+            medLineId := line.new(bar_index, projMed, bar_index, projMed, color = color.new(dirColor, MED_LINE_TRANSP), style = line.style_dotted)
+        else
+            zoneBoxId := na
+            medLineId := na
+        fxLineId := showEffectInput ? line.new(fxStartBar, fxOrigin, bar_index, fxExtreme, color = color.new(dirColor, FX_LINE_TRANSP), width = 1) : na
+        if showLabelsInput
+            fxLabelId := label.new(bar_index, fxExtreme, effectText(fxExtent, causeSize, fxOrigin, fxDir)
+              , style     = upBreak ? label.style_label_down : label.style_label_up
+              , color     = TRANSP_COLOR
+              , textcolor = dirColor
+              , size      = size.small
+              , tooltip   = effectTooltip(fxExtent, causeSize, fxOrigin, fxDir, projMed, projNear, projFar, projMedDist, sampleCount))
+        else
+            fxLabelId := na
+    else
+        //Still ranging: absorb the bar while the box fits under its height cap, otherwise tolerate the wick
+        float newTop = math.max(rgTop, high)
+        float newBot = math.min(rgBot, low)
+        if newTop - newBot <= rgMaxHeight
+            rgTop := newTop
+            rgBot := newBot
+        if not na(rgBoxId)
+            box.set_right(rgBoxId, bar_index)
+            box.set_top(rgBoxId, rgTop)
+            box.set_bottom(rgBoxId, rgBot)
+        if not na(rgLabelId)
+            label.set_x(rgLabelId, math.round((rgStart + bar_index) / 2.0))
+            label.set_y(rgLabelId, (rgTop + rgBot) / 2)
+        //The pending objectives creep away from the box as the cause keeps building
+        if not na(pendUpId) and array.size(ratioArray) > 0
+            float medRatio  = array.median(ratioArray)
+            float tentCause = causeSizeOf(bar_index - rgStart + 1, rgTop - rgBot, rgAtr)
+            float upObj = rgTop + tentCause * medRatio
+            float dnObj = rgBot - tentCause * medRatio
+            line.set_xy1(pendUpId, rgStart, upObj)
+            line.set_xy2(pendUpId, bar_index, upObj)
+            line.set_xy1(pendDnId, rgStart, dnObj)
+            line.set_xy2(pendDnId, bar_index, dnObj)
+else if phase == PH_EFFECT
+    //Track the farthest favorable excursion - the effect the cause is funding
+    if fxDir > 0
+        if high > fxExtreme
+            fxExtreme    := high
+            fxExtremeBar := bar_index
+    else
+        if low < fxExtreme
+            fxExtreme    := low
+            fxExtremeBar := bar_index
+    fxExtent := math.abs(fxExtreme - fxOrigin)
+
+    //Objective events: the effect reaches, then exceeds, what its cause typically funds
+    if not objHit and not na(projNear) and (fxDir > 0 ? fxExtreme >= projNear : fxExtreme <= projNear)
+        objHit  := true
+        evObjHit := true
+    if not objExceeded and not na(projFar) and (fxDir > 0 ? fxExtreme >= projFar : fxExtreme <= projFar)
+        objExceeded := true
+        evObjExceed := true
+
+    //Extend the running visuals
+    color dirColor = fxDir > 0 ? bullColorInput : bearColorInput
+    if not na(zoneBoxId)
+        box.set_right(zoneBoxId, bar_index)
+    if not na(medLineId)
+        line.set_x2(medLineId, bar_index)
+    if not na(fxLineId)
+        line.set_xy2(fxLineId, fxExtremeBar, fxExtreme)
+    if not na(fxLabelId)
+        label.set_xy(fxLabelId, fxExtremeBar, fxExtreme)
+        label.set_text(fxLabelId, effectText(fxExtent, causeSize, fxOrigin, fxDir))
+        float progressFrac = not na(projMedDist) and projMedDist > 0 ? math.min(fxExtent / projMedDist, 1.0) : na
+        label.set_textcolor(fxLabelId, na(progressFrac) ? dirColor : color.from_gradient(progressFrac, 0.0, 1.0, color.new(dirColor, FX_TEXT_FAR_TRANSP), dirColor))
+        label.set_tooltip(fxLabelId, effectTooltip(fxExtent, causeSize, fxOrigin, fxDir, projMed, projNear, projFar, projMedDist, array.size(ratioArray)))
+
+    //Ending checks: a reversal back through the far side of the origin range, or a fresh cause forming -
+    //the pause or ending whose own projection is then compared with the campaign objective
+    bool reversalEnd = fxDir > 0 ? close < fxFarSide : close > fxFarSide
+    if reversalEnd or formOk
+        if causeSize > 0
+            array.push(ratioArray, fxExtent / causeSize)
+            while array.size(ratioArray) > memInput
+                array.shift(ratioArray)
+        evEffectEnd := true
+        phase       := PH_IDLE
+        if not formOk
+            lastResolvedBar := bar_index
+        if not showHistoryInput
+            if not na(rgBoxId)
+                box.delete(rgBoxId)
+                rgBoxId := na
+            if not na(rgLabelId)
+                label.delete(rgLabelId)
+                rgLabelId := na
+            if not na(zoneBoxId)
+                box.delete(zoneBoxId)
+                zoneBoxId := na
+            if not na(medLineId)
+                line.delete(medLineId)
+                medLineId := na
+            if not na(fxLineId)
+                line.delete(fxLineId)
+                fxLineId := na
+            if not na(fxLabelId)
+                label.delete(fxLabelId)
+                fxLabelId := na
+
+//A fresh cause starts building: a capped-height window entirely after the last resolution
+if phase == PH_IDLE and formOk
+    phase       := PH_CAUSE
+    rgStart     := bar_index - minLenInput + 1
+    rgTop       := windowHi
+    rgBot       := windowLo
+    rgMaxHeight := widthMultInput * baseVol
+    rgAtr       := baseVol
+    evForm      := true
+
+    rgBoxId := showRangesInput ? box.new(rgStart, rgTop, bar_index, rgBot, border_color = color.new(rangeColorInput, RANGE_BORDER_TRANSP), bgcolor = color.new(rangeColorInput, RANGE_FILL_TRANSP)) : box(na)
+    if showLabelsInput
+        rgLabelId := label.new(math.round((rgStart + bar_index) / 2.0), (rgTop + rgBot) / 2, "cause"
+          , style     = label.style_label_center
+          , color     = TRANSP_COLOR
+          , textcolor = color.new(rangeColorInput, CAUSE_TEXT_TRANSP)
+          , size      = size.tiny
+          , tooltip   = "A trading range at least " + str.tostring(minLenInput) + " bars long - inventory changing hands sideways. This is the cause being built: the accumulation or distribution whose size bounds the move it can fund.")
+    else
+        rgLabelId := na
+    if showPendingInput and array.size(ratioArray) > 0
+        float medRatio  = array.median(ratioArray)
+        float tentCause = causeSizeOf(minLenInput, rgTop - rgBot, rgAtr)
+        pendUpId := line.new(rgStart, rgTop + tentCause * medRatio, bar_index, rgTop + tentCause * medRatio, color = color.new(bullColorInput, PEND_LINE_TRANSP), style = line.style_dotted)
+        pendDnId := line.new(rgStart, rgBot - tentCause * medRatio, bar_index, rgBot - tentCause * medRatio, color = color.new(bearColorInput, PEND_LINE_TRANSP), style = line.style_dotted)
+    else
+        pendUpId := na
+        pendDnId := na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+
+var table dashTable = showDashInput ? table.new(getTablePosition(dashPosInput), 2, 8, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1) : table(na)
+
+if barstate.islast and showDashInput
+    int   sampleCount = array.size(ratioArray)
+    float medRatio    = sampleCount > 0 ? array.median(ratioArray) : na
+    int   liveDur     = phase == PH_CAUSE ? bar_index - rgStart + 1 : causeDur
+    float liveHeight  = rgStart >= 0 ? rgTop - rgBot : na
+    float liveMid     = rgStart >= 0 ? (rgTop + rgBot) / 2 : na
+
+    string phaseTxt = phase == PH_CAUSE ? "building cause" : phase == PH_EFFECT ? (fxDir > 0 ? "markup under way" : "markdown under way") : "idle"
+    color  phaseColor = phase == PH_CAUSE ? rangeColorInput : phase == PH_EFFECT ? (fxDir > 0 ? bullColorInput : bearColorInput) : NEUTRAL_COLOR
+
+    string causeTxt = rgStart >= 0 and liveDur > 0 ? str.tostring(liveDur) + " bars x " + heightText(liveHeight, liveMid) : "-"
+    string calibTxt = sampleCount > 0 ? "median " + fmtRatio(medRatio) + " (n=" + str.tostring(sampleCount) + ")" : "calibrating (n=0)"
+
+    string pendTxt = "-"
+    if phase == PH_CAUSE and not na(medRatio)
+        float tentCause = causeSizeOf(liveDur, liveHeight, rgAtr)
+        float pendDist  = tentCause * medRatio
+        pendTxt := "+/- " + (liveMid > 0 ? fmtPct(pendDist / liveMid) : fmtPrice(pendDist))
+
+    string zoneTxt = not na(projNear) ? fmtPrice(math.min(projNear, projFar)) + " - " + fmtPrice(math.max(projNear, projFar)) : "-"
+
+    string fxTxt = "-"
+    string fxTip = "Farthest favorable excursion since the breakout, as a move from the origin and as a multiple of its cause."
+    if not na(fxExtent) and fxDir != 0
+        string moveTxt = fxOrigin > 0 ? fmtPct(fxExtent / fxOrigin) : fmtPrice(fxExtent)
+        fxTxt := (fxDir > 0 ? "+" : "-") + moveTxt + (causeSize > 0 ? " (" + fmtRatio(fxExtent / causeSize) + " cause)" : "")
+        if not na(projMedDist) and projMedDist > 0
+            fxTip := fxTip + " Currently " + str.tostring(fxExtent / projMedDist * 100, "#") + "% of the median objective distance."
+
+    string riskTxt = "-"
+    if phase == PH_CAUSE and not na(medRatio) and liveHeight > 0
+        float tentCause = causeSizeOf(liveDur, liveHeight, rgAtr)
+        riskTxt := fmtRatio(tentCause * medRatio / liveHeight)
+    else if not na(projMedDist) and causeHeight > 0
+        riskTxt := fmtRatio(projMedDist / causeHeight)
+
+    table.cell(dashTable, 0, 0, "cause & effect", text_color = DASH_TEXT, text_halign = text.align_left, text_size = size.small)
+    table.cell(dashTable, 1, 0, "")
+
+    dashCell(dashTable, 1, "phase", phaseTxt, "Where the campaign stands: preparation being built inside a range, an effect being marked up or down, or no structure in play.", phaseColor)
+    dashCell(dashTable, 2, "cause", causeTxt, "Duration and height of the active (or last resolved) trading range - the bar-chart approximation of the cause: preparation measured through range duration and width.", DASH_TEXT)
+    dashCell(dashTable, 3, "proportionality", calibTxt, "Median realized effect/cause ratio over the calibration memory, with the number of completed episodes observed on this chart. The law itself, measured: effects in proportion to their causes.", DASH_TEXT)
+    dashCell(dashTable, 4, "pending objective", pendTxt, "Distance the cause built so far would fund at the median observed proportionality - shown while the range is still forming, on both sides, since the resolution direction is not yet known.", DASH_TEXT)
+    dashCell(dashTable, 5, "objective zone", zoneTxt, "Interquartile objective zone projected at the last breakout: the cause size scaled by the 25th-75th percentile of observed effect/cause ratios. A zone for planning, not a precise target.", DASH_TEXT)
+    dashCell(dashTable, 6, "effect", fxTxt, fxTip, phase == PH_EFFECT ? (fxDir > 0 ? bullColorInput : bearColorInput) : DASH_TEXT)
+    dashCell(dashTable, 7, "effect / risk", riskTxt, "Projected median effect distance versus the height of the range - the risk of a stop across the cause. Wyckoff's sizing check: skip setups whose cause is too small to pay for the risk required to trade them.", DASH_TEXT)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(evForm, "New Cause Forming", "cause & effect: a trading range is forming on {{ticker}} ({{interval}}) - preparation is being built; per the law of cause and effect, the longer and wider it grows, the larger the move it can fund")
+
+alertcondition(evBreakUp, "Cause Resolved Upward (Markup)", "cause & effect: upside breakout from the trading range on {{ticker}} ({{interval}}) - the cause is complete and markup has begun; the objective zone scales the accumulated cause by the chart's observed effect/cause proportionality")
+
+alertcondition(evBreakDn, "Cause Resolved Downward (Markdown)", "cause & effect: downside breakout from the trading range on {{ticker}} ({{interval}}) - the cause is complete and markdown has begun; the objective zone scales the accumulated cause by the chart's observed effect/cause proportionality")
+
+alertcondition(evObjHit, "Objective Zone Reached", "cause & effect: price has reached the projected objective zone on {{ticker}} ({{interval}}) - the effect has delivered the extent its cause typically funds; a rational area for position traders to begin scaling out")
+
+alertcondition(evObjExceed, "Objective Zone Exceeded", "cause & effect: price has moved beyond the upper quartile of the objective zone on {{ticker}} ({{interval}}) - the effect is exceeding what causes of this size have typically funded; proportionality is a tendency, not a rule")
+
+alertcondition(evEffectEnd, "Effect Ended", "cause & effect: the effect episode on {{ticker}} ({{interval}}) has ended - either a fresh cause is forming or price reversed back through the origin range; its realized extent now feeds the proportionality calibration")
+
+//---------------------------------------------------------------------------------------------------------------------}

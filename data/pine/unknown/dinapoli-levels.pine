@@ -1,0 +1,411 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("DiNapoli Levels", shorttitle = "DiNapoli Levels", overlay = true, format = format.price, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+float RATIO_F38 = 0.382
+float RATIO_F61 = 0.618
+float RATIO_COP = 0.618
+float RATIO_OP  = 1.0
+float RATIO_XOP = 1.618
+
+int MAX_SWINGS  = 40
+int EXTEND_BARS = 4
+
+color BULL_COLOR       = #089981
+color BEAR_COLOR       = #f23645
+color EXPANSION_COLOR  = #5b9cf6
+color CONFLUENCE_COLOR = #ff9800
+color LABEL_BG         = #00000000
+
+string SWINGS_GROUP     = 'Swings'
+string LEVELS_GROUP     = 'Levels'
+string CONFLUENCE_GROUP = 'Confluence'
+string STYLE_GROUP      = 'Style'
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+swingLengthInput = input.int(14, 'Swing Length', minval = 2, group = SWINGS_GROUP, tooltip = 'Number of bars to the left and right required to confirm a swing point. Higher values select larger reactions and a longer-term focus number, lower values react to smaller swings.')
+
+maxReactionsInput = input.int(4, 'Max Reactions', minval = 1, maxval = 8, group = SWINGS_GROUP, tooltip = 'Maximum number of reactions kept against the current move. Each reaction generates its own 38.2% / 61.8% retracement set measured from the shared focus number, so several sets can be stacked at once.')
+
+showRetracementsInput = input.bool(true, 'Retracements (F38 / F61)', group = LEVELS_GROUP, tooltip = 'Display the 38.2% and 61.8% retracement levels of each reaction. F38 = focus - 0.382 x (focus - reaction), F61 = focus - 0.618 x (focus - reaction).')
+
+showExpansionsInput = input.bool(true, 'Expansions (COP / OP / XOP)', group = LEVELS_GROUP, tooltip = 'Display the contracted, objective and expanded objective points, projecting 0.618, 1.0 and 1.618 times the initial thrust A-B from the end of the reaction C. These serve as logical profit objectives.')
+
+showConfluenceInput = input.bool(true, 'Confluence Areas', group = CONFLUENCE_GROUP, tooltip = 'Highlight areas where retracement levels from different reactions overlap within a tight band. DiNapoli treated these overlaps as the prime entry zones.')
+
+confluenceToleranceInput = input.float(0.5, 'Tolerance', minval = 0.05, step = 0.05, inline = 'tol', group = CONFLUENCE_GROUP, tooltip = 'Retracement levels from different reactions closer than this ATR multiple are clustered into a single confluence area.')
+
+atrLengthInput = input.int(14, 'x ATR', minval = 1, inline = 'tol', group = CONFLUENCE_GROUP, tooltip = 'Length of the Average True Range used to size the confluence tolerance.')
+
+bullColorInput = input.color(BULL_COLOR, 'Bullish Levels', group = STYLE_GROUP)
+
+bearColorInput = input.color(BEAR_COLOR, 'Bearish Levels', group = STYLE_GROUP)
+
+expansionColorInput = input.color(EXPANSION_COLOR, 'Expansions', group = STYLE_GROUP)
+
+confluenceColorInput = input.color(CONFLUENCE_COLOR, 'Confluence', group = STYLE_GROUP)
+
+showMarkersInput = input.bool(true, 'Focus / Reaction Markers', group = STYLE_GROUP, tooltip = 'Mark the focus number and each reaction swing used to build the retracement sets.')
+
+extendLinesInput = input.bool(false, 'Extend Levels Right', group = STYLE_GROUP, tooltip = 'Extend every level and confluence area to the right edge of the chart.')
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Swing structure storage, strictly alternating high/low pivots
+var swingDirArray   = array.new<int>()
+var swingPriceArray = array.new<float>()
+var swingBarArray   = array.new<int>()
+
+// Per-bar working storage for reactions, levels and confluence clusters
+var reactionPriceArray = array.new<float>()
+var reactionBarArray   = array.new<int>()
+var f38Array           = array.new<float>()
+var f61Array           = array.new<float>()
+var levelValueArray    = array.new<float>()
+var levelSetArray      = array.new<int>()
+var zoneLoArray        = array.new<float>()
+var zoneHiArray        = array.new<float>()
+
+// Drawing object storage, cleared and rebuilt on the last bar
+var drawLineArray  = array.new<line>()
+var drawLabelArray = array.new<label>()
+var drawBoxArray   = array.new<box>()
+
+// Push a confirmed swing while keeping strict high/low alternation, same-side pivots keep the more extreme price
+addSwing(int dirValue, float priceValue, int barValue) =>
+    swingsStored = array.size(swingDirArray)
+    if swingsStored > 0 and array.get(swingDirArray, swingsStored - 1) == dirValue
+        lastPrice = array.get(swingPriceArray, swingsStored - 1)
+        if (dirValue == 1 and priceValue > lastPrice) or (dirValue == -1 and priceValue < lastPrice)
+            array.set(swingPriceArray, swingsStored - 1, priceValue)
+            array.set(swingBarArray, swingsStored - 1, barValue)
+    else
+        array.push(swingDirArray, dirValue)
+        array.push(swingPriceArray, priceValue)
+        array.push(swingBarArray, barValue)
+    if array.size(swingDirArray) > MAX_SWINGS
+        array.shift(swingDirArray)
+        array.shift(swingPriceArray)
+        array.shift(swingBarArray)
+
+// Close a sorted level cluster, storing it as a confluence area when it holds levels from at least two different reactions
+closeCluster(int startIndex, int endIndex) =>
+    if endIndex > startIndex
+        firstSet  = array.get(levelSetArray, startIndex)
+        mixedSets = false
+        for k = startIndex + 1 to endIndex
+            if array.get(levelSetArray, k) != firstSet
+                mixedSets := true
+        if mixedSets
+            array.push(zoneLoArray, array.get(levelValueArray, startIndex))
+            array.push(zoneHiArray, array.get(levelValueArray, endIndex))
+
+// Delete every stored drawing object
+clearDrawings() =>
+    for drawnLine in drawLineArray
+        line.delete(drawnLine)
+    for drawnLabel in drawLabelArray
+        label.delete(drawnLabel)
+    for drawnBox in drawBoxArray
+        box.delete(drawnBox)
+    array.clear(drawLineArray)
+    array.clear(drawLabelArray)
+    array.clear(drawBoxArray)
+
+// Horizontal level from its anchor bar to a little beyond the last bar
+newLevelLine(int anchorBar, float levelValue, color levelColor, string levelStyle) =>
+    array.push(drawLineArray, line.new(anchorBar, levelValue, bar_index + EXTEND_BARS, levelValue, color = levelColor, style = levelStyle, extend = extendLinesInput ? extend.right : extend.none))
+
+// Level name at the right end of a level
+newLevelLabel(float levelValue, string levelText, color levelColor) =>
+    array.push(drawLabelArray, label.new(bar_index + EXTEND_BARS, levelValue, levelText, style = label.style_label_left, color = LABEL_BG, textcolor = levelColor, size = size.small))
+
+// Small structural marker on a swing point
+newMarkerLabel(int anchorBar, float anchorPrice, string markerText, color markerColor, bool isHigh) =>
+    array.push(drawLabelArray, label.new(anchorBar, anchorPrice, markerText, style = isHigh ? label.style_label_down : label.style_label_up, color = LABEL_BG, textcolor = markerColor, size = size.tiny))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Swing Detection
+//---------------------------------------------------------------------------------------------------------------------{
+
+float pivotHighPrice = ta.pivothigh(high, swingLengthInput, swingLengthInput)
+float pivotLowPrice  = ta.pivotlow(low, swingLengthInput, swingLengthInput)
+
+if not na(pivotHighPrice)
+    addSwing(1, pivotHighPrice, bar_index - swingLengthInput)
+if not na(pivotLowPrice)
+    addSwing(-1, pivotLowPrice, bar_index - swingLengthInput)
+
+int swingCount = array.size(swingDirArray)
+int scanStart  = math.max(0, swingCount - (2 * maxReactionsInput + 2))
+
+// Structural extremes of the recent swing window, ties resolve to the most recent occurrence
+float hiPrice = na
+float loPrice = na
+int   hiBar   = na
+int   loBar   = na
+
+if swingCount > 0
+    for i = scanStart to swingCount - 1
+        swingDir   = array.get(swingDirArray, i)
+        swingPrice = array.get(swingPriceArray, i)
+        swingBar   = array.get(swingBarArray, i)
+        if swingDir == 1 and (na(hiPrice) or swingPrice >= hiPrice)
+            hiPrice := swingPrice
+            hiBar   := swingBar
+        if swingDir == -1 and (na(loPrice) or swingPrice <= loPrice)
+            loPrice := swingPrice
+            loBar   := swingBar
+
+// A pivot not yet confirmed can only hide inside the last swingLength bars
+int   windowLength  = swingLengthInput + 1
+float windowHigh    = ta.highest(high, windowLength)
+float windowLow     = ta.lowest(low, windowLength)
+int   windowHighOff = ta.highestbars(high, windowLength)
+int   windowLowOff  = ta.lowestbars(low, windowLength)
+
+// Move direction, up when the structural high is more recent than the structural low
+int moveDir = 0
+if not na(hiBar) and not na(loBar)
+    moveDir := hiBar > loBar ? 1 : hiBar < loBar ? -1 : 0
+
+// Focus number, the running extreme of the move being retraced
+float focusPrice = na
+int   focusBar   = na
+
+if moveDir == 1
+    focusPrice := hiPrice
+    focusBar   := hiBar
+    if windowHigh > focusPrice
+        focusPrice := windowHigh
+        focusBar   := bar_index + windowHighOff
+else if moveDir == -1
+    focusPrice := loPrice
+    focusBar   := loBar
+    if windowLow < focusPrice
+        focusPrice := windowLow
+        focusBar   := bar_index + windowLowOff
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Retracement Sets
+//---------------------------------------------------------------------------------------------------------------------{
+
+array.clear(reactionPriceArray)
+array.clear(reactionBarArray)
+array.clear(f38Array)
+array.clear(f61Array)
+
+if moveDir != 0
+    moveStartBar = moveDir == 1 ? loBar : hiBar
+    for i = scanStart to swingCount - 1
+        swingDir   = array.get(swingDirArray, i)
+        swingPrice = array.get(swingPriceArray, i)
+        swingBar   = array.get(swingBarArray, i)
+        inMove     = swingBar >= moveStartBar and swingBar < focusBar
+        validRange = moveDir == 1 ? swingPrice < focusPrice : swingPrice > focusPrice
+        if swingDir == -moveDir and inMove and validRange
+            array.push(reactionPriceArray, swingPrice)
+            array.push(reactionBarArray, swingBar)
+    while array.size(reactionPriceArray) > maxReactionsInput
+        array.shift(reactionPriceArray)
+        array.shift(reactionBarArray)
+
+int reactionCount = array.size(reactionPriceArray)
+
+// One F38/F61 set per reaction, all measured from the shared focus number
+if reactionCount > 0
+    for i = 0 to reactionCount - 1
+        reactionPrice = array.get(reactionPriceArray, i)
+        array.push(f38Array, focusPrice - RATIO_F38 * (focusPrice - reactionPrice))
+        array.push(f61Array, focusPrice - RATIO_F61 * (focusPrice - reactionPrice))
+
+// The freshest reaction defines the set used by the penetration setups
+float f38Primary  = na
+float f61Primary  = na
+int   primaryRBar = na
+
+if reactionCount > 0
+    f38Primary  := array.get(f38Array, reactionCount - 1)
+    f61Primary  := array.get(f61Array, reactionCount - 1)
+    primaryRBar := array.get(reactionBarArray, reactionCount - 1)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Expansions
+//---------------------------------------------------------------------------------------------------------------------{
+
+// A = start of the initial thrust, B = end of the thrust, C = end of the reaction that follows it
+float copLevel = na
+float opLevel  = na
+float xopLevel = na
+int   cBar     = na
+
+if moveDir != 0 and swingCount >= 3
+    lastSwingDir = array.get(swingDirArray, swingCount - 1)
+    cIndex       = lastSwingDir == -moveDir ? swingCount - 1 : swingCount - 2
+    if cIndex >= 2
+        aPrice   = array.get(swingPriceArray, cIndex - 2)
+        bPrice   = array.get(swingPriceArray, cIndex - 1)
+        cPrice   = array.get(swingPriceArray, cIndex)
+        validAbc = moveDir == 1 ? bPrice > aPrice and cPrice > aPrice : bPrice < aPrice and cPrice < aPrice
+        if validAbc
+            thrustRange = bPrice - aPrice
+            cBar     := array.get(swingBarArray, cIndex)
+            copLevel := cPrice + RATIO_COP * thrustRange
+            opLevel  := cPrice + RATIO_OP * thrustRange
+            xopLevel := cPrice + RATIO_XOP * thrustRange
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Confluence Areas
+//---------------------------------------------------------------------------------------------------------------------{
+
+float atrValue       = ta.atr(atrLengthInput)
+float toleranceValue = confluenceToleranceInput * nz(atrValue)
+
+array.clear(levelValueArray)
+array.clear(levelSetArray)
+array.clear(zoneLoArray)
+array.clear(zoneHiArray)
+
+if reactionCount >= 2 and toleranceValue > 0
+    for i = 0 to reactionCount - 1
+        array.push(levelValueArray, array.get(f38Array, i))
+        array.push(levelSetArray, i)
+        array.push(levelValueArray, array.get(f61Array, i))
+        array.push(levelSetArray, i)
+    totalLevels = array.size(levelValueArray)
+    // Insertion sort of the level values, keeping their reaction index alongside
+    for i = 1 to totalLevels - 1
+        currentValue = array.get(levelValueArray, i)
+        currentSet   = array.get(levelSetArray, i)
+        j = i - 1
+        while j >= 0 and array.get(levelValueArray, j) > currentValue
+            array.set(levelValueArray, j + 1, array.get(levelValueArray, j))
+            array.set(levelSetArray, j + 1, array.get(levelSetArray, j))
+            j -= 1
+        array.set(levelValueArray, j + 1, currentValue)
+        array.set(levelSetArray, j + 1, currentSet)
+    // Cluster adjacent levels within tolerance, then keep clusters spanning several reactions
+    clusterStart = 0
+    for i = 1 to totalLevels - 1
+        if array.get(levelValueArray, i) - array.get(levelValueArray, i - 1) > toleranceValue
+            closeCluster(clusterStart, i - 1)
+            clusterStart := i
+    closeCluster(clusterStart, totalLevels - 1)
+
+// True while the current bar trades inside any confluence area
+bool inConfluence = false
+int  zoneCount    = array.size(zoneLoArray)
+
+if zoneCount > 0
+    for z = 0 to zoneCount - 1
+        if low <= array.get(zoneHiArray, z) and high >= array.get(zoneLoArray, z)
+            inConfluence := true
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visuals
+//---------------------------------------------------------------------------------------------------------------------{
+
+if barstate.islast
+    clearDrawings()
+    color levelColor = moveDir == 1 ? bullColorInput : bearColorInput
+    // Stacked retracement sets, one per reaction, most recent reaction labeled R1
+    if showRetracementsInput and reactionCount > 0
+        for i = 0 to reactionCount - 1
+            reactionBar = array.get(reactionBarArray, i)
+            f38Value    = array.get(f38Array, i)
+            f61Value    = array.get(f61Array, i)
+            nameSuffix  = reactionCount > 1 ? ' (R' + str.tostring(reactionCount - i) + ')' : ''
+            newLevelLine(reactionBar, f38Value, levelColor, line.style_dashed)
+            newLevelLabel(f38Value, 'F38' + nameSuffix, levelColor)
+            newLevelLine(reactionBar, f61Value, color.new(levelColor, 30), line.style_dotted)
+            newLevelLabel(f61Value, 'F61' + nameSuffix, color.new(levelColor, 30))
+    // Focus number and reaction markers
+    if showMarkersInput and moveDir != 0
+        if not na(focusBar)
+            newMarkerLabel(focusBar, focusPrice, 'Focus', moveDir == 1 ? bullColorInput : bearColorInput, moveDir == 1)
+        if reactionCount > 0
+            for i = 0 to reactionCount - 1
+                newMarkerLabel(array.get(reactionBarArray, i), array.get(reactionPriceArray, i), 'R' + str.tostring(reactionCount - i), moveDir == 1 ? bullColorInput : bearColorInput, moveDir == -1)
+    // Expansion objectives projected from the end of the reaction
+    if showExpansionsInput and not na(copLevel) and not na(cBar)
+        newLevelLine(cBar, copLevel, expansionColorInput, line.style_dashed)
+        newLevelLabel(copLevel, 'COP', expansionColorInput)
+        newLevelLine(cBar, opLevel, expansionColorInput, line.style_dashed)
+        newLevelLabel(opLevel, 'OP', expansionColorInput)
+        newLevelLine(cBar, xopLevel, expansionColorInput, line.style_dashed)
+        newLevelLabel(xopLevel, 'XOP', expansionColorInput)
+    // Confluence areas where retracement levels from different reactions agree
+    if showConfluenceInput and zoneCount > 0 and not na(focusBar)
+        for z = 0 to zoneCount - 1
+            zoneLo = array.get(zoneLoArray, z)
+            zoneHi = array.get(zoneHiArray, z)
+            array.push(drawBoxArray, box.new(focusBar, zoneHi, bar_index + EXTEND_BARS, zoneLo, border_color = color.new(confluenceColorInput, 40), border_width = 1, border_style = line.style_dashed, extend = extendLinesInput ? extend.right : extend.none, bgcolor = color.new(confluenceColorInput, 85), text = 'Confluence', text_size = size.tiny, text_color = confluenceColorInput, text_halign = text.align_right))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Events only count while the freshest reaction set is unchanged, avoiding jumps from structural rebasing
+bool sameSet = not na(primaryRBar) and nz(primaryRBar, -1) == nz(primaryRBar[1], -1)
+
+bool f38PrevOk = not na(f38Primary) and not na(f38Primary[1])
+bool f61PrevOk = not na(f61Primary) and not na(f61Primary[1])
+
+bool crossUnder38 = f38PrevOk and low <= f38Primary and low[1] > f38Primary[1]
+bool crossOver38  = f38PrevOk and high >= f38Primary and high[1] < f38Primary[1]
+bool crossUnder61 = f61PrevOk and low <= f61Primary and low[1] > f61Primary[1]
+bool crossOver61  = f61PrevOk and high >= f61Primary and high[1] < f61Primary[1]
+
+bool pen38Bull  = moveDir == 1 and sameSet and crossUnder38
+bool pen38Bear  = moveDir == -1 and sameSet and crossOver38
+bool pen38Event = pen38Bull or pen38Bear
+
+// Penetration count per reaction set separates the single from the double penetration
+var int penSetBar = -1
+var int penCount  = 0
+
+if nz(primaryRBar, -1) != penSetBar
+    penSetBar := nz(primaryRBar, -1)
+    penCount  := 0
+if pen38Event
+    penCount += 1
+
+bool bullSinglePenetration = pen38Bull and penCount == 1
+bool bullDoublePenetration = pen38Bull and penCount == 2
+bool bearSinglePenetration = pen38Bear and penCount == 1
+bool bearDoublePenetration = pen38Bear and penCount == 2
+
+bool bull61Penetration = moveDir == 1 and sameSet and crossUnder61
+bool bear61Penetration = moveDir == -1 and sameSet and crossOver61
+
+// Expansion objectives reached, in the direction of the projected thrust
+bool abcStable = not na(cBar) and nz(cBar, -1) == nz(cBar[1], -1)
+
+bool copHit = abcStable and not na(copLevel) and not na(copLevel[1]) and (moveDir == 1 ? high >= copLevel and high[1] < copLevel[1] : low <= copLevel and low[1] > copLevel[1])
+bool opHit  = abcStable and not na(opLevel) and not na(opLevel[1]) and (moveDir == 1 ? high >= opLevel and high[1] < opLevel[1] : low <= opLevel and low[1] > opLevel[1])
+bool xopHit = abcStable and not na(xopLevel) and not na(xopLevel[1]) and (moveDir == 1 ? high >= xopLevel and high[1] < xopLevel[1] : low <= xopLevel and low[1] > xopLevel[1])
+
+bool confluenceTouch = inConfluence and not inConfluence[1]
+
+alertcondition(bullSinglePenetration, 'Bullish Single Penetration', 'First pullback penetrated the 38.2% level of the current upward thrust')
+alertcondition(bearSinglePenetration, 'Bearish Single Penetration', 'First pullback penetrated the 38.2% level of the current downward thrust')
+alertcondition(bullDoublePenetration, 'Bullish Double Penetration', 'Second penetration of the 38.2% level of the current upward thrust')
+alertcondition(bearDoublePenetration, 'Bearish Double Penetration', 'Second penetration of the 38.2% level of the current downward thrust')
+alertcondition(bull61Penetration, 'Bullish 61.8% Penetration', 'Pullback penetrated the 61.8% level of the current upward thrust, the risk area of the setup')
+alertcondition(bear61Penetration, 'Bearish 61.8% Penetration', 'Pullback penetrated the 61.8% level of the current downward thrust, the risk area of the setup')
+alertcondition(copHit, 'COP Objective Reached', 'Price reached the contracted objective point of the current expansion')
+alertcondition(opHit, 'OP Objective Reached', 'Price reached the objective point of the current expansion')
+alertcondition(xopHit, 'XOP Objective Reached', 'Price reached the expanded objective point of the current expansion')
+alertcondition(confluenceTouch, 'Confluence Area Touched', 'Price entered a confluence area where retracement levels from different reactions overlap')
+
+//---------------------------------------------------------------------------------------------------------------------}

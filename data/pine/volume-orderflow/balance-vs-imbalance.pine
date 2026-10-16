@@ -1,0 +1,607 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator('Balance vs Imbalance', 'Balance vs Imbalance', overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+int BAL    = 0
+int IMB_UP = 1
+int IMB_DN = -1
+
+int MAX_SESSIONS = 60
+int MAX_BOX_LOOKBACK = 9000
+
+BULL_COLOR    = #089981 // upward imbalance
+BEAR_COLOR    = #f23645 // downward imbalance
+NEUTRAL_COLOR = #787b86 // balance areas and session value areas - structure
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+GRP_SESSIONS = 'Sessions & Value'
+GRP_ACCEPT   = 'Acceptance'
+GRP_DASH     = 'Dashboard'
+GRP_STYLE    = 'Style'
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+sessionTfInput = input.timeframe('D', 'Session Timeframe', group = GRP_SESSIONS
+  , tooltip = 'Timeframe of one auction session. Each session builds its own profile whose value area is compared with the prior session: overlapping value areas read as balance, migrating value reads as imbalance. Use a timeframe well above the chart timeframe (e.g. 1D sessions on intraday charts, 1W sessions on daily charts).')
+
+rowsInput = input.int(24, 'Profile Rows', minval = 8, maxval = 50, group = GRP_SESSIONS
+  , tooltip = 'Number of price rows used to bin each session profile. More rows sharpen the point of control and value area, at the cost of noisier bins on short or quiet sessions.')
+
+vaPctInput = input.float(70, 'Value Area %', minval = 50, maxval = 95, step = 1, group = GRP_SESSIONS
+  , tooltip = 'Share of session volume contained in the value area, built outward from the point of control by adding the heavier of the two rows above versus the two rows below. 70% is the auction-theory standard.')
+
+overlapThreshInput = input.float(50, 'Overlap Threshold %', minval = 10, maxval = 100, step = 5, group = GRP_SESSIONS
+  , tooltip = 'Minimum overlap between consecutive value areas, as a percentage of the narrower area, for sessions to count as overlapping (balance). Anything below reads as value migration, the session-level evidence of imbalance.')
+
+shapeThreshInput = input.float(0.5, 'Elongation Threshold', minval = 0.25, maxval = 0.9, step = 0.05, group = GRP_SESSIONS
+  , tooltip = 'Shape read of the developing profile: value-area width divided by session range. A filling bell concentrates value (about 0.35 for a normal distribution) while an elongated directional profile spreads it (0.70 for a uniform one). Ratios above the threshold read as elongated.')
+
+periodTfInput = input.timeframe('30', 'Acceptance Period', group = GRP_ACCEPT
+  , tooltip = 'Timeframe of one acceptance period. Closes beyond a balance-area edge are counted period by period; 30 minutes is the classic Market Profile period. When the chart timeframe is higher, chart bars act as the periods.')
+
+acceptPeriodsInput = input.int(2, 'Acceptance Periods', minval = 1, maxval = 12, group = GRP_ACCEPT
+  , tooltip = 'Consecutive period closes beyond a balance edge required to confirm acceptance and begin an imbalance - the time component of the acceptance test. The same count of closes back inside the old area ends a failed imbalance, and probes that close back inside before the count completes are graded look-above-and-fail or look-below-and-fail.')
+
+useVolConfirmInput = input.bool(true, 'Volume Confirmation', inline = 'vc', group = GRP_ACCEPT
+  , tooltip = 'Also require the excursion outside the balance area to transact at least the chosen multiple of baseline volume - the volume component of the acceptance test. Breaks out of balance on hollow participation then stay probes until they either fund or fail. Applies to breaks out of balance; on symbols without volume data the test is skipped.')
+
+volFactorInput = input.float(1.0, 'Factor', minval = 0.25, maxval = 5, step = 0.25, inline = 'vc', group = GRP_ACCEPT
+  , tooltip = 'Minimum average volume per bar outside the area, as a multiple of the volume baseline, for a break to count as funded.')
+
+volLenInput = input.int(20, 'Volume Baseline Length', minval = 5, maxval = 500, group = GRP_ACCEPT
+  , tooltip = 'Length of the simple moving average of volume used as the participation baseline for the volume confirmation test.')
+
+showDashInput = input.bool(true, 'Show Dashboard', group = GRP_DASH
+  , tooltip = 'Display the auction-state dashboard: current regime, value-area relation, developing profile shape, session one-timeframing, acceptance watch, active balance area and data notes.')
+
+dashLocInput = input.string('Top Right', 'Location', options = ['Top Right', 'Top Left', 'Bottom Right', 'Bottom Left'], group = GRP_DASH
+  , tooltip = 'Position of the dashboard on the chart.')
+
+dashSizeInput = input.string('Small', 'Size', options = ['Tiny', 'Small', 'Normal'], group = GRP_DASH
+  , tooltip = 'Text size of the dashboard.')
+
+showBalanceInput = input.bool(true, 'Balance Areas', group = GRP_STYLE
+  , tooltip = 'Draw the active balance area as a box with a dotted rotation midline. The box grows as overlapping value areas merge into it and freezes where acceptance outside flips the regime to imbalance.')
+
+showSessionVaInput = input.bool(true, 'Session Value Areas', group = GRP_STYLE
+  , tooltip = 'Draw each completed session value area as a faint box so consecutive areas can be read side by side: overlap says balance, migration says imbalance. Migrating sessions use the imbalance colors.')
+
+showTrailInput = input.bool(true, 'Value Migration Trail', group = GRP_STYLE
+  , tooltip = 'Mark each completed session value-area midpoint with a dotted dash, tracing how value migrates (imbalance) or stalls (balance) from session to session.')
+
+sessionsShownInput = input.int(20, 'Sessions Shown', minval = 1, maxval = 60, group = GRP_STYLE
+  , tooltip = 'Number of most recent session value areas and value midpoints kept on the chart.')
+
+showMarkersInput = input.bool(true, 'Failed Probe Markers', group = GRP_STYLE
+  , tooltip = 'Mark confirmed look-above-and-fail and look-below-and-fail probes at the balance-area edges - the classic reversion setups back toward the middle of the range.')
+
+showLabelsInput = input.bool(true, 'Regime Labels', group = GRP_STYLE
+  , tooltip = 'Label regime transitions on the bar they confirm, together with the evidence that triggered them (acceptance, value migration, overlapping value or return inside).')
+
+showBgInput = input.bool(true, 'Imbalance Background', group = GRP_STYLE
+  , tooltip = 'Tint the chart background while the auction is one-sided (imbalance up or down). Balance periods stay untinted; the balance box carries them.')
+
+balColorInput = input.color(NEUTRAL_COLOR, 'Balance', group = GRP_STYLE
+  , tooltip = 'Color of balance areas, rotation midlines, balance labels and overlapping value-area readings.')
+
+bullColorInput = input.color(BULL_COLOR, 'Imbalance Up', group = GRP_STYLE
+  , tooltip = 'Color of upward imbalance: background tint, labels, upward value migration and look-below-and-fail markers.')
+
+bearColorInput = input.color(BEAR_COLOR, 'Imbalance Down', group = GRP_STYLE
+  , tooltip = 'Color of downward imbalance: background tint, labels, downward value migration and look-above-and-fail markers.')
+
+vaColorInput = input.color(NEUTRAL_COLOR, 'Session Value Areas', group = GRP_STYLE
+  , tooltip = 'Color of per-session value-area boxes and the value migration trail while value overlaps the prior session.')
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types
+//---------------------------------------------------------------------------------------------------------------------{
+type SessionRec
+    int   startIdx
+    float hi
+    float lo
+    float vaHigh
+    float vaLow
+    float poc
+    float shape
+    float mid
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// overlap between two value areas as a percentage of the narrower one
+overlapPct(float aHi, float aLo, float bHi, float bLo) =>
+    float ov   = math.min(aHi, bHi) - math.max(aLo, bLo)
+    float minW = math.min(aHi - aLo, bHi - bLo)
+    minW > 0 ? math.max(ov, 0.) / minW * 100 : ov >= 0 ? 100. : 0.
+
+// bin a session into rows and return its point of control, value area, and shape ratio
+// value area uses the canonical expansion: from the POC row, add the heavier of the
+// two rows above versus the two rows below until the target volume share is reached
+sessionProfile(array<float> hsArray, array<float> lsArray, array<float> vsArray, int rows, float vaFrac) =>
+    float pHi      = hsArray.max()
+    float pLo      = lsArray.min()
+    float rng      = pHi - pLo
+    bool  timeWtd  = vsArray.sum() <= 0
+    float pocOut   = math.avg(pHi, pLo)
+    float vahOut   = pHi
+    float valOut   = pLo
+    float shapeOut = na
+    if rng > 0
+        array<float> binsArray = array.new<float>(rows, 0.)
+        float binSize = rng / rows
+        for i = 0 to hsArray.size() - 1
+            float w = timeWtd ? 1. : vsArray.get(i)
+            if w > 0
+                int b0 = math.min(math.max(math.floor((lsArray.get(i) - pLo) / binSize), 0), rows - 1)
+                int b1 = math.min(math.max(math.floor((hsArray.get(i) - pLo) / binSize), 0), rows - 1)
+                float per = w / (b1 - b0 + 1)
+                for b = b0 to b1
+                    binsArray.set(b, binsArray.get(b) + per)
+        int   pocIdx  = 0
+        float bestVol = -1.
+        for b = 0 to rows - 1
+            if binsArray.get(b) > bestVol
+                bestVol := binsArray.get(b)
+                pocIdx  := b
+        float target = binsArray.sum() * vaFrac
+        float acc    = binsArray.get(pocIdx)
+        int   upIdx  = pocIdx
+        int   dnIdx  = pocIdx
+        while acc < target and (upIdx < rows - 1 or dnIdx > 0)
+            float upVol = 0.
+            int upSteps = 0
+            if upIdx < rows - 1
+                upVol   += binsArray.get(upIdx + 1)
+                upSteps := 1
+                if upIdx < rows - 2
+                    upVol   += binsArray.get(upIdx + 2)
+                    upSteps := 2
+            float dnVol = 0.
+            int dnSteps = 0
+            if dnIdx > 0
+                dnVol   += binsArray.get(dnIdx - 1)
+                dnSteps := 1
+                if dnIdx > 1
+                    dnVol   += binsArray.get(dnIdx - 2)
+                    dnSteps := 2
+            if upSteps > 0 and (dnSteps == 0 or upVol >= dnVol)
+                acc   += upVol
+                upIdx += upSteps
+            else
+                acc   += dnVol
+                dnIdx += dnSteps
+        pocOut   := pLo + (pocIdx + 0.5) * binSize
+        vahOut   := pLo + (upIdx + 1) * binSize
+        valOut   := pLo + dnIdx * binSize
+        shapeOut := (vahOut - valOut) / rng
+    [pocOut, vahOut, valOut, shapeOut, timeWtd]
+
+regimeColor(int s) =>
+    s == IMB_UP ? bullColorInput : s == IMB_DN ? bearColorInput : balColorInput
+
+dashLocation(string s) =>
+    switch s
+        'Top Right'    => position.top_right
+        'Top Left'     => position.top_left
+        'Bottom Right' => position.bottom_right
+        =>                position.bottom_left
+
+dashTextSize(string s) =>
+    switch s
+        'Tiny'   => size.tiny
+        'Normal' => size.normal
+        =>          size.small
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Session Engine & Value Migration
+//---------------------------------------------------------------------------------------------------------------------{
+var array<float>      sesHighsArray   = array.new<float>()
+var array<float>      sesLowsArray    = array.new<float>()
+var array<float>      sesVolsArray    = array.new<float>()
+var array<SessionRec> sessionsArray   = array.new<SessionRec>()
+var array<box>        vaBoxesArray    = array.new<box>()
+var array<line>       trailLinesArray = array.new<line>()
+
+var int   sesStartIdx = 0
+var int   regime      = BAL
+var bool  regimeLive  = false
+var float balHigh     = na
+var float balLow      = na
+var int   balStartIdx = na
+var int   imbStartIdx = na
+var box   balBox      = na
+var line  balMidLine  = na
+
+var int   aboveCount   = 0
+var int   belowCount   = 0
+var int   insideCount  = 0
+var bool  probeAbove   = false
+var bool  probeBelow   = false
+var float exVolSum     = 0.
+var int   exBarCount   = 0
+var int   exDir        = 0
+var int   otfDir       = 0
+var int   otfCount     = 0
+var bool  timeWeighted = false
+
+bool   imbUpEvt        = false
+bool   imbDnEvt        = false
+bool   newBalEvt       = false
+bool   lafEvt          = false
+bool   lbfEvt          = false
+bool   otfBreakEvt     = false
+bool   balanceStarted  = false
+string evtReason       = ''
+
+bool  newSession = timeframe.change(sessionTfInput)
+bool  newPeriod  = timeframe.change(periodTfInput)
+bool  tfTooHigh  = timeframe.in_seconds(timeframe.period) >= timeframe.in_seconds(sessionTfInput)
+float vol        = nz(volume)
+float volBase    = ta.sma(vol, volLenInput)
+
+if newSession and sesHighsArray.size() > 0
+    [pocV, vahV, valV, shapeV, tbV] = sessionProfile(sesHighsArray, sesLowsArray, sesVolsArray, rowsInput, vaPctInput / 100)
+    timeWeighted := tbV
+    SessionRec prevRec = sessionsArray.size() > 0 ? sessionsArray.get(sessionsArray.size() - 1) : na
+    SessionRec rec = SessionRec.new(startIdx = sesStartIdx, hi = sesHighsArray.max(), lo = sesLowsArray.min(), vaHigh = vahV, vaLow = valV, poc = pocV, shape = shapeV, mid = math.avg(vahV, valV))
+    sessionsArray.push(rec)
+    if sessionsArray.size() > MAX_SESSIONS
+        sessionsArray.shift()
+
+    // session-granularity one-timeframing: a session that does not violate the prior
+    // session's opposite extreme keeps the directional auction intact
+    int otfDirPrev = otfDir
+    if not na(prevRec)
+        bool holdsUp = rec.lo >= prevRec.lo
+        bool holdsDn = rec.hi <= prevRec.hi
+        if otfDir == 1
+            if holdsUp
+                otfCount += 1
+            else if holdsDn
+                otfDir   := -1
+                otfCount := 1
+            else
+                otfDir   := 0
+                otfCount := 0
+        else if otfDir == -1
+            if holdsDn
+                otfCount += 1
+            else if holdsUp
+                otfDir   := 1
+                otfCount := 1
+            else
+                otfDir   := 0
+                otfCount := 0
+        else
+            if holdsUp and not holdsDn
+                otfDir   := 1
+                otfCount := 1
+            else if holdsDn and not holdsUp
+                otfDir   := -1
+                otfCount := 1
+    if regimeLive and regime != BAL and otfDirPrev == regime and otfDir != otfDirPrev
+        otfBreakEvt := true
+
+    // side-by-side value areas: faint box per completed session + value midpoint trail
+    if showSessionVaInput or showTrailInput
+        color relColor = vaColorInput
+        if not na(prevRec)
+            float ovlPrev = overlapPct(rec.vaHigh, rec.vaLow, prevRec.vaHigh, prevRec.vaLow)
+            if ovlPrev < overlapThreshInput
+                relColor := rec.mid >= prevRec.mid ? bullColorInput : bearColorInput
+        int leftIdx = math.max(rec.startIdx, bar_index - MAX_BOX_LOOKBACK)
+        if showSessionVaInput
+            vaBoxesArray.push(box.new(leftIdx, rec.vaHigh, bar_index - 1, rec.vaLow, border_color = color.new(relColor, 65), border_style = line.style_dotted, bgcolor = color.new(relColor, 92)))
+            while vaBoxesArray.size() > sessionsShownInput
+                box.delete(vaBoxesArray.shift())
+        if showTrailInput
+            trailLinesArray.push(line.new(leftIdx, rec.mid, bar_index - 1, rec.mid, color = color.new(relColor, 40), style = line.style_dotted, width = 1))
+            while trailLinesArray.size() > sessionsShownInput
+                line.delete(trailLinesArray.shift())
+
+    // session-level regime read: overlapping value maintains or rebuilds balance,
+    // migrating value is the session-scale beginning of an imbalance
+    if not regimeLive
+        regimeLive     := true
+        regime         := BAL
+        balHigh        := vahV
+        balLow         := valV
+        balStartIdx    := rec.startIdx
+        balanceStarted := true
+    else if regime == BAL
+        if overlapPct(rec.vaHigh, rec.vaLow, balHigh, balLow) < overlapThreshInput
+            regime    := rec.mid >= math.avg(balHigh, balLow) ? IMB_UP : IMB_DN
+            evtReason := 'value migration'
+            if regime == IMB_UP
+                imbUpEvt := true
+            else
+                imbDnEvt := true
+        else
+            balHigh := math.max(balHigh, rec.vaHigh)
+            balLow  := math.min(balLow, rec.vaLow)
+    else if not na(prevRec) and not na(imbStartIdx) and rec.startIdx >= imbStartIdx
+        if overlapPct(rec.vaHigh, rec.vaLow, prevRec.vaHigh, prevRec.vaLow) >= overlapThreshInput
+            regime         := BAL
+            newBalEvt      := true
+            evtReason      := 'overlapping value'
+            balHigh        := math.max(rec.vaHigh, prevRec.vaHigh)
+            balLow         := math.min(rec.vaLow, prevRec.vaLow)
+            balStartIdx    := prevRec.startIdx
+            balanceStarted := true
+
+if newSession
+    sesHighsArray.clear()
+    sesLowsArray.clear()
+    sesVolsArray.clear()
+    sesStartIdx := bar_index
+
+sesHighsArray.push(high)
+sesLowsArray.push(low)
+sesVolsArray.push(vol)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Acceptance & Probe State Machine
+//---------------------------------------------------------------------------------------------------------------------{
+bool balDefined = regimeLive and not na(balHigh) and not na(balLow)
+bool sessionEvt = imbUpEvt or imbDnEvt or newBalEvt
+
+// volume component of the acceptance test, measured on completed excursion bars
+bool volOk = true
+if useVolConfirmInput and not timeWeighted and not na(volBase) and volBase > 0
+    volOk := exBarCount > 0 and exVolSum / exBarCount >= volBase * volFactorInput
+
+// grade the period that just closed: time outside builds acceptance, a close back
+// inside before the count completes fails the probe (look-above / look-below and fail)
+if balDefined and newPeriod and not sessionEvt and not na(close[1])
+    float pc = close[1]
+    if regime == BAL
+        if pc > balHigh
+            aboveCount += 1
+            belowCount := 0
+            if probeBelow
+                lbfEvt     := true
+                probeBelow := false
+            if aboveCount >= acceptPeriodsInput and volOk
+                regime    := IMB_UP
+                imbUpEvt  := true
+                evtReason := 'acceptance above'
+        else if pc < balLow
+            belowCount += 1
+            aboveCount := 0
+            if probeAbove
+                lafEvt     := true
+                probeAbove := false
+            if belowCount >= acceptPeriodsInput and volOk
+                regime    := IMB_DN
+                imbDnEvt  := true
+                evtReason := 'acceptance below'
+        else
+            if probeAbove
+                lafEvt := true
+            if probeBelow
+                lbfEvt := true
+            probeAbove := false
+            probeBelow := false
+            aboveCount := 0
+            belowCount := 0
+            exDir      := 0
+            exVolSum   := 0.
+            exBarCount := 0
+    else if regime == IMB_UP
+        if pc < balLow
+            belowCount  += 1
+            insideCount := 0
+            if belowCount >= acceptPeriodsInput
+                regime    := IMB_DN
+                imbDnEvt  := true
+                evtReason := 'acceptance below'
+        else if pc <= balHigh
+            insideCount += 1
+            belowCount  := 0
+            if insideCount >= acceptPeriodsInput
+                regime         := BAL
+                newBalEvt      := true
+                evtReason      := 'back inside'
+                balStartIdx    := bar_index
+                balanceStarted := true
+        else
+            insideCount := 0
+            belowCount  := 0
+    else
+        if pc > balHigh
+            aboveCount  += 1
+            insideCount := 0
+            if aboveCount >= acceptPeriodsInput
+                regime    := IMB_UP
+                imbUpEvt  := true
+                evtReason := 'acceptance above'
+        else if pc >= balLow
+            insideCount += 1
+            aboveCount  := 0
+            if insideCount >= acceptPeriodsInput
+                regime         := BAL
+                newBalEvt      := true
+                evtReason      := 'back inside'
+                balStartIdx    := bar_index
+                balanceStarted := true
+        else
+            insideCount := 0
+            aboveCount  := 0
+
+// track fresh probes and the participation transacted outside the area
+if balDefined and regime == BAL
+    if high > balHigh
+        probeAbove := true
+    if low < balLow
+        probeBelow := true
+    int sideNow = close > balHigh ? 1 : close < balLow ? -1 : 0
+    if sideNow != 0
+        if sideNow != exDir
+            exDir      := sideNow
+            exVolSum   := 0.
+            exBarCount := 0
+        exVolSum   += vol
+        exBarCount += 1
+
+bool regimeChanged = imbUpEvt or imbDnEvt or newBalEvt
+if regimeChanged
+    aboveCount  := 0
+    belowCount  := 0
+    insideCount := 0
+    probeAbove  := false
+    probeBelow  := false
+    exDir       := 0
+    exVolSum    := 0.
+    exBarCount  := 0
+    if regime != BAL
+        imbStartIdx := bar_index
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Balance Area Visuals & Regime Labels
+//---------------------------------------------------------------------------------------------------------------------{
+if balanceStarted and showBalanceInput
+    int   leftIdx = math.max(balStartIdx, bar_index - MAX_BOX_LOOKBACK)
+    float balMid  = math.avg(balHigh, balLow)
+    balBox     := box.new(leftIdx, balHigh, bar_index, balLow, border_color = color.new(balColorInput, 35), border_style = line.style_dashed, bgcolor = color.new(balColorInput, 88))
+    balMidLine := line.new(leftIdx, balMid, bar_index, balMid, color = color.new(balColorInput, 40), style = line.style_dotted)
+
+if regimeLive and regime == BAL
+    float balMid = math.avg(balHigh, balLow)
+    if not na(balBox)
+        box.set_right(balBox, bar_index)
+        box.set_top(balBox, balHigh)
+        box.set_bottom(balBox, balLow)
+    if not na(balMidLine)
+        line.set_x2(balMidLine, bar_index)
+        line.set_y1(balMidLine, balMid)
+        line.set_y2(balMidLine, balMid)
+
+if showLabelsInput and regimeLive
+    if imbUpEvt
+        label.new(bar_index, low, 'Imbalance ▲\n' + evtReason, style = label.style_label_up, color = #00000000, textcolor = bullColorInput, size = size.small)
+    if imbDnEvt
+        label.new(bar_index, high, 'Imbalance ▼\n' + evtReason, style = label.style_label_down, color = #00000000, textcolor = bearColorInput, size = size.small)
+    if newBalEvt
+        label.new(bar_index, close, 'Balance\n' + evtReason, style = label.style_label_left, color = #00000000, textcolor = balColorInput, size = size.small)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Background, Markers & Data Window
+//---------------------------------------------------------------------------------------------------------------------{
+bool crossUpEdge = ta.crossover(high, balHigh)
+bool crossDnEdge = ta.crossunder(low, balLow)
+bool tagUpEvt    = balDefined and regime == BAL and not regimeChanged and crossUpEdge
+bool tagDnEvt    = balDefined and regime == BAL and not regimeChanged and crossDnEdge
+
+color bgTint = showBgInput and regimeLive ? regime == IMB_UP ? color.new(bullColorInput, 92) : regime == IMB_DN ? color.new(bearColorInput, 92) : na : na
+bgcolor(bgTint, title = 'Imbalance Background')
+
+plotshape(showMarkersInput and lafEvt, 'Look Above & Fail', shape.triangledown, location.abovebar, bearColorInput, size = size.tiny)
+plotshape(showMarkersInput and lbfEvt, 'Look Below & Fail', shape.triangleup, location.belowbar, bullColorInput, size = size.tiny)
+
+plot(regimeLive ? regime : na, 'Regime (+1 up, 0 balance, -1 down)', display = display.data_window)
+plot(balDefined ? balHigh : na, 'Balance Area High', display = display.data_window)
+plot(balDefined ? balLow : na, 'Balance Area Low', display = display.data_window)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dashTable = na
+
+if showDashInput and na(dashTable)
+    dashTable := table.new(dashLocation(dashLocInput), 2, 7, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+if showDashInput and barstate.islast and not na(dashTable)
+    string txtSize   = dashTextSize(dashSizeInput)
+    color labelColor = DASH_HEADER
+
+    string regimeTxt = not regimeLive ? '—' : regime == BAL ? 'BALANCE' : regime == IMB_UP ? 'IMBALANCE ▲' : 'IMBALANCE ▼'
+    color  regimeCol = not regimeLive ? DASH_TEXT : regimeColor(regime)
+
+    string vaTxt = '—'
+    color  vaCol = DASH_TEXT
+    if sessionsArray.size() >= 2
+        SessionRec r1 = sessionsArray.get(sessionsArray.size() - 1)
+        SessionRec r0 = sessionsArray.get(sessionsArray.size() - 2)
+        float ovl = overlapPct(r1.vaHigh, r1.vaLow, r0.vaHigh, r0.vaLow)
+        if ovl >= overlapThreshInput
+            vaTxt := 'Overlapping · ' + str.tostring(ovl, '#') + '%'
+            vaCol := balColorInput
+        else
+            vaTxt := (r1.mid >= r0.mid ? 'Migrating ▲ · ' : 'Migrating ▼ · ') + str.tostring(ovl, '#') + '%'
+            vaCol := r1.mid >= r0.mid ? bullColorInput : bearColorInput
+
+    string shapeTxt = '—'
+    color  shapeCol = DASH_TEXT
+    if sesHighsArray.size() > 1
+        [dPocV, dVahV, dValV, dShapeV, dTbV] = sessionProfile(sesHighsArray, sesLowsArray, sesVolsArray, rowsInput, vaPctInput / 100)
+        if not na(dShapeV)
+            bool elongated = dShapeV >= shapeThreshInput
+            shapeTxt := (elongated ? 'Elongated · ' : 'Bell · ') + str.tostring(dShapeV, '0.00')
+            shapeCol := elongated ? close >= dPocV ? bullColorInput : bearColorInput : balColorInput
+
+    string otfTxt = otfCount > 0 ? (otfDir == 1 ? '▲ × ' : '▼ × ') + str.tostring(otfCount) : 'None'
+    color  otfCol = otfCount > 0 ? otfDir == 1 ? bullColorInput : bearColorInput : DASH_TEXT
+
+    string accTxt = '—'
+    color  accCol = DASH_TEXT
+    string volTag = useVolConfirmInput and not timeWeighted ? volOk ? ' · vol ✓' : ' · vol ✗' : ''
+    if regimeLive
+        if regime == BAL and aboveCount > 0
+            accTxt := '▲ ' + str.tostring(aboveCount) + '/' + str.tostring(acceptPeriodsInput) + volTag
+            accCol := bullColorInput
+        else if regime == BAL and belowCount > 0
+            accTxt := '▼ ' + str.tostring(belowCount) + '/' + str.tostring(acceptPeriodsInput) + volTag
+            accCol := bearColorInput
+        else if regime != BAL and insideCount > 0
+            accTxt := 'Re-entry ' + str.tostring(insideCount) + '/' + str.tostring(acceptPeriodsInput)
+            accCol := balColorInput
+        else if regime == IMB_UP and belowCount > 0
+            accTxt := 'Reversal ▼ ' + str.tostring(belowCount) + '/' + str.tostring(acceptPeriodsInput)
+            accCol := bearColorInput
+        else if regime == IMB_DN and aboveCount > 0
+            accTxt := 'Reversal ▲ ' + str.tostring(aboveCount) + '/' + str.tostring(acceptPeriodsInput)
+            accCol := bullColorInput
+
+    string areaTxt = balDefined ? str.tostring(balLow, format.mintick) + ' — ' + str.tostring(balHigh, format.mintick) : '—'
+    string dataTxt = tfTooHigh ? 'Chart TF ≥ session TF' : not regimeLive ? 'Collecting first session' : timeWeighted ? 'Time-weighted (no volume)' : 'Volume-weighted'
+    color  dataCol = tfTooHigh ? bearColorInput : DASH_TEXT
+
+    table.cell(dashTable, 0, 0, 'Regime', text_color = labelColor, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 0, regimeTxt, text_color = regimeCol, text_size = txtSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 1, 'Value areas', text_color = labelColor, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 1, vaTxt, text_color = vaCol, text_size = txtSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 2, 'Developing shape', text_color = labelColor, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 2, shapeTxt, text_color = shapeCol, text_size = txtSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 3, 'One-timeframing', text_color = labelColor, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 3, otfTxt, text_color = otfCol, text_size = txtSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 4, 'Acceptance watch', text_color = labelColor, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 4, accTxt, text_color = accCol, text_size = txtSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 5, 'Balance area', text_color = labelColor, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 5, areaTxt, text_color = DASH_TEXT, text_size = txtSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 6, 'Data', text_color = labelColor, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 6, dataTxt, text_color = dataCol, text_size = txtSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(imbUpEvt, 'Imbalance Up Begins', 'Balance vs Imbalance: acceptance/value migration above the balance area - upward one-sided auction underway')
+alertcondition(imbDnEvt, 'Imbalance Down Begins', 'Balance vs Imbalance: acceptance/value migration below the balance area - downward one-sided auction underway')
+alertcondition(newBalEvt, 'New Balance Formed', 'Balance vs Imbalance: value areas are overlapping again or price re-entered the old area - two-sided balance in effect')
+alertcondition(lafEvt, 'Look Above & Fail', 'Balance vs Imbalance: probe above the balance area failed back inside - rotation back toward the middle favored')
+alertcondition(lbfEvt, 'Look Below & Fail', 'Balance vs Imbalance: probe below the balance area failed back inside - rotation back toward the middle favored')
+alertcondition(tagUpEvt, 'Balance Upper Edge Tagged', 'Balance vs Imbalance: price tagged the upper edge of the balance area - watch for acceptance or a look-above-and-fail')
+alertcondition(tagDnEvt, 'Balance Lower Edge Tagged', 'Balance vs Imbalance: price tagged the lower edge of the balance area - watch for acceptance or a look-below-and-fail')
+alertcondition(otfBreakEvt, 'One-Timeframing Broken', 'Balance vs Imbalance: the session one-timeframing sequence broke - the directional drive is loosening')
+
+//---------------------------------------------------------------------------------------------------------------------}

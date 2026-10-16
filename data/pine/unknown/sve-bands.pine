@@ -1,0 +1,175 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("SVE Bands", shorttitle = "SVE Bands", overlay = true, format = format.price)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULLISH_COLOR = #089981
+BEARISH_COLOR = #f23645
+NEUTRAL_COLOR = #787b86 // fixed centerline color - structure, not a side
+
+FILL_BAND_TRANSP  = 80  // gradient transparency at the bands (strongest shading, at the stretch zones)
+FILL_BASIS_TRANSP = 100 // gradient transparency at the centerline (fully transparent, the neutral zone)
+
+TYPICAL_INPUT = "Typical Price"
+HEIKIN_INPUT  = "Heikin-Ashi Typical"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+inputSeriesInput = input.string(TYPICAL_INPUT, "Input Series", options = [TYPICAL_INPUT, HEIKIN_INPUT]
+  , group   = "Settings"
+  , tooltip = "Series fed into the smoothing chain. Typical Price follows Vervoort's 2013 band study, which smooths (high + low + close) / 3. Heikin-Ashi Typical first rebuilds the candles Heikin-Ashi style - folding each bar together with its neighbors before any filtering - the preprocessing behind the 'smoothed Heikin-Ashi bands' nickname. Either way the envelope logic itself stays conventional; only the input is denoised.")
+
+smoothLengthInput = input.int(8, "Smoothing Length", minval = 1
+  , group   = "Settings"
+  , tooltip = "Length of the exponential smoothing applied to the input, and of the second average run on that smoothed series. The double pass is the signature: a lone erratic bar barely moves the center, so an excursion to a band is more likely to reflect a genuine stretch. Eight bars is Vervoort's published default; longer settings calm the bands further at the cost of extra lag.")
+
+volLengthInput = input.int(13, "Volatility Length", minval = 1
+  , group   = "Settings"
+  , tooltip = "Lookback of the exponential average run on the bar-to-bar deviation measure that sets the band offset. The measure compares each bar's typical price against the neighboring low - a range-flavored gauge that still widens and narrows with realized volatility. 13 bars is the published default.")
+
+devMultInput = input.float(3.55, "Deviation Multiplier", minval = 0.1, step = 0.05
+  , group   = "Settings"
+  , tooltip = "How many averaged deviation units the upper band sits above the smoothed center. 3.55 is Vervoort's published factor - wider than the Bollinger two-sigma convention because the deviation measure is range-based rather than a standard deviation. Lower values produce more band touches, higher values reserve touches for stronger stretches.")
+
+lowerAdjustInput = input.float(0.9, "Lower Band Adjust", minval = 0.1, step = 0.05
+  , group   = "Settings"
+  , tooltip = "Fraction of the upper offset used for the lower band. Vervoort observed that price reaches the upper band more often than the lower one, so the published study pulls the lower band slightly closer with a 0.9 factor. Set to 1 for a symmetrical envelope.")
+
+upperColorInput = input.color(BEARISH_COLOR, "Upper Band"
+  , group   = "Style"
+  , tooltip = "Color of the upper band and the gradient above the centerline - the rail marking bullish stretch on the smoothed series, where the calmer mean-reversion reads look for excursion and re-entry. Also used for the falling-slope centerline tint and the bearish reversion marker.")
+
+centerColorInput = input.color(NEUTRAL_COLOR, "Centerline"
+  , group   = "Style"
+  , tooltip = "Color of the smoothed centerline when slope coloring is off (and while the slope is flat). The center rounds through turns without the bar-by-bar jitter of an equal-length average of closes - its slope carries the trend bias, and band excursions aim back at it.")
+
+lowerColorInput = input.color(BULLISH_COLOR, "Lower Band"
+  , group   = "Style"
+  , tooltip = "Color of the lower band and the gradient below the centerline - the rail marking bearish stretch, sitting slightly closer to the center per the lower band adjustment. Also used for the rising-slope centerline tint and the bullish reversion marker.")
+
+slopeColorInput = input.bool(true, "Color Centerline By Slope"
+  , group   = "Style"
+  , tooltip = "Tints the centerline by its slope - lower band color while rising, upper band color while falling - so the trend bias reads at a glance. Because the center is heavily smoothed, these slope changes flicker far less than on a raw-price average. Disable for the fixed centerline color.")
+
+showFillInput = input.bool(true, "Band Gradient Fill"
+  , group   = "Style"
+  , tooltip = "Vertical gradient from the centerline out to each band - fully transparent at the center, strongest at the band - so channel space intensifies toward the stretch zones. Purely visual, the levels are unaffected.")
+
+showMarkersInput = input.bool(false, "Reversion Markers"
+  , group   = "Style"
+  , tooltip = "Optional triangles on bars where price closes back inside a band after an excursion - the calmer mean-reversion triggers this construction is built for. Off by default to keep the chart clean; the excursion and reversion alerts cover the same events regardless.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+// Sylvain Vervoort's volatility bands denoise the input before any envelope math runs. Optionally the candles are first
+// rebuilt Heikin-Ashi style, each bar averaging in its neighbors
+haCloseValue = (open + high + low + close) / 4
+
+var float haOpenValue = na
+haOpenValue := na(haOpenValue) ? (open + close) / 2 : (haOpenValue + haCloseValue[1]) / 2
+
+haHighValue = math.max(high, math.max(haOpenValue, haCloseValue))
+haLowValue  = math.min(low,  math.min(haOpenValue, haCloseValue))
+
+useHeikin  = inputSeriesInput == HEIKIN_INPUT
+typicalSrc = useHeikin ? (haHighValue + haLowValue + haCloseValue) / 3 : hlc3
+lowSrc     = useHeikin ? haLowValue : low
+
+// The band offset comes from typical-to-low differences across adjacent bars: distance to the prior low when typical
+// price is rising, distance from the prior typical price to the current low when it is falling. The measure is
+// range-flavored rather than a standard deviation, yet still widens and narrows with realized volatility
+prevTypical = nz(typicalSrc[1], typicalSrc)
+devMeasure  = typicalSrc >= prevTypical ? typicalSrc - nz(lowSrc[1], lowSrc) : prevTypical - lowSrc
+
+devHigh = ta.ema(devMeasure, volLengthInput) * devMultInput
+devLow  = devHigh * lowerAdjustInput
+
+// The center is an average of exponentially smoothed typical price - the double pass that keeps a single wide-range
+// bar from deflecting the bands the way it deflects a raw Bollinger pair. The lower band sits slightly closer per
+// Vervoort's asymmetry adjustment
+smoothTypical = ta.ema(typicalSrc, smoothLengthInput)
+centerLine    = ta.sma(smoothTypical, smoothLengthInput)
+bandAnchor    = ta.ema(smoothTypical, smoothLengthInput)
+
+upperBand = bandAnchor + devHigh
+lowerBand = bandAnchor - devLow
+
+bandsReady = not na(upperBand) and not na(lowerBand) and not na(centerLine)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Band Events
+//---------------------------------------------------------------------------------------------------------------------{
+// Because the pair is smoothed, an excursion beyond a band filters the one-bar spikes that tag raw bands - fewer
+// touches, each carrying more weight, at the price of arriving later
+upperBreachCross  = ta.crossover(close, upperBand)
+lowerBreachCross  = ta.crossunder(close, lowerBand)
+upperReentryCross = ta.crossunder(close, upperBand)
+lowerReentryCross = ta.crossover(close, lowerBand)
+
+centerCrossUpRaw   = ta.crossover(close, centerLine)
+centerCrossDownRaw = ta.crossunder(close, centerLine)
+
+upperBreach = bandsReady and upperBreachCross
+lowerBreach = bandsReady and lowerBreachCross
+
+// A close back inside after an excursion is the calmer mean-reversion trigger; the centerline is its natural target
+upperReentry = bandsReady and upperReentryCross
+lowerReentry = bandsReady and lowerReentryCross
+
+centerCrossUp   = bandsReady and centerCrossUpRaw
+centerCrossDown = bandsReady and centerCrossDownRaw
+
+// The smoothed center rounds through turns, so its slope flips are the low-flicker trend bias read
+centerRising  = centerLine > nz(centerLine[1], centerLine)
+centerFalling = centerLine < nz(centerLine[1], centerLine)
+
+slopeTurnUp   = bandsReady and centerRising and not centerRising[1]
+slopeTurnDown = bandsReady and centerFalling and not centerFalling[1]
+
+centerPlotColor = slopeColorInput ? centerRising ? lowerColorInput : centerFalling ? upperColorInput : centerColorInput : centerColorInput
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+upperPlotId  = plot(upperBand, "Upper Band", color = upperColorInput, linewidth = 2)
+centerPlotId = plot(centerLine, "Centerline", color = centerPlotColor, linewidth = 2)
+lowerPlotId  = plot(lowerBand, "Lower Band", color = lowerColorInput, linewidth = 2)
+
+fill(centerPlotId, upperPlotId
+  , top_value    = upperBand
+  , bottom_value = centerLine
+  , top_color    = showFillInput ? color.new(upperColorInput, FILL_BAND_TRANSP) : na
+  , bottom_color = showFillInput ? color.new(upperColorInput, FILL_BASIS_TRANSP) : na
+  , title        = "Upper Band Gradient Fill")
+
+fill(centerPlotId, lowerPlotId
+  , top_value    = centerLine
+  , bottom_value = lowerBand
+  , top_color    = showFillInput ? color.new(lowerColorInput, FILL_BASIS_TRANSP) : na
+  , bottom_color = showFillInput ? color.new(lowerColorInput, FILL_BAND_TRANSP) : na
+  , title        = "Lower Band Gradient Fill")
+
+plotshape(showMarkersInput and upperReentry, "Bearish Reversion Marker", shape.triangledown, location.abovebar, color = upperColorInput, size = size.tiny)
+plotshape(showMarkersInput and lowerReentry, "Bullish Reversion Marker", shape.triangleup, location.belowbar, color = lowerColorInput, size = size.tiny)
+
+// Data-window readout of the band spread: sustained narrowing marks volatility compression, widening marks release
+plot(upperBand - lowerBand, "Band Width", color = NEUTRAL_COLOR, display = display.data_window)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(upperBreach, "Upper Band Excursion", "SVE Bands: price closed above the upper band on {{ticker}} - a stretch beyond the smoothed envelope, weightier than a raw-band touch because one-bar spikes barely move this pair ({{interval}})")
+alertcondition(lowerBreach, "Lower Band Excursion", "SVE Bands: price closed below the lower band on {{ticker}} - a stretch beyond the smoothed envelope, weightier than a raw-band touch because one-bar spikes barely move this pair ({{interval}})")
+alertcondition(upperReentry, "Bearish Reversion", "SVE Bands: price closed back inside the upper band on {{ticker}} - the calmer mean-reversion trigger, aiming back toward the smoothed centerline ({{interval}})")
+alertcondition(lowerReentry, "Bullish Reversion", "SVE Bands: price closed back inside the lower band on {{ticker}} - the calmer mean-reversion trigger, aiming back toward the smoothed centerline ({{interval}})")
+alertcondition(centerCrossUp, "Centerline Cross Up", "SVE Bands: price closed above the smoothed centerline on {{ticker}} - position between the bands has shifted to the upper half ({{interval}})")
+alertcondition(centerCrossDown, "Centerline Cross Down", "SVE Bands: price closed below the smoothed centerline on {{ticker}} - position between the bands has shifted to the lower half ({{interval}})")
+alertcondition(slopeTurnUp, "Centerline Slope Up", "SVE Bands: the smoothed centerline turned up on {{ticker}} - a low-flicker bias shift, later than a raw average would signal but less prone to one-bar head fakes ({{interval}})")
+alertcondition(slopeTurnDown, "Centerline Slope Down", "SVE Bands: the smoothed centerline turned down on {{ticker}} - a low-flicker bias shift, later than a raw average would signal but less prone to one-bar head fakes ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

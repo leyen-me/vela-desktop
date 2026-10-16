@@ -1,0 +1,240 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/ MPL-2.0
+//@version=6
+indicator("Short-Term Order Block Rejections", shorttitle="ST OB Rejections", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+// --- Constants ---
+const color BULL_COLOR = #089981
+const color BEAR_COLOR = #f23645
+
+// --- Inputs ---
+int pivotLengthInput = input.int(3, "Structure pivot bars", minval=1, maxval=20, tooltip="Bars on each side required to confirm a swing high or low for market structure.")
+int obSearchBarsInput = input.int(8, "Search back for order block", minval=1, maxval=30, tooltip="Maximum candles searched before a CHoCH. The highest bullish candle is selected for bearish blocks, and the lowest bearish candle for bullish blocks, to anchor zones at the structural extreme.")
+int maxReactionBarsInput = input.int(8, "Maximum reaction window", minval=1, maxval=100, tooltip="Signals are allowed only this many bars after a CHoCH order block forms. Blocks remain drawn afterward as historical context.")
+float minBodyPercentInput = input.float(60.0, "Minimum signal body (% of candle range)", minval=1.0, maxval=100.0, step=1.0, tooltip="The signal candle body must use at least this percentage of its full high-low range.")
+int maxBlocksPerSideInput = input.int(100, "Historical blocks per direction", minval=1, maxval=200, tooltip="Maximum number of bullish and bearish blocks retained. Oldest blocks are removed when this limit is reached.")
+
+bool showChochInput = input.bool(true, "Show CHoCH levels", group="Market Structure", tooltip="Draws a dashed line from the broken confirmed swing level and marks each change of character.")
+bool filterSignalsByTrendInput = input.bool(true, "Only signal with current structure", group="Market Structure", tooltip="Allows bullish rejection signals only after bullish CHoCH and bearish rejection signals only after bearish CHoCH.")
+bool requireSwingRangeInput = input.bool(true, "Require block inside broken swing range", group="Market Structure", tooltip="Rejects bullish source candles fully above the broken swing high and bearish source candles fully below the broken swing low.")
+bool avoidFreshExtremeSignalsInput = input.bool(true, "Avoid signals on fresh swing extremes", group="Market Structure", tooltip="Suppresses short signals making a fresh local low and long signals making a fresh local high, avoiding entries at the end of an extension.")
+bool filterChopSignalsInput = input.bool(true, "Require significant pivot-to-block range", group="Range Filter", tooltip="Allows signals only when the latest confirmed swing pivot is sufficiently far from the order block, filtering narrow sideways structures.")
+int rangeAtrLengthInput = input.int(14, "Range ATR length", minval=1, maxval=100, group="Range Filter", tooltip="ATR period used to normalize pivot-to-block distance across symbols and timeframes.")
+float minPivotRangeAtrInput = input.float(2.0, "Minimum pivot-to-block distance (ATR)", minval=0.1, maxval=10.0, step=0.1, group="Range Filter", tooltip="The latest confirmed pivot must be at least this many ATRs away from the order block before a rejection signal is allowed. Increase it to filter more chop.")
+
+bool removeOverlappingInput = input.bool(true, "Suppress overlapping blocks", group="Cleanup", tooltip="Avoids adding a block when it substantially overlaps any existing bullish or bearish block.")
+float overlapThresholdInput = input.float(25.0, "Overlap threshold (%)", minval=1.0, maxval=100.0, step=1.0, group="Cleanup", tooltip="A new block is skipped when its overlap with any existing block covers at least this percentage of the smaller zone.")
+
+color bullBlockColorInput = input.color(color.new(BULL_COLOR, 84), "Bullish block fill", group="Style", tooltip="Fill color for bullish order blocks.")
+color bearBlockColorInput = input.color(color.new(BEAR_COLOR, 84), "Bearish block fill", group="Style", tooltip="Fill color for bearish order blocks.")
+color bullBorderColorInput = input.color(BULL_COLOR, "Bullish block border", group="Style", tooltip="Border color for bullish order blocks.")
+color bearBorderColorInput = input.color(BEAR_COLOR, "Bearish block border", group="Style", tooltip="Border color for bearish order blocks.")
+
+// --- Functions ---
+f_isDuplicateZone(float newTop, float newBottom, array<float> existingTops, array<float> existingBottoms, float thresholdPercent) =>
+    bool isDuplicate = false
+    float newHeight = math.max(newTop - newBottom, syminfo.mintick)
+    if array.size(existingTops) > 0
+        for zoneIndex = 0 to array.size(existingTops) - 1
+            float existingTop = array.get(existingTops, zoneIndex)
+            float existingBottom = array.get(existingBottoms, zoneIndex)
+            float existingHeight = math.max(existingTop - existingBottom, syminfo.mintick)
+            float intersection = math.max(0.0, math.min(newTop, existingTop) - math.max(newBottom, existingBottom))
+            float smallerHeight = math.min(newHeight, existingHeight)
+            if intersection / smallerHeight * 100.0 >= thresholdPercent
+                isDuplicate := true
+    isDuplicate
+
+// --- Confirmed swing structure ---
+float confirmedPivotHigh = ta.pivothigh(high, pivotLengthInput, pivotLengthInput)
+float confirmedPivotLow = ta.pivotlow(low, pivotLengthInput, pivotLengthInput)
+
+var float lastSwingHigh = na
+var float previousSwingHigh = na
+var int lastSwingHighBar = na
+var float lastSwingLow = na
+var float previousSwingLow = na
+var int lastSwingLowBar = na
+var int structureTrend = 0
+
+if not na(confirmedPivotHigh)
+    previousSwingHigh := lastSwingHigh
+    lastSwingHigh := confirmedPivotHigh
+    lastSwingHighBar := bar_index - pivotLengthInput
+
+if not na(confirmedPivotLow)
+    previousSwingLow := lastSwingLow
+    lastSwingLow := confirmedPivotLow
+    lastSwingLowBar := bar_index - pivotLengthInput
+
+bool higherHighHigherLow = not na(previousSwingHigh) and not na(previousSwingLow) and lastSwingHigh > previousSwingHigh and lastSwingLow > previousSwingLow
+bool lowerHighLowerLow = not na(previousSwingHigh) and not na(previousSwingLow) and lastSwingHigh < previousSwingHigh and lastSwingLow < previousSwingLow
+
+if structureTrend == 0
+    if higherHighHigherLow
+        structureTrend := 1
+    else if lowerHighLowerLow
+        structureTrend := -1
+
+// A CHoCH is a confirmed close through the protected swing against the established trend.
+bool bullishChoch = structureTrend == -1 and not na(lastSwingHigh) and not na(lastSwingHighBar) and close > lastSwingHigh and close[1] <= lastSwingHigh
+bool bearishChoch = structureTrend == 1 and not na(lastSwingLow) and not na(lastSwingLowBar) and close < lastSwingLow and close[1] >= lastSwingLow
+
+if bullishChoch
+    structureTrend := 1
+else if bearishChoch
+    structureTrend := -1
+
+bool bullishStructureAllowed = not filterSignalsByTrendInput or structureTrend == 1
+bool bearishStructureAllowed = not filterSignalsByTrendInput or structureTrend == -1
+
+// --- CHoCH visualization ---
+if showChochInput and bullishChoch
+    line.new(x1=lastSwingHighBar, y1=lastSwingHigh, x2=bar_index, y2=lastSwingHigh, xloc=xloc.bar_index, color=BULL_COLOR, style=line.style_dashed, width=1)
+    label.new(x=lastSwingHighBar + int((bar_index - lastSwingHighBar) / 2), y=lastSwingHigh, text="CHoCH", xloc=xloc.bar_index, style=label.style_label_down, color=color.new(BULL_COLOR, 100), textcolor=BULL_COLOR, size=size.tiny)
+
+if showChochInput and bearishChoch
+    line.new(x1=lastSwingLowBar, y1=lastSwingLow, x2=bar_index, y2=lastSwingLow, xloc=xloc.bar_index, color=BEAR_COLOR, style=line.style_dashed, width=1)
+    label.new(x=lastSwingLowBar + int((bar_index - lastSwingLowBar) / 2), y=lastSwingLow, text="CHoCH", xloc=xloc.bar_index, style=label.style_label_up, color=color.new(BEAR_COLOR, 100), textcolor=BEAR_COLOR, size=size.tiny)
+
+// --- Historical order block storage ---
+var array<float> bullTops = array.new_float()
+var array<float> bullBottoms = array.new_float()
+var array<int> bullBornBars = array.new_int()
+var array<bool> bullUsedFlags = array.new_bool()
+var array<box> bullBoxes = array.new_box()
+
+var array<float> bearTops = array.new_float()
+var array<float> bearBottoms = array.new_float()
+var array<int> bearBornBars = array.new_int()
+var array<bool> bearUsedFlags = array.new_bool()
+var array<box> bearBoxes = array.new_box()
+
+// --- CHoCH-only order block creation ---
+if bullishChoch
+    bool foundBullCandle = false
+    float foundBullTop = na
+    float foundBullBottom = na
+    int foundBullOffset = na
+    for i = 1 to obSearchBarsInput
+        if close[i] < open[i] and (not foundBullCandle or low[i] < foundBullBottom)
+            foundBullTop := high[i]
+            foundBullBottom := low[i]
+            foundBullOffset := i
+            foundBullCandle := true
+    bool bullSourceWithinSwing = not requireSwingRangeInput or foundBullTop < lastSwingHigh
+    if foundBullCandle and bullSourceWithinSwing
+        bool duplicateBull = removeOverlappingInput and (f_isDuplicateZone(foundBullTop, foundBullBottom, bullTops, bullBottoms, overlapThresholdInput) or f_isDuplicateZone(foundBullTop, foundBullBottom, bearTops, bearBottoms, overlapThresholdInput))
+        if not duplicateBull
+            box newBullBox = box.new(left=bar_index - foundBullOffset, top=foundBullTop, right=bar_index + 1, bottom=foundBullBottom, xloc=xloc.bar_index, bgcolor=bullBlockColorInput, border_color=bullBorderColorInput)
+            array.push(bullTops, foundBullTop)
+            array.push(bullBottoms, foundBullBottom)
+            array.push(bullBornBars, bar_index)
+            array.push(bullUsedFlags, false)
+            array.push(bullBoxes, newBullBox)
+            if array.size(bullBoxes) > maxBlocksPerSideInput
+                box.delete(array.shift(bullBoxes))
+                array.shift(bullTops)
+                array.shift(bullBottoms)
+                array.shift(bullBornBars)
+                array.shift(bullUsedFlags)
+
+if bearishChoch
+    bool foundBearCandle = false
+    float foundBearTop = na
+    float foundBearBottom = na
+    int foundBearOffset = na
+    for i = 1 to obSearchBarsInput
+        if close[i] > open[i] and (not foundBearCandle or high[i] > foundBearTop)
+            foundBearTop := high[i]
+            foundBearBottom := low[i]
+            foundBearOffset := i
+            foundBearCandle := true
+    bool bearSourceWithinSwing = not requireSwingRangeInput or foundBearBottom > lastSwingLow
+    if foundBearCandle and bearSourceWithinSwing
+        bool duplicateBear = removeOverlappingInput and (f_isDuplicateZone(foundBearTop, foundBearBottom, bearTops, bearBottoms, overlapThresholdInput) or f_isDuplicateZone(foundBearTop, foundBearBottom, bullTops, bullBottoms, overlapThresholdInput))
+        if not duplicateBear
+            box newBearBox = box.new(left=bar_index - foundBearOffset, top=foundBearTop, right=bar_index + 1, bottom=foundBearBottom, xloc=xloc.bar_index, bgcolor=bearBlockColorInput, border_color=bearBorderColorInput)
+            array.push(bearTops, foundBearTop)
+            array.push(bearBottoms, foundBearBottom)
+            array.push(bearBornBars, bar_index)
+            array.push(bearUsedFlags, false)
+            array.push(bearBoxes, newBearBox)
+            if array.size(bearBoxes) > maxBlocksPerSideInput
+                box.delete(array.shift(bearBoxes))
+                array.shift(bearTops)
+                array.shift(bearBottoms)
+                array.shift(bearBornBars)
+                array.shift(bearUsedFlags)
+
+// --- Rejection signals and historical box extension ---
+float candleRange = math.max(high - low, syminfo.mintick)
+float bodyPercent = math.abs(close - open) / candleRange * 100.0
+float rangeAtrValue = ta.atr(rangeAtrLengthInput)
+int swingExtremeLookback = math.max(pivotLengthInput * 2, 2)
+float priorLookbackLow = ta.lowest(low[1], swingExtremeLookback)
+float priorLookbackHigh = ta.highest(high[1], swingExtremeLookback)
+bool bearishAtFreshLow = low < priorLookbackLow
+bool bullishAtFreshHigh = high > priorLookbackHigh
+bool bullishSignal = false
+bool bearishSignal = false
+
+int bullZoneIndex = array.size(bullTops) - 1
+while bullZoneIndex >= 0
+    float zoneTop = array.get(bullTops, bullZoneIndex)
+    float zoneBottom = array.get(bullBottoms, bullZoneIndex)
+    int bornBar = array.get(bullBornBars, bullZoneIndex)
+    int zoneAge = bar_index - bornBar
+    box zoneBox = array.get(bullBoxes, bullZoneIndex)
+    bool zoneMitigated = barstate.isconfirmed and zoneAge > 0 and close < zoneBottom
+    bool fullZoneReclaim = low < zoneBottom and close > zoneTop
+    bool wickRejection = low < zoneBottom and open > zoneBottom and close > zoneBottom
+    bool zoneInReactionWindow = zoneAge > 0 and zoneAge <= maxReactionBarsInput
+    bool bullishRangePass = not filterChopSignalsInput or (not na(lastSwingHigh) and not na(rangeAtrValue) and lastSwingHigh - zoneTop >= rangeAtrValue * minPivotRangeAtrInput)
+    bool zoneSignal = barstate.isconfirmed and bullishRangePass and (bullishStructureAllowed or fullZoneReclaim) and (fullZoneReclaim or not avoidFreshExtremeSignalsInput or not bullishAtFreshHigh) and zoneInReactionWindow and not array.get(bullUsedFlags, bullZoneIndex) and (wickRejection or fullZoneReclaim) and close > open and bodyPercent >= minBodyPercentInput
+    if zoneAge >= 0 and zoneAge <= maxReactionBarsInput
+        box.set_right(zoneBox, bar_index + 1)
+    if zoneSignal
+        bullishSignal := true
+        array.set(bullUsedFlags, bullZoneIndex, true)
+    if zoneMitigated
+        box.delete(zoneBox)
+        array.remove(bullTops, bullZoneIndex)
+        array.remove(bullBottoms, bullZoneIndex)
+        array.remove(bullBornBars, bullZoneIndex)
+        array.remove(bullUsedFlags, bullZoneIndex)
+        array.remove(bullBoxes, bullZoneIndex)
+    bullZoneIndex -= 1
+
+int bearZoneIndex = array.size(bearTops) - 1
+while bearZoneIndex >= 0
+    float zoneTop = array.get(bearTops, bearZoneIndex)
+    float zoneBottom = array.get(bearBottoms, bearZoneIndex)
+    int bornBar = array.get(bearBornBars, bearZoneIndex)
+    int zoneAge = bar_index - bornBar
+    box zoneBox = array.get(bearBoxes, bearZoneIndex)
+    bool zoneMitigated = barstate.isconfirmed and zoneAge > 0 and close > zoneTop
+    bool fullZoneReclaim = high > zoneTop and close < zoneBottom
+    bool wickRejection = high > zoneTop and open < zoneTop and close < zoneTop
+    bool zoneInReactionWindow = zoneAge > 0 and zoneAge <= maxReactionBarsInput
+    bool bearishRangePass = not filterChopSignalsInput or (not na(lastSwingLow) and not na(rangeAtrValue) and zoneBottom - lastSwingLow >= rangeAtrValue * minPivotRangeAtrInput)
+    bool zoneSignal = barstate.isconfirmed and bearishRangePass and (bearishStructureAllowed or fullZoneReclaim) and (fullZoneReclaim or not avoidFreshExtremeSignalsInput or not bearishAtFreshLow) and zoneInReactionWindow and not array.get(bearUsedFlags, bearZoneIndex) and (wickRejection or fullZoneReclaim) and close < open and bodyPercent >= minBodyPercentInput
+    if zoneAge >= 0 and zoneAge <= maxReactionBarsInput
+        box.set_right(zoneBox, bar_index + 1)
+    if zoneSignal
+        bearishSignal := true
+        array.set(bearUsedFlags, bearZoneIndex, true)
+    if zoneMitigated
+        box.delete(zoneBox)
+        array.remove(bearTops, bearZoneIndex)
+        array.remove(bearBottoms, bearZoneIndex)
+        array.remove(bearBornBars, bearZoneIndex)
+        array.remove(bearUsedFlags, bearZoneIndex)
+        array.remove(bearBoxes, bearZoneIndex)
+    bearZoneIndex -= 1
+
+// --- Visual signals and alerts ---
+plotshape(bullishSignal, title="Bullish order block rejection", style=shape.labelup, location=location.belowbar, color=color.new(BULL_COLOR, 5), text="OB", textcolor=color.white, size=size.tiny)
+plotshape(bearishSignal, title="Bearish order block rejection", style=shape.labeldown, location=location.abovebar, color=color.new(BEAR_COLOR, 5), text="OB", textcolor=color.white, size=size.tiny)
+
+alertcondition(bullishSignal, title="Bullish order block rejection", message="Bullish order block rejection on {{ticker}} {{interval}}")
+alertcondition(bearishSignal, title="Bearish order block rejection", message="Bearish order block rejection on {{ticker}} {{interval}}")

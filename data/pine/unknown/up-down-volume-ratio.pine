@@ -1,0 +1,246 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Up/down Volume Ratio", shorttitle = "Up/down Volume Ratio", overlay = false, format = format.price, precision = 2)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR    = #089981 // volume favoring up bars - net accumulation
+BEAR_COLOR    = #f23645 // volume favoring down bars - net distribution
+TREND_COLOR   = #ff9800 // the one accent - the optional ratio trend line
+LEVEL_COLOR   = #787b86 // balance level
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+BALANCE = 1.0 // up and down volume in perfect balance
+
+FILL_VALUE_TRANSP   = 50  // gradient transparency at the ratio value
+FILL_BALANCE_TRANSP = 100 // gradient transparency at the balance line
+
+WINDOW_ROLLING = "Rolling Window"
+WINDOW_SESSION = "Session Totals"
+SPLIT_BAR      = "Bar Direction"
+SPLIT_TICK     = "Intrabar Upticks/Downticks"
+BASIS_PREV     = "Previous Close"
+BASIS_OPEN     = "Bar Open"
+UNCH_EXCLUDE   = "Exclude"
+UNCH_PRIOR     = "Prior Direction"
+
+TXT_NA = "-"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+windowInput = input.string(WINDOW_ROLLING, "Accumulation Window", options = [WINDOW_ROLLING, WINDOW_SESSION], group = "Calculation",
+     tooltip = "How up and down volume accumulate before the ratio is taken. 'Rolling Window' sums the last N bars - the classic screening construction from the growth-stock tradition. 'Session Totals' ratios the running totals since the start of the trading day - the intraday variant, intended for intraday charts.")
+
+lengthInput = input.int(50, "Window Length", minval = 2, group = "Calculation",
+     tooltip = "Number of bars summed in Rolling Window mode. The classic screening construction uses 50 trading days on daily charts, about ten weeks - long enough to describe a whole base and short enough to notice a change in character. Shorter windows react faster but swing harder on single sessions.")
+
+splitInput = input.string(SPLIT_BAR, "Volume Split", options = [SPLIT_BAR, SPLIT_TICK], group = "Calculation",
+     tooltip = "How each bar's volume is bucketed. 'Bar Direction' assigns the whole bar's volume to the up or down side from its direction - the deliberately coarse classic construction, where a bar higher by a cent contributes all of its volume to the up side. 'Intrabar Upticks/Downticks' splits each bar's volume into up and down portions by the tick rule on a lower timeframe - the finer split used by the intraday variant.")
+
+basisInput = input.string(BASIS_PREV, "Up/Down Basis", options = [BASIS_PREV, BASIS_OPEN], group = "Calculation",
+     tooltip = "Reference that labels a bar as up or down when the split is 'Bar Direction': the prior close (the classic convention) or the bar's own open. Conventions differ between tools, which is why two of them can print different values on the same chart.")
+
+unchangedInput = input.string(UNCH_EXCLUDE, "Unchanged Bars", options = [UNCH_EXCLUDE, UNCH_PRIOR], group = "Calculation",
+     tooltip = "Handling of bars with no net change: 'Exclude' leaves their volume out of both sides (most implementations), 'Prior Direction' assigns it to the direction of the last decisive bar. The same convention is applied to unchanged intrabar prices when the intrabar split is active.")
+
+autoTfInput = input.bool(true, "Auto Intrabar Timeframe", group = "Calculation",
+     tooltip = "Automatically picks the lower timeframe used by the 'Intrabar Upticks/Downticks' split from the chart timeframe. Disable it to set a custom one below.")
+
+ltfInput = input.timeframe("1", "Custom Intrabar Timeframe", group = "Calculation",
+     tooltip = "Intrabar timeframe used when Auto is disabled. Values above the chart timeframe are clamped to the chart timeframe. Wherever intrabar data is unavailable, such as deep history, the bar direction split is used as a fallback.")
+
+trendInput = input.bool(false, "Trend Line", group = "Calculation",
+     tooltip = "Smooths the ratio with a moving average so its trend can be tracked as well as its level - a ratio holding above 1.0 and improving is the classic accumulation read, while a ratio deteriorating as price pushes higher means up moves on thinning participation.")
+
+trendLengthInput = input.int(10, "Trend Length", minval = 1, group = "Calculation",
+     tooltip = "Number of bars in the trend line moving average.")
+
+trendTypeInput = input.string("SMA", "Trend Type", options = ["SMA", "EMA"], group = "Calculation",
+     tooltip = "Moving average type used for the trend line.")
+
+showDashInput = input.bool(true, "Show Dashboard", group = "Dashboard",
+     tooltip = "Displays the current ratio - the single screenable number the construction was designed to produce - alongside its accumulation/distribution bias, the up-volume share, and the up and down volume totals of the active window.")
+
+dashPosInput = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = "Dashboard",
+     tooltip = "Dashboard position on the pane.")
+
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = "Dashboard",
+     tooltip = "Dashboard text size.")
+
+bullColorInput = input.color(BULL_COLOR, "Accumulation", inline = "colors", group = "Style",
+     tooltip = "Color used while the ratio sits above 1.0 - volume has favored advancing bars.")
+
+bearColorInput = input.color(BEAR_COLOR, " Distribution", inline = "colors", group = "Style",
+     tooltip = "Color used while the ratio sits below 1.0 - volume has favored declining bars.")
+
+gradientInput = input.bool(true, "Gradient Fill", group = "Style",
+     tooltip = "Fills the area between the ratio and the 1.0 balance line with a vertical gradient, fully transparent at balance and strongest at the current value.")
+
+trendColorInput = input.color(TREND_COLOR, "Trend Line", group = "Style",
+     tooltip = "Color of the optional ratio trend line.")
+
+levelColorInput = input.color(LEVEL_COLOR, "Balance Level", group = "Style",
+     tooltip = "Color of the dashed 1.0 balance level separating net accumulation from net distribution.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// classifies one intrabar's volume as up or down by the tick rule: prices above the previous intrabar close
+// are upticks and prices below are downticks, while unchanged prices follow the selected unchanged convention
+intrabarUpDownVolumes() =>
+    var int tickDirection = 0
+    int rawTick  = close > close[1] ? 1 : close < close[1] ? -1 : 0
+    int tickLean = rawTick != 0 ? rawTick : unchangedInput == UNCH_PRIOR ? tickDirection : 0
+    tickDirection := rawTick != 0 ? rawTick : tickDirection
+    [tickLean == 1 ? nz(volume) : 0., tickLean == -1 ? nz(volume) : 0.]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+// intrabar inspection timeframe for the tick split: fine enough to resolve upticks and downticks, always at or
+// below the chart timeframe
+int chartSeconds  = timeframe.in_seconds()
+int autoSeconds   = chartSeconds >= 604800 ? 3600 : chartSeconds >= 86400 ? 1800 : chartSeconds >= 14400 ? 900 : chartSeconds >= 3600 ? 300 : chartSeconds > 60 ? 60 : chartSeconds
+int customSeconds = math.min(math.max(timeframe.in_seconds(ltfInput), 1), chartSeconds)
+string intrabarTf = timeframe.from_seconds(autoTfInput ? autoSeconds : customSeconds)
+
+[upTickVolumeArray, downTickVolumeArray] = request.security_lower_tf(syminfo.tickerid, intrabarTf, intrabarUpDownVolumes())
+
+// bar direction split - the whole bar's volume goes to the side of its direction against the selected basis;
+// unchanged bars are excluded from both sides or inherit the last decisive direction
+float basisPrice   = basisInput == BASIS_OPEN ? open : close[1]
+int   rawDirection = close > basisPrice ? 1 : close < basisPrice ? -1 : 0
+
+var int priorDirection = 0
+int barDirection = rawDirection != 0 ? rawDirection : unchangedInput == UNCH_PRIOR ? priorDirection : 0
+priorDirection := rawDirection != 0 ? rawDirection : priorDirection
+
+float upBarVolume   = barDirection == 1 ? nz(volume) : 0.
+float downBarVolume = barDirection == -1 ? nz(volume) : 0.
+
+// intrabar tick split, falling back to the bar direction split where no intrabar data exists
+bool  hasIntrabarData = upTickVolumeArray.size() > 0
+float upTickVolume    = hasIntrabarData ? nz(upTickVolumeArray.sum()) : upBarVolume
+float downTickVolume  = hasIntrabarData ? nz(downTickVolumeArray.sum()) : downBarVolume
+
+bool  useIntrabar = splitInput == SPLIT_TICK
+float upVolume    = useIntrabar ? upTickVolume : upBarVolume
+float downVolume  = useIntrabar ? downTickVolume : downBarVolume
+
+// classic screening construction - up and down volume summed over the rolling window
+float upRolling   = math.sum(upVolume, lengthInput)
+float downRolling = math.sum(downVolume, lengthInput)
+
+// intraday variant - running totals since the start of the trading day
+bool newSession = timeframe.change("D")
+
+var float upSession   = 0.
+var float downSession = 0.
+if newSession
+    upSession   := 0.
+    downSession := 0.
+upSession   += upVolume
+downSession += downVolume
+
+// the ratio: summed up volume divided by summed down volume, read around 1.0 - above it volume has favored
+// advancing bars (net accumulation), below it declining bars (net distribution)
+bool  sessionMode = windowInput == WINDOW_SESSION
+float upTotal     = sessionMode ? upSession : upRolling
+float downTotal   = sessionMode ? downSession : downRolling
+
+float ratio   = downTotal > 0 ? upTotal / downTotal : na
+float upShare = upTotal + downTotal > 0 ? 100 * upTotal / (upTotal + downTotal) : na
+
+// trend of the ratio - the level says who has been paying up, the trend says whether that is improving
+float trendSma = ta.sma(ratio, trendLengthInput)
+float trendEma = ta.ema(ratio, trendLengthInput)
+float trendMa  = trendTypeInput == "EMA" ? trendEma : trendSma
+
+// balance crosses - the shift from net distribution to net accumulation and back
+bool accumulationShift = ta.crossover(ratio, BALANCE)
+bool distributionShift = ta.crossunder(ratio, BALANCE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+color ratioColor = ratio > BALANCE ? bullColorInput : bearColorInput
+
+color fillTopColor    = not gradientInput ? na : ratio > BALANCE ? color.new(bullColorInput, FILL_VALUE_TRANSP) : color.new(bearColorInput, FILL_BALANCE_TRANSP)
+color fillBottomColor = not gradientInput ? na : ratio > BALANCE ? color.new(bullColorInput, FILL_BALANCE_TRANSP) : color.new(bearColorInput, FILL_VALUE_TRANSP)
+
+ratioPlotId   = plot(ratio, "Up/Down Volume Ratio", color = ratioColor, linewidth = 1, style = plot.style_linebr)
+balancePlotId = plot(BALANCE, "Balance (fill anchor)", color = na, editable = false, display = display.none)
+
+fill(ratioPlotId, balancePlotId, top_value = math.max(BALANCE, ratio), bottom_value = math.min(BALANCE, ratio), top_color = fillTopColor, bottom_color = fillBottomColor, title = "Ratio Gradient Fill")
+
+plot(trendInput ? trendMa : na, "Ratio Trend", color = trendColorInput, linewidth = 1, style = plot.style_linebr)
+
+hline(BALANCE, "Balance (1.0)", color = levelColorInput, linestyle = hline.style_dashed)
+
+plot(upTotal, "Up Volume", color = bullColorInput, display = display.data_window)
+plot(downTotal, "Down Volume", color = bearColorInput, display = display.data_window)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+dashPosition = switch dashPosInput
+    "Top Left"     => position.top_left
+    "Bottom Right" => position.bottom_right
+    "Bottom Left"  => position.bottom_left
+    =>                position.top_right
+
+dashTextSize = switch dashSizeInput
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    =>          size.small
+
+var table dashTable = table.new(dashPosition, 2, 6
+  , bgcolor      = DASH_BG
+  , border_width = 0
+  , frame_color  = DASH_FRAME
+  , frame_width  = 1)
+
+if barstate.islast and showDashInput
+    color labelColor = DASH_HEADER
+    color valueColor = DASH_TEXT
+
+    string windowText = sessionMode ? "Session" : str.tostring(lengthInput) + " bars"
+    string ratioText  = na(ratio) ? TXT_NA : str.tostring(ratio, "#.##")
+    string biasText   = na(ratio) ? TXT_NA : ratio > BALANCE ? "Accumulation" : ratio < BALANCE ? "Distribution" : "Balanced"
+    color  biasColor  = na(ratio) ? valueColor : ratio > BALANCE ? bullColorInput : ratio < BALANCE ? bearColorInput : valueColor
+    string shareText  = na(upShare) ? TXT_NA : str.tostring(upShare, "#.#") + "%"
+    string upText     = na(upTotal) ? TXT_NA : str.tostring(upTotal, format.volume)
+    string downText   = na(downTotal) ? TXT_NA : str.tostring(downTotal, format.volume)
+
+    table.cell(dashTable, 0, 0, "U/D Volume Ratio", text_color = DASH_TEXT, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 0, windowText, text_color = DASH_HEADER, text_halign = text.align_right, text_size = dashTextSize)
+
+    table.cell(dashTable, 0, 1, "Ratio", text_color = labelColor, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 1, ratioText, text_color = biasColor, text_halign = text.align_right, text_size = dashTextSize)
+
+    table.cell(dashTable, 0, 2, "Bias", text_color = labelColor, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 2, biasText, text_color = biasColor, text_halign = text.align_right, text_size = dashTextSize)
+
+    table.cell(dashTable, 0, 3, "Up Share", text_color = labelColor, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 3, shareText, text_color = valueColor, text_halign = text.align_right, text_size = dashTextSize)
+
+    table.cell(dashTable, 0, 4, "Up Volume", text_color = labelColor, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 4, upText, text_color = valueColor, text_halign = text.align_right, text_size = dashTextSize)
+
+    table.cell(dashTable, 0, 5, "Down Volume", text_color = labelColor, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 5, downText, text_color = valueColor, text_halign = text.align_right, text_size = dashTextSize)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(accumulationShift, "Accumulation Shift", "Up/down Volume Ratio crossed above 1.0 on {{ticker}} - accumulated volume now favors up bars, net accumulation ({{interval}})")
+alertcondition(distributionShift, "Distribution Shift", "Up/down Volume Ratio crossed below 1.0 on {{ticker}} - accumulated volume now favors down bars, net distribution ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

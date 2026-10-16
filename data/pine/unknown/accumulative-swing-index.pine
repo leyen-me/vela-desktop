@@ -1,0 +1,217 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Accumulative Swing Index", "Accumulative Swing Index", overlay = false, format = format.price, precision = 2, max_lines_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+color MAIN_COLOR = #787b86 // neutral - the ASI between its prior swing points
+color BULL_COLOR = #089981
+color BEAR_COLOR = #f23645
+
+int LEVEL_TRANSP   = 40
+int SUSPECT_TRANSP = 50
+
+string MODE_ATR   = "ATR-Based"
+string MODE_FIXED = "Fixed Value"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+string limitModeInput = input.string(MODE_ATR, "Limit Move (T)", options = [MODE_ATR, MODE_FIXED], group = "Swing Index", tooltip = "Divisor T in Wilder's Swing Index formula. Wilder used the contract's limit move, the maximum allowed one-day move of a futures contract. Markets without price limits commonly substitute an ATR-based value, which rescales the line without changing its shape.")
+
+int atrLengthInput = input.int(14, "ATR Length", minval = 1, group = "Swing Index", tooltip = "Average True Range length used as the limit move divisor when 'ATR-Based' is selected.")
+
+float fixedLimitInput = input.float(300.0, "Fixed Limit Move", minval = 0.000001, group = "Swing Index", tooltip = "Constant divisor used when 'Fixed Value' is selected. Set it to the exchange limit move of the contract; in markets without price limits any large constant only rescales the line.")
+
+int swingLengthInput = input.int(10, "Swing Length", minval = 1, maxval = 200, group = "Swings & Breakouts", tooltip = "Bars on each side required to confirm a swing high or low. The same length is applied to price and to the ASI; these swing points drive breakout validation, trendlines and divergences.")
+
+bool showSwingLevelsInput = input.bool(true, "Show ASI Swing Levels", group = "Swings & Breakouts", tooltip = "Display the most recent confirmed ASI swing high and low as levels. Wilder read the ASI exceeding its own prior swing point as validation of the corresponding breakout on price.")
+
+bool showBreakoutMarkersInput = input.bool(false, "Breakout Markers", group = "Swings & Breakouts", tooltip = "Mark price swing breakouts in the pane: triangles when the ASI confirms the breakout by exceeding its own prior swing point, crosses when the ASI does not confirm it (suspect breakout). Alerts are available either way.")
+
+bool showTrendlinesInput = input.bool(true, "ASI Trendlines", group = "Trendlines", tooltip = "Automatically connect the two most recent falling ASI swing highs and rising ASI swing lows, projecting each trendline until the ASI breaks it. Trendline breaks on the ASI often lead the equivalent break on price.")
+
+bool showDivergenceInput = input.bool(false, "Divergence Lines", group = "Divergences", tooltip = "Draw a dashed line between the two ASI readings where price printed a new swing extreme but the ASI failed to follow it. Alerts are available either way.")
+
+color asiColorInput  = input.color(MAIN_COLOR, "ASI Line", group = "Style", tooltip = "Neutral color of the ASI while it sits between its prior swing high and low. Beyond the prior swing high the line takes the bullish color, beyond the prior swing low the bearish color - Wilder's validation of the corresponding breakout.")
+color bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "direction", group = "Style")
+color bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "direction", group = "Style")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Wilder's per-bar Swing Index, the building block the ASI accumulates
+swingIndex(float limitMove) =>
+    float prevClose = close[1]
+    float prevOpen  = open[1]
+    float result    = 0.0
+    bool  valid     = not (na(prevClose) or na(prevOpen) or na(open) or na(high) or na(low) or na(close) or na(limitMove) or limitMove <= 0)
+    if valid
+        float hc = math.abs(high - prevClose)
+        float lc = math.abs(low - prevClose)
+        float hl = high - low
+        float co = math.abs(prevClose - prevOpen)
+        float rTerm = hc >= lc and hc >= hl ? hc - 0.5 * lc + 0.25 * co : lc >= hc and lc >= hl ? lc - 0.5 * hc + 0.25 * co : hl + 0.25 * co
+        float kTerm = math.max(hc, lc)
+        float numerator = close - prevClose + 0.5 * (close - open) + 0.25 * (prevClose - prevOpen)
+        result := rTerm > 0 ? 50 * (numerator / rTerm) * (kTerm / limitMove) : 0.0
+    result
+
+// Maintains the automatic trendline over ASI swing points for one side, returns the break flag
+asiTrendline(float src, float pivotValue, int pivotBar, bool isResistance, color lineColor, bool show) =>
+    var float lastVal   = na
+    var int   lastBar   = na
+    var float startVal  = na
+    var int   startBar  = na
+    var float lineSlope = na
+    var bool  active    = false
+    var line  lineId    = na
+    if not na(pivotValue)
+        if not na(lastVal) and pivotBar > lastBar and (isResistance ? pivotValue < lastVal : pivotValue > lastVal)
+            startVal  := lastVal
+            startBar  := lastBar
+            lineSlope := (pivotValue - lastVal) / (pivotBar - lastBar)
+            float projectedNow = startVal + lineSlope * (bar_index - startBar)
+            active := isResistance ? src <= projectedNow : src >= projectedNow
+            if not na(lineId)
+                line.set_extend(lineId, extend.none)
+            if show
+                lineId := line.new(lastBar, lastVal, pivotBar, pivotValue, color = lineColor, style = line.style_dashed, extend = active ? extend.right : extend.none)
+        lastVal := pivotValue
+        lastBar := pivotBar
+    float projected = active ? startVal + lineSlope * (bar_index - startBar) : na
+    bool sameLine   = active and not na(projected) and not na(projected[1]) and startBar == startBar[1]
+    bool breakFlag  = sameLine and (isResistance ? src > projected and src[1] <= projected[1] : src < projected and src[1] >= projected[1])
+    if breakFlag
+        active := false
+        if not na(lineId)
+            line.set_extend(lineId, extend.none)
+            line.set_x2(lineId, bar_index)
+            line.set_y2(lineId, projected)
+    breakFlag
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Swing Index & Accumulation
+//---------------------------------------------------------------------------------------------------------------------{
+float atrValue  = ta.atr(atrLengthInput)
+float limitMove = limitModeInput == MODE_ATR ? atrValue : fixedLimitInput
+
+float siValue = swingIndex(limitMove)
+
+var float asiValue = 0.0
+asiValue += siValue
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Swing Points & Breakout Validation
+//---------------------------------------------------------------------------------------------------------------------{
+float asiPivotHigh   = ta.pivothigh(asiValue, swingLengthInput, swingLengthInput)
+float asiPivotLow    = ta.pivotlow(asiValue, swingLengthInput, swingLengthInput)
+float pricePivotHigh = ta.pivothigh(high, swingLengthInput, swingLengthInput)
+float pricePivotLow  = ta.pivotlow(low, swingLengthInput, swingLengthInput)
+
+int pivotBarIndex = bar_index - swingLengthInput
+
+var float asiSwingHigh   = na
+var float asiSwingLow    = na
+var float priceSwingHigh = na
+var float priceSwingLow  = na
+
+if not na(asiPivotHigh)
+    asiSwingHigh := asiPivotHigh
+if not na(asiPivotLow)
+    asiSwingLow := asiPivotLow
+if not na(pricePivotHigh)
+    priceSwingHigh := pricePivotHigh
+if not na(pricePivotLow)
+    priceSwingLow := pricePivotLow
+
+// Breaks of the ASI's own prior swing points
+bool asiSwingBreakUp   = ta.crossover(asiValue, asiSwingHigh)
+bool asiSwingBreakDown = ta.crossunder(asiValue, asiSwingLow)
+
+// Price swing breakouts, validated or not by the ASI exceeding its own prior swing point
+bool priceBreakUp   = ta.crossover(close, priceSwingHigh)
+bool priceBreakDown = ta.crossunder(close, priceSwingLow)
+
+bool asiConfirmsUp   = not na(asiSwingHigh) and asiValue > asiSwingHigh
+bool asiConfirmsDown = not na(asiSwingLow) and asiValue < asiSwingLow
+
+bool confirmedBreakUp   = priceBreakUp and asiConfirmsUp
+bool suspectBreakUp     = priceBreakUp and not na(asiSwingHigh) and not asiConfirmsUp
+bool confirmedBreakDown = priceBreakDown and asiConfirmsDown
+bool suspectBreakDown   = priceBreakDown and not na(asiSwingLow) and not asiConfirmsDown
+
+// Automatic trendlines on the ASI swing points
+bool asiTlBreakUp   = asiTrendline(asiValue, asiPivotHigh, pivotBarIndex, true, bearColorInput, showTrendlinesInput)
+bool asiTlBreakDown = asiTrendline(asiValue, asiPivotLow, pivotBarIndex, false, bullColorInput, showTrendlinesInput)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Divergences
+//---------------------------------------------------------------------------------------------------------------------{
+var int   lastPhBar   = na
+var float lastPhPrice = na
+var float lastPhAsi   = na
+var int   lastPlBar   = na
+var float lastPlPrice = na
+var float lastPlAsi   = na
+
+bool bearishDivergence = false
+bool bullishDivergence = false
+
+if not na(pricePivotHigh)
+    float pivotAsi = asiValue[swingLengthInput]
+    if not na(lastPhPrice) and not na(lastPhAsi) and pricePivotHigh > lastPhPrice and pivotAsi < lastPhAsi
+        bearishDivergence := true
+        if showDivergenceInput
+            line.new(lastPhBar, lastPhAsi, pivotBarIndex, pivotAsi, color = bearColorInput, style = line.style_dashed, width = 2)
+    lastPhBar   := pivotBarIndex
+    lastPhPrice := pricePivotHigh
+    lastPhAsi   := pivotAsi
+
+if not na(pricePivotLow)
+    float pivotAsi = asiValue[swingLengthInput]
+    if not na(lastPlPrice) and not na(lastPlAsi) and pricePivotLow < lastPlPrice and pivotAsi > lastPlAsi
+        bullishDivergence := true
+        if showDivergenceInput
+            line.new(lastPlBar, lastPlAsi, pivotBarIndex, pivotAsi, color = bullColorInput, style = line.style_dashed, width = 2)
+    lastPlBar   := pivotBarIndex
+    lastPlPrice := pricePivotLow
+    lastPlAsi   := pivotAsi
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visuals
+//---------------------------------------------------------------------------------------------------------------------{
+// State coloring - beyond the prior ASI swing high is the validated bullish side, beyond the prior swing low the bearish side
+color asiColor = asiConfirmsUp ? bullColorInput : asiConfirmsDown ? bearColorInput : asiColorInput
+
+plot(asiValue, "ASI", asiColor, 2)
+
+float swingHighLevel = showSwingLevelsInput ? asiSwingHigh : na
+float swingLowLevel  = showSwingLevelsInput ? asiSwingLow : na
+
+plot(swingHighLevel, "ASI Swing High", swingHighLevel == swingHighLevel[1] ? color.new(bearColorInput, LEVEL_TRANSP) : na, 1, plot.style_linebr)
+plot(swingLowLevel, "ASI Swing Low", swingLowLevel == swingLowLevel[1] ? color.new(bullColorInput, LEVEL_TRANSP) : na, 1, plot.style_linebr)
+
+plotshape(showBreakoutMarkersInput and confirmedBreakUp, "Confirmed Bullish Breakout", shape.triangleup, location.bottom, bullColorInput, size = size.tiny)
+plotshape(showBreakoutMarkersInput and suspectBreakUp, "Suspect Bullish Breakout", shape.xcross, location.bottom, color.new(bullColorInput, SUSPECT_TRANSP), size = size.tiny)
+plotshape(showBreakoutMarkersInput and confirmedBreakDown, "Confirmed Bearish Breakdown", shape.triangledown, location.top, bearColorInput, size = size.tiny)
+plotshape(showBreakoutMarkersInput and suspectBreakDown, "Suspect Bearish Breakdown", shape.xcross, location.top, color.new(bearColorInput, SUSPECT_TRANSP), size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(asiSwingBreakUp, "ASI Swing High Break", "The ASI crossed above its prior swing high on {{ticker}} ({{interval}})")
+alertcondition(asiSwingBreakDown, "ASI Swing Low Break", "The ASI crossed below its prior swing low on {{ticker}} ({{interval}})")
+alertcondition(confirmedBreakUp, "Confirmed Bullish Breakout", "Price broke above its prior swing high with the ASI beyond its own prior swing high on {{ticker}} ({{interval}})")
+alertcondition(suspectBreakUp, "Suspect Bullish Breakout", "Price broke above its prior swing high without ASI confirmation on {{ticker}} ({{interval}})")
+alertcondition(confirmedBreakDown, "Confirmed Bearish Breakdown", "Price broke below its prior swing low with the ASI beyond its own prior swing low on {{ticker}} ({{interval}})")
+alertcondition(suspectBreakDown, "Suspect Bearish Breakdown", "Price broke below its prior swing low without ASI confirmation on {{ticker}} ({{interval}})")
+alertcondition(asiTlBreakUp, "Bullish ASI Trendline Break", "The ASI broke above its falling trendline on {{ticker}} ({{interval}})")
+alertcondition(asiTlBreakDown, "Bearish ASI Trendline Break", "The ASI broke below its rising trendline on {{ticker}} ({{interval}})")
+alertcondition(bullishDivergence, "Bullish ASI Divergence", "Price made a lower swing low while the ASI made a higher low on {{ticker}} ({{interval}})")
+alertcondition(bearishDivergence, "Bearish ASI Divergence", "Price made a higher swing high while the ASI made a lower high on {{ticker}} ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

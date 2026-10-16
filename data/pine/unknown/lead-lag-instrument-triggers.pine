@@ -1,0 +1,354 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Lead-lag Instrument Triggers"
+  , shorttitle       = "Lead-lag Instrument Triggers"
+  , overlay          = true
+  , format           = format.price
+  , max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+color BULL_COLOR        = #089981
+color BEAR_COLOR        = #f23645
+color NEUTRAL_COLOR     = #787b86
+color TRANSPARENT_COLOR = #00000000
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+int LEVEL_TRANSP = 75 // Transparency of the chart breakout levels while their side is not armed
+int MARK_TRANSP  = 25 // Transparency of the leader event markers
+int BG_TRANSP    = 92 // Transparency of the armed-window background highlight
+
+string GROUP_LEADER = "Leader"
+string GROUP_EVENTS = "Leader Events"
+string GROUP_RULES  = "Trigger Rules"
+string GROUP_DASH   = "Dashboard"
+string GROUP_STYLE  = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+leaderSymbolInput = input.symbol("BINANCE:BTCUSDT", "Leader Symbol"
+  , group   = GROUP_LEADER
+  , tooltip = "Related instrument presumed to move first. The chart symbol is treated as the lagger: decisive events on the leader arm a trigger window, and the chart executes only when it confirms inside that window. Classic pairs: ES1! leading an NQ chart, BTC leading altcoin charts, a sector leader versus its peers.")
+
+breakoutLengthInput = input.int(20, "Breakout Length"
+  , minval  = 2
+  , maxval  = 200
+  , group   = GROUP_EVENTS
+  , tooltip = "Lookback used to build the key levels (highest high / lowest low of the prior bars) on BOTH the leader and the chart. The leader must take out its own level first; the chart then confirms by breaking its equivalent level.")
+
+useBreakoutInput = input.bool(true, "Breakouts"
+  , group   = GROUP_EVENTS
+  , tooltip = "Leader event: the leader closes across its prior N-bar extreme - a decisive breakout in that direction.")
+
+useFailureInput = input.bool(true, "Failures At Key Levels"
+  , group   = GROUP_EVENTS
+  , tooltip = "Leader event: the leader pokes beyond its prior N-bar extreme but closes back inside - a failed test that arms the OPPOSITE direction (a failure at highs is bearish, a failure at lows is bullish).")
+
+useThrustInput = input.bool(true, "Momentum Thrusts"
+  , group   = GROUP_EVENTS
+  , tooltip = "Leader event: the leader prints an unusually large one-bar return, measured as a z-score of its bar-to-bar percent change.")
+
+thrustWindowInput = input.int(100, "Thrust Window"
+  , minval  = 20
+  , maxval  = 500
+  , group   = GROUP_EVENTS
+  , tooltip = "Number of leader bars used to estimate the mean and standard deviation of its one-bar returns for the thrust z-score.")
+
+thrustSigmaInput = input.float(2.0, "Thrust Threshold (Sigma)"
+  , minval  = 0.5
+  , maxval  = 6
+  , step    = 0.25
+  , group   = GROUP_EVENTS
+  , tooltip = "Minimum absolute z-score of the leader's one-bar return for a momentum thrust event.")
+
+triggerWindowInput = input.int(10, "Trigger Window (Bars)"
+  , minval  = 1
+  , maxval  = 500
+  , group   = GROUP_RULES
+  , tooltip = "How many bars after a leader event the chart may confirm. A chart breakout inside this window becomes a trigger; the window expiring without confirmation produces a non-confirmation signal. Exploitable lags run from near-simultaneous to a few bars, so keep this short.")
+
+corrGateInput = input.bool(true, "Correlation Gate"
+  , group   = GROUP_RULES
+  , tooltip = "Only arm trigger windows while the rolling correlation between leader and chart one-bar returns is above the minimum. Lead-lag relationships compress, invert and vanish, so co-movement is re-validated continuously instead of being assumed.")
+
+corrLengthInput = input.int(100, "Correlation Length"
+  , minval  = 10
+  , maxval  = 500
+  , group   = GROUP_RULES
+  , tooltip = "Rolling window (bars) for the correlation between leader and chart one-bar returns.")
+
+corrMinInput = input.float(0.3, "Minimum Correlation"
+  , minval  = -1
+  , maxval  = 1
+  , step    = 0.05
+  , group   = GROUP_RULES
+  , tooltip = "Correlation gate threshold. Leader events occurring while the rolling correlation sits below this value do not arm trigger windows.")
+
+catchupToggleInput = input.bool(true, "Catch-up Setups"
+  , group   = GROUP_RULES
+  , tooltip = "After a leader impulse, flag the chart when it has not yet followed - the rotation play of positioning for the lagged catch-up leg. Follow-through is probabilistic, so these are setups, not confirmed triggers.")
+
+catchupDelayInput = input.int(3, "Catch-up Check Delay"
+  , minval  = 1
+  , maxval  = 100
+  , group   = GROUP_RULES
+  , tooltip = "Bars after the leader event at which the catch-up test runs (clamped to the trigger window).")
+
+catchupFractionInput = input.float(0.25, "Catch-up Max Relative Move"
+  , minval  = 0
+  , maxval  = 1
+  , step    = 0.05
+  , group   = GROUP_RULES
+  , tooltip = "The chart counts as 'not yet moved' when its move since the leader event is below this fraction of the leader's move in the same direction.")
+
+nonConfToggleInput = input.bool(true, "Non-confirmation Signals"
+  , group   = GROUP_RULES
+  , tooltip = "When the trigger window expires without the chart confirming, mark the non-confirmation - the lagger refusing to follow is early evidence the leader's move may be exhausting rather than spreading.")
+
+showDashboardInput = input.bool(true, "Show Dashboard"
+  , group   = GROUP_DASH
+  , tooltip = "Compact panel showing the leader symbol, the rolling correlation, the gate status and the current trigger-window state.")
+
+dashLocationInput = input.string("Top Right", "Location"
+  , options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"]
+  , group   = GROUP_DASH
+  , tooltip = "Dashboard position on the chart.")
+
+dashSizeInput = input.string("Small", "Size"
+  , options = ["Tiny", "Small", "Normal"]
+  , group   = GROUP_DASH
+  , tooltip = "Dashboard text size.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", group = GROUP_STYLE, inline = "colors")
+bearColorInput = input.color(BEAR_COLOR, "Bearish", group = GROUP_STYLE, inline = "colors")
+
+showLevelsInput = input.bool(true, "Chart Breakout Levels"
+  , group   = GROUP_STYLE
+  , tooltip = "Plot the chart's own prior N-bar extremes - the equivalent levels the lagger must break to confirm. The armed side is emphasized while a trigger window is open.")
+
+showBackgroundInput = input.bool(true, "Highlight Armed Window"
+  , group   = GROUP_STYLE
+  , tooltip = "Tint the background while a trigger window is armed, in the direction of the leader event.")
+
+showLeaderMarksInput = input.bool(true, "Leader Event Markers"
+  , group   = GROUP_STYLE
+  , tooltip = "Mark the bars where a gated leader event arms a trigger window (bullish at the bottom of the chart, bearish at the top).")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Runs inside the leader's request.security() context so levels, sessions and return statistics use leader bars.
+// Detects the decisive leader events: breakouts, failures at key levels, momentum thrusts (1 = event, 0 = none).
+leaderEvents() =>
+    float upperLevel  = ta.highest(high, breakoutLengthInput)[1]
+    float lowerLevel  = ta.lowest(low, breakoutLengthInput)[1]
+    bool  bullBreak   = ta.crossover(close, upperLevel)
+    bool  bearBreak   = ta.crossunder(close, lowerLevel)
+    bool  bearFailure = high > upperLevel and close < upperLevel
+    bool  bullFailure = low < lowerLevel and close > lowerLevel
+    float barReturn   = ta.roc(close, 1)
+    float returnMean  = ta.sma(barReturn, thrustWindowInput)
+    float returnStdev = ta.stdev(barReturn, thrustWindowInput)
+    float returnZ     = not na(returnStdev) and returnStdev > 0 ? (barReturn - returnMean) / returnStdev : 0
+    bool  bullThrust  = returnZ >= thrustSigmaInput
+    bool  bearThrust  = returnZ <= -thrustSigmaInput
+    bool  bullEvent   = useBreakoutInput and bullBreak or useFailureInput and bullFailure or useThrustInput and bullThrust
+    bool  bearEvent   = useBreakoutInput and bearBreak or useFailureInput and bearFailure or useThrustInput and bearThrust
+    [bullEvent ? 1 : 0, bearEvent ? 1 : 0, close, barReturn, time]
+
+// Maps the dashboard location option to a table position
+getTablePosition(positionText) =>
+    switch positionText
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        => position.bottom_left
+
+// Maps the dashboard size option to a text size
+getTableSize(sizeText) =>
+    switch sizeText
+        "Tiny"   => size.tiny
+        "Normal" => size.normal
+        => size.small
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Leader Data & Events
+//---------------------------------------------------------------------------------------------------------------------{
+
+[leaderBullValue, leaderBearValue, leaderClose, leaderReturn, leaderTime] = request.security(leaderSymbolInput, timeframe.period, leaderEvents(), ignore_invalid_symbol = true)
+
+// Accept events only on fresh leader bars - session and holiday mismatches repeat the last
+// leader bar across several chart bars, which must not re-arm the window
+bool newLeaderBar    = not na(leaderTime) and leaderTime != nz(leaderTime[1])
+bool leaderBullEvent = newLeaderBar and not na(leaderClose) and nz(leaderBullValue) > 0.5
+bool leaderBearEvent = newLeaderBar and not na(leaderClose) and nz(leaderBearValue) > 0.5
+
+var bool leaderDataSeen = false
+if not na(leaderClose)
+    leaderDataSeen := true
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Relationship Gate & Chart Levels
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Rolling co-movement check on one-bar returns: a leader-lagger label estimated in one regime
+// frequently fails out of sample, so windows only arm while the pair still moves together
+float chartReturn      = ta.roc(close, 1)
+float correlationValue = ta.correlation(leaderReturn, chartReturn, corrLengthInput)
+bool  corrOk           = not corrGateInput or (not na(correlationValue) and correlationValue >= corrMinInput)
+
+// The chart's equivalent key levels: same construction as the leader's, on the lagger's own bars
+float chartUpper     = ta.highest(high, breakoutLengthInput)[1]
+float chartLower     = ta.lowest(low, breakoutLengthInput)[1]
+bool  chartBullBreak = ta.crossover(close, chartUpper)
+bool  chartBearBreak = ta.crossunder(close, chartLower)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Trigger State Machine
+//---------------------------------------------------------------------------------------------------------------------{
+
+var int   armedDirection = 0
+var int   armedBarIndex  = na
+var float leaderRefClose = na
+var float chartRefClose  = na
+var bool  catchupChecked = true
+
+bool leaderArmedBull = false
+bool leaderArmedBear = false
+bool bullishTrigger  = false
+bool bearishTrigger  = false
+bool bullishCatchup  = false
+bool bearishCatchup  = false
+bool nonConfBearish  = false
+bool nonConfBullish  = false
+
+// Expire stale windows first, flagging the non-confirmation when the chart never followed the leader
+if armedDirection != 0 and bar_index - armedBarIndex > triggerWindowInput
+    nonConfBearish := nonConfToggleInput and armedDirection == 1
+    nonConfBullish := nonConfToggleInput and armedDirection == -1
+    armedDirection := 0
+    armedBarIndex  := na
+    leaderRefClose := na
+    chartRefClose  := na
+    catchupChecked := true
+
+// Arm (or re-arm) the trigger window on a gated leader event; simultaneous opposite events are ambiguous and ignored
+if leaderBullEvent != leaderBearEvent and corrOk
+    armedDirection  := leaderBullEvent ? 1 : -1
+    armedBarIndex   := bar_index
+    leaderRefClose  := leaderClose
+    chartRefClose   := close
+    catchupChecked  := false
+    leaderArmedBull := leaderBullEvent
+    leaderArmedBear := leaderBearEvent
+
+// Confirmed triggers: the chart breaks its equivalent level while the window is armed - the
+// breakout is only taken because the leader has already broken; one trigger consumes the window
+if armedDirection == 1 and chartBullBreak
+    bullishTrigger := true
+if armedDirection == -1 and chartBearBreak
+    bearishTrigger := true
+
+if bullishTrigger or bearishTrigger
+    armedDirection := 0
+    armedBarIndex  := na
+    leaderRefClose := na
+    chartRefClose  := na
+    catchupChecked := true
+
+// Catch-up setups: a few bars into the window the leader's move has held but the chart has not
+// yet followed - candidates for the lagged catch-up leg
+if catchupToggleInput and armedDirection != 0 and not catchupChecked and bar_index - armedBarIndex >= math.min(catchupDelayInput, triggerWindowInput)
+    float leaderMove = leaderClose / leaderRefClose - 1
+    float chartMove  = close / chartRefClose - 1
+    if not na(leaderMove) and not na(chartMove)
+        bullishCatchup := armedDirection == 1 and leaderMove > 0 and chartMove < catchupFractionInput * leaderMove
+        bearishCatchup := armedDirection == -1 and leaderMove < 0 and chartMove > catchupFractionInput * leaderMove
+    catchupChecked := true
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visuals
+//---------------------------------------------------------------------------------------------------------------------{
+
+plot(showLevelsInput ? chartUpper : na, "Upper Breakout Level", armedDirection == 1 ? bullColorInput : color.new(bullColorInput, LEVEL_TRANSP), 1, plot.style_linebr)
+plot(showLevelsInput ? chartLower : na, "Lower Breakout Level", armedDirection == -1 ? bearColorInput : color.new(bearColorInput, LEVEL_TRANSP), 1, plot.style_linebr)
+
+bgcolor(showBackgroundInput and armedDirection == 1 ? color.new(bullColorInput, BG_TRANSP) : showBackgroundInput and armedDirection == -1 ? color.new(bearColorInput, BG_TRANSP) : na, title = "Armed Trigger Window")
+
+plotchar(showLeaderMarksInput and leaderArmedBull, "Leader Bullish Event", "◆", location.bottom, color.new(bullColorInput, MARK_TRANSP), size = size.tiny)
+plotchar(showLeaderMarksInput and leaderArmedBear, "Leader Bearish Event", "◆", location.top, color.new(bearColorInput, MARK_TRANSP), size = size.tiny)
+
+if bullishTrigger
+    label.new(bar_index, low, "▲", yloc = yloc.belowbar, style = label.style_label_up, color = bullColorInput, textcolor = chart.bg_color, size = size.small, tooltip = "Bullish lead-lag trigger - the chart broke its equivalent level inside the window armed by the leader's bullish event")
+if bearishTrigger
+    label.new(bar_index, high, "▼", yloc = yloc.abovebar, style = label.style_label_down, color = bearColorInput, textcolor = chart.bg_color, size = size.small, tooltip = "Bearish lead-lag trigger - the chart broke its equivalent level inside the window armed by the leader's bearish event")
+if bullishCatchup
+    label.new(bar_index, low, "◇", yloc = yloc.belowbar, style = label.style_label_up, color = TRANSPARENT_COLOR, textcolor = bullColorInput, size = size.small, tooltip = "Bullish catch-up setup - the leader moved up but the chart has not yet followed")
+if bearishCatchup
+    label.new(bar_index, high, "◇", yloc = yloc.abovebar, style = label.style_label_down, color = TRANSPARENT_COLOR, textcolor = bearColorInput, size = size.small, tooltip = "Bearish catch-up setup - the leader moved down but the chart has not yet followed")
+if nonConfBearish
+    label.new(bar_index, high, "✕", yloc = yloc.abovebar, style = label.style_label_down, color = TRANSPARENT_COLOR, textcolor = bearColorInput, size = size.small, tooltip = "Non-confirmation - the leader's bullish move was not confirmed by the chart within the window (possible exhaustion)")
+if nonConfBullish
+    label.new(bar_index, low, "✕", yloc = yloc.belowbar, style = label.style_label_up, color = TRANSPARENT_COLOR, textcolor = bullColorInput, size = size.small, tooltip = "Non-confirmation - the leader's bearish move was not confirmed by the chart within the window (possible exhaustion)")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+
+var table dashboardTable = na
+
+if showDashboardInput and barstate.islast
+    if na(dashboardTable)
+        dashboardTable := table.new(getTablePosition(dashLocationInput), 2, 4, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+    string dashSize = getTableSize(dashSizeInput)
+
+    array<string> symbolParts = str.split(leaderSymbolInput, ":")
+    string leaderDisplay      = array.size(symbolParts) > 1 ? array.get(symbolParts, 1) : leaderSymbolInput
+    if not leaderDataSeen
+        leaderDisplay := leaderDisplay + " (no data)"
+
+    string corrText = na(correlationValue) ? "-" : str.tostring(correlationValue, "0.00")
+    color corrColor = na(correlationValue) ? DASH_TEXT : color.from_gradient(correlationValue, -1, 1, bearColorInput, bullColorInput)
+
+    string gateText = corrGateInput ? corrOk ? "Pass" : "Fail" : "Off"
+    color gateColor = corrGateInput ? corrOk ? bullColorInput : bearColorInput : DASH_TEXT
+
+    int barsLeft     = armedDirection != 0 ? math.max(triggerWindowInput - (bar_index - armedBarIndex), 0) : 0
+    string stateText = armedDirection == 1 ? "Armed ▲ · " + str.tostring(barsLeft) + " bars left" : armedDirection == -1 ? "Armed ▼ · " + str.tostring(barsLeft) + " bars left" : "Idle"
+    color stateColor = armedDirection == 1 ? bullColorInput : armedDirection == -1 ? bearColorInput : DASH_TEXT
+
+    table.cell(dashboardTable, 0, 0, "Leader", text_color = DASH_HEADER, text_halign = text.align_left, text_size = dashSize)
+    table.cell(dashboardTable, 1, 0, leaderDisplay, text_color = leaderDataSeen ? DASH_TEXT : bearColorInput, text_halign = text.align_right, text_size = dashSize)
+    table.cell(dashboardTable, 0, 1, "Correlation", text_color = DASH_HEADER, text_halign = text.align_left, text_size = dashSize)
+    table.cell(dashboardTable, 1, 1, corrText, text_color = corrColor, text_halign = text.align_right, text_size = dashSize)
+    table.cell(dashboardTable, 0, 2, "Gate", text_color = DASH_HEADER, text_halign = text.align_left, text_size = dashSize)
+    table.cell(dashboardTable, 1, 2, gateText, text_color = gateColor, text_halign = text.align_right, text_size = dashSize)
+    table.cell(dashboardTable, 0, 3, "Window", text_color = DASH_HEADER, text_halign = text.align_left, text_size = dashSize)
+    table.cell(dashboardTable, 1, 3, stateText, text_color = stateColor, text_halign = text.align_right, text_size = dashSize)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(bullishTrigger, "Bullish Trigger", "Bullish lead-lag trigger on {{ticker}} - the chart breakout confirmed the leader's bullish event inside the trigger window")
+alertcondition(bearishTrigger, "Bearish Trigger", "Bearish lead-lag trigger on {{ticker}} - the chart breakdown confirmed the leader's bearish event inside the trigger window")
+alertcondition(leaderArmedBull, "Leader Bullish Event", "Leader bullish event - a bullish trigger window is armed on {{ticker}}")
+alertcondition(leaderArmedBear, "Leader Bearish Event", "Leader bearish event - a bearish trigger window is armed on {{ticker}}")
+alertcondition(bullishCatchup, "Bullish Catch-up Setup", "Bullish catch-up setup on {{ticker}} - the leader moved up and the chart has not yet followed")
+alertcondition(bearishCatchup, "Bearish Catch-up Setup", "Bearish catch-up setup on {{ticker}} - the leader moved down and the chart has not yet followed")
+alertcondition(nonConfBearish, "Bearish Non-confirmation", "Non-confirmation on {{ticker}} - the leader's bullish move was not confirmed within the trigger window")
+alertcondition(nonConfBullish, "Bullish Non-confirmation", "Non-confirmation on {{ticker}} - the leader's bearish move was not confirmed within the trigger window")
+
+//---------------------------------------------------------------------------------------------------------------------}

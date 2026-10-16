@@ -1,0 +1,366 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("ABCD", "ABCD", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 100)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+RATIO_CLASSIC = 1.000
+RATIO_EXT_1   = 1.272
+RATIO_EXT_2   = 1.618
+BC_EXT_MIN    = 1.272
+BC_EXT_MAX    = 1.618
+MAX_PIVOTS    = 8
+MAX_FWD_BARS  = 500
+LABEL_BG      = #00000000
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+lenInput = input.int(10, "Swing Length", minval = 2, group = "Swing Detection", tooltip = "Number of bars on each side required to confirm a swing high or swing low. The alternating swings supply the A, B and C anchors; larger values return bigger patterns that confirm later.")
+
+retMinInput = input.float(0.618, "C Retracement Min", minval = 0.1, maxval = 0.99, step = 0.01, group = "Pattern Ratios", tooltip = "Lower bound of the valid C retracement of the AB leg. Textbook patterns hold C between 0.618 and 0.786 of AB; looser readings accept values down to 0.382.")
+retMaxInput = input.float(0.786, "C Retracement Max", minval = 0.2, maxval = 1.0, step = 0.01, group = "Pattern Ratios", tooltip = "Upper bound of the valid C retracement of the AB leg. C must never exceed A or the structure is void; looser readings accept values up to 0.886.")
+tolInput = input.float(0.05, "Completion Ratio Tolerance", minval = 0.01, maxval = 0.25, step = 0.01, group = "Pattern Ratios", tooltip = "Accepted deviation of the CD to AB ratio when matching a completion. With 0.05, a CD leg between 0.95 and 1.05 times AB completes the classic AB=CD.")
+showExtInput = input.bool(true, "Extended Variants (1.272 and 1.618)", group = "Pattern Ratios", tooltip = "Also project and match the extended ABCD variants, where CD runs to 1.272 or 1.618 times AB. Markets that overrun exact equality often react near the next harmonic multiple.")
+showBcExtInput = input.bool(true, "BC Extension Zone (1.272 to 1.618)", group = "Pattern Ratios", tooltip = "Shade the 1.272 to 1.618 extension window of the BC leg, the second way to project D. Agreement between this zone and the AB=CD level makes the completion worth watching.")
+
+bullColorInput = input.color(#089981, "Bullish Patterns", group = "Style", tooltip = "Color of bullish patterns, which decline from A to B, correct up to C, and complete at a swing low near D.")
+bearColorInput = input.color(#f23645, "Bearish Patterns", group = "Style", tooltip = "Color of bearish patterns, which advance from A to B, correct down to C, and complete at a swing high near D.")
+widthInput = input.int(2, "Leg Line Width", minval = 1, maxval = 5, group = "Style", tooltip = "Width of the drawn A to B, B to C and C to D pattern legs.")
+showPointsInput = input.bool(true, "Point Labels (A, B, C)", group = "Style", tooltip = "Show the A, B and C letters at the pattern anchor points. The D completion label is always shown and carries the matched ratio with full pattern details in its tooltip.")
+
+// normalized retracement window, protects against inverted user bounds
+retLo = math.min(retMinInput, retMaxInput)
+retHi = math.max(retMinInput, retMaxInput)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types
+//---------------------------------------------------------------------------------------------------------------------{
+type Pivot
+    float price
+    int   barIdx
+    int   dir
+    int   seq
+
+type AbcdSlot
+    int   state = 0
+    int   dir = 0
+    float aPrice
+    int   aBar
+    float bPrice
+    int   bBar
+    float cPrice
+    int   cBar
+    int   cSeq
+    float abDist
+    int   abBars
+    float retr
+    float d100
+    float d127
+    float d162
+    float bcExtNear
+    float bcExtFar
+    float voidLevel
+    bool  touched = false
+    int   formedBar = -1
+    int   touchedBar = -1
+    int   completedBar = -1
+    line  abLn
+    line  bcLn
+    line  d100Ln
+    line  d127Ln
+    line  d162Ln
+    box   bcBox
+    label aLb
+    label bLb
+    label cLb
+    label t100Lb
+    label t127Lb
+    label t162Lb
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// append an alternating swing to the pivot array, extending the last swing when a same-direction extreme prints
+addPivot(array<Pivot> arr, float price, int barIdx, int dir) =>
+    bool changed = false
+    int n = array.size(arr)
+    if n == 0
+        array.push(arr, Pivot.new(price, barIdx, dir, 0))
+        changed := true
+    else
+        Pivot prev = array.get(arr, n - 1)
+        if prev.dir == dir
+            if (dir == 1 and price > prev.price) or (dir == -1 and price < prev.price)
+                prev.price := price
+                prev.barIdx := barIdx
+                changed := true
+        else
+            array.push(arr, Pivot.new(price, barIdx, dir, prev.seq + 1))
+            changed := true
+    if array.size(arr) > MAX_PIVOTS
+        array.shift(arr)
+    changed
+
+// delete every drawing owned by a slot and clear the references
+clearDrawings(AbcdSlot s) =>
+    line.delete(s.abLn)
+    line.delete(s.bcLn)
+    line.delete(s.d100Ln)
+    line.delete(s.d127Ln)
+    line.delete(s.d162Ln)
+    box.delete(s.bcBox)
+    label.delete(s.aLb)
+    label.delete(s.bLb)
+    label.delete(s.cLb)
+    label.delete(s.t100Lb)
+    label.delete(s.t127Lb)
+    label.delete(s.t162Lb)
+    s.abLn := line(na)
+    s.bcLn := line(na)
+    s.d100Ln := line(na)
+    s.d127Ln := line(na)
+    s.d162Ln := line(na)
+    s.bcBox := box(na)
+    s.aLb := label(na)
+    s.bLb := label(na)
+    s.cLb := label(na)
+    s.t100Lb := label(na)
+    s.t127Lb := label(na)
+    s.t162Lb := label(na)
+
+// keep the drawings on the chart but release the references, archiving a completed pattern
+releaseDrawings(AbcdSlot s) =>
+    s.abLn := line(na)
+    s.bcLn := line(na)
+    s.d100Ln := line(na)
+    s.d127Ln := line(na)
+    s.d162Ln := line(na)
+    s.bcBox := box(na)
+    s.aLb := label(na)
+    s.bLb := label(na)
+    s.cLb := label(na)
+    s.t100Lb := label(na)
+    s.t127Lb := label(na)
+    s.t162Lb := label(na)
+
+// a forming pattern failed, remove its drawings and idle the slot
+voidSlot(AbcdSlot s) =>
+    clearDrawings(s)
+    s.state := 0
+
+// project the D completions from the confirmed A, B, C anchors
+computeLevels(AbcdSlot s) =>
+    float sgn = s.dir == 1 ? -1.0 : 1.0
+    float bcDist = math.abs(s.cPrice - s.bPrice)
+    s.retr := bcDist / s.abDist
+    s.d100 := s.cPrice + sgn * s.abDist * RATIO_CLASSIC
+    s.d127 := s.cPrice + sgn * s.abDist * RATIO_EXT_1
+    s.d162 := s.cPrice + sgn * s.abDist * RATIO_EXT_2
+    s.bcExtNear := s.cPrice + sgn * bcDist * BC_EXT_MIN
+    s.bcExtFar := s.cPrice + sgn * bcDist * BC_EXT_MAX
+    s.voidLevel := s.cPrice + sgn * s.abDist * ((showExtInput ? RATIO_EXT_2 : RATIO_CLASSIC) + tolInput)
+
+// draw or redraw the legs, anchors and D projections of a forming pattern
+drawForming(AbcdSlot s) =>
+    clearDrawings(s)
+    color col = s.dir == 1 ? bullColorInput : bearColorInput
+    color faint = color.new(col, 45)
+    int rightEnd = math.min(math.max(bar_index, s.cBar + s.abBars), bar_index + MAX_FWD_BARS)
+    s.abLn := line.new(s.aBar, s.aPrice, s.bBar, s.bPrice, color = col, width = widthInput)
+    s.bcLn := line.new(s.bBar, s.bPrice, s.cBar, s.cPrice, color = col, width = widthInput)
+    s.d100Ln := line.new(s.cBar, s.d100, rightEnd, s.d100, color = col, style = line.style_dashed)
+    s.t100Lb := label.new(rightEnd, s.d100, "1.000", style = label.style_label_left, color = LABEL_BG, textcolor = col, size = size.tiny)
+    if showExtInput
+        s.d127Ln := line.new(s.cBar, s.d127, rightEnd, s.d127, color = faint, style = line.style_dotted)
+        s.t127Lb := label.new(rightEnd, s.d127, "1.272", style = label.style_label_left, color = LABEL_BG, textcolor = faint, size = size.tiny)
+        s.d162Ln := line.new(s.cBar, s.d162, rightEnd, s.d162, color = faint, style = line.style_dotted)
+        s.t162Lb := label.new(rightEnd, s.d162, "1.618", style = label.style_label_left, color = LABEL_BG, textcolor = faint, size = size.tiny)
+    if showBcExtInput
+        s.bcBox := box.new(s.cBar, math.max(s.bcExtNear, s.bcExtFar), rightEnd, math.min(s.bcExtNear, s.bcExtFar), border_color = color.new(col, 70), border_style = line.style_dotted, bgcolor = color.new(col, 92))
+    if showPointsInput
+        s.aLb := label.new(s.aBar, s.aPrice, "A", style = s.dir == 1 ? label.style_label_down : label.style_label_up, color = LABEL_BG, textcolor = col, size = size.small)
+        s.bLb := label.new(s.bBar, s.bPrice, "B", style = s.dir == 1 ? label.style_label_up : label.style_label_down, color = LABEL_BG, textcolor = col, size = size.small)
+        s.cLb := label.new(s.cBar, s.cPrice, "C", style = s.dir == 1 ? label.style_label_down : label.style_label_up, color = LABEL_BG, textcolor = col, size = size.small)
+
+// test a confirmed D swing against the tracked CD to AB variants, completing the pattern on the nearest match
+tryComplete(AbcdSlot s, float dPrice, int dBar) =>
+    float ratio = math.abs(dPrice - s.cPrice) / s.abDist
+    float matched = na
+    float bestDiff = tolInput
+    if math.abs(ratio - RATIO_CLASSIC) <= bestDiff
+        bestDiff := math.abs(ratio - RATIO_CLASSIC)
+        matched := RATIO_CLASSIC
+    if showExtInput and math.abs(ratio - RATIO_EXT_1) <= bestDiff
+        bestDiff := math.abs(ratio - RATIO_EXT_1)
+        matched := RATIO_EXT_1
+    if showExtInput and math.abs(ratio - RATIO_EXT_2) <= bestDiff
+        bestDiff := math.abs(ratio - RATIO_EXT_2)
+        matched := RATIO_EXT_2
+    if not na(matched)
+        color col = s.dir == 1 ? bullColorInput : bearColorInput
+        float bcDist = math.abs(s.cPrice - s.bPrice)
+        line.new(s.cBar, s.cPrice, dBar, dPrice, color = col, width = widthInput)
+        string tip = (s.dir == 1 ? "Bullish" : "Bearish") + " ABCD completed"
+        tip := tip + "\nC retracement of AB: " + str.tostring(s.retr, "0.000")
+        tip := tip + "\nCD to AB ratio: " + str.tostring(ratio, "0.000") + " (matched " + str.tostring(matched, "0.000") + ")"
+        tip := tip + "\nBC extension at D: " + str.tostring(math.abs(dPrice - s.cPrice) / bcDist, "0.000")
+        tip := tip + "\nAB bars: " + str.tostring(s.abBars) + ", CD bars: " + str.tostring(dBar - s.cBar)
+        label.new(dBar, dPrice, "D (" + str.tostring(matched, "0.000") + ")", style = s.dir == 1 ? label.style_label_up : label.style_label_down, color = LABEL_BG, textcolor = col, size = size.small, tooltip = tip)
+        if not na(s.d100Ln)
+            line.set_x2(s.d100Ln, dBar)
+        if not na(s.d127Ln)
+            line.set_x2(s.d127Ln, dBar)
+        if not na(s.d162Ln)
+            line.set_x2(s.d162Ln, dBar)
+        if not na(s.bcBox)
+            box.set_right(s.bcBox, dBar)
+        if not na(s.t100Lb)
+            label.set_x(s.t100Lb, dBar)
+        if not na(s.t127Lb)
+            label.set_x(s.t127Lb, dBar)
+        if not na(s.t162Lb)
+            label.set_x(s.t162Lb, dBar)
+        releaseDrawings(s)
+        s.completedBar := bar_index
+        s.state := 0
+
+// per-bar upkeep of a forming pattern: extend projections, register the D touch, void broken structures
+maintainSlot(AbcdSlot s) =>
+    if s.state == 1
+        int rightEnd = math.min(math.max(bar_index, s.cBar + s.abBars), bar_index + MAX_FWD_BARS)
+        if not na(s.d100Ln)
+            line.set_x2(s.d100Ln, rightEnd)
+        if not na(s.d127Ln)
+            line.set_x2(s.d127Ln, rightEnd)
+        if not na(s.d162Ln)
+            line.set_x2(s.d162Ln, rightEnd)
+        if not na(s.bcBox)
+            box.set_right(s.bcBox, rightEnd)
+        if not na(s.t100Lb)
+            label.set_x(s.t100Lb, rightEnd)
+        if not na(s.t127Lb)
+            label.set_x(s.t127Lb, rightEnd)
+        if not na(s.t162Lb)
+            label.set_x(s.t162Lb, rightEnd)
+        bool hitD = s.dir == 1 ? low <= s.d100 : high >= s.d100
+        if hitD and not s.touched
+            s.touched := true
+            s.touchedBar := bar_index
+        bool brokeA = s.dir == 1 ? high > s.aPrice : low < s.aPrice
+        bool beyondD = s.dir == 1 ? low < s.voidLevel : high > s.voidLevel
+        if brokeA or beyondD
+            voidSlot(s)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Swing Detection
+//---------------------------------------------------------------------------------------------------------------------{
+var array<Pivot> pivotArray = array.new<Pivot>()
+var AbcdSlot bullSlot = AbcdSlot.new(dir = 1)
+var AbcdSlot bearSlot = AbcdSlot.new(dir = -1)
+
+swingHigh = ta.pivothigh(high, lenInput, lenInput)
+swingLow = ta.pivotlow(low, lenInput, lenInput)
+recentLowest = ta.lowest(low, lenInput + 1)
+recentHighest = ta.highest(high, lenInput + 1)
+
+int pivotBarIdx = bar_index - lenInput
+int lastDirNow = array.size(pivotArray) > 0 ? array.get(pivotArray, array.size(pivotArray) - 1).dir : 0
+bool pivotChanged = false
+
+// when a bar confirms both swings, process the one opposite to the last swing first to preserve alternation
+if not na(swingHigh) and not na(swingLow) and lastDirNow == 1
+    pivotChanged := addPivot(pivotArray, swingLow, pivotBarIdx, -1)
+    pivotChanged := addPivot(pivotArray, swingHigh, pivotBarIdx, 1) or pivotChanged
+else
+    if not na(swingHigh)
+        pivotChanged := addPivot(pivotArray, swingHigh, pivotBarIdx, 1) or pivotChanged
+    if not na(swingLow)
+        pivotChanged := addPivot(pivotArray, swingLow, pivotBarIdx, -1) or pivotChanged
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Pattern Detection
+//---------------------------------------------------------------------------------------------------------------------{
+if pivotChanged and array.size(pivotArray) > 0
+    int nPiv = array.size(pivotArray)
+    Pivot lastPiv = array.get(pivotArray, nPiv - 1)
+    // lifecycle of awaiting patterns: the swing right after C is the D candidate, anything later voids the structure
+    if bullSlot.state == 1
+        if lastPiv.seq > bullSlot.cSeq + 1
+            voidSlot(bullSlot)
+        else if lastPiv.seq == bullSlot.cSeq + 1 and lastPiv.dir == -1
+            tryComplete(bullSlot, lastPiv.price, lastPiv.barIdx)
+    if bearSlot.state == 1
+        if lastPiv.seq > bearSlot.cSeq + 1
+            voidSlot(bearSlot)
+        else if lastPiv.seq == bearSlot.cSeq + 1 and lastPiv.dir == 1
+            tryComplete(bearSlot, lastPiv.price, lastPiv.barIdx)
+    // formation: the newest swing is the C candidate, a swing high starts a bullish count, a swing low a bearish one
+    if nPiv >= 3
+        Pivot cCand = lastPiv
+        Pivot bCand = array.get(pivotArray, nPiv - 2)
+        Pivot aCand = array.get(pivotArray, nPiv - 3)
+        int dirCand = cCand.dir
+        AbcdSlot slot = dirCand == 1 ? bullSlot : bearSlot
+        float abD = math.abs(aCand.price - bCand.price)
+        float bcD = math.abs(cCand.price - bCand.price)
+        float retrCand = abD > 0 ? bcD / abD : na
+        bool cOk = dirCand == 1 ? cCand.price < aCand.price : cCand.price > aCand.price
+        bool windowOk = not na(retrCand) and retrCand >= retLo and retrCand <= retHi
+        if cOk and windowOk
+            bool sameStruct = slot.state == 1 and slot.aBar == aCand.barIdx and slot.bBar == bCand.barIdx
+            if slot.state == 1 and not sameStruct
+                voidSlot(slot)
+            slot.aPrice := aCand.price
+            slot.aBar := aCand.barIdx
+            slot.bPrice := bCand.price
+            slot.bBar := bCand.barIdx
+            slot.cPrice := cCand.price
+            slot.cBar := cCand.barIdx
+            slot.cSeq := cCand.seq
+            slot.abDist := abD
+            slot.abBars := bCand.barIdx - aCand.barIdx
+            computeLevels(slot)
+            // discard structures already voided between the C swing and its confirmation bar
+            bool alreadyBroken = slot.dir == 1 ? recentLowest < slot.voidLevel or recentHighest > slot.aPrice : recentHighest > slot.voidLevel or recentLowest < slot.aPrice
+            if alreadyBroken
+                voidSlot(slot)
+            else
+                if not sameStruct
+                    slot.touched := false
+                    slot.formedBar := bar_index
+                slot.state := 1
+                drawForming(slot)
+                bool hitAlready = slot.dir == 1 ? recentLowest <= slot.d100 : recentHighest >= slot.d100
+                if hitAlready and not slot.touched
+                    slot.touched := true
+                    slot.touchedBar := bar_index
+        else if slot.state == 1 and slot.cSeq == cCand.seq
+            // the C swing of the awaiting pattern extended out of the valid window
+            voidSlot(slot)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Pattern Tracking
+//---------------------------------------------------------------------------------------------------------------------{
+maintainSlot(bullSlot)
+maintainSlot(bearSlot)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+bullFormedEvent = bullSlot.formedBar == bar_index
+bearFormedEvent = bearSlot.formedBar == bar_index
+bullReachedEvent = bullSlot.touchedBar == bar_index
+bearReachedEvent = bearSlot.touchedBar == bar_index
+bullCompletedEvent = bullSlot.completedBar == bar_index
+bearCompletedEvent = bearSlot.completedBar == bar_index
+
+alertcondition(bullFormedEvent, "Bullish ABCD Forming", "Bullish ABCD forming - C confirmed within the retracement window, D completion projected below")
+alertcondition(bearFormedEvent, "Bearish ABCD Forming", "Bearish ABCD forming - C confirmed within the retracement window, D completion projected above")
+alertcondition(bullReachedEvent, "Bullish ABCD D Reached", "Price reached the projected bullish AB=CD completion level (D)")
+alertcondition(bearReachedEvent, "Bearish ABCD D Reached", "Price reached the projected bearish AB=CD completion level (D)")
+alertcondition(bullCompletedEvent, "Bullish ABCD Completed", "Bullish ABCD completed - swing low confirmed within tolerance of a tracked CD to AB ratio")
+alertcondition(bearCompletedEvent, "Bearish ABCD Completed", "Bearish ABCD completed - swing high confirmed within tolerance of a tracked CD to AB ratio")
+//---------------------------------------------------------------------------------------------------------------------}

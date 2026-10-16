@@ -1,0 +1,258 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Curve Position", shorttitle = "Curve Position", overlay = true, format = format.price)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULLISH_COLOR = #089981
+BEARISH_COLOR = #f23645
+NEUTRAL_COLOR = #787b86 // structure - the growth curve and the zone boundaries
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+MS_PER_DAY = 86400000.0 // one calendar day in milliseconds - the unit of the fit's time axis
+
+LOW_ON_CURVE  = -1 // lower portion of the corridor - cheap, longs have location
+EQUILIBRIUM   =  0 // middle of the corridor - neither side has a location edge
+HIGH_ON_CURVE =  1 // upper portion of the corridor - expensive, shorts have location
+
+BAND_LINE_TRANSP = 30  // transparency of the deviation band lines
+BAND_EDGE_TRANSP = 80  // corridor gradient transparency at the bands (strongest shading)
+BAND_MID_TRANSP  = 100 // corridor gradient transparency at the curve (fully transparent)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+srcInput = input.source(close, "Source"
+  , group   = "Settings"
+  , tooltip = "Price series the growth curve is fitted to. Only strictly positive values can enter a logarithmic fit, so non-positive or missing bars are skipped - they simply contribute no point. Closing prices are the standard choice.")
+
+bandMultInput = input.float(2.0, "Band Width (Std. Errors)", minval = 0.25, step = 0.25
+  , group   = "Settings"
+  , tooltip = "Half-width of the corridor in standard errors of the regression, measured in log space so the bands stay proportional to price. 2 is the conventional envelope. The corridor between the lower and upper band is the curve that position is read against - wider bands re-classify your location less often, narrower bands sooner.")
+
+warmupInput = input.int(100, "Warm-Up Bars", minval = 3
+  , group   = "Settings"
+  , tooltip = "Fitted points required before the curve, bands and position readout are displayed. A fit over its first handful of bars is statistically meaningless and can distort the chart scale, so the display is withheld while every bar still feeds the regression. The curve is only as trustworthy as the history under it - prefer long daily or weekly histories, so execution-timeframe trades inherit a genuinely higher-horizon location.")
+
+lowThresholdInput = input.float(33.33, "Low On Curve Below (%)", minval = 0, maxval = 50
+  , group   = "Curve Zones"
+  , tooltip = "Corridor position below which price counts as low on the curve - cheap, longs have location and can aim across the corridor. The common convention splits the corridor into thirds; set both boundaries to 50 for a simple premium/discount split around the midline.")
+
+highThresholdInput = input.float(66.67, "High On Curve Above (%)", minval = 50, maxval = 100
+  , group   = "Curve Zones"
+  , tooltip = "Corridor position above which price counts as high on the curve - expensive, shorts have location. High on the curve is location, not a standalone signal: strong trends ride the upper band and keep re-anchoring the fit, so pair the gate with a trend filter before fading.")
+
+showZonesInput = input.bool(true, "Show Zone Boundaries"
+  , group   = "Curve Zones"
+  , tooltip = "Draws the two levels separating the low and high zones from the equilibrium middle, so the direction gate is visible on the price panel itself.")
+
+showDashboardInput = input.bool(true, "Show Dashboard"
+  , group   = "Dashboard"
+  , tooltip = "Position panel: where price sits in the corridor, the zone that position falls in, the direction gate it implies, and how many data points the fit currently rests on - the honest measure of how much the curve can be trusted.")
+
+dashboardLocationInput = input.string("Top Right", "Location", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"]
+  , group   = "Dashboard"
+  , tooltip = "Chart corner the dashboard is anchored to.")
+
+dashboardSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"]
+  , group   = "Dashboard"
+  , tooltip = "Text size of the dashboard.")
+
+bullColorInput = input.color(BULLISH_COLOR, "Demand Side"
+  , group   = "Style"
+  , tooltip = "Color of the lower band, of the demand-side gradient, and of the low-on-curve readouts - the wholesale side of the corridor.")
+
+bearColorInput = input.color(BEARISH_COLOR, "Supply Side"
+  , group   = "Style"
+  , tooltip = "Color of the upper band, of the supply-side gradient, and of the high-on-curve readouts - the retail side of the corridor.")
+
+curveColorInput = input.color(NEUTRAL_COLOR, "Growth Curve"
+  , group   = "Style"
+  , tooltip = "Color of the fitted growth curve itself - the corridor midline that equilibrium is centered on.")
+
+zoneColorInput = input.color(color.new(NEUTRAL_COLOR, 50), "Zone Boundaries"
+  , group   = "Style"
+  , tooltip = "Color of the two zone-boundary levels drawn between the corridor thirds.")
+
+showFillInput = input.bool(true, "Corridor Gradient Fills"
+  , group   = "Style"
+  , tooltip = "Shades the corridor with vertical gradients - fully transparent at the curve, strongest at each band - so cheap and expensive territory read at a glance. Purely visual, the position logic is unaffected.")
+
+showMarkersInput = input.bool(false, "Zone Transition Markers"
+  , group   = "Style"
+  , tooltip = "Displays a small marker on the bar where price crosses into a different curve zone. Off by default to keep the chart clean - the alerts cover the same transitions regardless.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Logarithmic Regression Fit
+//---------------------------------------------------------------------------------------------------------------------{
+// The long-horizon construction of curve position: a logarithmic regression of log price on log elapsed time, fitted
+// over the chart's full history, with deviation bands around the fit. Each bar is evaluated with the fit as of that
+// bar (walk-forward, so plotted history does not repaint), while the latest bar always carries the full-history fit.
+var int startTime = time
+
+// Calendar time keeps the fit's axis consistent across timeframes and session gaps; +1 keeps the log defined on bar one
+elapsedDays = (time - startTime) / MS_PER_DAY + 1.0
+xLogTime    = math.log(elapsedDays)
+
+// Guard the log fit - only strictly positive prices are defined in log space
+srcValid  = not na(srcInput) and srcInput > 0
+yLogPrice = srcValid ? math.log(srcInput) : na
+
+// Expanding-window least squares over the full history via running sums - O(1) per bar, no lookback loops
+var float fitPoints = 0.0
+var float sumX      = 0.0
+var float sumY      = 0.0
+var float sumXY     = 0.0
+var float sumX2     = 0.0
+var float sumY2     = 0.0
+
+if srcValid
+    fitPoints += 1.0
+    sumX      += xLogTime
+    sumY      += yLogPrice
+    sumXY     += xLogTime * yLogPrice
+    sumX2     += xLogTime * xLogTime
+    sumY2     += yLogPrice * yLogPrice
+
+denom    = fitPoints * sumX2 - sumX * sumX
+fitReady = fitPoints >= warmupInput and fitPoints > 2 and denom > 0
+
+float slopeCoef     = fitReady ? (fitPoints * sumXY - sumX * sumY) / denom : na
+float interceptCoef = fitReady ? (sumY - slopeCoef * sumX) / fitPoints : na
+
+// Fitted log price at the current bar's log time - the growth curve - and the regression's standard error, computed
+// from the same sums (SSE = Σy² - aΣy - bΣxy, floored at zero against floating-point cancellation)
+float fitLog = fitReady ? interceptCoef + slopeCoef * xLogTime : na
+float stdErr = fitReady ? math.sqrt(math.max(sumY2 - interceptCoef * sumY - slopeCoef * sumXY, 0.0) / (fitPoints - 2.0)) : na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Corridor & Position
+//---------------------------------------------------------------------------------------------------------------------{
+// Deviation bands sit a fixed number of standard errors either side of the fit in log space, so in price space the
+// corridor stays proportional to price - the growth-curve equivalent of the zone-to-zone corridor
+halfWidthLog = bandMultInput * stdErr
+upperLog     = fitLog + halfWidthLog
+lowerLog     = fitLog - halfWidthLog
+corridorLog  = 2.0 * halfWidthLog
+
+curveMid   = math.exp(fitLog)
+curveUpper = math.exp(upperLog)
+curveLower = math.exp(lowerLog)
+
+// Where price sits in the corridor: 0% at the lower band (wholesale), 100% at the upper band (retail); readings
+// beyond 0-100 mean the corridor boundary itself is broken
+float positionPct = not na(yLogPrice) and not na(corridorLog) and corridorLog > 0 ? 100.0 * (yLogPrice - lowerLog) / corridorLog : na
+positionClamped   = math.min(math.max(positionPct, 0.0), 100.0)
+
+// Zone boundaries in price space - the levels separating the corridor thirds
+lowBoundary  = math.exp(lowerLog + corridorLog * lowThresholdInput / 100.0)
+highBoundary = math.exp(lowerLog + corridorLog * highThresholdInput / 100.0)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Zone Logic
+//---------------------------------------------------------------------------------------------------------------------{
+// The directional rule of the framework: longs allowed low on the curve, shorts allowed high, patience in the middle -
+// a filter applied before any execution-timeframe signal gets a vote
+int curveZone = na
+if not na(positionPct)
+    curveZone := positionPct < lowThresholdInput ? LOW_ON_CURVE : positionPct > highThresholdInput ? HIGH_ON_CURVE : EQUILIBRIUM
+
+prevZoneValid = not na(curveZone[1])
+enteredLow    = prevZoneValid and not na(curveZone) and curveZone == LOW_ON_CURVE  and curveZone[1] != LOW_ON_CURVE
+enteredEquil  = prevZoneValid and not na(curveZone) and curveZone == EQUILIBRIUM   and curveZone[1] != EQUILIBRIUM
+enteredHigh   = prevZoneValid and not na(curveZone) and curveZone == HIGH_ON_CURVE and curveZone[1] != HIGH_ON_CURVE
+
+// A close beyond a band is the corridor's boundary breaking - the cue to reassess the map as the fit re-anchors
+brokeAbove = ta.crossover(positionPct, 100.0)
+brokeBelow = ta.crossunder(positionPct, 0.0)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+color positionColor = na(positionClamped) ? na : color.from_gradient(positionClamped, 0.0, 100.0, bullColorInput, bearColorInput)
+
+upperPlotId = plot(curveUpper, "Upper Deviation Band", color = color.new(bearColorInput, BAND_LINE_TRANSP), linewidth = 1)
+curvePlotId = plot(curveMid, "Growth Curve", color = curveColorInput, linewidth = 1)
+lowerPlotId = plot(curveLower, "Lower Deviation Band", color = color.new(bullColorInput, BAND_LINE_TRANSP), linewidth = 1)
+
+fill(curvePlotId, upperPlotId
+  , top_value    = curveUpper
+  , bottom_value = curveMid
+  , top_color    = showFillInput ? color.new(bearColorInput, BAND_EDGE_TRANSP) : na
+  , bottom_color = showFillInput ? color.new(bearColorInput, BAND_MID_TRANSP) : na
+  , title        = "Supply Side Gradient Fill")
+
+fill(curvePlotId, lowerPlotId
+  , top_value    = curveMid
+  , bottom_value = curveLower
+  , top_color    = showFillInput ? color.new(bullColorInput, BAND_MID_TRANSP) : na
+  , bottom_color = showFillInput ? color.new(bullColorInput, BAND_EDGE_TRANSP) : na
+  , title        = "Demand Side Gradient Fill")
+
+plot(showZonesInput ? lowBoundary : na, "Equilibrium Floor", color = zoneColorInput, linewidth = 1)
+plot(showZonesInput ? highBoundary : na, "Equilibrium Ceiling", color = zoneColorInput, linewidth = 1)
+
+// Position readout for the status line and data window only - it never touches the price scale
+plot(positionPct, "Curve Position %", color = positionColor, display = display.status_line + display.data_window)
+
+plotshape(showMarkersInput and enteredLow, "Entered Low Zone", shape.triangleup, location.belowbar, color = bullColorInput, size = size.tiny)
+plotshape(showMarkersInput and enteredHigh, "Entered High Zone", shape.triangledown, location.abovebar, color = bearColorInput, size = size.tiny)
+plotshape(showMarkersInput and enteredEquil, "Entered Equilibrium", shape.circle, location.abovebar, color = curveColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+dashboardLocation = switch dashboardLocationInput
+    "Top Right"    => position.top_right
+    "Top Left"     => position.top_left
+    "Bottom Right" => position.bottom_right
+    => position.bottom_left
+
+dashboardTextSize = switch dashboardSizeInput
+    "Tiny"  => size.tiny
+    "Small" => size.small
+    => size.normal
+
+var table dashboardTable = table.new(dashboardLocation, 2, 4, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+if barstate.islast and showDashboardInput
+    positionText = na(positionPct) ? "—" : str.tostring(positionPct, "0.0") + "%"
+    valueColor   = na(positionClamped) ? DASH_TEXT : color.from_gradient(positionClamped, 0.0, 100.0, bullColorInput, bearColorInput)
+
+    zoneText = na(curveZone) ? "Warming up" :
+      positionPct < 0.0 ? "Below corridor" :
+      positionPct > 100.0 ? "Above corridor" :
+      curveZone == LOW_ON_CURVE ? "Low on curve" :
+      curveZone == HIGH_ON_CURVE ? "High on curve" : "Equilibrium"
+    zoneColor = na(curveZone) ? DASH_TEXT : curveZone == LOW_ON_CURVE ? bullColorInput : curveZone == HIGH_ON_CURVE ? bearColorInput : NEUTRAL_COLOR
+
+    biasText  = na(curveZone) ? "—" : curveZone == LOW_ON_CURVE ? "Longs allowed" : curveZone == HIGH_ON_CURVE ? "Shorts allowed" : "Patience"
+
+    // How much history the fit rests on - shown against the warm-up requirement until it is met
+    fitPointsText = str.tostring(fitPoints, "#") + (fitPoints < warmupInput ? " / " + str.tostring(warmupInput) : "")
+
+    table.cell(dashboardTable, 0, 0, "Position",     text_color = DASH_HEADER, text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 0, positionText,   text_color = valueColor,  text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 1, "Zone",         text_color = DASH_HEADER, text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 1, zoneText,       text_color = zoneColor,   text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 2, "Bias Gate",    text_color = DASH_HEADER, text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 2, biasText,       text_color = zoneColor,   text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 3, "Fit Points",   text_color = DASH_HEADER, text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 3, fitPointsText,  text_color = DASH_TEXT,   text_size = dashboardTextSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(enteredLow, "Entered Low Zone (Longs Allowed)", "Curve Position: {{ticker}} entered the low zone of the growth curve corridor - price is cheap on the curve, longs have location and can aim across the corridor ({{interval}})")
+alertcondition(enteredEquil, "Entered Equilibrium (Patience)", "Curve Position: {{ticker}} entered the equilibrium middle of the corridor - neither side has a location edge, fresh signals there are skipped ({{interval}})")
+alertcondition(enteredHigh, "Entered High Zone (Shorts Allowed)", "Curve Position: {{ticker}} entered the high zone of the growth curve corridor - price is expensive on the curve, shorts have location; pair with a trend filter before fading a strong uptrend ({{interval}})")
+alertcondition(brokeAbove, "Corridor Broken Upward", "Curve Position: {{ticker}} moved beyond the upper deviation band - the corridor boundary is broken, reassess the map as the fit re-anchors ({{interval}})")
+alertcondition(brokeBelow, "Corridor Broken Downward", "Curve Position: {{ticker}} moved beyond the lower deviation band - the corridor boundary is broken, reassess the map as the fit re-anchors ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

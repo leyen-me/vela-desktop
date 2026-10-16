@@ -1,0 +1,216 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Hidden Divergence", shorttitle = "Hidden Divergence", overlay = false, precision = 2, max_lines_count = 500, max_labels_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR      = #089981
+BEAR_COLOR      = #f23645
+NEUTRAL_COLOR   = #787b86
+STOCH_SMOOTHING = 3 // classic slow %K smoothing
+DIV_LINE_WIDTH  = 2
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+oscTypeInput = input.string("RSI", "Oscillator", options = ["RSI", "Stochastic", "CCI", "MACD", "MACD Histogram", "External"], group = "Oscillator",
+     tooltip = "Momentum gauge whose swings are read against price swings. The hidden divergence geometry is identical for every oscillator — smoother gauges swing less often, so they print fewer but cleaner patterns.")
+
+oscLengthInput = input.int(14, "Length", minval = 2, group = "Oscillator",
+     tooltip = "Lookback applied to RSI, Stochastic and CCI.")
+
+macdFastInput = input.int(12, "MACD Fast", minval = 1, inline = "macd", group = "Oscillator",
+     tooltip = "Fast moving average length, used when the oscillator is MACD or MACD Histogram.")
+
+macdSlowInput = input.int(26, "Slow", minval = 2, inline = "macd", group = "Oscillator",
+     tooltip = "Slow moving average length, used when the oscillator is MACD or MACD Histogram.")
+
+macdSignalInput = input.int(9, "Signal", minval = 1, inline = "macd", group = "Oscillator",
+     tooltip = "Signal smoothing length, used when the oscillator is MACD Histogram.")
+
+externalSourceInput = input.source(close, "External Source", group = "Oscillator",
+     tooltip = "Series compared against price when the oscillator is set to External — select another indicator's plot to scan any momentum gauge for hidden divergence.")
+
+swingLeftInput = input.int(5, "Left Bars", minval = 1, maxval = 50, inline = "swing", group = "Swing Detection",
+     tooltip = "Bars that must print to the left of a swing point without exceeding it.")
+
+swingRightInput = input.int(5, "Right Bars", minval = 1, maxval = 50, inline = "swing", group = "Swing Detection",
+     tooltip = "Bars that must print to the right of a swing point without exceeding it before the swing counts as confirmed. Detection only fires once the second swing is confirmed — signals arrive later but drawn pivots do not repaint.")
+
+maxSwingGapInput = input.int(60, "Max Bars Between Swings", minval = 5, maxval = 500, group = "Swing Detection",
+     tooltip = "Maximum distance in bars between the two compared swings. Consecutive swings further apart than this are not treated as part of the same structure and are not compared.")
+
+trendFilterInput = input.string("Structure (HH/HL)", "Trend Filter", options = ["None", "Structure (HH/HL)", "Higher Timeframe MA"], group = "Trend Filter",
+     tooltip = "Hidden divergence is only defined when there is a trend to continue. Structure (HH/HL) requires the prior swing structure to point with the signal — the last confirmed swing high must be a higher high before hidden bullish, the last confirmed swing low a lower low before hidden bearish (the pattern itself supplies the other half of the structure). Higher Timeframe MA requires price to hold on the trend side of the selected moving average. None keeps every geometric match.")
+
+htfTimeframeInput = input.timeframe("D", "MA Timeframe", inline = "htf", group = "Trend Filter",
+     tooltip = "Timeframe of the trend-filter moving average — use the chart timeframe or a higher one.")
+
+htfLengthInput = input.int(50, "Length", minval = 1, inline = "htf", group = "Trend Filter",
+     tooltip = "Length of the higher-timeframe trend-filter moving average.")
+
+htfTypeInput = input.string("EMA", "MA Type", options = ["EMA", "SMA"], group = "Trend Filter",
+     tooltip = "Moving average type used by the Higher Timeframe MA trend filter.")
+
+showOscLinesInput = input.bool(true, "Divergence Lines on Oscillator", group = "Style",
+     tooltip = "Draws the line connecting the two oscillator swings of each hidden divergence in this pane.")
+
+showPriceLinesInput = input.bool(true, "Divergence Lines on Price", group = "Style",
+     tooltip = "Draws the line connecting the two price swings of each hidden divergence on the main chart.")
+
+showLabelsInput = input.bool(true, "Signal Labels", group = "Style",
+     tooltip = "Marks the confirming swing on the main chart with a Hidden Bull / Hidden Bear label.")
+
+showAnchorsInput = input.bool(true, "Swing Invalidation Levels", group = "Style",
+     tooltip = "Extends a dashed level from the price swing anchoring the most recent signal on each side. The continuation premise is falsified once price closes beyond it — the level stops extending and the invalidation alert fires.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "colors", group = "Style",
+     tooltip = "Color of hidden bullish divergence lines, labels and invalidation levels.")
+
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "colors", group = "Style",
+     tooltip = "Color of hidden bearish divergence lines, labels and invalidation levels.")
+
+oscColorInput = input.color(NEUTRAL_COLOR, "Oscillator", group = "Style",
+     tooltip = "Color of the oscillator line displayed in this pane.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Oscillator
+//---------------------------------------------------------------------------------------------------------------------{
+// Every candidate is computed on every bar so series histories stay consistent regardless of the selected gauge
+rsiValue   = ta.rsi(close, oscLengthInput)
+stochValue = ta.sma(ta.stoch(close, high, low, oscLengthInput), STOCH_SMOOTHING)
+cciValue   = ta.cci(hlc3, oscLengthInput)
+[macdValue, macdSignalValue, macdHistValue] = ta.macd(close, macdFastInput, macdSlowInput, macdSignalInput)
+
+osc = switch oscTypeInput
+    "RSI"            => rsiValue
+    "Stochastic"     => stochValue
+    "CCI"            => cciValue
+    "MACD"           => macdValue
+    "MACD Histogram" => macdHistValue
+    => externalSourceInput
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Trend Filter
+//---------------------------------------------------------------------------------------------------------------------{
+// Swing structure state — updated as price swings confirm in the detection section below
+var int highStructure = 0 // 1: last confirmed swing high was a higher high, -1: a lower high
+var int lowStructure  = 0 // 1: last confirmed swing low was a higher low,  -1: a lower low
+
+[htfEma, htfSma] = request.security(syminfo.tickerid, htfTimeframeInput, [ta.ema(close, htfLengthInput), ta.sma(close, htfLengthInput)])
+htfMa = htfTypeInput == "EMA" ? htfEma : htfSma
+
+// Hidden bullish fires on a higher low, so the structure filter demands the preceding higher high (HH + HL uptrend);
+// hidden bearish fires on a lower high, so it demands the preceding lower low (LH + LL downtrend)
+uptrendOk = switch trendFilterInput
+    "None"              => true
+    "Structure (HH/HL)" => highStructure == 1
+    => not na(htfMa) and close > htfMa
+
+downtrendOk = switch trendFilterInput
+    "None"              => true
+    "Structure (HH/HL)" => lowStructure == -1
+    => not na(htfMa) and close < htfMa
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Hidden Divergence Detection
+//---------------------------------------------------------------------------------------------------------------------{
+pivotHighPrice = ta.pivothigh(high, swingLeftInput, swingRightInput)
+pivotLowPrice  = ta.pivotlow(low, swingLeftInput, swingRightInput)
+
+// Previous confirmed swings — price, oscillator value read at the same swing bar, and swing bar index
+var float prevHighPrice = na
+var float prevHighOsc   = na
+var int   prevHighBar   = na
+var float prevLowPrice  = na
+var float prevLowOsc    = na
+var int   prevLowBar    = na
+
+// Latest anchored swings — the levels whose break falsifies each continuation premise
+var float bullAnchorPrice = na
+var float bearAnchorPrice = na
+var line  bullAnchorLine  = na
+var line  bearAnchorLine  = na
+
+bool hiddenBullish = false
+bool hiddenBearish = false
+
+// Hidden bearish — price lower high against oscillator higher high, within an established downtrend
+if not na(pivotHighPrice)
+    float swingOsc  = osc[swingRightInput]
+    int   swingBar  = bar_index - swingRightInput
+    bool comparable = not na(prevHighPrice) and not na(prevHighOsc) and not na(swingOsc) and swingBar - prevHighBar <= maxSwingGapInput
+    if comparable and downtrendOk and pivotHighPrice < prevHighPrice and swingOsc > prevHighOsc
+        hiddenBearish := true
+        if showOscLinesInput
+            line.new(prevHighBar, prevHighOsc, swingBar, swingOsc, color = bearColorInput, width = DIV_LINE_WIDTH)
+        if showPriceLinesInput
+            line.new(prevHighBar, prevHighPrice, swingBar, pivotHighPrice, color = bearColorInput, width = DIV_LINE_WIDTH, force_overlay = true)
+        if showLabelsInput
+            label.new(swingBar, pivotHighPrice, "Hidden Bear", color = bearColorInput, textcolor = chart.bg_color, style = label.style_label_down, size = size.small, tooltip = "Hidden bearish divergence — lower high in price, higher high in the oscillator", force_overlay = true)
+        bearAnchorPrice := pivotHighPrice
+        if showAnchorsInput
+            bearAnchorLine := line.new(swingBar, pivotHighPrice, bar_index, pivotHighPrice, color = bearColorInput, style = line.style_dashed, force_overlay = true)
+    if not na(prevHighPrice)
+        highStructure := pivotHighPrice > prevHighPrice ? 1 : pivotHighPrice < prevHighPrice ? -1 : highStructure
+    prevHighPrice := pivotHighPrice
+    prevHighOsc   := swingOsc
+    prevHighBar   := swingBar
+
+// Hidden bullish — price higher low against oscillator lower low, within an established uptrend
+if not na(pivotLowPrice)
+    float swingOsc  = osc[swingRightInput]
+    int   swingBar  = bar_index - swingRightInput
+    bool comparable = not na(prevLowPrice) and not na(prevLowOsc) and not na(swingOsc) and swingBar - prevLowBar <= maxSwingGapInput
+    if comparable and uptrendOk and pivotLowPrice > prevLowPrice and swingOsc < prevLowOsc
+        hiddenBullish := true
+        if showOscLinesInput
+            line.new(prevLowBar, prevLowOsc, swingBar, swingOsc, color = bullColorInput, width = DIV_LINE_WIDTH)
+        if showPriceLinesInput
+            line.new(prevLowBar, prevLowPrice, swingBar, pivotLowPrice, color = bullColorInput, width = DIV_LINE_WIDTH, force_overlay = true)
+        if showLabelsInput
+            label.new(swingBar, pivotLowPrice, "Hidden Bull", color = bullColorInput, textcolor = chart.bg_color, style = label.style_label_up, size = size.small, tooltip = "Hidden bullish divergence — higher low in price, lower low in the oscillator", force_overlay = true)
+        bullAnchorPrice := pivotLowPrice
+        if showAnchorsInput
+            bullAnchorLine := line.new(swingBar, pivotLowPrice, bar_index, pivotLowPrice, color = bullColorInput, style = line.style_dashed, force_overlay = true)
+    if not na(prevLowPrice)
+        lowStructure := pivotLowPrice > prevLowPrice ? 1 : pivotLowPrice < prevLowPrice ? -1 : lowStructure
+    prevLowPrice := pivotLowPrice
+    prevLowOsc   := swingOsc
+    prevLowBar   := swingBar
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Invalidation Levels
+//---------------------------------------------------------------------------------------------------------------------{
+// The continuation idea is wrong once the anchoring swing gives way on a closing basis
+bullInvalidated = not na(bullAnchorPrice) and close < bullAnchorPrice
+bearInvalidated = not na(bearAnchorPrice) and close > bearAnchorPrice
+
+if not na(bullAnchorLine)
+    line.set_x2(bullAnchorLine, bar_index)
+if not na(bearAnchorLine)
+    line.set_x2(bearAnchorLine, bar_index)
+
+if bullInvalidated
+    bullAnchorPrice := na
+    bullAnchorLine  := na
+if bearInvalidated
+    bearAnchorPrice := na
+    bearAnchorLine  := na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+plot(osc, "Oscillator", color = oscColorInput, linewidth = 1)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(hiddenBullish, "Hidden Bullish Divergence", "Hidden bullish divergence confirmed on {{ticker}} ({{interval}}) — price higher low against oscillator lower low, continuation setup within the uptrend")
+alertcondition(hiddenBearish, "Hidden Bearish Divergence", "Hidden bearish divergence confirmed on {{ticker}} ({{interval}}) — price lower high against oscillator higher high, continuation setup within the downtrend")
+alertcondition(bullInvalidated, "Hidden Bullish Invalidated", "Hidden bullish divergence invalidated on {{ticker}} ({{interval}}) — price closed below the anchoring higher low")
+alertcondition(bearInvalidated, "Hidden Bearish Invalidated", "Hidden bearish divergence invalidated on {{ticker}} ({{interval}}) — price closed above the anchoring lower high")
+
+//---------------------------------------------------------------------------------------------------------------------}

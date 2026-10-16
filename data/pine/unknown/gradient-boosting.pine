@@ -1,0 +1,504 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Gradient Boosting", "Gradient Boosting", overlay = false, format = format.price, precision = 2, calc_bars_count = 3000)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+int   FEAT_COUNT  = 5
+int   MIN_SAMPLES = 100
+int   DASH_ROWS   = 13
+float EPS         = 1e-9
+float PROB_FLOOR  = 1e-4
+float LEAF_CAP    = 100.0
+int   RNG_A       = 48271
+int   RNG_M       = 2147483647
+
+string TASK_CLS = "Log Loss (Classification)"
+string TASK_REG = "Squared Error (Regression)"
+
+string GRP_BOOST = "Boosting"
+string GRP_FEAT  = "Features"
+string GRP_SIG   = "Signals"
+string GRP_DASH  = "Dashboard"
+string GRP_STYLE = "Style"
+
+color BULL_COLOR  = #089981
+color BEAR_COLOR  = #f23645
+color GUIDE_COLOR = #787b86
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+taskInput      = input.string(TASK_CLS, "Loss / Target", options = [TASK_CLS, TASK_REG], group = GRP_BOOST, tooltip = "Loss function L the stagewise ensemble minimizes. Log loss makes it a directional classifier: leaves output log-odds and the indicator plots P(up) over the horizon. Squared error makes it a regressor: the indicator plots the expected forward percent return. Each boosting round fits a shallow tree to the negative gradient of this loss.")
+horizonInput   = input.int(10, "Prediction Horizon (bars)", minval = 1, maxval = 100, group = GRP_BOOST, tooltip = "Bars ahead used to label each training sample: the sign (classification) or the value (regression) of the percent change of close over the next N bars.")
+windowInput    = input.int(300, "Training Window (samples)", minval = 100, maxval = 600, group = GRP_BOOST, tooltip = "Most recent labeled bars the ensemble is fit on, split chronologically into an earlier training slice and a later validation slice. Larger windows give steadier models but adapt more slowly and cost more computation.")
+valFracInput   = input.float(0.25, "Validation Fraction", minval = 0.1, maxval = 0.4, step = 0.05, group = GRP_BOOST, tooltip = "Share of the window reserved as the chronologically LATER validation slice that drives early stopping and permutation importance. Never a random split, so validation stays out of sample in time.")
+retrainInput   = input.int(100, "Retrain Every (bars)", minval = 10, maxval = 500, group = GRP_BOOST, tooltip = "Walk-forward cadence: the ensemble is refit on closed bars every N bars, and bars in between are scored by the last fitted model. Lower values adapt faster but are heavier to compute.")
+roundsInput    = input.int(40, "Max Boosting Rounds (M)", minval = 5, maxval = 150, group = GRP_BOOST, tooltip = "Upper bound on the number of trees grown. The number actually kept is chosen by early stopping on the validation slice, not by this input.")
+etaInput       = input.float(0.05, "Learning Rate (eta)", minval = 0.005, maxval = 0.5, step = 0.005, group = GRP_BOOST, tooltip = "Shrinkage applied to every tree's contribution, F_m = F_prev + eta * h_m. Small values, commonly 0.01 to 0.1, make the ensemble improve in small, correctable steps.")
+depthInput     = input.int(2, "Max Tree Depth", minval = 1, maxval = 4, group = GRP_BOOST, tooltip = "Depth of each weak learner. Shallow trees of depth 2 to 4 are the practitioner norm on market data; deeper trees chase noise in the labels.")
+minLeafInput   = input.int(8, "Min Samples per Leaf", minval = 2, maxval = 50, group = GRP_BOOST, tooltip = "Smallest number of training samples a leaf may hold; a split is rejected when either side would fall below this. Part of the regularization on tree size.")
+lambdaInput    = input.float(1.0, "L2 Leaf Regularization (lambda)", minval = 0, maxval = 20, step = 0.5, group = GRP_BOOST, tooltip = "XGBoost-style penalty on leaf weights: leaf values become sum(gradient) / (sum(hessian) + lambda) and split gains are damped accordingly. Higher values shrink leaves toward zero — extra insurance on noisy financial labels.")
+subsampleInput = input.float(0.7, "Row Subsample per Round", minval = 0.3, maxval = 1, step = 0.05, group = GRP_BOOST, tooltip = "Stochastic gradient boosting: each round fits its tree on a random fraction of the training rows, which decorrelates the trees and further reduces overfitting. 1 disables row subsampling.")
+colsampleInput = input.float(0.8, "Feature Subsample per Round", minval = 0.3, maxval = 1, step = 0.05, group = GRP_BOOST, tooltip = "Random fraction of the features made available to each round's tree. 1 disables feature subsampling.")
+patienceInput  = input.int(10, "Early Stopping Patience", minval = 3, maxval = 50, group = GRP_BOOST, tooltip = "Boosting stops once the validation loss has not improved for this many consecutive rounds, and the ensemble is truncated at the best validation round. This replaces picking a fixed number of trees.")
+binsInput      = input.int(8, "Split Candidates per Feature", minval = 4, maxval = 16, group = GRP_BOOST, tooltip = "Histogram-style split finding: number of evenly spaced candidate thresholds scanned per feature at each node, in the spirit of modern boosted-tree implementations.")
+seedInput      = input.int(1, "Random Seed", minval = 1, maxval = 9999, group = GRP_BOOST, tooltip = "Seed of the deterministic random generator behind row/feature subsampling and permutation importance, so results are reproducible bar for bar.")
+
+rsiLenInput   = input.int(14, "RSI Length", minval = 2, maxval = 100, group = GRP_FEAT, tooltip = "Momentum feature: RSI of close rescaled to -1..+1. Bounded and stationary, so tree thresholds stay meaningful over time.")
+trendLenInput = input.int(20, "Trend Z-Score Length", minval = 5, maxval = 200, group = GRP_FEAT, tooltip = "Trend feature: close minus its simple moving average, in standard deviations of close over the same window.")
+momLenInput   = input.int(10, "Momentum ROC Length", minval = 1, maxval = 100, group = GRP_FEAT, tooltip = "Momentum feature: percent rate of change of close over this length, normalized by its own volatility over the normalization window.")
+atrLenInput   = input.int(14, "ATR Length", minval = 1, maxval = 100, group = GRP_FEAT, tooltip = "Volatility feature: Average True Range as a percent of close, z-scored over the normalization window into a volatility-regime reading.")
+rangeLenInput = input.int(20, "Range Position Length", minval = 2, maxval = 200, group = GRP_FEAT, tooltip = "Position feature: where close sits inside the N-bar high-low range, rescaled to -1..+1.")
+normLenInput  = input.int(100, "Normalization Window", minval = 20, maxval = 500, group = GRP_FEAT, tooltip = "Lookback used to z-score the momentum and volatility features, keeping every input to the trees on a stationary scale.")
+
+threshInput = input.float(60, "Probability Threshold %", minval = 50, maxval = 95, step = 1, group = GRP_SIG, tooltip = "Classification only: dashed guides and the high-confidence alerts trigger when P(up) crosses above this level or below 100 minus it — the gate practitioners use when a boosted model filters an existing strategy's signals. Regression signals use the zero line.")
+
+showDashInput = input.bool(true, "Show Dashboard", group = GRP_DASH, tooltip = "Model card: task, trees kept by early stopping, validation loss, base rate, sample counts, current prediction, and feature importance read two ways — gain-based (flattering) and permutation on held-out data (the safer read).")
+dashPosInput  = input.string("Top Right", "Location", options = ["Top Right", "Top Left", "Middle Right", "Middle Left", "Bottom Right", "Bottom Left"], group = GRP_DASH, tooltip = "Dashboard position on the chart.")
+textSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = GRP_DASH, tooltip = "Dashboard text size.")
+
+bullColorInput  = input.color(BULL_COLOR, "Bullish", inline = "clr1", group = GRP_STYLE)
+bearColorInput  = input.color(BEAR_COLOR, "Bearish", inline = "clr1", group = GRP_STYLE)
+guideColorInput = input.color(GUIDE_COLOR, "Center / Guides", inline = "clr2", group = GRP_STYLE)
+showThreshInput = input.bool(true, "Show Probability Thresholds", group = GRP_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Data Structures
+//---------------------------------------------------------------------------------------------------------------------{
+// rolling feature rows, their closes, and forward-return labels (labelArray[i] belongs to featMatrix row i)
+var matrix<float> featMatrix = matrix.new<float>(0, FEAT_COUNT)
+var array<float>  closeArray = array.new_float()
+var array<float>  labelArray = array.new_float()
+
+// fitted ensemble: trees stored as implicit binary heaps, tree t occupies slots [t * nodesPerTree, (t+1) * nodesPerTree)
+// node encoding: feature >= 0 -> internal split, -1 -> leaf (value in modelLeaf), -2 -> unused slot
+var array<int>   modelFeat = array.new_int()
+var array<float> modelThr  = array.new_float()
+var array<float> modelLeaf = array.new_float()
+
+var array<float>  gainImp   = array.new_float(FEAT_COUNT, 0.0)
+var array<float>  permImp   = array.new_float(FEAT_COUNT, 0.0)
+var array<string> featNames = array.from("RSI", "Trend Z", "Momentum Z", "ATR Regime", "Range Pos")
+var array<float>  rngState  = array.new_float(1, seedInput)
+
+var float modelBase    = na
+var int   modelTrees   = 0
+var int   roundsRan    = 0
+var float valLossStat  = na
+var float baseRateStat = na
+var int   trainNStat   = 0
+var int   valNStat     = 0
+var int   lastTrainBar = na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// deterministic Park-Miller generator (state carried in a 1-element array), uniform in [0, 1)
+// the modulus is taken in exact float arithmetic: products stay below 2^53, so no precision is lost
+rand01(array<float> stateArr) =>
+    float s = math.max(array.get(stateArr, 0), 1)
+    float prod = RNG_A * s
+    float s2 = prod - math.floor(prod / RNG_M) * RNG_M
+    array.set(stateArr, 0, s2 < 1 ? 1 : s2)
+    s2 / 2147483647.0
+
+logistic(float x) =>
+    float xc = math.max(math.min(x, 30), -30)
+    1 / (1 + math.exp(-xc))
+
+// per-sample loss: log loss (classification) or squared error (regression)
+sampleLoss(bool isCls, float yVal, float fVal) =>
+    float out = 0.0
+    if isCls
+        float p = math.max(math.min(logistic(fVal), 1 - PROB_FLOOR), PROB_FLOOR)
+        out := -(yVal * math.log(p) + (1 - yVal) * math.log(1 - p))
+    else
+        float d = yVal - fVal
+        out := d * d
+    out
+
+sliceLoss(bool isCls, array<float> yArr, array<float> fArr, int fromIdx, int toIdx) =>
+    float s = 0.0
+    for j = fromIdx to toIdx
+        s += sampleLoss(isCls, array.get(yArr, j), array.get(fArr, j))
+    s / (toIdx - fromIdx + 1)
+
+// sufficient statistics (count, gradient sum, hessian sum) of the samples currently sitting in a heap node
+nodeStats(array<int> nodeOf, array<float> resArr, array<float> hesArr, int nodeId) =>
+    float cnt  = 0.0
+    float sumR = 0.0
+    float sumH = 0.0
+    int n = array.size(nodeOf)
+    if n > 0
+        for j = 0 to n - 1
+            if array.get(nodeOf, j) == nodeId
+                cnt  += 1
+                sumR += array.get(resArr, j)
+                sumH += array.get(hesArr, j)
+    [cnt, sumR, sumH]
+
+// greedy split search on the pseudo-residuals: evenly spaced candidate thresholds per usable feature,
+// scored with the regularized gain  G_L^2/(H_L+lambda) + G_R^2/(H_R+lambda) - G^2/(H+lambda)
+// (for squared error the hessian sum is the count, so this reduces to classic variance-reduction gain)
+bestSplit(matrix<float> featMat, int rowOffset, array<int> nodeOf, array<float> resArr, array<float> hesArr, array<bool> colUse, int nodeId, float cnt, float sumR, float sumH, int minLeaf, float lambda, int bins) =>
+    float bestGain = EPS
+    int   bestFeat = -1
+    float bestThr  = 0.0
+    int   n = array.size(nodeOf)
+    float parentScore = sumR * sumR / (sumH + lambda + EPS)
+    for f = 0 to FEAT_COUNT - 1
+        if array.get(colUse, f)
+            float fMin = 1e18
+            float fMax = -1e18
+            for j = 0 to n - 1
+                if array.get(nodeOf, j) == nodeId
+                    float xv = matrix.get(featMat, rowOffset + j, f)
+                    fMin := math.min(fMin, xv)
+                    fMax := math.max(fMax, xv)
+            if fMax - fMin > 1e-9
+                for q = 1 to bins
+                    float thr  = fMin + (fMax - fMin) * q / (bins + 1)
+                    float cntL  = 0.0
+                    float sumRL = 0.0
+                    float sumHL = 0.0
+                    for j = 0 to n - 1
+                        if array.get(nodeOf, j) == nodeId and matrix.get(featMat, rowOffset + j, f) <= thr
+                            cntL  += 1
+                            sumRL += array.get(resArr, j)
+                            sumHL += array.get(hesArr, j)
+                    if cntL >= minLeaf and cnt - cntL >= minLeaf
+                        float sumRR = sumR - sumRL
+                        float sumHR = sumH - sumHL
+                        float gainVal = sumRL * sumRL / (sumHL + lambda + EPS) + sumRR * sumRR / (sumHR + lambda + EPS) - parentScore
+                        if gainVal > bestGain
+                            bestGain := gainVal
+                            bestFeat := f
+                            bestThr  := thr
+    [bestGain, bestFeat, bestThr]
+
+// walks one stored tree for a feature row; subFeat >= 0 substitutes that feature's value (permutation importance)
+treeValue(array<int> featArr, array<float> thrArr, array<float> leafArr, int baseIdx, matrix<float> featMat, int rowIdx, int subFeat, float subVal, int maxDepth) =>
+    float out = 0.0
+    int nodeId = 1
+    for step = 0 to maxDepth
+        int nf = array.get(featArr, baseIdx + nodeId - 1)
+        if nf <= -1
+            out := nf == -1 ? array.get(leafArr, baseIdx + nodeId - 1) : 0.0
+            break
+        float xv = nf == subFeat ? subVal : matrix.get(featMat, rowIdx, nf)
+        nodeId := xv <= array.get(thrArr, baseIdx + nodeId - 1) ? 2 * nodeId : 2 * nodeId + 1
+    out
+
+// F(x) = F_0 + eta * sum of tree outputs
+ensembleValue(array<int> featArr, array<float> thrArr, array<float> leafArr, matrix<float> featMat, int rowIdx, int subFeat, float subVal, float baseScore, int nTrees, int nodesPerTree, int maxDepth, float lr) =>
+    float s = baseScore
+    if nTrees > 0
+        for t = 0 to nTrees - 1
+            s += lr * treeValue(featArr, thrArr, leafArr, t * nodesPerTree, featMat, rowIdx, subFeat, subVal, maxDepth)
+    s
+
+// full stagewise fit, Friedman-style:
+//   F_0 = argmin_c sum L(y_i, c) -> base log-odds (log loss) or mean target (squared error)
+//   r_i = -dL/dF at the current ensemble; h_m = depth-limited tree fit to (x_i, r_i) on a row/feature subsample
+//   F_m = F_prev + eta * h_m, with early stopping on the chronologically later validation slice
+// writes the truncated ensemble into outFeat/outThr/outLeaf and both importance reads into outGain/outPerm
+trainModel(matrix<float> featMat, array<float> labels, array<float> stateArr, array<int> outFeat, array<float> outThr, array<float> outLeaf, array<float> outGain, array<float> outPerm, bool isCls, int windowN, float valFrac, int maxRounds, float lr, int maxDepth, int minLeaf, float lambda, float subsFrac, float colsFrac, int patience, int bins, int nodesPerTree) =>
+    int labeled   = array.size(labels)
+    int nUse      = math.min(windowN, labeled)
+    int rowOffset = labeled - nUse
+    int valN      = math.max(int(nUse * valFrac), 10)
+    int trainN    = nUse - valN
+    bool okFit    = trainN >= 30 and valN >= 10
+    float baseScore = 0.0
+    float meanY     = 0.0
+    int   bestRound = 0
+    int   mDone     = 0
+    float bestLoss  = na
+    if okFit
+        // targets from the forward returns: 0/1 direction for log loss, percent return for squared error
+        array<float> yArr = array.new_float(nUse, 0.0)
+        for j = 0 to nUse - 1
+            float retVal = array.get(labels, rowOffset + j)
+            array.set(yArr, j, isCls ? (retVal > 0 ? 1.0 : 0.0) : retVal)
+        for j = 0 to trainN - 1
+            meanY += array.get(yArr, j)
+        meanY /= trainN
+        if isCls
+            float pBase = math.max(math.min(meanY, 0.98), 0.02)
+            baseScore := math.log(pBase / (1 - pBase))
+        else
+            baseScore := meanY
+        array<float> fArr   = array.new_float(nUse, baseScore)
+        array<float> resArr = array.new_float(trainN, 0.0)
+        array<float> hesArr = array.new_float(trainN, 0.0)
+        array<int>   nodeOf = array.new_int(trainN, 0)
+        array<bool>  colUse = array.new_bool(FEAT_COUNT, true)
+        int stSize = maxRounds * nodesPerTree
+        array<int>   stFeat = array.new_int(stSize, -2)
+        array<float> stThr  = array.new_float(stSize, 0.0)
+        array<float> stLeaf = array.new_float(stSize, 0.0)
+        array<float> roundGain = array.new_float(maxRounds * FEAT_COUNT, 0.0)
+        bestLoss := sliceLoss(isCls, yArr, fArr, trainN, nUse - 1)
+        for mRound = 0 to maxRounds - 1
+            mDone := mRound + 1
+            // pseudo-residuals r_i = -dL/dF (y - p for log loss, y - F for squared error) and hessians
+            for j = 0 to trainN - 1
+                float fj = array.get(fArr, j)
+                float yj = array.get(yArr, j)
+                if isCls
+                    float pj = logistic(fj)
+                    array.set(resArr, j, yj - pj)
+                    array.set(hesArr, j, math.max(pj * (1 - pj), 1e-6))
+                else
+                    array.set(resArr, j, yj - fj)
+                    array.set(hesArr, j, 1.0)
+            // stochastic gradient boosting: random row subsample per round (0 = out, 1 = root)
+            int nIn = 0
+            for j = 0 to trainN - 1
+                bool inRound = rand01(stateArr) < subsFrac
+                array.set(nodeOf, j, inRound ? 1 : 0)
+                nIn += inRound ? 1 : 0
+            if nIn < 4 * minLeaf
+                for j = 0 to trainN - 1
+                    array.set(nodeOf, j, 1)
+            // random feature subsample per round
+            int nCols = 0
+            for f = 0 to FEAT_COUNT - 1
+                bool useCol = rand01(stateArr) < colsFrac
+                array.set(colUse, f, useCol)
+                nCols += useCol ? 1 : 0
+            if nCols == 0
+                array.set(colUse, math.min(int(rand01(stateArr) * FEAT_COUNT), FEAT_COUNT - 1), true)
+            // grow one depth-limited tree on (x, r), level by level over the implicit heap
+            int treeBase = mRound * nodesPerTree
+            for level = 0 to maxDepth
+                int levelStart = level == 0 ? 1 : level == 1 ? 2 : level == 2 ? 4 : level == 3 ? 8 : 16
+                for nodeId = levelStart to 2 * levelStart - 1
+                    [cnt, sumR, sumH] = nodeStats(nodeOf, resArr, hesArr, nodeId)
+                    if cnt > 0
+                        int   bestFeat = -1
+                        float bestThr  = 0.0
+                        if level < maxDepth and cnt >= 2 * minLeaf
+                            [gainVal, splitFeat, splitThr] = bestSplit(featMat, rowOffset, nodeOf, resArr, hesArr, colUse, nodeId, cnt, sumR, sumH, minLeaf, lambda, bins)
+                            if splitFeat >= 0
+                                bestFeat := splitFeat
+                                bestThr  := splitThr
+                                int gIdx = mRound * FEAT_COUNT + splitFeat
+                                array.set(roundGain, gIdx, array.get(roundGain, gIdx) + gainVal)
+                        if bestFeat >= 0
+                            array.set(stFeat, treeBase + nodeId - 1, bestFeat)
+                            array.set(stThr, treeBase + nodeId - 1, bestThr)
+                            for j = 0 to trainN - 1
+                                if array.get(nodeOf, j) == nodeId
+                                    array.set(nodeOf, j, matrix.get(featMat, rowOffset + j, bestFeat) <= bestThr ? 2 * nodeId : 2 * nodeId + 1)
+                        else
+                            // leaf value: one-step Newton, sum(gradient) / (sum(hessian) + lambda)
+                            array.set(stFeat, treeBase + nodeId - 1, -1)
+                            float leafVal = sumR / (sumH + lambda + EPS)
+                            array.set(stLeaf, treeBase + nodeId - 1, math.max(math.min(leafVal, LEAF_CAP), -LEAF_CAP))
+            // shrunken stagewise update F_m = F_prev + eta * h_m on train and validation samples
+            for j = 0 to nUse - 1
+                array.set(fArr, j, array.get(fArr, j) + lr * treeValue(stFeat, stThr, stLeaf, treeBase, featMat, rowOffset + j, -1, 0.0, maxDepth))
+            // early stopping on the chronologically later validation slice
+            float valLoss = sliceLoss(isCls, yArr, fArr, trainN, nUse - 1)
+            if valLoss < bestLoss - 1e-9
+                bestLoss  := valLoss
+                bestRound := mRound + 1
+            if mRound + 1 - bestRound >= patience
+                break
+        // keep the ensemble truncated at the best validation round
+        array.clear(outFeat)
+        array.clear(outThr)
+        array.clear(outLeaf)
+        if bestRound > 0
+            for i = 0 to bestRound * nodesPerTree - 1
+                array.push(outFeat, array.get(stFeat, i))
+                array.push(outThr, array.get(stThr, i))
+                array.push(outLeaf, array.get(stLeaf, i))
+        // gain-based importance over the kept rounds, normalized to percentage shares
+        float totalGain = 0.0
+        for f = 0 to FEAT_COUNT - 1
+            float gSum = 0.0
+            if bestRound > 0
+                for m = 0 to bestRound - 1
+                    gSum += array.get(roundGain, m * FEAT_COUNT + f)
+            array.set(outGain, f, gSum)
+            totalGain += gSum
+        for f = 0 to FEAT_COUNT - 1
+            array.set(outGain, f, totalGain > EPS ? 100 * array.get(outGain, f) / totalGain : 0.0)
+        // permutation importance on the held-out validation slice: loss increase when one feature is shuffled
+        for f = 0 to FEAT_COUNT - 1
+            array.set(outPerm, f, 0.0)
+        if bestRound > 0
+            array<float> permVals = array.new_float(valN, 0.0)
+            for f = 0 to FEAT_COUNT - 1
+                for j = 0 to valN - 1
+                    array.set(permVals, j, matrix.get(featMat, rowOffset + trainN + j, f))
+                for j = 0 to valN - 2
+                    int swapIdx = math.min(j + int(rand01(stateArr) * (valN - j)), valN - 1)
+                    float tmpVal = array.get(permVals, j)
+                    array.set(permVals, j, array.get(permVals, swapIdx))
+                    array.set(permVals, swapIdx, tmpVal)
+                float permLoss = 0.0
+                for j = 0 to valN - 1
+                    float fHat = ensembleValue(outFeat, outThr, outLeaf, featMat, rowOffset + trainN + j, f, array.get(permVals, j), baseScore, bestRound, nodesPerTree, maxDepth, lr)
+                    permLoss += sampleLoss(isCls, array.get(yArr, trainN + j), fHat)
+                array.set(outPerm, f, permLoss / valN - bestLoss)
+    [okFit, baseScore, bestRound, mDone, bestLoss, meanY, trainN, valN]
+
+getTablePosition(string txt) =>
+    switch txt
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Middle Right" => position.middle_right
+        "Middle Left"  => position.middle_left
+        "Bottom Left"  => position.bottom_left
+        => position.bottom_right
+
+getTextSize(string txt) =>
+    switch txt
+        "Tiny"   => size.tiny
+        "Normal" => size.normal
+        => size.small
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+bool isClsTask    = taskInput == TASK_CLS
+int  nodesPerTree = depthInput == 1 ? 3 : depthInput == 2 ? 7 : depthInput == 3 ? 15 : 31
+
+// stationary engineered features from OHLCV — the modest table of numeric inputs boosted trees dominate
+float rsiRaw    = ta.rsi(close, rsiLenInput)
+float f1Rsi     = (rsiRaw - 50) / 50
+float trendMean = ta.sma(close, trendLenInput)
+float trendSd   = ta.stdev(close, trendLenInput)
+float f2Trend   = trendSd > 0 ? (close - trendMean) / trendSd : 0
+float rocRaw    = ta.roc(close, momLenInput)
+float rocSd     = ta.stdev(rocRaw, normLenInput)
+float f3Mom     = rocSd > 0 ? rocRaw / rocSd : 0
+float atrPct    = ta.atr(atrLenInput) / close * 100
+float atrMean   = ta.sma(atrPct, normLenInput)
+float atrSd     = ta.stdev(atrPct, normLenInput)
+float f4Vol     = atrSd > 0 ? (atrPct - atrMean) / atrSd : 0
+float rangeHi   = ta.highest(high, rangeLenInput)
+float rangeLo   = ta.lowest(low, rangeLenInput)
+float f5Pos     = rangeHi > rangeLo ? 2 * (close - rangeLo) / (rangeHi - rangeLo) - 1 : 0
+bool  featOk    = not (na(f1Rsi) or na(f2Trend) or na(f3Mom) or na(f4Vol) or na(f5Pos))
+
+// rolling history on closed bars only (each historical bar once, realtime bars at their confirming update);
+// labels use fully realized horizons — no lookahead into the fit
+bool retrainedNow = false
+bool barClosed    = barstate.ishistory or barstate.isconfirmed
+if barClosed and featOk
+    matrix.add_row(featMatrix, matrix.rows(featMatrix), array.from(f1Rsi, f2Trend, f3Mom, f4Vol, f5Pos))
+    array.push(closeArray, close)
+    int rowsNow = matrix.rows(featMatrix)
+    if rowsNow > horizonInput
+        array.push(labelArray, (close / array.get(closeArray, rowsNow - 1 - horizonInput) - 1) * 100)
+    int keepRows = windowInput + horizonInput + 10
+    if rowsNow > keepRows
+        matrix.remove_row(featMatrix, 0)
+        array.shift(closeArray)
+        array.shift(labelArray)
+    if array.size(labelArray) >= MIN_SAMPLES and (na(lastTrainBar) or bar_index - lastTrainBar >= retrainInput)
+        [okFit, baseScore, usedTrees, ranRounds, lossVal, meanTrainY, trainCount, valCount] = trainModel(featMatrix, labelArray, rngState, modelFeat, modelThr, modelLeaf, gainImp, permImp, isClsTask, windowInput, valFracInput, roundsInput, etaInput, depthInput, minLeafInput, lambdaInput, subsampleInput, colsampleInput, patienceInput, binsInput, nodesPerTree)
+        lastTrainBar := bar_index
+        if okFit
+            modelBase    := baseScore
+            modelTrees   := usedTrees
+            roundsRan    := ranRounds
+            valLossStat  := lossVal
+            baseRateStat := meanTrainY
+            trainNStat   := trainCount
+            valNStat     := valCount
+            retrainedNow := true
+
+// score the latest closed feature row with the last fitted ensemble
+int lastRowIdx = matrix.rows(featMatrix) - 1
+float scoreVal = na
+if not na(modelBase) and lastRowIdx >= 0
+    scoreVal := ensembleValue(modelFeat, modelThr, modelLeaf, featMatrix, lastRowIdx, -1, 0.0, modelBase, modelTrees, nodesPerTree, depthInput, etaInput)
+
+float oscVal      = na(scoreVal) ? na : isClsTask ? 100 * logistic(scoreVal) : scoreVal
+float centerLevel = isClsTask ? 50.0 : 0.0
+bool  aboveCenter = oscVal >= centerLevel
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+color oscColor = aboveCenter ? bullColorInput : bearColorInput
+
+oscPlotId    = plot(oscVal, "Prediction", oscColor, 2, plot.style_linebr)
+centerPlotId = plot(centerLevel, "Center", color.new(guideColorInput, 30), 1)
+
+fill(oscPlotId, centerPlotId,
+     top_value    = math.max(oscVal, centerLevel),
+     bottom_value = math.min(oscVal, centerLevel),
+     top_color    = aboveCenter ? color.new(bullColorInput, 50) : color.new(bearColorInput, 100),
+     bottom_color = aboveCenter ? color.new(bullColorInput, 100) : color.new(bearColorInput, 50),
+     title        = "Prediction Gradient")
+
+hline(threshInput, "Bullish Probability Threshold", color.new(GUIDE_COLOR, 40), hline.style_dashed, display = isClsTask and showThreshInput ? display.all : display.none)
+hline(100 - threshInput, "Bearish Probability Threshold", color.new(GUIDE_COLOR, 40), hline.style_dashed, display = isClsTask and showThreshInput ? display.all : display.none)
+
+// model card: ensemble state, validation diagnostics, and both feature-importance reads
+var table dashTable = table.new(getTablePosition(dashPosInput), 3, DASH_ROWS, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+if barstate.islast and showDashInput
+    string txtSize = getTextSize(textSizeInput)
+    color  fgColor = DASH_TEXT
+    color  dimText = DASH_HEADER
+    table.clear(dashTable, 0, 0, 2, DASH_ROWS - 1)
+    table.cell(dashTable, 0, 0, "Gradient Boosting", text_color = fgColor, text_size = txtSize, text_halign = text.align_left, bgcolor = DASH_BG)
+    table.cell(dashTable, 1, 0, "", bgcolor = DASH_BG)
+    table.cell(dashTable, 2, 0, "", bgcolor = DASH_BG)
+    if na(modelBase)
+        table.cell(dashTable, 0, 1, "Collecting history: " + str.tostring(array.size(labelArray)) + " / " + str.tostring(MIN_SAMPLES) + " labeled samples before the first fit", text_color = dimText, text_size = txtSize, text_halign = text.align_left)
+    else
+        string refitTxt = na(lastTrainBar) ? "" : " · refit " + str.tostring(bar_index - lastTrainBar) + " bars ago"
+        table.cell(dashTable, 0, 1, "Task", text_color = dimText, text_size = txtSize, text_halign = text.align_left)
+        table.cell(dashTable, 1, 1, (isClsTask ? "Classification (log loss)" : "Regression (squared error)") + refitTxt, text_color = fgColor, text_size = txtSize, text_halign = text.align_right)
+        table.cell(dashTable, 0, 2, "Trees (early stop)", text_color = dimText, text_size = txtSize, text_halign = text.align_left)
+        table.cell(dashTable, 1, 2, str.tostring(modelTrees) + " kept / " + str.tostring(roundsRan) + " grown", text_color = fgColor, text_size = txtSize, text_halign = text.align_right)
+        table.cell(dashTable, 0, 3, isClsTask ? "Val Log Loss" : "Val MSE", text_color = dimText, text_size = txtSize, text_halign = text.align_left)
+        table.cell(dashTable, 1, 3, str.tostring(valLossStat, "#.####"), text_color = fgColor, text_size = txtSize, text_halign = text.align_right)
+        table.cell(dashTable, 0, 4, isClsTask ? "Base Up-Rate" : "Mean Target", text_color = dimText, text_size = txtSize, text_halign = text.align_left)
+        table.cell(dashTable, 1, 4, isClsTask ? str.tostring(100 * baseRateStat, "#.#") + "%" : str.tostring(baseRateStat, "#.##") + "%", text_color = fgColor, text_size = txtSize, text_halign = text.align_right)
+        table.cell(dashTable, 0, 5, "Samples (train / val)", text_color = dimText, text_size = txtSize, text_halign = text.align_left)
+        table.cell(dashTable, 1, 5, str.tostring(trainNStat) + " / " + str.tostring(valNStat), text_color = fgColor, text_size = txtSize, text_halign = text.align_right)
+        table.cell(dashTable, 0, 6, "Prediction", text_color = dimText, text_size = txtSize, text_halign = text.align_left)
+        string predTxt = na(oscVal) ? "—" : isClsTask ? "P(up) " + str.tostring(oscVal, "#.#") + "%" : (oscVal >= 0 ? "+" : "") + str.tostring(oscVal, "#.##") + "%"
+        table.cell(dashTable, 1, 6, predTxt, text_color = aboveCenter ? bullColorInput : bearColorInput, text_size = txtSize, text_halign = text.align_right)
+        table.cell(dashTable, 0, 7, "Feature", text_color = dimText, text_size = txtSize, text_halign = text.align_left, bgcolor = DASH_BG)
+        table.cell(dashTable, 1, 7, "Gain %", text_color = dimText, text_size = txtSize, text_halign = text.align_right, bgcolor = DASH_BG)
+        table.cell(dashTable, 2, 7, "Perm Δloss", text_color = dimText, text_size = txtSize, text_halign = text.align_right, bgcolor = DASH_BG)
+        for f = 0 to FEAT_COUNT - 1
+            float gPct   = array.get(gainImp, f)
+            float pDelta = array.get(permImp, f)
+            table.cell(dashTable, 0, 8 + f, array.get(featNames, f), text_color = fgColor, text_size = txtSize, text_halign = text.align_left)
+            table.cell(dashTable, 1, 8 + f, str.tostring(gPct, "#.#") + "%", text_color = dimText, text_size = txtSize, text_halign = text.align_right)
+            table.cell(dashTable, 2, 8 + f, (pDelta > 0 ? "+" : "") + str.tostring(pDelta, "#.####"), text_color = pDelta > 0 ? fgColor : dimText, text_size = txtSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+bool crossUpCenter = ta.crossover(oscVal, centerLevel)
+bool crossDnCenter = ta.crossunder(oscVal, centerLevel)
+bool crossUpThresh = ta.crossover(oscVal, threshInput)
+bool crossDnThresh = ta.crossunder(oscVal, 100 - threshInput)
+
+alertcondition(crossUpCenter, "Bullish Flip", "gradient boosting: the boosted ensemble's prediction crossed above the center line — it now favors upside over the horizon.")
+alertcondition(crossDnCenter, "Bearish Flip", "gradient boosting: the boosted ensemble's prediction crossed below the center line — it now favors downside over the horizon.")
+alertcondition(crossUpThresh and isClsTask, "High-Confidence Bullish", "gradient boosting: P(up) crossed above the probability threshold.")
+alertcondition(crossDnThresh and isClsTask, "High-Confidence Bearish", "gradient boosting: P(up) crossed below 100 minus the probability threshold.")
+alertcondition(retrainedNow, "Model Retrained", "gradient boosting: the ensemble was refit on the latest window with early stopping.")
+
+//---------------------------------------------------------------------------------------------------------------------}

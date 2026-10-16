@@ -1,0 +1,255 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Climactic Action", "Climactic Action", overlay = true, max_lines_count = 500, max_labels_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+MODE_MULTIPLE   = "Multiple of Average"
+MODE_PERCENTILE = "Percentile Rank"
+
+SIZE_TINY   = "Tiny"
+SIZE_SMALL  = "Small"
+SIZE_NORMAL = "Normal"
+
+LABEL_BG = #00000000
+
+//Data-window-only effort measures
+NEUTRAL_COLOR = #787b86
+
+//Transparency applied to a climax level once follow-through invalidates it
+FADE_TRANSPARENCY = 80
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+trendLengthInput = input.int(20, "Prior Trend Length", minval = 2, maxval = 500, group = "Climax Detection",
+  tooltip = "Bars used to qualify the move behind the bar. A selling climax requires a net decline across this window and a push into a fresh low beneath all of it; a buying climax mirrors both at the highs. A climax is a terminal event - without a mature trend behind it, the same signature is just a busy bar.")
+
+baselineLengthInput = input.int(20, "Volume & Range Baseline", minval = 2, maxval = 500, group = "Climax Detection",
+  tooltip = "Trailing window used to build the baselines: average volume, average bar range, and the volume percentile rank. Climactic is always a relative label - volume and range are judged against the instrument's own recent prints, never against an absolute number.")
+
+volumeBasisInput = input.string(MODE_MULTIPLE, "Volume Basis", options = [MODE_MULTIPLE, MODE_PERCENTILE], group = "Climax Detection",
+  tooltip = "How climactic volume is qualified. 'Multiple of Average' demands volume above the Volume Multiple times the baseline average - the relative volume read. 'Percentile Rank' demands volume ranking above the Volume Percentile among the baseline window's prints.")
+
+volumeMultInput = input.float(2.5, "Volume Multiple", minval = 1, step = 0.1, group = "Climax Detection",
+  tooltip = "Relative volume threshold used with 'Multiple of Average' - the bar's volume must reach this multiple of average volume to tower over the recent prints.")
+
+volumePctlInput = input.float(95, "Volume Percentile", minval = 50, maxval = 100, group = "Climax Detection",
+  tooltip = "Percentile threshold used with 'Percentile Rank' - the bar's volume must rank above this percentile of the baseline window's prints.")
+
+rangeMultInput = input.float(2, "Range Multiple", minval = 1, step = 0.1, group = "Climax Detection",
+  tooltip = "The bar's range (high - low) must reach this multiple of the average range - the unusually wide bar that dwarfs its neighbors. Volume alone is not the tell: climactic action pairs extreme effort with extreme spread.")
+
+followThroughInput = input.int(5, "Follow-Through Window", minval = 1, maxval = 100, group = "Climax Aftermath",
+  tooltip = "Bars after the climax that must pass without a close beyond the climax extreme. Completing the window confirms follow-through failure - the move stopped making progress, the exhaustion read. A close beyond the extreme instead invalidates the climax as trend continuation.")
+
+testWindowInput = input.int(50, "Secondary Test Window", minval = 2, maxval = 500, group = "Climax Aftermath",
+  tooltip = "Maximum bars after the climax to keep tracking its level while waiting for a secondary test. Episodes with no test inside the window are retired and their level frozen.")
+
+testVolumeInput = input.float(50, "Test Volume, % of Climax", minval = 1, maxval = 100, group = "Climax Aftermath",
+  tooltip = "A secondary test must print on visibly lighter volume: at or below this percentage of the climax bar's volume.")
+
+testProximityInput = input.float(33, "Test Proximity, % of Climax Range", minval = 1, maxval = 100, group = "Climax Aftermath",
+  tooltip = "How close price must return to the climax extreme to count as a test, as a percentage of the climax bar's range. 33 demands a return into the final third of the climax bar's span; the test may also dip briefly beyond the extreme, only a close beyond it invalidates the level.")
+
+showLevelInput = input.bool(true, "Climax Extreme Level", group = "Style",
+  tooltip = "Draw a horizontal level at the climax extreme - the reference edge the subsequent range is expected to trade around. Dotted while awaiting follow-through, solid once the climax is confirmed, faded if it is invalidated.")
+
+showTestInput = input.bool(true, "Mark Secondary Tests", group = "Style",
+  tooltip = "Tag the classic confirmation: after a confirmed climax, a return toward the climax extreme on visibly lighter volume.")
+
+bullColorInput = input.color(#089981, "Selling Climax", inline = "colors", group = "Style",
+  tooltip = "Selling climax color - downtrend exhaustion, potential accumulation edge (bullish implication).")
+
+bearColorInput = input.color(#f23645, "Buying Climax", inline = "colors", group = "Style",
+  tooltip = "Buying climax color - uptrend exhaustion, potential distribution edge (bearish implication).")
+
+labelSizeInput = input.string(SIZE_SMALL, "Label Size", options = [SIZE_TINY, SIZE_SMALL, SIZE_NORMAL], group = "Style",
+  tooltip = "Size of the SC, BC and ST tags.")
+
+colorBarsInput = input.bool(false, "Color Climax Bars", group = "Style",
+  tooltip = "Additionally color the candles that print climactic action.")
+
+labelSize = labelSizeInput == SIZE_TINY ? size.tiny : labelSizeInput == SIZE_NORMAL ? size.normal : size.small
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types & Functions
+//---------------------------------------------------------------------------------------------------------------------{
+//State of the latest climax episode on one side of the market
+type ClimaxEpisode
+    bool  active      = false
+    bool  confirmed   = false
+    int   startBar    = 0
+    float extreme     = na
+    float climaxRange = na
+    float climaxVol   = na
+    line  levelLine   = na
+
+//Runs one side's episode: the climactic print, the follow-through test, invalidation, and the secondary test.
+//The sideSign math folds both directions into one path: +1 reads selling climaxes at lows, -1 buying climaxes at highs.
+processClimax(ClimaxEpisode episode, bool detected, bool isSelling, color eventColor, float relVol, float relRange, float closePct) =>
+    bool confirmEvent = false
+    bool testEvent    = false
+    bool failEvent    = false
+
+    float sideSign = isSelling ? 1 : -1
+    float refPrice = isSelling ? low : high
+
+    //Manage a live episode on confirmed bars without a fresh climactic print
+    if barstate.isconfirmed and episode.active and not detected
+        if sideSign * (close - episode.extreme) < 0
+            //Close beyond the extreme: the move still has fuel, the exhaustion read fails
+            failEvent      := true
+            episode.active := false
+            if not na(episode.levelLine)
+                line.set_x2(episode.levelLine, bar_index)
+                line.set_color(episode.levelLine, color.new(eventColor, FADE_TRANSPARENCY))
+        else
+            if not na(episode.levelLine)
+                line.set_x2(episode.levelLine, bar_index)
+            if not episode.confirmed and bar_index - episode.startBar >= followThroughInput
+                //Subsequent bars failed to extend the move - the climax reading is confirmed
+                episode.confirmed := true
+                confirmEvent      := true
+                if not na(episode.levelLine)
+                    line.set_style(episode.levelLine, line.style_solid)
+            if episode.confirmed and bar_index - episode.startBar > followThroughInput
+                nearExtreme = sideSign * (refPrice - episode.extreme) <= episode.climaxRange * testProximityInput / 100
+                lighterVol  = not na(volume) and episode.climaxVol > 0 and volume <= episode.climaxVol * testVolumeInput / 100
+                if nearExtreme and lighterVol
+                    //Secondary test: a return toward the extreme on visibly lighter volume
+                    testEvent      := true
+                    episode.active := false
+                    if not na(episode.levelLine)
+                        line.set_x2(episode.levelLine, bar_index)
+                    if showTestInput
+                        label.new(bar_index, refPrice, "ST"
+                          , style     = isSelling ? label.style_label_up : label.style_label_down
+                          , color     = LABEL_BG
+                          , textcolor = eventColor
+                          , size      = labelSize
+                          , tooltip   = "Secondary test\nReturn toward the climax extreme on lighter volume"
+                          + "\nVolume: " + str.tostring(100 * volume / episode.climaxVol, "#") + "% of the climax print")
+            if episode.active and bar_index - episode.startBar >= math.max(testWindowInput, followThroughInput + 1)
+                //No secondary test inside the window - retire the episode and freeze its level
+                episode.active := false
+
+    //Fresh climactic print
+    if detected
+        if episode.active and not episode.confirmed
+            //A short burst of climactic bars extends the pending episode to its newest extreme
+            episode.startBar := bar_index
+            if sideSign * (refPrice - episode.extreme) < 0
+                episode.extreme := refPrice
+            episode.climaxRange := math.max(episode.climaxRange, high - low)
+            episode.climaxVol   := math.max(episode.climaxVol, nz(volume))
+            if not na(episode.levelLine)
+                line.set_y1(episode.levelLine, episode.extreme)
+                line.set_y2(episode.levelLine, episode.extreme)
+                line.set_x2(episode.levelLine, bar_index)
+        else
+            //Open a fresh episode; a prior episode still waiting on its test is closed out first
+            if episode.active
+                if sideSign * (close - episode.extreme) < 0
+                    failEvent := true
+                    if not na(episode.levelLine)
+                        line.set_color(episode.levelLine, color.new(eventColor, FADE_TRANSPARENCY))
+                if not na(episode.levelLine)
+                    line.set_x2(episode.levelLine, bar_index)
+            episode.active      := true
+            episode.confirmed   := false
+            episode.startBar    := bar_index
+            episode.extreme     := refPrice
+            episode.climaxRange := high - low
+            episode.climaxVol   := nz(volume)
+            episode.levelLine   := showLevelInput ? line.new(bar_index, refPrice, bar_index, refPrice, color = eventColor, style = line.style_dotted) : line(na)
+
+        //Tag the climactic bar; hover for its measured signature
+        label.new(bar_index, refPrice, isSelling ? "SC" : "BC"
+          , style     = isSelling ? label.style_label_up : label.style_label_down
+          , color     = eventColor
+          , textcolor = chart.bg_color
+          , size      = labelSize
+          , tooltip   = (isSelling ? "Selling climax" : "Buying climax")
+          + "\nVolume: " + str.tostring(relVol, "#.##") + "x average"
+          + "\nRange: " + str.tostring(relRange, "#.##") + "x average"
+          + "\nClose off the " + (isSelling ? "low" : "high") + ": " + str.tostring(closePct, "#") + "%")
+
+    [confirmEvent, testEvent, failEvent]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Climax Detection
+//---------------------------------------------------------------------------------------------------------------------{
+barRange = high - low
+
+//Baselines, computed unconditionally on every bar
+averageVolume  = ta.sma(volume, baselineLengthInput)
+averageRange   = ta.sma(barRange, baselineLengthInput)
+volumePctlRank = ta.percentrank(volume, baselineLengthInput)
+
+//Prior-window extremes, excluding the current bar
+priorLowest  = ta.lowest(low, trendLengthInput)[1]
+priorHighest = ta.highest(high, trendLengthInput)[1]
+
+//Relative effort measures - climactic is earned against the instrument's own recent prints
+relativeVolume = not na(averageVolume) and averageVolume > 0 ? volume / averageVolume : na
+relativeRange  = not na(averageRange) and averageRange > 0 ? barRange / averageRange : na
+
+//Extreme volume
+volumeOk = switch volumeBasisInput
+    MODE_MULTIPLE => not na(relativeVolume) and relativeVolume >= volumeMultInput
+    => not na(volumePctlRank) and volumePctlRank >= volumePctlInput
+
+//Extreme range
+rangeOk = not na(relativeRange) and relativeRange >= rangeMultInput
+
+//Extended prior move, measured up to the previous bar so the climax bar does not qualify its own trend
+referenceClose = close[trendLengthInput + 1]
+priorDecline   = not na(referenceClose) and not na(close[1]) and close[1] < referenceClose
+priorAdvance   = not na(referenceClose) and not na(close[1]) and close[1] > referenceClose
+
+//The climax presses into fresh extremes beyond the whole prior window
+freshLow  = not na(priorLowest) and low < priorLowest
+freshHigh = not na(priorHighest) and high > priorHighest
+
+//Close position inside the bar - a finish well off the extreme says the flush met opposing interest
+closeOffLow  = barRange > 0 ? 100 * (close - low) / barRange : 50
+closeOffHigh = barRange > 0 ? 100 * (high - close) / barRange : 50
+
+sellingClimax = priorDecline and freshLow and volumeOk and rangeOk and barstate.isconfirmed
+buyingClimax  = priorAdvance and freshHigh and volumeOk and rangeOk and barstate.isconfirmed
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Climax Episodes
+//---------------------------------------------------------------------------------------------------------------------{
+var ClimaxEpisode sellingEpisode = ClimaxEpisode.new()
+var ClimaxEpisode buyingEpisode  = ClimaxEpisode.new()
+
+[scConfirmEvent, scTestEvent, scFailEvent] = processClimax(sellingEpisode, sellingClimax, true, bullColorInput, nz(relativeVolume), nz(relativeRange), closeOffLow)
+[bcConfirmEvent, bcTestEvent, bcFailEvent] = processClimax(buyingEpisode, buyingClimax, false, bearColorInput, nz(relativeVolume), nz(relativeRange), closeOffHigh)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visuals
+//---------------------------------------------------------------------------------------------------------------------{
+//Optional candle coloring; the effort measures are reported in the data window
+barcolor(colorBarsInput and sellingClimax ? bullColorInput : colorBarsInput and buyingClimax ? bearColorInput : na, title = "Climax Bars")
+
+plot(relativeVolume, "Relative Volume", color = NEUTRAL_COLOR, display = display.data_window)
+plot(relativeRange, "Relative Range", color = NEUTRAL_COLOR, display = display.data_window)
+plot(volumePctlRank, "Volume Percentile", color = NEUTRAL_COLOR, display = display.data_window)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(sellingClimax, "Selling Climax", "Selling climax - ultra-high volume and extreme range pressing into fresh lows after an extended decline")
+alertcondition(buyingClimax, "Buying Climax", "Buying climax - ultra-high volume and extreme range pressing into fresh highs after an extended advance")
+alertcondition(scConfirmEvent, "Selling Climax Confirmed", "Selling climax confirmed - the follow-through window completed without a close below the climax low")
+alertcondition(bcConfirmEvent, "Buying Climax Confirmed", "Buying climax confirmed - the follow-through window completed without a close above the climax high")
+alertcondition(scTestEvent, "Secondary Test of Selling Climax", "Secondary test - price returned toward the selling climax low on visibly lighter volume")
+alertcondition(bcTestEvent, "Secondary Test of Buying Climax", "Secondary test - price returned toward the buying climax high on visibly lighter volume")
+alertcondition(scFailEvent, "Selling Climax Invalidated", "Close below the selling climax low - downside follow-through resumed, the exhaustion read is invalidated")
+alertcondition(bcFailEvent, "Buying Climax Invalidated", "Close above the buying climax high - upside follow-through resumed, the exhaustion read is invalidated")
+
+//---------------------------------------------------------------------------------------------------------------------}

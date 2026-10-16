@@ -1,0 +1,494 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/ MPL-2.0
+
+//@version=6
+indicator("Structure Volume Profile Setups", "Structure VP Setups", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+
+// --- Groups ---
+const string GRP_SETUP = "Setup"
+const string GRP_TRADE = "Trade"
+const string GRP_HIST  = "History"
+const string GRP_STYLE = "Style"
+
+// --- Tooltips ---
+const string TT_SWING = "Pivot lookback used to detect swing points. Higher values return larger, slower market structure."
+const string TT_BOS   = "Number of consecutive BOS in one direction required before an opposing CHoCH can trigger a setup."
+const string TT_HTF   = "Setups are only allowed in the direction of the trend on the selected higher timeframe, measured with a 50 period EMA on confirmed values. Set to Off to trade both directions."
+const string TT_GAP   = "Rejects setups whose trend leg contains a price gap larger than one ATR, such as a session or weekend gap. It also invalidates a pending entry before the session break, so price can never gap straight through the level."
+const string TT_SIDE  = "Longs are only accepted when the POC is below price at the trigger bar, and shorts only when the POC is above it, so every entry is a retracement into the level rather than a breakout through it."
+const string TT_VA    = "Percentage of the leg volume contained in the value area, which defines the value area high and low used as targets."
+const string TT_ROWS  = "Number of price rows used to build the volume profile. Higher values give a more precise POC."
+const string TT_MODE  = "Value Area: target at the value area high for longs, or low for shorts. ATR: target at a fixed ATR distance from the entry."
+const string TT_TP    = "Target distance from the POC entry, in ATR. Only used when Target Mode is set to ATR."
+const string TT_SL    = "Stop distance from the POC entry, in ATR. Used in both target modes."
+const string TT_VOID  = "A pending entry stays valid until price reaches the POC. When enabled, a new CHoCH printing before the entry is touched cancels the setup. When disabled, the entry stays valid until it is reached or the expiry below elapses."
+const string TT_EXP   = "Number of bars a pending entry stays valid when the CHoCH cancellation is disabled. Set to 0 to keep pending entries valid indefinitely."
+
+// --- Fixed behaviour ---
+const int    HTF_LEN      = 50     // EMA length defining the higher timeframe trend
+const float  GAP_ATR      = 1.0    // gap size threshold, in ATR
+const int    ATR_LEN      = 14     // ATR length used for stops and targets
+const int    PROFILE_W    = 25     // horizontal size in bars of the largest profile row
+const int    MAX_LOOKBACK = 300    // maximum leg length kept in memory
+const int    PROJECTION   = 30     // bars the target and stop boxes are projected forward
+const int    MIN_WIDTH    = 6      // minimum width of a cancelled projection, so it stays visible
+
+// --- Inputs ---
+swingLen      = input.int(5, "Swing Length", minval = 2, maxval = 50, group = GRP_SETUP, tooltip = TT_SWING)
+bosRequired   = input.int(3, "Consecutive BOS Required", minval = 1, maxval = 10, group = GRP_SETUP, tooltip = TT_BOS)
+htfChoice     = input.string("Off", "HTF Trend Filter", options = ["Off", "15 min", "1 hour", "4 hours", "1 day"], group = GRP_SETUP, tooltip = TT_HTF)
+useGapFilter  = input.bool(true, "Skip Setups Containing Gaps", group = GRP_SETUP, tooltip = TT_GAP)
+useSideFilter = input.bool(true, "Require Retracement Into POC", group = GRP_SETUP, tooltip = TT_SIDE)
+rowsCount     = input.int(30, "Profile Rows", minval = 5, maxval = 60, group = GRP_SETUP, tooltip = TT_ROWS)
+vaPercent     = input.float(70, "Value Area %", minval = 10, maxval = 100, step = 5, group = GRP_SETUP, tooltip = TT_VA)
+
+tpMode        = input.string("Value Area", "Target Mode", options = ["Value Area", "ATR"], group = GRP_TRADE, tooltip = TT_MODE)
+tpMult        = input.float(2.0, "Target (ATR)", minval = 0.1, step = 0.1, group = GRP_TRADE, tooltip = TT_TP)
+slMult        = input.float(1.0, "Stop (ATR)", minval = 0.1, step = 0.1, group = GRP_TRADE, tooltip = TT_SL)
+voidOnChoch   = input.bool(true, "Cancel Pending Entry On New CHoCH", group = GRP_TRADE, tooltip = TT_VOID)
+pendingExpiry = input.int(0, "Pending Entry Expiry (bars)", minval = 0, maxval = 500, group = GRP_TRADE, tooltip = TT_EXP)
+
+maxSetups     = input.int(20, "Setups Kept On Chart", minval = 1, maxval = 100, group = GRP_HIST, tooltip = "Total number of past setups kept on the chart. Older ones are removed once this count is exceeded.")
+maxProfiles   = input.int(5, "Profiles Kept Drawn", minval = 1, maxval = 20, group = GRP_HIST, tooltip = "Number of the most recent setups that keep their volume profile rows drawn. Older setups keep only their levels and boxes, which preserves drawing resources.")
+showCancelled = input.bool(true, "Show Cancelled Setups", group = GRP_HIST, tooltip = "Keeps setups that were invalidated before their entry was reached on the chart, drawn in a faded style.")
+
+showStructure = input.bool(true, "Show Structure", group = GRP_STYLE, tooltip = "Displays the BOS and CHoCH detections used by the logic.")
+showStats     = input.bool(true, "Show Statistics", group = GRP_STYLE, tooltip = "Displays a table with the setups triggered and their outcome.")
+bullCss       = input.color(#089981, "Bullish", inline = "dir", group = GRP_STYLE, tooltip = "Colors of bullish structure and targets.")
+bearCss       = input.color(#f23645, "Bearish", inline = "dir", group = GRP_STYLE, tooltip = "Colors of bearish structure and targets.")
+rowCss        = input.color(#5b9cf6, "Profile", inline = "vp", group = GRP_STYLE, tooltip = "Color of the profile rows outside the value area.")
+vaCss         = input.color(#ff9800, "Value Area", inline = "vp", group = GRP_STYLE, tooltip = "Color of the profile rows inside the value area.")
+
+// --- Resolved settings ---
+bool   useHtf = htfChoice != "Off"
+string htfTf  = switch htfChoice
+    "15 min"  => "15"
+    "1 hour"  => "60"
+    "4 hours" => "240"
+    "1 day"   => "1D"
+    => "60"
+
+// --- Types ---
+type Setup
+    array<box> rows
+    box        frame
+    box        tpBox
+    box        slBox
+    line       pocLine
+    line       vahLine
+    line       valLine
+    label      info
+
+method clearRows(Setup st) =>
+    if not na(st) and not na(st.rows)
+        for b in st.rows
+            box.delete(b)
+        st.rows.clear()
+        box.delete(st.frame)
+        line.delete(st.vahLine)
+        line.delete(st.valLine)
+
+method destroy(Setup st) =>
+    if not na(st)
+        st.clearRows()
+        box.delete(st.tpBox)
+        box.delete(st.slBox)
+        line.delete(st.pocLine)
+        label.delete(st.info)
+
+// fades a setup that was invalidated before its entry was reached, keeping it visible for review
+method cancel(Setup st, int cancelBar, bool keep) =>
+    if not na(st)
+        if keep
+            if not na(st.tpBox)
+                st.tpBox.set_right(math.max(cancelBar, st.tpBox.get_left() + MIN_WIDTH))
+                st.tpBox.set_bgcolor(color.new(chart.fg_color, 90))
+                st.tpBox.set_border_color(color.new(chart.fg_color, 70))
+            if not na(st.slBox)
+                st.slBox.set_right(math.max(cancelBar, st.slBox.get_left() + MIN_WIDTH))
+                st.slBox.set_bgcolor(color.new(chart.fg_color, 90))
+                st.slBox.set_border_color(color.new(chart.fg_color, 70))
+            if not na(st.info)
+                st.info.set_x(cancelBar)
+                st.info.set_textcolor(color.new(chart.fg_color, 45))
+            if not na(st.pocLine)
+                st.pocLine.set_x2(cancelBar)
+                st.pocLine.set_style(line.style_dotted)
+                st.pocLine.set_width(1)
+        else
+            box.delete(st.tpBox)
+            box.delete(st.slBox)
+            label.delete(st.info)
+            if not na(st.pocLine)
+                st.pocLine.set_x2(cancelBar)
+                st.pocLine.set_style(line.style_dotted)
+                st.pocLine.set_width(1)
+
+// --- Higher timeframe trend ---
+htfTrend() =>
+    int dir = close > ta.ema(close, HTF_LEN) ? 1 : -1
+    dir[1]
+
+int   htfDir = nz(request.security(syminfo.tickerid, htfTf, htfTrend(), lookahead = barmerge.lookahead_off), 0)
+float atrVal = nz(ta.atr(ATR_LEN), syminfo.mintick)
+
+// --- Gap detection ---
+bool isGap = atrVal > 0 and bar_index > 0 and math.abs(open - nz(close[1], open)) > atrVal * GAP_ATR
+
+// A session break is the moment price can jump straight past a pending entry
+bool sessionBreak = session.islastbar or session.islastbar_regular
+
+// --- Rolling bar cache (avoids dynamic historical references) ---
+var array<float> hCache = array.new<float>()
+var array<float> lCache = array.new<float>()
+var array<float> vCache = array.new<float>()
+var array<bool>  gCache = array.new<bool>()
+
+hCache.push(high)
+lCache.push(low)
+vCache.push(nz(volume, 1.0))
+gCache.push(isGap)
+
+if hCache.size() > MAX_LOOKBACK
+    hCache.shift()
+    lCache.shift()
+    vCache.shift()
+    gCache.shift()
+
+int cacheFirstBar = bar_index - hCache.size() + 1
+
+// --- Market structure state ---
+var float lastHigh    = na
+var int   lastHighBar = na
+var bool  highTaken   = true
+var float lastLow     = na
+var int   lastLowBar  = na
+var bool  lowTaken    = true
+var int   trendDir    = 0
+
+var int   bullBos     = 0
+var int   bearBos     = 0
+
+var int   chochBar    = na  // candle that broke structure and started the current trend
+var float trendExt    = na  // running extreme of the current trend
+var int   trendExtBar = na  // bar of that extreme
+
+float ph = ta.pivothigh(high, swingLen, swingLen)
+float pl = ta.pivotlow(low, swingLen, swingLen)
+
+if not na(ph)
+    lastHigh    := ph
+    lastHighBar := bar_index - swingLen
+    highTaken   := false
+
+if not na(pl)
+    lastLow    := pl
+    lastLowBar := bar_index - swingLen
+    lowTaken   := false
+
+if trendDir == 1 and (na(trendExt) or high > trendExt)
+    trendExt    := high
+    trendExtBar := bar_index
+if trendDir == -1 and (na(trendExt) or low < trendExt)
+    trendExt    := low
+    trendExtBar := bar_index
+
+// --- Gap presence over a bar range ---
+hasGap(int startBar, int endBar) =>
+    bool found = false
+    int  last  = gCache.size() - 1
+    int  i1    = math.max(0, math.min(last, startBar - cacheFirstBar))
+    int  i2    = math.max(i1, math.min(last, endBar - cacheFirstBar))
+    for i = i1 to i2
+        if gCache.get(i)
+            found := true
+            break
+    found
+
+// --- Profile builder over a bar range, using the cache ---
+buildProfile(int startBar, int endBar, int rowsN, float vaP) =>
+    int last = hCache.size() - 1
+    int i1   = math.max(0, math.min(last, startBar - cacheFirstBar))
+    int i2   = math.max(i1, math.min(last, endBar - cacheFirstBar))
+    float top = hCache.get(i1)
+    float bot = lCache.get(i1)
+    for i = i1 to i2
+        top := math.max(top, hCache.get(i))
+        bot := math.min(bot, lCache.get(i))
+    float step = (top - bot) / rowsN
+    array<float> vols = array.new<float>(rowsN, 0.0)
+    if step > 0
+        for i = i1 to i2
+            int r1 = math.max(0, math.min(rowsN - 1, int(math.floor((lCache.get(i) - bot) / step))))
+            int r2 = math.max(0, math.min(rowsN - 1, int(math.floor((hCache.get(i) - bot) / step))))
+            float vPer = vCache.get(i) / (r2 - r1 + 1)
+            for r = r1 to r2
+                vols.set(r, vols.get(r) + vPer)
+    float maxVol = vols.max()
+    int   pocIdx = math.max(0, vols.indexof(maxVol))
+    float target = vols.sum() * vaP / 100.0
+    int   up     = pocIdx
+    int   dn     = pocIdx
+    float acc    = vols.get(pocIdx)
+    for _i = 0 to rowsN - 1
+        if acc >= target or (up >= rowsN - 1 and dn <= 0)
+            break
+        float vUp = up < rowsN - 1 ? vols.get(up + 1) : -1.0
+        float vDn = dn > 0 ? vols.get(dn - 1) : -1.0
+        if vUp >= vDn
+            up  += 1
+            acc += vUp
+        else
+            dn  -= 1
+            acc += vDn
+    float poc = bot + (pocIdx + 0.5) * step
+    float vah = bot + (up + 1) * step
+    float val = bot + dn * step
+    [vols, poc, vah, val, top, bot, step, maxVol, cacheFirstBar + i1, cacheFirstBar + i2]
+
+// --- POC preview, used by the retracement filter before anything is drawn ---
+pocOf(int startBar, int endBar) =>
+    [_v, poc, _vah, _val, _t, _b, step, maxVol, _s, _e] = buildProfile(startBar, endBar, rowsCount, vaPercent)
+    step > 0 and maxVol > 0 ? poc : na
+
+// --- Retracement side check: long needs POC below price, short needs POC above ---
+validSide(int dir, float poc) =>
+    bool ok = true
+    if useSideFilter
+        ok := na(poc) ? false : dir == 1 ? close > poc : close < poc
+    ok
+
+// --- Setup management ---
+var array<Setup> setups = array.new<Setup>()
+
+var float pEntry  = na
+var float pTp     = na
+var float pSl     = na
+var int   pDir    = 0
+var int   pBar    = na
+var bool  pFilled = false
+var Setup pSetup  = na
+
+var int   nSetups  = 0
+var int   nWins    = 0
+var int   nLoss    = 0
+var int   nGapRej  = 0
+var int   nSideRej = 0
+var int   nVoided  = 0
+
+drawSetup(int dir, int anchorBar, int endBar) =>
+    [vols, poc, vah, val, top, bot, step, maxVol, pStart, pEnd] = buildProfile(anchorBar, endBar, rowsCount, vaPercent)
+    float entry = na
+    float tp    = na
+    float sl    = na
+    if step > 0 and maxVol > 0
+        int   width = math.min(PROFILE_W, math.max(5, pEnd - pStart))
+        Setup st    = Setup.new(array.new<box>(), na, na, na, na, na, na, na)
+        for i = 0 to rowsCount - 1
+            int w = int(math.round(vols.get(i) / maxVol * width))
+            if w > 0
+                float rTop = bot + (i + 1) * step
+                float rBot = bot + i * step
+                bool  inVa = rTop <= vah + step * 0.5 and rBot >= val - step * 0.5
+                color css  = inVa ? vaCss : rowCss
+                st.rows.push(box.new(pStart, rTop, pStart + w, rBot, border_color = color.new(css, 60), bgcolor = color.new(css, inVa ? 35 : 55)))
+        st.frame := box.new(pStart, top, pEnd, bot, border_color = color.new(chart.fg_color, 60), bgcolor = color.new(chart.fg_color, 95))
+        entry := poc
+        tp    := tpMode == "Value Area" ? (dir == 1 ? vah : val) : (dir == 1 ? poc + atrVal * tpMult : poc - atrVal * tpMult)
+        sl    := dir == 1 ? poc - atrVal * slMult : poc + atrVal * slMult
+        color dirCss = dir == 1 ? bullCss : bearCss
+        st.pocLine := line.new(pStart, entry, bar_index + PROJECTION, entry, color = chart.fg_color, width = 2)
+        st.vahLine := line.new(pStart, vah, bar_index, vah, color = color.new(chart.fg_color, 30), style = line.style_dotted)
+        st.valLine := line.new(pStart, val, bar_index, val, color = color.new(chart.fg_color, 30), style = line.style_dotted)
+        st.tpBox   := box.new(bar_index, tp, bar_index + PROJECTION, entry, border_color = color.new(bullCss, 20), bgcolor = color.new(bullCss, 70))
+        st.slBox   := box.new(bar_index, entry, bar_index + PROJECTION, sl, border_color = color.new(bearCss, 20), bgcolor = color.new(bearCss, 70))
+        float rr = math.abs(sl - entry) > 0 ? math.abs(tp - entry) / math.abs(sl - entry) : na
+        st.info := label.new(bar_index + PROJECTION, tp, (dir == 1 ? "LONG" : "SHORT") + "  ·  R:R " + str.tostring(rr, "#.##"), style = label.style_label_down, color = #00000000, textcolor = dirCss, size = size.small)
+        setups.push(st)
+        if setups.size() > maxProfiles
+            Setup aged = setups.get(setups.size() - 1 - maxProfiles)
+            aged.clearRows()
+        while setups.size() > maxSetups
+            Setup old = setups.shift()
+            old.destroy()
+    [entry, tp, sl]
+
+// --- Trigger logic ---
+bool bullBreak = not na(lastHigh) and not highTaken and close > lastHigh
+bool bearBreak = not na(lastLow) and not lowTaken and close < lastLow
+
+bool longSignal  = false
+bool shortSignal = false
+bool chochEvent  = false
+int  sigStart    = na
+int  sigEnd      = na
+
+bool canArm = pDir == 0 and not (useGapFilter and (sessionBreak or isGap))
+
+if bullBreak
+    highTaken := true
+    bool isBos = trendDir == 1
+    if showStructure
+        line.new(lastHighBar, lastHigh, bar_index, lastHigh, color = color.new(bullCss, 40), style = line.style_dashed)
+        label.new(int(math.avg(lastHighBar, bar_index)), lastHigh, isBos ? "BOS" : "CHoCH", style = label.style_label_down, color = #00000000, textcolor = bullCss, size = size.tiny)
+    if isBos
+        bullBos += 1
+    else
+        // bullish CHoCH : profile the completed bearish leg -> short setup
+        if bearBos >= bosRequired and (not useHtf or htfDir == -1) and not na(chochBar) and canArm
+            int s0 = chochBar
+            int e0 = nz(trendExtBar, bar_index)
+            if useGapFilter and hasGap(s0, e0)
+                nGapRej += 1
+            else if not validSide(-1, pocOf(s0, e0))
+                nSideRej += 1
+            else
+                shortSignal := true
+                sigStart    := s0
+                sigEnd      := e0
+        chochEvent  := true
+        bearBos     := 0
+        bullBos     := 0
+        trendDir    := 1
+        chochBar    := bar_index
+        trendExt    := high
+        trendExtBar := bar_index
+
+if bearBreak
+    lowTaken := true
+    bool isBos = trendDir == -1
+    if showStructure
+        line.new(lastLowBar, lastLow, bar_index, lastLow, color = color.new(bearCss, 40), style = line.style_dashed)
+        label.new(int(math.avg(lastLowBar, bar_index)), lastLow, isBos ? "BOS" : "CHoCH", style = label.style_label_up, color = #00000000, textcolor = bearCss, size = size.tiny)
+    if isBos
+        bearBos += 1
+    else
+        // bearish CHoCH : profile the completed bullish leg -> long setup
+        if bullBos >= bosRequired and (not useHtf or htfDir == 1) and not na(chochBar) and canArm
+            int s0 = chochBar
+            int e0 = nz(trendExtBar, bar_index)
+            if useGapFilter and hasGap(s0, e0)
+                nGapRej += 1
+            else if not validSide(1, pocOf(s0, e0))
+                nSideRej += 1
+            else
+                longSignal := true
+                sigStart   := s0
+                sigEnd     := e0
+        chochEvent  := true
+        bullBos     := 0
+        bearBos     := 0
+        trendDir    := -1
+        chochBar    := bar_index
+        trendExt    := low
+        trendExtBar := bar_index
+
+// --- A new CHoCH, an expiry, or an imminent session gap invalidates a pending entry ---
+bool setupVoided = false
+bool gapVoid     = useGapFilter and (sessionBreak or isGap)
+bool chochVoid   = voidOnChoch and chochEvent
+bool expiryVoid  = pendingExpiry > 0 and not na(pBar) and bar_index - pBar >= pendingExpiry
+
+if (chochVoid or gapVoid or expiryVoid) and pDir != 0 and not pFilled
+    if not na(pSetup)
+        pSetup.cancel(bar_index, showCancelled)
+    pSetup      := na
+    pDir        := 0
+    setupVoided := true
+    nVoided     += 1
+
+// --- New setup ---
+if longSignal or shortSignal
+    int dir = longSignal ? 1 : -1
+    [e, t, x] = drawSetup(dir, nz(sigStart, bar_index), nz(sigEnd, bar_index))
+    if not na(e)
+        pEntry  := e
+        pTp     := t
+        pSl     := x
+        pDir    := dir
+        pBar    := bar_index
+        pFilled := false
+        pSetup  := setups.size() > 0 ? setups.get(setups.size() - 1) : na
+        nSetups += 1
+
+// --- Pending entry and trade tracking ---
+bool entryFilled = false
+bool tpHit       = false
+bool slHit       = false
+
+if pDir != 0 and not na(pEntry)
+    if not pFilled
+        if low <= pEntry and high >= pEntry
+            pFilled     := true
+            entryFilled := true
+            // anchor the target and stop projection to the bar the entry filled on
+            if not na(pSetup)
+                if not na(pSetup.tpBox)
+                    pSetup.tpBox.set_left(bar_index)
+                    pSetup.tpBox.set_right(bar_index + PROJECTION)
+                if not na(pSetup.slBox)
+                    pSetup.slBox.set_left(bar_index)
+                    pSetup.slBox.set_right(bar_index + PROJECTION)
+                if not na(pSetup.info)
+                    pSetup.info.set_x(bar_index + PROJECTION)
+        else if not na(pSetup)
+            // trail the pending entry level and its projection until touched or invalidated
+            if not na(pSetup.pocLine)
+                pSetup.pocLine.set_x2(bar_index + 2)
+            if not na(pSetup.tpBox)
+                pSetup.tpBox.set_left(bar_index)
+                pSetup.tpBox.set_right(bar_index + PROJECTION)
+            if not na(pSetup.slBox)
+                pSetup.slBox.set_left(bar_index)
+                pSetup.slBox.set_right(bar_index + PROJECTION)
+            if not na(pSetup.info)
+                pSetup.info.set_x(bar_index + PROJECTION)
+    if pFilled
+        if pDir == 1
+            if low <= pSl
+                slHit := true
+            else if high >= pTp
+                tpHit := true
+        else
+            if high >= pSl
+                slHit := true
+            else if low <= pTp
+                tpHit := true
+    if tpHit or slHit
+        nWins  += tpHit ? 1 : 0
+        nLoss  += slHit ? 1 : 0
+        // close the projection on the bar the trade resolved
+        if not na(pSetup)
+            if not na(pSetup.tpBox)
+                pSetup.tpBox.set_right(math.max(bar_index, pSetup.tpBox.get_left() + MIN_WIDTH))
+            if not na(pSetup.slBox)
+                pSetup.slBox.set_right(math.max(bar_index, pSetup.slBox.get_left() + MIN_WIDTH))
+            if not na(pSetup.info)
+                pSetup.info.set_x(bar_index)
+        pDir    := 0
+        pFilled := false
+        pSetup  := na
+
+// --- Statistics ---
+var table statsTable = table.new(position.top_right, 2, 6, bgcolor = color.new(chart.bg_color, 20), border_color = color.new(chart.fg_color, 80), border_width = 1)
+if showStats and barstate.islast
+    float winRate = nWins + nLoss > 0 ? nWins / (nWins + nLoss) * 100 : na
+    statsTable.cell(0, 0, "Setups", text_color = chart.fg_color, text_size = size.small)
+    statsTable.cell(1, 0, str.tostring(nSetups), text_color = chart.fg_color, text_size = size.small)
+    statsTable.cell(0, 1, "Targets", text_color = chart.fg_color, text_size = size.small)
+    statsTable.cell(1, 1, str.tostring(nWins), text_color = bullCss, text_size = size.small)
+    statsTable.cell(0, 2, "Stops", text_color = chart.fg_color, text_size = size.small)
+    statsTable.cell(1, 2, str.tostring(nLoss), text_color = bearCss, text_size = size.small)
+    statsTable.cell(0, 3, "Win Rate", text_color = chart.fg_color, text_size = size.small)
+    statsTable.cell(1, 3, na(winRate) ? "n/a" : str.tostring(winRate, "#.#") + "%", text_color = chart.fg_color, text_size = size.small)
+    statsTable.cell(0, 4, "Cancelled", text_color = chart.fg_color, text_size = size.small)
+    statsTable.cell(1, 4, str.tostring(nVoided), text_color = color.new(chart.fg_color, 30), text_size = size.small)
+    statsTable.cell(0, 5, "HTF Trend", text_color = chart.fg_color, text_size = size.small)
+    statsTable.cell(1, 5, not useHtf ? "Off" : htfDir == 1 ? "Bullish" : "Bearish", text_color = not useHtf ? chart.fg_color : htfDir == 1 ? bullCss : bearCss, text_size = size.small)
+
+// --- Alerts ---
+alertcondition(longSignal, "Long Setup", "Bullish volume profile setup detected")
+alertcondition(shortSignal, "Short Setup", "Bearish volume profile setup detected")
+alertcondition(entryFilled, "Entry Triggered", "Price reached the POC entry level")
+alertcondition(tpHit, "Target Reached", "Setup reached its target")
+alertcondition(slHit, "Stop Reached", "Setup reached its stop")
+alertcondition(setupVoided, "Setup Cancelled", "Pending setup cancelled before the entry was reached")

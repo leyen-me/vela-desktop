@@ -1,0 +1,497 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Impulse Leg", "Impulse Leg", overlay = true, max_lines_count = 500, max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+NEUTRAL_COLOR = #787b86
+DASH_BG       = #161616
+DASH_FRAME    = #2E2E2E
+DASH_HEADER   = #808080
+DASH_TEXT     = #DBDBDB
+
+//Classification of a completed leg: impulse (took out the prior swing), candidate (impulse quality, no break), none
+CLASS_NONE      = 0
+CLASS_CANDIDATE = 1
+CLASS_IMPULSE   = 2
+
+//Storage caps
+MAX_STORED_BARS = 90000
+MAX_SWINGS      = 500
+MAX_PRIOR_LEGS  = 30
+
+//Visual tuning
+CANDIDATE_TRANSPARENCY = 45
+FRAMEWORK_TRANSPARENCY = 75
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+swingLengthInput = input.int(10, "Swing Length", minval = 2, group = "Swing Detection",
+  tooltip = "Bars to the left and right required to confirm a swing high or swing low. The zigzag built from these confirmed swings gives every leg a defined origin and end; larger values read larger structure but confirm later, and a leg's label only firms up once the swing at its end has formed.")
+
+compareLegsInput = input.int(4, "Prior Legs to Compare", minval = 1, maxval = 20, group = "Impulse Criteria",
+  tooltip = "Number of completed neighboring legs forming the comparison baseline. Impulse legs are judged relative to the moves around them rather than by absolute size.")
+
+distanceMultInput = input.float(1.0, "Min Distance Ratio", minval = 0, step = 0.05, group = "Impulse Criteria",
+  tooltip = "The leg must travel at least this multiple of the prior legs' average price distance.")
+
+speedMultInput = input.float(1.25, "Min Speed Ratio", minval = 0, step = 0.05, group = "Impulse Criteria",
+  tooltip = "The leg must cover at least this multiple of the prior legs' average distance per bar - noticeably more ground in less time is the core impulse test.")
+
+directionalPctInput = input.float(60, "Min Directional Candles %", minval = 0, maxval = 100, group = "Impulse Criteria",
+  tooltip = "Minimum share of the leg's candles that close in the leg direction - full-bodied candles stacked one way.")
+
+overlapPctInput = input.float(50, "Max Bar Overlap %", minval = 0, maxval = 100, group = "Impulse Criteria",
+  tooltip = "Maximum average overlap between consecutive candle ranges inside the leg, as a percentage of each bar's range. Impulses show little bar-to-bar overlap; heavy overlap reads corrective.")
+
+pullbackPctInput = input.float(50, "Max Internal Pullback %", minval = 0, maxval = 100, group = "Impulse Criteria",
+  tooltip = "Deepest pause inside the leg as a percentage of its total travel. Impulses rest in brief, shallow consolidations; a deeper mid-leg retracement argues the move is corrective.")
+
+closeBreakInput = input.bool(false, "Break Requires Close Beyond Swing", group = "Impulse Criteria",
+  tooltip = "When enabled a leg only counts as taking out the prior swing point once a candle closes beyond it; otherwise trading through the level intrabar is enough. Legs that meet every impulse criterion but do not take out the prior swing stay candidates.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", group = "Style", inline = "colors",
+  tooltip = "Color of bullish impulse legs, their labels and their levels.")
+
+bearColorInput = input.color(BEAR_COLOR, "Bearish", group = "Style", inline = "colors",
+  tooltip = "Color of bearish impulse legs, their labels and their levels.")
+
+legWidthInput = input.int(2, "Impulse Line Width", minval = 1, maxval = 5, group = "Style",
+  tooltip = "Width of confirmed impulse leg lines. Candidate legs draw one step thinner, dashed and faded.")
+
+showLabelsInput = input.bool(true, "Leg Labels", group = "Style",
+  tooltip = "Label classified legs near their midpoint. Hover a label for the leg's measured statistics against each criterion.")
+
+showCandidatesInput = input.bool(true, "Show Candidate Legs", group = "Style",
+  tooltip = "Draw legs that meet every impulse criterion but die short of the prior swing point - fast pushes that printed no structural break are only candidates.")
+
+showFrameworkInput = input.bool(false, "Show Swing Framework", group = "Style",
+  tooltip = "Faint dotted zigzag connecting every confirmed swing point, so classified legs can be read against the neighboring legs they were compared with.")
+
+showLevelsInput = input.bool(true, "Latest Impulse Origin & Extreme", group = "Style",
+  tooltip = "Dotted levels at the origin and extreme of the most recent impulse leg. The pair anchors retracement and projection measurements, and the origin doubles as the invalidation level for continuation trades - price back through it fully unwinds the leg.")
+
+showDashInput = input.bool(true, "Show Dashboard", group = "Dashboard",
+  tooltip = "Compact readout of the latest completed leg: direction, classification, and how it measured against each impulse criterion.")
+
+dashPositionInput = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = "Dashboard",
+  tooltip = "Corner of the chart holding the dashboard.")
+
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = "Dashboard",
+  tooltip = "Dashboard text size.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// State
+//---------------------------------------------------------------------------------------------------------------------{
+//Per-bar OHLC storage so a completed leg can be measured bar by bar (index = bar_index - oldestStoredBar)
+var array<float> openArray  = array.new<float>()
+var array<float> highArray  = array.new<float>()
+var array<float> lowArray   = array.new<float>()
+var array<float> closeArray = array.new<float>()
+var int oldestStoredBar = 0
+
+//Zigzag swing points, oldest first; the last two swings bound the leg currently being classified
+var array<int>   swingBarArray   = array.new<int>()
+var array<float> swingPriceArray = array.new<float>()
+var int lastSwingDir = 0
+
+//Distance and speed of locked legs - the neighbor baseline new legs are compared against
+var array<float> priorLegRangeArray = array.new<float>()
+var array<float> priorLegSpeedArray = array.new<float>()
+
+//Current (most recently completed, still extendable) leg
+var int   currentClass     = CLASS_NONE
+var bool  impulseAlerted   = false
+var bool  candidateAlerted = false
+var line  currentLegLine   = na
+var label currentLegLabel  = na
+var line  currentFrameLine = na
+
+//Most recent leg locked while classified as an impulse - fallback anchor for the origin/extreme levels
+var bool  haveLockedImpulse   = false
+var int   lockedOriginBar     = na
+var float lockedOriginPrice   = na
+var int   lockedExtremeBar    = na
+var float lockedExtremePrice  = na
+
+//Origin/extreme levels of the latest impulse leg
+var bool  levelsValid       = false
+var bool  levelsUp          = true
+var int   levelOriginBar    = na
+var float levelOriginPrice  = na
+var int   levelExtremeBar   = na
+var float levelExtremePrice = na
+var line  originLine        = na
+var line  extremeLine       = na
+var label originTag         = na
+var label extremeTag        = na
+
+//Dashboard snapshot of the latest completed leg
+var int   dashDirection   = 0
+var int   dashClass       = -1
+var bool  dashBroke       = false
+var float dashDistance    = na
+var float dashSpeed       = na
+var float dashDirectional = na
+var float dashOverlap     = na
+var float dashPullback    = na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+//Average of the most recent `count` elements of an array
+averageOfRecent(array<float> valuesArray, int count) =>
+    int n = array.size(valuesArray)
+    int used = math.min(n, count)
+    float result = na
+    if used > 0
+        float sum = 0.
+        for i = n - used to n - 1
+            sum += array.get(valuesArray, i)
+        result := sum / used
+    result
+
+formatRatio(float value) =>
+    na(value) ? "—" : str.tostring(value, "#.##") + "×"
+
+formatPercent(float value) =>
+    na(value) ? "—" : str.tostring(value, "#.#") + "%"
+
+//Measure a completed leg and classify it against the impulse criteria.
+//Returns [class, distanceRatio, speedRatio, directionalPct, overlapPct, pullbackPct, brokeSwing]
+classifyLeg(int startBar, float startPrice, int endBar, float endPrice, float priorSwingPrice) =>
+    bool  isUp     = endPrice > startPrice
+    int   legBars  = endBar - startBar
+    float legRange = math.abs(endPrice - startPrice)
+    int   startIndex = startBar - oldestStoredBar
+    int   directionalCount = 0
+    float overlapSum  = 0.
+    float maxPullback = 0.
+    float runExtreme  = startPrice
+    float maxClose    = na
+    float minClose    = na
+    if legBars >= 1 and startIndex >= 0
+        for barId = startBar + 1 to endBar
+            int idx = barId - oldestStoredBar
+            float o = array.get(openArray, idx)
+            float h = array.get(highArray, idx)
+            float l = array.get(lowArray, idx)
+            float c = array.get(closeArray, idx)
+            float hPrev = array.get(highArray, idx - 1)
+            float lPrev = array.get(lowArray, idx - 1)
+            //Full-bodied candles stacked one way
+            directionalCount += isUp ? (c > o ? 1 : 0) : (c < o ? 1 : 0)
+            //Bar-to-bar overlap as a share of the current bar's range
+            float barRange = h - l
+            float overlap  = math.max(0., math.min(h, hPrev) - math.max(l, lPrev))
+            overlapSum += barRange > 0 ? overlap / barRange : 1.
+            //Deepest pause inside the leg, measured from the running extreme
+            if isUp
+                maxPullback := math.max(maxPullback, runExtreme - l)
+                runExtreme  := math.max(runExtreme, h)
+            else
+                maxPullback := math.max(maxPullback, h - runExtreme)
+                runExtreme  := math.min(runExtreme, l)
+            maxClose := na(maxClose) ? c : math.max(maxClose, c)
+            minClose := na(minClose) ? c : math.min(minClose, c)
+    bool  measured       = legBars >= 1 and startIndex >= 0 and legRange > 0
+    float directionalPct = measured ? 100. * directionalCount / legBars : na
+    float overlapPct     = measured ? 100. * overlapSum / legBars : na
+    float pullbackPct    = measured ? 100. * maxPullback / legRange : na
+    //Neighbor baseline: the leg is judged relative to the moves around it, not by absolute size
+    float baseRange     = averageOfRecent(priorLegRangeArray, compareLegsInput)
+    float baseSpeed     = averageOfRecent(priorLegSpeedArray, compareLegsInput)
+    float distanceRatio = measured and not na(baseRange) and baseRange > 0 ? legRange / baseRange : na
+    float speedRatio    = measured and not na(baseSpeed) and baseSpeed > 0 ? legRange / legBars / baseSpeed : na
+    //Structural work: did the leg take out the prior same-side swing point?
+    bool brokeSwing = false
+    if not na(priorSwingPrice)
+        if closeBreakInput
+            brokeSwing := isUp ? not na(maxClose) and maxClose > priorSwingPrice : not na(minClose) and minClose < priorSwingPrice
+        else
+            brokeSwing := isUp ? endPrice > priorSwingPrice : endPrice < priorSwingPrice
+    bool quality = measured
+      and not na(distanceRatio) and distanceRatio >= distanceMultInput
+      and not na(speedRatio) and speedRatio >= speedMultInput
+      and directionalPct >= directionalPctInput
+      and overlapPct <= overlapPctInput
+      and pullbackPct <= pullbackPctInput
+    int legClass = quality ? (brokeSwing ? CLASS_IMPULSE : CLASS_CANDIDATE) : CLASS_NONE
+    [legClass, distanceRatio, speedRatio, directionalPct, overlapPct, pullbackPct, brokeSwing]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Swing Detection
+//---------------------------------------------------------------------------------------------------------------------{
+array.push(openArray, open)
+array.push(highArray, high)
+array.push(lowArray, low)
+array.push(closeArray, close)
+
+if array.size(openArray) > MAX_STORED_BARS
+    array.shift(openArray)
+    array.shift(highArray)
+    array.shift(lowArray)
+    array.shift(closeArray)
+    oldestStoredBar += 1
+
+//Confirmed swing points (known swingLength bars after the fact)
+float pivotHighPrice = ta.pivothigh(swingLengthInput, swingLengthInput)
+float pivotLowPrice  = ta.pivotlow(swingLengthInput, swingLengthInput)
+int   pivotBar       = bar_index - swingLengthInput
+
+bool legEvent = false
+
+//Same-direction pivots extend the current leg; opposite pivots lock it and start the next one.
+//On an outside bar both confirm at once - handle the extension side first to keep alternation clean.
+bool highFirst = lastSwingDir == 1
+
+if barstate.isconfirmed
+    for passIndex = 0 to 1
+        bool  isHighPass = highFirst ? passIndex == 0 : passIndex == 1
+        float passPrice  = isHighPass ? pivotHighPrice : pivotLowPrice
+        int   passDir    = isHighPass ? 1 : -1
+        if not na(passPrice)
+            int swingCount = array.size(swingBarArray)
+            if lastSwingDir == passDir and swingCount > 0
+                //Same direction: the leg extends only if this swing is more extreme
+                float lastPrice = array.get(swingPriceArray, swingCount - 1)
+                if (passDir == 1 ? passPrice > lastPrice : passPrice < lastPrice)
+                    array.set(swingBarArray, swingCount - 1, pivotBar)
+                    array.set(swingPriceArray, swingCount - 1, passPrice)
+                    legEvent := true
+            else
+                //Opposite direction: the current leg is now fully fixed - push it into the neighbor baseline
+                if swingCount >= 2
+                    int   lockedStartBar   = array.get(swingBarArray, swingCount - 2)
+                    float lockedStartPrice = array.get(swingPriceArray, swingCount - 2)
+                    int   lockedEndBar     = array.get(swingBarArray, swingCount - 1)
+                    float lockedEndPrice   = array.get(swingPriceArray, swingCount - 1)
+                    array.push(priorLegRangeArray, math.abs(lockedEndPrice - lockedStartPrice))
+                    array.push(priorLegSpeedArray, math.abs(lockedEndPrice - lockedStartPrice) / math.max(1, lockedEndBar - lockedStartBar))
+                    if array.size(priorLegRangeArray) > MAX_PRIOR_LEGS
+                        array.shift(priorLegRangeArray)
+                        array.shift(priorLegSpeedArray)
+                    //Remember the leg for the origin/extreme levels if it locked as an impulse
+                    if currentClass == CLASS_IMPULSE
+                        haveLockedImpulse  := true
+                        lockedOriginBar    := lockedStartBar
+                        lockedOriginPrice  := lockedStartPrice
+                        lockedExtremeBar   := lockedEndBar
+                        lockedExtremePrice := lockedEndPrice
+                //Start bookkeeping for the new leg; locked drawings stay on the chart
+                currentClass     := CLASS_NONE
+                impulseAlerted   := false
+                candidateAlerted := false
+                currentLegLine   := na
+                currentLegLabel  := na
+                currentFrameLine := na
+                array.push(swingBarArray, pivotBar)
+                array.push(swingPriceArray, passPrice)
+                if array.size(swingBarArray) > MAX_SWINGS
+                    array.shift(swingBarArray)
+                    array.shift(swingPriceArray)
+                lastSwingDir := passDir
+                legEvent     := true
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Leg Classification
+//---------------------------------------------------------------------------------------------------------------------{
+bool bullImpulseAlert   = false
+bool bearImpulseAlert   = false
+bool bullCandidateAlert = false
+bool bearCandidateAlert = false
+
+int swingTotal = array.size(swingBarArray)
+
+if legEvent and swingTotal >= 2
+    int   originBar    = array.get(swingBarArray, swingTotal - 2)
+    float originPrice  = array.get(swingPriceArray, swingTotal - 2)
+    int   extremeBar   = array.get(swingBarArray, swingTotal - 1)
+    float extremePrice = array.get(swingPriceArray, swingTotal - 1)
+    float priorSwingPrice = swingTotal >= 3 ? array.get(swingPriceArray, swingTotal - 3) : na
+    [legClass, distanceRatio, speedRatio, directionalPct, overlapPct, pullbackPct, brokeSwing] = classifyLeg(originBar, originPrice, extremeBar, extremePrice, priorSwingPrice)
+    bool  legUp    = extremePrice > originPrice
+    color legColor = legUp ? bullColorInput : bearColorInput
+    //Faint zigzag context connecting every swing
+    if showFrameworkInput
+        if na(currentFrameLine)
+            currentFrameLine := line.new(originBar, originPrice, extremeBar, extremePrice, color = color.new(NEUTRAL_COLOR, FRAMEWORK_TRANSPARENCY), style = line.style_dotted)
+        else
+            line.set_xy2(currentFrameLine, extremeBar, extremePrice)
+    //Labels are provisional while the leg can still extend - redraw the current leg on every evaluation
+    if not na(currentLegLine)
+        line.delete(currentLegLine)
+        currentLegLine := na
+    if not na(currentLegLabel)
+        label.delete(currentLegLabel)
+        currentLegLabel := na
+    if legClass == CLASS_IMPULSE or (legClass == CLASS_CANDIDATE and showCandidatesInput)
+        bool  confirmedImpulse = legClass == CLASS_IMPULSE
+        color drawColor        = confirmedImpulse ? legColor : color.new(legColor, CANDIDATE_TRANSPARENCY)
+        currentLegLine := line.new(originBar, originPrice, extremeBar, extremePrice
+          , color = drawColor
+          , style = confirmedImpulse ? line.style_solid : line.style_dashed
+          , width = confirmedImpulse ? legWidthInput : math.max(1, legWidthInput - 1))
+        if showLabelsInput
+            string legTip = "Bars: " + str.tostring(extremeBar - originBar)
+              + "\nDistance vs prior legs: " + formatRatio(distanceRatio)
+              + "\nSpeed vs prior legs: " + formatRatio(speedRatio)
+              + "\nDirectional candles: " + formatPercent(directionalPct)
+              + "\nBar overlap: " + formatPercent(overlapPct)
+              + "\nInternal pullback: " + formatPercent(pullbackPct)
+              + "\nPrior swing taken out: " + (brokeSwing ? "Yes" : "No")
+            currentLegLabel := label.new(math.floor((originBar + extremeBar) / 2), (originPrice + extremePrice) / 2, confirmedImpulse ? "Impulse" : "Candidate"
+              , style     = legUp ? label.style_label_up : label.style_label_down
+              , color     = #00000000
+              , textcolor = drawColor
+              , size      = size.small
+              , tooltip   = legTip)
+    //Fire each classification once per leg, on the bar its end swing confirms or upgrades
+    if legClass == CLASS_IMPULSE and not impulseAlerted
+        impulseAlerted   := true
+        bullImpulseAlert := legUp
+        bearImpulseAlert := not legUp
+    if legClass == CLASS_CANDIDATE and not candidateAlerted
+        candidateAlerted   := true
+        bullCandidateAlert := legUp
+        bearCandidateAlert := not legUp
+    currentClass := legClass
+    //Origin and extreme of the latest impulse - measurement anchors and the invalidation level
+    if legClass == CLASS_IMPULSE
+        levelsValid       := true
+        levelsUp          := legUp
+        levelOriginBar    := originBar
+        levelOriginPrice  := originPrice
+        levelExtremeBar   := extremeBar
+        levelExtremePrice := extremePrice
+    else if haveLockedImpulse
+        levelsValid       := true
+        levelsUp          := lockedExtremePrice > lockedOriginPrice
+        levelOriginBar    := lockedOriginBar
+        levelOriginPrice  := lockedOriginPrice
+        levelExtremeBar   := lockedExtremeBar
+        levelExtremePrice := lockedExtremePrice
+    else
+        levelsValid := false
+    //Dashboard snapshot of the latest completed leg
+    dashDirection   := legUp ? 1 : -1
+    dashClass       := legClass
+    dashBroke       := brokeSwing
+    dashDistance    := distanceRatio
+    dashSpeed       := speedRatio
+    dashDirectional := directionalPct
+    dashOverlap     := overlapPct
+    dashPullback    := pullbackPct
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Impulse Origin & Extreme Levels
+//---------------------------------------------------------------------------------------------------------------------{
+if showLevelsInput
+    if levelsValid
+        color levelColor = levelsUp ? bullColorInput : bearColorInput
+        if na(originLine)
+            originLine  := line.new(levelOriginBar, levelOriginPrice, levelOriginBar + 1, levelOriginPrice, extend = extend.right, color = levelColor, style = line.style_dotted)
+            extremeLine := line.new(levelExtremeBar, levelExtremePrice, levelExtremeBar + 1, levelExtremePrice, extend = extend.right, color = levelColor, style = line.style_dotted)
+        else
+            line.set_xy1(originLine, levelOriginBar, levelOriginPrice)
+            line.set_xy2(originLine, levelOriginBar + 1, levelOriginPrice)
+            line.set_color(originLine, levelColor)
+            line.set_xy1(extremeLine, levelExtremeBar, levelExtremePrice)
+            line.set_xy2(extremeLine, levelExtremeBar + 1, levelExtremePrice)
+            line.set_color(extremeLine, levelColor)
+        if barstate.islast
+            if na(originTag)
+                originTag := label.new(bar_index + 1, levelOriginPrice, "Origin"
+                  , style     = label.style_label_left
+                  , color     = #00000000
+                  , textcolor = levelColor
+                  , size      = size.tiny
+                  , tooltip   = "Origin of the latest impulse leg - anchor for retracement measurements and the natural invalidation: price trading back through it fully unwinds the leg.")
+                extremeTag := label.new(bar_index + 1, levelExtremePrice, "Extreme"
+                  , style     = label.style_label_left
+                  , color     = #00000000
+                  , textcolor = levelColor
+                  , size      = size.tiny
+                  , tooltip   = "Extreme of the latest impulse leg - with the origin it frames retracement and projection measurements for the correction that follows.")
+            else
+                label.set_xy(originTag, bar_index + 1, levelOriginPrice)
+                label.set_textcolor(originTag, levelColor)
+                label.set_xy(extremeTag, bar_index + 1, levelExtremePrice)
+                label.set_textcolor(extremeTag, levelColor)
+    else
+        if not na(originLine)
+            line.delete(originLine)
+            originLine := na
+        if not na(extremeLine)
+            line.delete(extremeLine)
+            extremeLine := na
+        if not na(originTag)
+            label.delete(originTag)
+            originTag := na
+        if not na(extremeTag)
+            label.delete(extremeTag)
+            extremeTag := na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+string tablePosition = switch dashPositionInput
+    "Top Right"    => position.top_right
+    "Top Left"     => position.top_left
+    "Bottom Right" => position.bottom_right
+    => position.bottom_left
+
+string tableTextSize = switch dashSizeInput
+    "Tiny"  => size.tiny
+    "Small" => size.small
+    => size.normal
+
+var table dashboardTable = showDashInput ? table.new(tablePosition, 2, 7, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1) : na
+
+if showDashInput and barstate.islast
+    color titleColor = DASH_TEXT
+    color labelColor = DASH_HEADER
+    color valueColor = DASH_TEXT
+    color mutedColor = NEUTRAL_COLOR
+    color dirColor   = dashDirection == 1 ? bullColorInput : dashDirection == -1 ? bearColorInput : mutedColor
+    string statusText = dashClass == CLASS_IMPULSE ? "Impulse" : dashClass == CLASS_CANDIDATE ? "Candidate" : dashClass == CLASS_NONE ? (na(dashDistance) ? "Unclassified" : "Not impulsive") : "Waiting"
+    if dashDirection != 0
+        statusText := (dashDirection == 1 ? "Bullish · " : "Bearish · ") + statusText
+    color statusColor = dashClass == CLASS_IMPULSE ? dirColor : dashClass == CLASS_CANDIDATE ? color.new(dirColor, 30) : mutedColor
+    table.cell(dashboardTable, 0, 0, "Latest Leg", text_color = titleColor, text_size = tableTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 0, statusText, text_color = statusColor, text_size = tableTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 1, "Distance", text_color = labelColor, text_size = tableTextSize, text_halign = text.align_left,
+      tooltip = "Leg travel vs the average of the prior legs. Minimum required: " + str.tostring(distanceMultInput, "#.##") + "×")
+    table.cell(dashboardTable, 1, 1, formatRatio(dashDistance), text_color = valueColor, text_size = tableTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 2, "Speed", text_color = labelColor, text_size = tableTextSize, text_halign = text.align_left,
+      tooltip = "Per-bar travel vs the average of the prior legs. Minimum required: " + str.tostring(speedMultInput, "#.##") + "×")
+    table.cell(dashboardTable, 1, 2, formatRatio(dashSpeed), text_color = valueColor, text_size = tableTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 3, "Directional", text_color = labelColor, text_size = tableTextSize, text_halign = text.align_left,
+      tooltip = "Share of the leg's candles closing in the leg direction. Minimum required: " + str.tostring(directionalPctInput, "#.#") + "%")
+    table.cell(dashboardTable, 1, 3, formatPercent(dashDirectional), text_color = valueColor, text_size = tableTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 4, "Overlap", text_color = labelColor, text_size = tableTextSize, text_halign = text.align_left,
+      tooltip = "Average overlap between consecutive candle ranges inside the leg. Maximum allowed: " + str.tostring(overlapPctInput, "#.#") + "%")
+    table.cell(dashboardTable, 1, 4, formatPercent(dashOverlap), text_color = valueColor, text_size = tableTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 5, "Pullback", text_color = labelColor, text_size = tableTextSize, text_halign = text.align_left,
+      tooltip = "Deepest internal retracement of the leg relative to its total travel. Maximum allowed: " + str.tostring(pullbackPctInput, "#.#") + "%")
+    table.cell(dashboardTable, 1, 5, formatPercent(dashPullback), text_color = valueColor, text_size = tableTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 6, "Prior swing", text_color = labelColor, text_size = tableTextSize, text_halign = text.align_left,
+      tooltip = "Whether the leg took out the prior same-side swing point - the structural break separating a confirmed impulse from a candidate.")
+    table.cell(dashboardTable, 1, 6, dashClass == -1 ? "—" : dashBroke ? "Taken out" : "Held", text_color = dashClass != -1 and dashBroke ? dirColor : mutedColor, text_size = tableTextSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(bullImpulseAlert, "Bullish Impulse Leg", "Bullish impulse leg confirmed - fast one-sided leg up that took out the prior swing high")
+alertcondition(bearImpulseAlert, "Bearish Impulse Leg", "Bearish impulse leg confirmed - fast one-sided leg down that took out the prior swing low")
+alertcondition(bullImpulseAlert or bearImpulseAlert, "Any Impulse Leg", "Impulse leg confirmed - fast one-sided leg that took out the prior swing point")
+alertcondition(bullCandidateAlert, "Bullish Impulse Candidate", "Bullish impulse candidate - leg up met the impulse criteria but died short of the prior swing high")
+alertcondition(bearCandidateAlert, "Bearish Impulse Candidate", "Bearish impulse candidate - leg down met the impulse criteria but died short of the prior swing low")
+
+//---------------------------------------------------------------------------------------------------------------------}

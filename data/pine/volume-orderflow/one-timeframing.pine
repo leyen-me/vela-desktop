@@ -1,0 +1,256 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("One-timeframing", shorttitle = "One-timeframing", overlay = true)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+color NEUTRAL_COLOR = #787b86
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+int BG_TRANSP     = 93
+int INSIDE_TRANSP = 55
+int HTF_TRANSP    = 25
+int MUTED_TRANSP  = 45
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+minStreakInput  = input.int(2, "Minimum Sequence Length", minval = 1, group = "Audit", tooltip = "Completed periods in a row that must hold the prior period's opposite extreme before the sequence is treated as active one-timeframing — colored, tracked in the dashboard and alerted. 1 flags every qualifying period; higher values demand more evidence of one-sided control.")
+equalHoldsInput = input.bool(true, "Equal Extreme Holds", group = "Audit", tooltip = "Common convention: a period that only matches the prior extreme (equal low in an up sequence, equal high in a down one) does not end the sequence — only an actual trade through it does. Disable for the stricter reading where an equal extreme already breaks it.")
+
+htfEnabledInput = input.bool(true, "Run Higher Timeframe Audit", group = "Higher Timeframe Audit", tooltip = "Run the same period-by-period audit on a higher timeframe bracket while watching a lower timeframe chart — the classic Market Profile routine of auditing 30-minute periods intraday, or days within the week for swing context. The bracket state tints the background and its invalidation level is plotted as the thicker step line.")
+htfTfInput      = input.timeframe("30", "Bracket Timeframe", group = "Higher Timeframe Audit", tooltip = "Bracket used by the higher timeframe audit. 30-minute periods are the native Market Profile convention for an intraday audit; use D to audit days within a week or W for weeks within a month. Ignored unless it is above the chart timeframe.")
+
+showDashInput = input.bool(true, "Show Dashboard", group = "Dashboard", tooltip = "Summary panel with the state of each audit: direction (one-timeframing up, down, or two-timeframing), sequence length in periods, and the current invalidation level.")
+dashPosInput  = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], inline = "dash", group = "Dashboard", tooltip = "Dashboard corner on the chart.")
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], inline = "dash", group = "Dashboard", tooltip = "Dashboard text size.")
+
+bullColorInput = input.color(#089981, "Bullish", inline = "colors", group = "Style", tooltip = "Color for one-timeframing up: bar coloring, invalidation levels, background tint, dashboard cells, and the marker of a down-sequence break (an upside violation).")
+bearColorInput = input.color(#f23645, "Bearish", inline = "colors", group = "Style", tooltip = "Color for one-timeframing down: bar coloring, invalidation levels, background tint, dashboard cells, and the marker of an up-sequence break (a downside violation).")
+
+colorBarsInput    = input.bool(true, "Color Bars",             group = "Style", tooltip = "Color chart bars by the chart timeframe audit while a sequence is active. Periods that hold the extreme without extending the range (inside periods) are tinted lighter — the sequence survives them, but the controlling side has stopped making progress.")
+showLevelInput    = input.bool(true, "Invalidation Level",     group = "Style", tooltip = "Plot the running invalidation level of the chart timeframe audit — the prior period's opposite extreme, rolled forward as each new period completes. The line in the sand for stops and alerts: the first trade through it ends the sequence.")
+showHtfLevelInput = input.bool(true, "HTF Invalidation Level", group = "Style", tooltip = "Plot the running invalidation level of the higher timeframe audit — the prior completed bracket's opposite extreme, as a thicker step line.")
+showBreakInput    = input.bool(true, "Break Markers",          group = "Style", tooltip = "Mark chart timeframe sequence breaks with a cross at the violated side. A break first introduces two-sided trade; whether the breaking period closes beyond the violated extreme separates a probe from acceptance (both are covered by alerts).")
+showHtfBgInput    = input.bool(true, "HTF Background",         group = "Style", tooltip = "Tint the chart background while the higher timeframe audit is in an active sequence, highlighting the interval one side has controlled.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Compact display label for a timeframe string
+tfLabel(string tf) =>
+    int sec = timeframe.in_seconds(tf)
+    sec >= 2592000 ? tf : sec % 604800 == 0 ? str.tostring(sec / 604800) + "W" : sec % 86400 == 0 ? str.tostring(sec / 86400) + "D" : sec % 3600 == 0 ? str.tostring(sec / 3600) + "h" : sec % 60 == 0 ? str.tostring(sec / 60) + "m" : str.tostring(sec) + "s"
+
+// One-timeframing state machine, advanced once per completed period.
+// A period continues an up sequence while it holds the prior period's low (holdU) and a down sequence while it
+// holds the prior period's high (holdD). A new sequence needs directional evidence: holding one extreme while
+// extending through the other. The first trade through the running extreme ends the sequence; a breaking period
+// that is itself directional immediately seeds the opposite sequence.
+otfStep(int state, int streak, bool holdU, bool holdD, bool hh, bool ll) =>
+    int  newState  = state
+    int  newStreak = streak
+    bool brokeUp   = false
+    bool brokeDn   = false
+    if state == 1
+        if holdU
+            newStreak += 1
+        else
+            brokeUp   := true
+            newState  := holdD and ll ? -1 : 0
+            newStreak := holdD and ll ? 1 : 0
+    else if state == -1
+        if holdD
+            newStreak += 1
+        else
+            brokeDn   := true
+            newState  := holdU and hh ? 1 : 0
+            newStreak := holdU and hh ? 1 : 0
+    else
+        if holdU and hh
+            newState  := 1
+            newStreak := 1
+        else if holdD and ll
+            newState  := -1
+            newStreak := 1
+    [newState, newStreak, brokeUp, brokeDn]
+
+// Dashboard helpers — "Two-TF" is the Market Profile term for a market both sides are trading
+seqTxt(int state, int streak) =>
+    state == 1 ? (streak >= minStreakInput ? "▲ One-TF Up" : "▲ Building") : state == -1 ? (streak >= minStreakInput ? "▼ One-TF Down" : "▼ Building") : "Two-TF"
+
+seqCol(int state, int streak) =>
+    state == 1 ? (streak >= minStreakInput ? bullColorInput : color.new(bullColorInput, MUTED_TRANSP)) : state == -1 ? (streak >= minStreakInput ? bearColorInput : color.new(bearColorInput, MUTED_TRANSP)) : NEUTRAL_COLOR
+
+// One dashboard row: audit label, sequence state, streak in periods, running invalidation level
+dashRow(table t, int row, string labelTxt, int state, int streak, float level, bool ok, string offTxt, string txtSize, string tip) =>
+    string sTxt   = ok ? seqTxt(state, streak) : offTxt
+    color  sCol   = ok ? seqCol(state, streak) : NEUTRAL_COLOR
+    bool   hasSeq = ok and state != 0
+    table.cell(t, 0, row, labelTxt, text_color = DASH_HEADER, text_size = txtSize, text_halign = text.align_left)
+    table.cell(t, 1, row, sTxt, text_color = sCol, text_size = txtSize, text_halign = text.align_center, tooltip = tip)
+    table.cell(t, 2, row, hasSeq ? str.tostring(streak) : "—", text_color = hasSeq ? DASH_TEXT : NEUTRAL_COLOR, text_size = txtSize, text_halign = text.align_center)
+    table.cell(t, 3, row, hasSeq ? str.tostring(level, format.mintick) : "—", text_color = hasSeq ? DASH_TEXT : NEUTRAL_COLOR, text_size = txtSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Chart Timeframe Audit
+//---------------------------------------------------------------------------------------------------------------------{
+// Every chart bar is one period: an up sequence holds each prior period's low, a down sequence each prior period's high
+bool priorOk      = not na(high[1]) and not na(low[1])
+bool holdUp       = priorOk and (equalHoldsInput ? low >= low[1] : low > low[1])
+bool holdDown     = priorOk and (equalHoldsInput ? high <= high[1] : high < high[1])
+bool higherHigh   = priorOk and high > high[1]
+bool lowerLow     = priorOk and low < low[1]
+bool insidePeriod = holdUp and holdDown
+
+var int otfState  = 0
+var int otfStreak = 0
+
+[cState, cStreak, cBrokeUp, cBrokeDn] = otfStep(otfState, otfStreak, holdUp, holdDown, higherHigh, lowerLow)
+
+// Break events only count when the violated sequence had reached the active length
+bool bullBreakEvt = cBrokeUp and otfStreak >= minStreakInput
+bool bearBreakEvt = cBrokeDn and otfStreak >= minStreakInput
+
+otfState  := cState
+otfStreak := cStreak
+
+bool bullActive = otfState == 1  and otfStreak >= minStreakInput
+bool bearActive = otfState == -1 and otfStreak >= minStreakInput
+
+bool bullStartEvt    = bullActive and not bullActive[1]
+bool bearStartEvt    = bearActive and not bearActive[1]
+bool bullContinueEvt = bullActive and bullActive[1]
+bool bearContinueEvt = bearActive and bearActive[1]
+
+// A tick through the extreme ends the pattern by definition; a close beyond it upgrades the break into acceptance
+bool bullAcceptEvt = bullBreakEvt and close < low[1]
+bool bearAcceptEvt = bearBreakEvt and close > high[1]
+
+float chartInvalidation = bullActive ? low[1] : bearActive ? high[1] : na
+float dashChartLevel    = otfState == 1 ? low[1] : otfState == -1 ? high[1] : na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Higher Timeframe Audit
+//---------------------------------------------------------------------------------------------------------------------{
+// The same audit run on a higher timeframe bracket, accumulated from chart bars so nothing repaints:
+// sequence starts and continuations confirm when a bracket completes, while a violation of the running
+// extreme registers on the very chart bar it trades — the earliest mechanical hint that control is contested.
+bool htfIsHigher = timeframe.in_seconds(htfTfInput) > timeframe.in_seconds(timeframe.period)
+bool htfOn       = htfEnabledInput and htfIsHigher
+bool htfRoll     = timeframe.change(htfTfInput)
+
+var int   htfState  = 0
+var int   htfStreak = 0
+var float htfPrevHi = na
+var float htfPrevLo = na
+var float htfCurHi  = na
+var float htfCurLo  = na
+
+bool htfBullBreakEvt = false
+bool htfBearBreakEvt = false
+
+if htfOn
+    if na(htfCurHi)
+        htfCurHi := high
+        htfCurLo := low
+    else if htfRoll
+        if not na(htfPrevHi)
+            bool hHoldU = equalHoldsInput ? htfCurLo >= htfPrevLo : htfCurLo > htfPrevLo
+            bool hHoldD = equalHoldsInput ? htfCurHi <= htfPrevHi : htfCurHi < htfPrevHi
+            bool hHh    = htfCurHi > htfPrevHi
+            bool hLl    = htfCurLo < htfPrevLo
+            [hState, hStreak, hBrokeUp, hBrokeDn] = otfStep(htfState, htfStreak, hHoldU, hHoldD, hHh, hLl)
+            htfBullBreakEvt := hBrokeUp and htfStreak >= minStreakInput
+            htfBearBreakEvt := hBrokeDn and htfStreak >= minStreakInput
+            htfState  := hState
+            htfStreak := hStreak
+        htfPrevHi := htfCurHi
+        htfPrevLo := htfCurLo
+        htfCurHi  := high
+        htfCurLo  := low
+    else
+        htfCurHi := math.max(htfCurHi, high)
+        htfCurLo := math.min(htfCurLo, low)
+
+    // first trade through the running extreme ends the bracket sequence immediately
+    if htfState == 1 and (equalHoldsInput ? low < htfPrevLo : low <= htfPrevLo)
+        htfBullBreakEvt := htfBullBreakEvt or htfStreak >= minStreakInput
+        htfState        := 0
+        htfStreak       := 0
+    if htfState == -1 and (equalHoldsInput ? high > htfPrevHi : high >= htfPrevHi)
+        htfBearBreakEvt := htfBearBreakEvt or htfStreak >= minStreakInput
+        htfState        := 0
+        htfStreak       := 0
+
+bool htfBullActive = htfOn and htfState == 1  and htfStreak >= minStreakInput
+bool htfBearActive = htfOn and htfState == -1 and htfStreak >= minStreakInput
+
+bool htfBullStartEvt = htfBullActive and not htfBullActive[1]
+bool htfBearStartEvt = htfBearActive and not htfBearActive[1]
+
+float htfInvalidation = htfBullActive ? htfPrevLo : htfBearActive ? htfPrevHi : na
+float dashHtfLevel    = htfState == 1 ? htfPrevLo : htfState == -1 ? htfPrevHi : na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visuals
+//---------------------------------------------------------------------------------------------------------------------{
+color barCss = bullActive ? (insidePeriod ? color.new(bullColorInput, INSIDE_TRANSP) : bullColorInput) : bearActive ? (insidePeriod ? color.new(bearColorInput, INSIDE_TRANSP) : bearColorInput) : na
+
+barcolor(colorBarsInput ? barCss : na, title = "One-Timeframing State")
+
+plot(showLevelInput ? chartInvalidation : na, "Invalidation Level", bullActive ? bullColorInput : bearColorInput, 1, plot.style_steplinebr)
+plot(showHtfLevelInput ? htfInvalidation : na, "HTF Invalidation Level", color.new(htfBullActive ? bullColorInput : bearColorInput, HTF_TRANSP), 2, plot.style_steplinebr)
+
+plotshape(showBreakInput and bullBreakEvt, "One-Timeframing Up Break", shape.xcross, location.belowbar, bearColorInput, size = size.tiny)
+plotshape(showBreakInput and bearBreakEvt, "One-Timeframing Down Break", shape.xcross, location.abovebar, bullColorInput, size = size.tiny)
+
+bgcolor(showHtfBgInput and htfBullActive ? color.new(bullColorInput, BG_TRANSP) : showHtfBgInput and htfBearActive ? color.new(bearColorInput, BG_TRANSP) : na, title = "HTF Sequence Background")
+
+plot(otfState,  "Chart Sequence State",  editable = false, display = display.data_window)
+plot(otfStreak, "Chart Sequence Length", editable = false, display = display.data_window)
+plot(htfState,  "HTF Sequence State",    editable = false, display = display.data_window)
+plot(htfStreak, "HTF Sequence Length",   editable = false, display = display.data_window)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+string dashLocation = dashPosInput == "Top Right" ? position.top_right : dashPosInput == "Top Left" ? position.top_left : dashPosInput == "Bottom Right" ? position.bottom_right : position.bottom_left
+string dashTextSize = dashSizeInput == "Tiny" ? size.tiny : dashSizeInput == "Small" ? size.small : size.normal
+
+var table dash = na
+
+if showDashInput and barstate.islast
+    if na(dash)
+        dash := table.new(dashLocation, 4, htfEnabledInput ? 3 : 2, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+    table.cell(dash, 0, 0, "Audit",        text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dash, 1, 0, "State",        text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_center)
+    table.cell(dash, 2, 0, "Streak",       text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_center)
+    table.cell(dash, 3, 0, "Invalidation", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_right)
+    dashRow(dash, 1, "Chart · " + tfLabel(timeframe.period), otfState, otfStreak, dashChartLevel, true, "", dashTextSize, "Chart timeframe audit — every bar is one period. One-TF Up holds each prior period's low, One-TF Down holds each prior period's high, Two-TF means neither side is in control. Streak counts consecutive holding periods; invalidation is the prior period's opposite extreme.")
+    if htfEnabledInput
+        dashRow(dash, 2, "HTF · " + tfLabel(htfTfInput), htfState, htfStreak, dashHtfLevel, htfIsHigher, "≤ Chart TF", dashTextSize, "Higher timeframe bracket audit. Starts and continuations confirm as each bracket completes; the first trade through the running extreme ends the sequence immediately. Invalidation is the prior completed bracket's opposite extreme.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(bullStartEvt,    "One-Timeframing Up Started",         "One-timeframing up on {{ticker}} {{interval}} — successive periods are holding their prior period's low. Invalidation sits at the prior period low.")
+alertcondition(bearStartEvt,    "One-Timeframing Down Started",       "One-timeframing down on {{ticker}} {{interval}} — successive periods are holding their prior period's high. Invalidation sits at the prior period high.")
+alertcondition(bullContinueEvt, "One-Timeframing Up Continued",       "One-timeframing up extended on {{ticker}} {{interval}} — a new period completed without trading below the prior low. Invalidation rolls forward to the new prior period low.")
+alertcondition(bearContinueEvt, "One-Timeframing Down Continued",     "One-timeframing down extended on {{ticker}} {{interval}} — a new period completed without trading above the prior high. Invalidation rolls forward to the new prior period high.")
+alertcondition(bullBreakEvt,    "One-Timeframing Up Broken",          "One-timeframing up broken on {{ticker}} {{interval}} — price traded through the prior period's low.")
+alertcondition(bearBreakEvt,    "One-Timeframing Down Broken",        "One-timeframing down broken on {{ticker}} {{interval}} — price traded through the prior period's high.")
+alertcondition(bullAcceptEvt,   "One-Timeframing Up Break Accepted",  "Up-sequence break accepted on {{ticker}} {{interval}} — the breaking period closed below the violated prior low, a real change of tone rather than a probe.")
+alertcondition(bearAcceptEvt,   "One-Timeframing Down Break Accepted","Down-sequence break accepted on {{ticker}} {{interval}} — the breaking period closed above the violated prior high, a real change of tone rather than a probe.")
+alertcondition(htfBullStartEvt, "HTF One-Timeframing Up Started",     "Higher timeframe one-timeframing up on {{ticker}} {{interval}} — the audit bracket is holding prior period lows.")
+alertcondition(htfBearStartEvt, "HTF One-Timeframing Down Started",   "Higher timeframe one-timeframing down on {{ticker}} {{interval}} — the audit bracket is holding prior period highs.")
+alertcondition(htfBullBreakEvt, "HTF One-Timeframing Up Broken",      "Higher timeframe one-timeframing up broken on {{ticker}} {{interval}} — price traded through the prior bracket's low.")
+alertcondition(htfBearBreakEvt, "HTF One-Timeframing Down Broken",    "Higher timeframe one-timeframing down broken on {{ticker}} {{interval}} — price traded through the prior bracket's high.")
+
+//---------------------------------------------------------------------------------------------------------------------}

@@ -1,0 +1,336 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Continuation", "Continuation", overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+int ST_NONE  = 0
+int ST_TREND = 1
+int ST_PAUSE = 2
+
+int MAX_LOOKBACK     = 1000
+int HISTORY_BUFFER   = 1200
+int STOP_EXTEND_BARS = 8
+
+string STRUCTURE_GROUP  = 'Trend Structure'
+string PAUSE_GROUP      = 'Pause'
+string RESOLUTION_GROUP = 'Resolution'
+string STYLE_GROUP      = 'Style'
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+swingLengthInput = input.int(10, 'Swing Length', minval = 2, maxval = 50, group = STRUCTURE_GROUP, tooltip = 'Pivot length used to confirm swing highs and lows. An uptrend is established once structure prints a higher high and a higher low, a downtrend once it prints a lower low and a lower high. Larger values target larger structure.')
+
+minPauseInput          = input.int(3, 'Minimum Pause Length', minval = 1, maxval = 50, group = PAUSE_GROUP, tooltip = 'Bars without a new trend extreme before the rest is treated as a forming pause.')
+maxPauseInput          = input.int(40, 'Maximum Pause Length', minval = 2, maxval = 250, group = PAUSE_GROUP, tooltip = 'Pauses lasting longer than this are treated as stale and invalidated, digestion has turned into a fight.')
+maxRetraceInput        = input.float(61.8, 'Maximum Retracement %', minval = 10, maxval = 100, step = 0.1, group = PAUSE_GROUP, tooltip = 'Deepest portion of the impulse leg the pause may give back. Deeper pullbacks shift the case toward reversal and invalidate the setup.')
+rangeContractionInput  = input.bool(true, 'Range Contraction', group = PAUSE_GROUP, tooltip = 'Require the average true range of the pause to contract below that of the impulse leg, marking a rest rather than a fight.')
+volumeContractionInput = input.bool(true, 'Volume Contraction', group = PAUSE_GROUP, tooltip = 'Require average volume to thin out during the pause relative to the impulse leg. Skipped when the symbol reports no volume.')
+
+triggerInput   = input.string('Close', 'Resolution Trigger', options = ['Close', 'Wick'], group = RESOLUTION_GROUP, tooltip = 'How price must clear the pause extreme in the trend direction to confirm continuation, on a closing basis (conservative) or on any wick beyond it (faster).')
+expansionInput = input.bool(false, 'Expansion On Resolution', group = RESOLUTION_GROUP, tooltip = 'Additionally require the true range of the resolution bar to expand beyond the pause average, favoring a decisive resumption.')
+
+bullColorInput    = input.color(#089981, 'Bullish', inline = 'clr', group = STYLE_GROUP, tooltip = 'Bullish continuation color.')
+bearColorInput    = input.color(#f23645, 'Bearish', inline = 'clr', group = STYLE_GROUP, tooltip = 'Bearish continuation color.')
+neutralColorInput = input.color(#787b86, 'Neutral', inline = 'clr', group = STYLE_GROUP, tooltip = 'Neutral color used for invalidated pauses and stop levels.')
+showPauseInput    = input.bool(true, 'Show Pause Zones', group = STYLE_GROUP, tooltip = 'Draw a box around each pause while it forms and keep it on the chart once it resolves into continuation.')
+showFailedInput   = input.bool(false, 'Show Invalidated Pauses', group = STYLE_GROUP, tooltip = 'Keep invalidated pauses on the chart, recolored with the neutral color, instead of removing them.')
+showSwingInput    = input.bool(true, 'Show Prior Swing Level', group = STYLE_GROUP, tooltip = 'Plot the prior swing the trend must hold. While a pullback holds this level, the trend side keeps the benefit of the doubt.')
+showStopInput     = input.bool(true, 'Show Stop Levels', group = STYLE_GROUP, tooltip = 'On each confirmed continuation, draw a dotted level at the pause extreme, beyond which stops are commonly placed.')
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// average of a cumulative series between two snapshots
+avgFromCum(float cumNow, float cumThen, int lengthBars) =>
+    lengthBars > 0 and not na(cumNow) and not na(cumThen) ? (cumNow - cumThen) / lengthBars : na
+
+// remove a live pause box, or keep it on the chart recolored as invalidated
+dropPauseBox(box boxId, bool keep, color failColor) =>
+    if not na(boxId)
+        if keep
+            box.set_right(boxId, bar_index)
+            box.set_border_color(boxId, color.new(failColor, 55))
+            box.set_bgcolor(boxId, color.new(failColor, 93))
+        else
+            box.delete(boxId)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Swing Structure
+//---------------------------------------------------------------------------------------------------------------------{
+float trueRange = ta.tr(true)
+float pivotHigh = ta.pivothigh(swingLengthInput, swingLengthInput)
+float pivotLow  = ta.pivotlow(swingLengthInput, swingLengthInput)
+
+var float cumVolume = 0.0
+var float cumRange  = 0.0
+cumVolume += nz(volume)
+cumRange  += nz(trueRange)
+
+max_bars_back(cumVolume, HISTORY_BUFFER)
+max_bars_back(cumRange, HISTORY_BUFFER)
+max_bars_back(high, HISTORY_BUFFER)
+max_bars_back(low, HISTORY_BUFFER)
+
+var float swingHigh0    = na
+var float swingHigh1    = na
+var int   swingHigh0Bar = na
+var float swingLow0     = na
+var float swingLow1     = na
+var int   swingLow0Bar  = na
+
+bool newSwingHigh = not na(pivotHigh)
+bool newSwingLow  = not na(pivotLow)
+
+if newSwingHigh
+    swingHigh1    := swingHigh0
+    swingHigh0    := pivotHigh
+    swingHigh0Bar := bar_index - swingLengthInput
+
+if newSwingLow
+    swingLow1    := swingLow0
+    swingLow0    := pivotLow
+    swingLow0Bar := bar_index - swingLengthInput
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Continuation State Machine
+//---------------------------------------------------------------------------------------------------------------------{
+var int  state             = ST_NONE
+var int  direction         = 0
+var int  continuationCount = 0
+var bool pauseBlocked      = false
+
+var float legStartValue = na
+var int   legStartBar   = na
+var float legEndValue   = na
+var int   legEndBar     = na
+
+var float legStartCumVolume = na
+var float legStartCumRange  = na
+var float legEndCumVolume   = na
+var float legEndCumRange    = na
+
+var float pauseExtreme    = na
+var int   pauseExtremeBar = na
+
+var box pauseBox = na
+
+bool wickTrigger  = triggerInput == 'Wick'
+int  maxPauseBars = math.max(maxPauseInput, minPauseInput)
+
+bool bullContinuationEvent = false
+bool bearContinuationEvent = false
+bool bullPauseEvent        = false
+bool bearPauseEvent        = false
+bool pauseInvalidEvent     = false
+
+// a close through the prior swing breaks trend structure outright
+if state != ST_NONE and (direction == 1 ? close < legStartValue : close > legStartValue)
+    if state == ST_PAUSE
+        pauseInvalidEvent := true
+        dropPauseBox(pauseBox, showFailedInput, neutralColorInput)
+        pauseBox := na
+    state             := ST_NONE
+    direction         := 0
+    continuationCount := 0
+    pauseBlocked      := false
+    legStartValue     := na
+    legEndValue       := na
+    pauseExtreme      := na
+    pauseExtremeBar   := na
+
+// pause management, trendward resolution or invalidation
+if state == ST_PAUSE
+    if direction == 1 and low < pauseExtreme
+        pauseExtreme    := low
+        pauseExtremeBar := bar_index
+    if direction == -1 and high > pauseExtreme
+        pauseExtreme    := high
+        pauseExtremeBar := bar_index
+
+    float legRange   = math.abs(legEndValue - legStartValue)
+    float retracePct = legRange > 0 ? math.abs(legEndValue - pauseExtreme) / legRange * 100 : na
+
+    bool resolved   = direction == 1 ? (wickTrigger ? high > legEndValue : close > legEndValue) : (wickTrigger ? low < legEndValue : close < legEndValue)
+    bool newExtreme = direction == 1 ? high > legEndValue : low < legEndValue
+
+    if resolved
+        // weigh the evidence the pause left behind, measured up to the bar before resolution
+        int   pauseLength   = bar_index - legEndBar
+        int   quietLength   = pauseLength - 1
+        int   impulseLength = legEndBar - legStartBar
+        float impulseVolume = avgFromCum(legEndCumVolume, legStartCumVolume, impulseLength)
+        float impulseRange  = avgFromCum(legEndCumRange, legStartCumRange, impulseLength)
+        float pauseVolume   = quietLength > 0 ? avgFromCum(cumVolume[1], legEndCumVolume, quietLength) : na
+        float pauseRange    = quietLength > 0 ? avgFromCum(cumRange[1], legEndCumRange, quietLength) : na
+
+        bool retraceOk   = not na(retracePct) and retracePct <= maxRetraceInput
+        bool rangeOk     = not rangeContractionInput or na(pauseRange) or na(impulseRange) or impulseRange <= 0 or pauseRange < impulseRange
+        bool volumeOk    = not volumeContractionInput or na(pauseVolume) or na(impulseVolume) or impulseVolume <= 0 or pauseVolume < impulseVolume
+        bool expansionOk = not expansionInput or na(pauseRange) or trueRange > pauseRange
+
+        if retraceOk and rangeOk and volumeOk and expansionOk
+            continuationCount += 1
+            if direction == 1
+                bullContinuationEvent := true
+            else
+                bearContinuationEvent := true
+
+            color directionColor = direction == 1 ? bullColorInput : bearColorInput
+            if not na(pauseBox)
+                box.set_right(pauseBox, bar_index)
+                box.set_border_color(pauseBox, color.new(directionColor, 35))
+                box.set_border_style(pauseBox, line.style_solid)
+                box.set_bgcolor(pauseBox, color.new(directionColor, 85))
+                pauseBox := na
+            if showStopInput
+                line.new(bar_index, pauseExtreme, bar_index + STOP_EXTEND_BARS, pauseExtreme, color = color.new(neutralColorInput, 20), style = line.style_dotted)
+
+            string rangeRatioText  = na(pauseRange) or na(impulseRange) or impulseRange <= 0 ? 'n/a' : str.tostring(pauseRange / impulseRange, '#.##') + 'x'
+            string volumeRatioText = na(pauseVolume) or na(impulseVolume) or impulseVolume <= 0 ? 'n/a' : str.tostring(pauseVolume / impulseVolume, '#.##') + 'x'
+            string tooltipText     = (direction == 1 ? 'Bullish' : 'Bearish') + ' continuation #' + str.tostring(continuationCount)
+            tooltipText += '\nPause: ' + str.tostring(pauseLength) + ' bars, retraced ' + (na(retracePct) ? 'n/a' : str.tostring(retracePct, '#.#') + '%')
+            tooltipText += '\nPause/impulse range: ' + rangeRatioText
+            tooltipText += '\nPause/impulse volume: ' + volumeRatioText
+            tooltipText += '\nStop beyond pause extreme: ' + str.tostring(pauseExtreme, format.mintick)
+
+            if direction == 1
+                label.new(bar_index, low, '', yloc = yloc.belowbar, style = label.style_triangleup, color = bullColorInput, textcolor = chart.fg_color, size = size.tiny, tooltip = tooltipText)
+            else
+                label.new(bar_index, high, '', yloc = yloc.abovebar, style = label.style_triangledown, color = bearColorInput, textcolor = chart.fg_color, size = size.tiny, tooltip = tooltipText)
+        else
+            // resolved trendward without the required character, no signal
+            dropPauseBox(pauseBox, false, neutralColorInput)
+            pauseBox := na
+
+        // either way a new leg begins, the pause extreme becomes the prior swing to hold
+        legStartValue := pauseExtreme
+        legStartBar   := pauseExtremeBar
+        int anchorOffset = bar_index - pauseExtremeBar
+        legStartCumVolume := cumVolume[anchorOffset]
+        legStartCumRange  := cumRange[anchorOffset]
+        legEndValue       := direction == 1 ? high : low
+        legEndBar         := bar_index
+        legEndCumVolume   := cumVolume
+        legEndCumRange    := cumRange
+        pauseExtreme      := na
+        pauseExtremeBar   := na
+        pauseBlocked      := false
+        state             := ST_TREND
+    else if newExtreme
+        // marginal poke beyond the extreme without the trigger, the leg extends and the pause dissolves
+        dropPauseBox(pauseBox, false, neutralColorInput)
+        pauseBox          := na
+        legEndValue       := direction == 1 ? high : low
+        legEndBar         := bar_index
+        legEndCumVolume   := cumVolume
+        legEndCumRange    := cumRange
+        pauseExtreme      := na
+        pauseExtremeBar   := na
+        pauseBlocked      := false
+        state             := ST_TREND
+    else if (not na(retracePct) and retracePct > maxRetraceInput) or bar_index - legEndBar > maxPauseBars
+        // deep retracement or stale pause, the continuation case is off until a new extreme prints
+        pauseInvalidEvent := true
+        dropPauseBox(pauseBox, showFailedInput, neutralColorInput)
+        pauseBox        := na
+        pauseBlocked    := true
+        pauseExtreme    := na
+        pauseExtremeBar := na
+        state           := ST_TREND
+    else if not na(pauseBox)
+        box.set_right(pauseBox, bar_index)
+        if direction == 1
+            box.set_bottom(pauseBox, pauseExtreme)
+        else
+            box.set_top(pauseBox, pauseExtreme)
+
+// impulse extension and pause formation
+if state == ST_TREND
+    bool newExtreme = direction == 1 ? high > legEndValue : low < legEndValue
+    if newExtreme
+        legEndValue     := direction == 1 ? high : low
+        legEndBar       := bar_index
+        legEndCumVolume := cumVolume
+        legEndCumRange  := cumRange
+        pauseBlocked    := false
+    else
+        int restLength = bar_index - legEndBar
+        if not pauseBlocked and restLength >= minPauseInput
+            if restLength > maxPauseBars
+                pauseBlocked := true
+            else
+                state := ST_PAUSE
+                float pauseExtremeValue  = direction == 1 ? low : high
+                int   pauseExtremeOffset = 0
+                if restLength > 1
+                    for i = 1 to restLength - 1
+                        if direction == 1
+                            if low[i] < pauseExtremeValue
+                                pauseExtremeValue  := low[i]
+                                pauseExtremeOffset := i
+                        else
+                            if high[i] > pauseExtremeValue
+                                pauseExtremeValue  := high[i]
+                                pauseExtremeOffset := i
+                pauseExtreme    := pauseExtremeValue
+                pauseExtremeBar := bar_index - pauseExtremeOffset
+                if direction == 1
+                    bullPauseEvent := true
+                else
+                    bearPauseEvent := true
+                if showPauseInput
+                    color directionColor = direction == 1 ? bullColorInput : bearColorInput
+                    pauseBox := box.new(legEndBar, math.max(legEndValue, pauseExtreme), bar_index, math.min(legEndValue, pauseExtreme), border_color = color.new(directionColor, 55), border_width = 1, border_style = line.style_dashed, bgcolor = color.new(directionColor, 92))
+
+// a fresh trend is established once structure prints two rising swings, or two falling ones
+if state == ST_NONE and (newSwingHigh or newSwingLow) and not na(swingHigh1) and not na(swingLow1)
+    bool upStructure   = swingHigh0 > swingHigh1 and swingLow0 > swingLow1 and close > swingLow0
+    bool downStructure = swingHigh0 < swingHigh1 and swingLow0 < swingLow1 and close < swingHigh0
+    if upStructure or downStructure
+        direction     := upStructure ? 1 : -1
+        legStartValue := upStructure ? swingLow0 : swingHigh0
+        legStartBar   := math.max(upStructure ? swingLow0Bar : swingHigh0Bar, bar_index - MAX_LOOKBACK)
+        int   span          = bar_index - legStartBar
+        float extremeValue  = upStructure ? high : low
+        int   extremeOffset = 0
+        if span > 0
+            for i = 1 to span
+                if upStructure
+                    if high[i] > extremeValue
+                        extremeValue  := high[i]
+                        extremeOffset := i
+                else
+                    if low[i] < extremeValue
+                        extremeValue  := low[i]
+                        extremeOffset := i
+        legEndValue       := extremeValue
+        legEndBar         := bar_index - extremeOffset
+        legStartCumVolume := cumVolume[span]
+        legStartCumRange  := cumRange[span]
+        legEndCumVolume   := cumVolume[extremeOffset]
+        legEndCumRange    := cumRange[extremeOffset]
+        continuationCount := 0
+        pauseBlocked      := false
+        pauseExtreme      := na
+        pauseExtremeBar   := na
+        state             := ST_TREND
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visualization
+//---------------------------------------------------------------------------------------------------------------------{
+plot(showSwingInput and state != ST_NONE ? legStartValue : na, 'Prior Swing', direction == 1 ? color.new(bullColorInput, 30) : color.new(bearColorInput, 30), 1, plot.style_linebr)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(bullContinuationEvent, 'Bullish Continuation', 'Bullish continuation confirmed, the pause resolved upward and the uptrend is resuming')
+alertcondition(bearContinuationEvent, 'Bearish Continuation', 'Bearish continuation confirmed, the pause resolved downward and the downtrend is resuming')
+alertcondition(bullPauseEvent, 'Bullish Pause Forming', 'A pause is forming within the uptrend, watching for an upward resolution')
+alertcondition(bearPauseEvent, 'Bearish Pause Forming', 'A pause is forming within the downtrend, watching for a downward resolution')
+alertcondition(pauseInvalidEvent, 'Pause Invalidated', 'Continuation setup invalidated, deep retracement, stale pause, or broken prior swing')
+
+//---------------------------------------------------------------------------------------------------------------------}

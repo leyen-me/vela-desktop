@@ -1,0 +1,395 @@
+// This work is licensed under Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Three Rising Valleys & Falling Peaks", shorttitle = "Three Rising Valleys & Falling Peaks", overlay = true, max_lines_count = 500, max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+color BULL_COLOR    = #089981
+color BEAR_COLOR    = #f23645
+color NEUTRAL_COLOR = #787b86
+color HIDDEN_COLOR  = #00000000
+
+int MAX_SWINGS = 60
+
+string DETECT_GROUP = 'Pattern Detection'
+string SHAPE_GROUP  = 'Shape & Context'
+string TRADE_GROUP  = 'Confirmation & Targets'
+string STYLE_GROUP  = 'Style'
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+swingLengthInput = input.int(5, 'Swing Length', minval = 2, maxval = 50, group = DETECT_GROUP, tooltip = 'Bars to the left and right a high or low must dominate to count as a confirmed swing. The valleys and peaks are read from these swings, so the third one is recognized this many bars after it prints.')
+
+stepInput = input.float(0.25, 'Minimum Step (ATR)', minval = 0, maxval = 10, step = 0.05, group = DETECT_GROUP, tooltip = 'Each valley must bottom at least this many ATRs above the one before (each peak this far below the one before). Near-equal extremes are a triple bottom or top, not a rising or falling sequence.')
+
+maxSpanInput = input.int(150, 'Maximum Span (bars)', minval = 10, maxval = 1000, group = DETECT_GROUP, tooltip = 'Most bars from the first to the third valley (or peak).')
+
+atrLengthInput = input.int(14, 'ATR Length', minval = 1, maxval = 200, group = DETECT_GROUP)
+
+proportionInput = input.float(3.0, 'Proportion Tolerance (x)', minval = 1, maxval = 20, step = 0.25, group = SHAPE_GROUP, tooltip = 'Bulkowski asks for valleys (or peaks) that look alike: all narrow or all wide, all short or all tall, not mixed. Each one\'s height (the move into it) and width (bars of that move) must stay within this ratio of the others. Higher values accept more mixed shapes.')
+
+trendLengthInput = input.int(40, 'Prior Trend Window (bars)', minval = 5, maxval = 500, group = SHAPE_GROUP, tooltip = 'Price usually rises into both patterns. The close this many bars before the first valley (or peak) classifies the pattern: rising into three rising valleys makes it a continuation, falling into it a reversal; rising into three falling peaks records a weakening rally.')
+
+earlyInput = input.bool(true, 'Early Entry Trendline', group = TRADE_GROUP, tooltip = 'Bulkowski\'s early entry for three rising valleys: when the highest peak sits between the first two valleys, draw a down-sloping trendline across the two peaks; a close above it is an earlier buy signal than the confirmation close.')
+
+windowInput = input.int(60, 'Confirmation Window (bars)', minval = 5, maxval = 500, group = TRADE_GROUP, tooltip = 'Bars after the third valley (or peak) within which the confirming close must arrive. A close beyond the third valley (or peak) first invalidates the pattern.')
+
+bullTargetInput = input.float(57, 'Rising Valleys Target %', minval = 10, maxval = 200, step = 1, group = TRADE_GROUP, tooltip = 'Bulkowski\'s measure rule: the height from the highest peak to the lowest valley, multiplied by the share of his samples that reached a full-height target (57% in his bull-market table for three rising valleys), added to the highest peak. 100 projects the full height.')
+
+bearTargetInput = input.float(23, 'Falling Peaks Target %', minval = 10, maxval = 200, step = 1, group = TRADE_GROUP, tooltip = 'Bulkowski\'s measure rule for three falling peaks: the height from the highest peak to the lowest valley, multiplied by his published share (23%), subtracted from the lowest valley. 100 projects the full height.')
+
+stopBufferInput = input.float(0.1, 'Stop Buffer (ATR)', minval = 0, maxval = 3, step = 0.05, group = TRADE_GROUP, tooltip = 'The stop sits slightly beyond the third valley (or third peak), the last minor swing of the pattern. For falling peaks this is Bulkowski\'s cover rule: price back above any of the peaks.')
+
+watchInput = input.int(60, 'Post-Confirmation Watch (bars)', minval = 5, maxval = 500, group = TRADE_GROUP, tooltip = 'Bars the target and stop are tracked after confirmation.')
+
+showBullInput     = input.bool(true, 'Three Rising Valleys', inline = 'show', group = STYLE_GROUP)
+showBearInput     = input.bool(true, 'Three Falling Peaks', inline = 'show', group = STYLE_GROUP)
+bullColorInput    = input.color(BULL_COLOR, 'Rising Valleys', inline = 'colors', group = STYLE_GROUP)
+bearColorInput    = input.color(BEAR_COLOR, 'Falling Peaks', inline = 'colors', group = STYLE_GROUP)
+neutralColorInput = input.color(NEUTRAL_COLOR, 'Unconfirmed', inline = 'colors', group = STYLE_GROUP)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types
+//---------------------------------------------------------------------------------------------------------------------{
+
+// dir 1 = three rising valleys, -1 = three falling peaks. Swings: x = the three valleys (peaks), r = the reactions between them
+type Pattern
+    int    dir
+    int    b1
+    float  x1
+    int    rb1
+    float  r1
+    int    b2
+    float  x2
+    int    rb2
+    float  r2
+    int    b3
+    float  x3
+    float  level
+    float  height
+    string context
+    string volText
+    int    state    = 0
+    int    confBar  = 0
+    bool   early    = false
+    float  target
+    float  stop
+    line   leg1
+    line   leg2
+    line   leg3
+    line   leg4
+    line   levelLn
+    line   trendLn
+    label  lb1
+    label  lb2
+    label  lb3
+    line   targetLn
+    label  targetLb
+    line   stopLn
+    label  stopLb
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Variables
+//---------------------------------------------------------------------------------------------------------------------{
+
+var array<float> zzPrice = array.new<float>()
+var array<int>   zzBar   = array.new<int>()
+var array<int>   zzDir   = array.new<int>()
+
+var array<float> closeArr  = array.new<float>()
+var array<float> cumVolArr = array.new<float>()
+
+var Pattern bullForming = na
+var Pattern bearForming = na
+var Pattern bullActive  = na
+var Pattern bearActive  = na
+
+float atrValue  = ta.atr(atrLengthInput)
+float pivotHigh = ta.pivothigh(high, swingLengthInput, swingLengthInput)
+float pivotLow  = ta.pivotlow(low, swingLengthInput, swingLengthInput)
+
+var float cumVol = 0.0
+cumVol += nz(volume)
+array.push(closeArr, close)
+array.push(cumVolArr, cumVol)
+
+var bool volumeSeen = false
+if nz(volume) > 0
+    volumeSeen := true
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions & Methods
+//---------------------------------------------------------------------------------------------------------------------{
+
+method patternColor(Pattern this) =>
+    this.dir == 1 ? bullColorInput : bearColorInput
+
+method patternName(Pattern this) =>
+    this.dir == 1 ? 'Three Rising Valleys' : 'Three Falling Peaks'
+
+method erase(Pattern this) =>
+    line.delete(this.leg1)
+    line.delete(this.leg2)
+    line.delete(this.leg3)
+    line.delete(this.leg4)
+    line.delete(this.levelLn)
+    line.delete(this.trendLn)
+    label.delete(this.lb1)
+    label.delete(this.lb2)
+    label.delete(this.lb3)
+
+method recolor(Pattern this, color col) =>
+    line.set_color(this.leg1, col)
+    line.set_color(this.leg2, col)
+    line.set_color(this.leg3, col)
+    line.set_color(this.leg4, col)
+    line.set_color(this.levelLn, col)
+    label.set_textcolor(this.lb1, col)
+    label.set_textcolor(this.lb2, col)
+    label.set_textcolor(this.lb3, col)
+
+avgVolume(int fromBar, int toBar) =>
+    toBar > fromBar ? (array.get(cumVolArr, toBar) - array.get(cumVolArr, fromBar)) / (toBar - fromBar) : na
+
+pushSwing(float price, int swingBar, int swingDir) =>
+    bool changed = false
+    int  n       = array.size(zzPrice)
+    if n > 0 and array.get(zzDir, n - 1) == swingDir
+        if (swingDir == 1 and price >= array.get(zzPrice, n - 1)) or (swingDir == -1 and price <= array.get(zzPrice, n - 1))
+            array.set(zzPrice, n - 1, price)
+            array.set(zzBar, n - 1, swingBar)
+            changed := true
+    else
+        array.push(zzPrice, price)
+        array.push(zzBar, swingBar)
+        array.push(zzDir, swingDir)
+        if array.size(zzPrice) > MAX_SWINGS
+            array.shift(zzPrice)
+            array.shift(zzBar)
+            array.shift(zzDir)
+        changed := true
+    changed
+
+within(float a, float b, float c, float ratio) =>
+    float lo = math.min(a, math.min(b, c))
+    float hi = math.max(a, math.max(b, c))
+    lo > 0 and hi / lo <= ratio
+
+// Validate the last six swings: dir 1 reads valley-peak-valley-peak-valley after a peak, dir -1 the mirror
+tryDetect(int dir) =>
+    Pattern result = na
+    int n = array.size(zzPrice)
+    // the last swing must be a valley (dir 1) or a peak (dir -1)
+    if n >= 6 and array.get(zzDir, n - 1) == -dir and atrValue > 0
+        float x3  = array.get(zzPrice, n - 1)
+        int   b3  = array.get(zzBar, n - 1)
+        float r2  = array.get(zzPrice, n - 2)
+        int   rb2 = array.get(zzBar, n - 2)
+        float x2  = array.get(zzPrice, n - 3)
+        int   b2  = array.get(zzBar, n - 3)
+        float r1  = array.get(zzPrice, n - 4)
+        int   rb1 = array.get(zzBar, n - 4)
+        float x1  = array.get(zzPrice, n - 5)
+        int   b1  = array.get(zzBar, n - 5)
+        float r0  = array.get(zzPrice, n - 6)
+        int   rb0 = array.get(zzBar, n - 6)
+
+        float step   = stepInput * atrValue
+        bool  stepOk = dir * (x2 - x1) >= step and dir * (x3 - x2) >= step
+        bool  spanOk = b3 - b1 <= maxSpanInput
+
+        // proportional: the move into each valley (peak) alike in height and in width
+        float h1 = math.abs(r0 - x1)
+        float h2 = math.abs(r1 - x2)
+        float h3 = math.abs(r2 - x3)
+        bool  propOk = within(h1, h2, h3, proportionInput) and within(b1 - rb0, b2 - rb1, b3 - rb2, proportionInput)
+
+        Pattern active = dir == 1 ? bullActive : bearActive
+        bool    fresh  = na(active) or active.b3 != b3
+
+        if stepOk and spanOk and propOk and fresh
+            float level  = dir == 1 ? math.max(r1, r2) : math.min(r1, r2)
+            float height = dir == 1 ? level - x1 : x1 - level
+            int   origin = b1 - trendLengthInput
+            string context = 'Prior trend: n/a'
+            if origin >= 0
+                bool risingInto = array.get(closeArr, origin) < array.get(closeArr, b1)
+                context := dir == 1 ? (risingInto ? 'Continuation: price rose into the pattern' : 'Reversal: price fell into the pattern') : (risingInto ? 'After an advance: a weakening rally' : 'Inside a decline: continuation')
+            float v1 = avgVolume(b1, rb1)
+            float v2 = avgVolume(rb1, rb2)
+            float v3 = avgVolume(rb2, b3)
+            string volText = volumeSeen and not na(v1) and not na(v3) and v1 > 0 ? 'Volume across the pattern: ' + (v3 < v1 ? 'falling' : 'rising') + ' (' + str.tostring(v3 / v1, '#.##') + 'x from the first leg)' : 'Volume: n/a'
+
+            result := Pattern.new(dir = dir, b1 = b1, x1 = x1, rb1 = rb1, r1 = r1, b2 = b2, x2 = x2, rb2 = rb2, r2 = r2, b3 = b3, x3 = x3, level = level, height = height, context = context, volText = volText)
+            color col = neutralColorInput
+            result.leg1 := line.new(b1, x1, rb1, r1, color = col, width = 2)
+            result.leg2 := line.new(rb1, r1, b2, x2, color = col, width = 2)
+            result.leg3 := line.new(b2, x2, rb2, r2, color = col, width = 2)
+            result.leg4 := line.new(rb2, r2, b3, x3, color = col, width = 2)
+            int levelBar = dir == 1 ? (r1 >= r2 ? rb1 : rb2) : (r1 <= r2 ? rb1 : rb2)
+            result.levelLn := line.new(levelBar, level, bar_index, level, color = col, style = line.style_dashed, width = 1)
+            // Bulkowski's early-entry line: highest peak between the first two valleys
+            if dir == 1 and earlyInput and r1 > r2
+                result.trendLn := line.new(rb1, r1, rb2, r2, color = color.new(bullColorInput, 40), style = line.style_dotted, extend = extend.right)
+            string what = dir == 1 ? 'Valley ' : 'Peak '
+            string st   = dir == 1 ? label.style_label_up : label.style_label_down
+            result.lb1 := label.new(b1, x1, '1', style = st, color = HIDDEN_COLOR, textcolor = col, size = size.small, tooltip = what + '1: ' + str.tostring(x1, format.mintick))
+            result.lb2 := label.new(b2, x2, '2', style = st, color = HIDDEN_COLOR, textcolor = col, size = size.small, tooltip = what + '2: ' + str.tostring(x2, format.mintick) + ', ' + str.tostring(math.abs(x2 - x1) / atrValue, '#.#') + ' ATR ' + (dir == 1 ? 'above' : 'below') + ' 1')
+            result.lb3 := label.new(b3, x3, '3', style = st, color = HIDDEN_COLOR, textcolor = col, size = size.small, tooltip = what + '3: ' + str.tostring(x3, format.mintick) + ', ' + str.tostring(math.abs(x3 - x2) / atrValue, '#.#') + ' ATR ' + (dir == 1 ? 'above' : 'below') + ' 2\nConfirmation level: ' + str.tostring(level, format.mintick) + '\n' + context + '\n' + volText)
+    result
+
+// Pattern awaiting its confirming close: 0 = waiting, 1 = confirmed, 2 = invalidated or expired, 3 = early entry
+trackForming(Pattern p) =>
+    int evt = 0
+    line.set_x2(p.levelLn, bar_index)
+    bool invalid   = p.dir == 1 ? close < p.x3 : close > p.x3
+    bool confirmed = p.dir == 1 ? close > p.level : close < p.level
+    if invalid or bar_index - p.b3 > windowInput
+        p.erase()
+        evt := 2
+    else if confirmed
+        color col = p.patternColor()
+        p.state   := 1
+        p.confBar := bar_index
+        float pct = p.dir == 1 ? bullTargetInput : bearTargetInput
+        p.target  := p.level + p.dir * p.height * pct / 100
+        p.stop    := p.x3 - p.dir * stopBufferInput * atrValue
+        p.recolor(col)
+        line.set_style(p.levelLn, line.style_solid)
+        if not na(p.trendLn)
+            line.set_extend(p.trendLn, extend.none)
+            line.set_x2(p.trendLn, bar_index)
+            line.set_y2(p.trendLn, p.r1 + (p.r2 - p.r1) * (bar_index - p.rb1) / (p.rb2 - p.rb1))
+        string tip = p.patternName() + ' confirmed: close ' + (p.dir == 1 ? 'above the highest peak ' : 'below the lowest valley ') + str.tostring(p.level, format.mintick) + '\n' + p.context + '\nPattern height ' + str.tostring(p.height, format.mintick) + ', target at ' + str.tostring(pct, '#') + '% of it\n' + p.volText
+        int midBar = math.round((p.b1 + p.b3) / 2)
+        label.new(midBar, p.x1, p.patternName(), style = p.dir == 1 ? label.style_label_up : label.style_label_down, color = HIDDEN_COLOR, textcolor = col, size = size.normal, tooltip = tip)
+        label.new(bar_index, p.dir == 1 ? math.min(low, low[1], low[2]) : math.max(high, high[1], high[2]), 'Confirmed', style = p.dir == 1 ? label.style_label_up : label.style_label_down, color = col, textcolor = color.white, size = size.small, tooltip = tip)
+        p.targetLn := line.new(bar_index, p.target, bar_index, p.target, color = col, style = line.style_dashed)
+        p.targetLb := label.new(bar_index, p.target, 'Target ' + str.tostring(p.target, format.mintick), style = label.style_label_right, color = HIDDEN_COLOR, textcolor = col, size = size.small, tooltip = 'Bulkowski measure rule: ' + str.tostring(pct, '#') + '% of the pattern height projected from the confirmation level. A planning reference, not a promise.')
+        p.stopLn := line.new(bar_index, p.stop, bar_index, p.stop, color = neutralColorInput, style = line.style_dotted)
+        p.stopLb := label.new(bar_index, p.stop, 'Stop ' + str.tostring(p.stop, format.mintick), style = label.style_label_right, color = HIDDEN_COLOR, textcolor = neutralColorInput, size = size.small, tooltip = p.dir == 1 ? 'Slightly below the third valley' : 'Slightly above the third peak: price back above any of the peaks covers the short')
+        evt := 1
+    else if p.dir == 1 and not p.early and not na(p.trendLn) and bar_index > p.rb2
+        float tl = p.r1 + (p.r2 - p.r1) * (bar_index - p.rb1) / (p.rb2 - p.rb1)
+        if close > tl
+            p.early := true
+            line.set_extend(p.trendLn, extend.none)
+            line.set_x2(p.trendLn, bar_index)
+            line.set_y2(p.trendLn, tl)
+            line.set_color(p.trendLn, bullColorInput)
+            label.new(bar_index, low, 'Early', style = label.style_label_up, color = HIDDEN_COLOR, textcolor = bullColorInput, size = size.small, tooltip = 'Close above the down-sloping trendline across the two highest peaks: Bulkowski\'s early entry, ahead of the confirmation close at ' + str.tostring(p.level, format.mintick))
+            evt := 3
+    evt
+
+// Confirmed pattern: 0 = tracking, 1 = target reached, 2 = stopped, 4 = watch over
+trackActive(Pattern p) =>
+    int evt = 0
+    line.set_x2(p.targetLn, bar_index)
+    line.set_x2(p.stopLn, bar_index)
+    bool targetHit = p.dir == 1 ? high >= p.target : low <= p.target
+    bool stopHit   = p.dir == 1 ? close < p.stop : close > p.stop
+    if targetHit
+        // mark the outcome on the levels themselves: the target line ends where it was reached
+        line.set_style(p.targetLn, line.style_solid)
+        label.set_text(p.targetLb, 'Target ' + str.tostring(p.target, format.mintick) + ' reached')
+        label.set_tooltip(p.targetLb, 'Measured target reached ' + str.tostring(bar_index - p.confBar) + ' bars after confirmation')
+        evt := 1
+    else if stopHit
+        line.delete(p.targetLn)
+        label.delete(p.targetLb)
+        line.set_style(p.stopLn, line.style_solid)
+        label.set_text(p.stopLb, 'Stopped ' + str.tostring(p.stop, format.mintick))
+        label.set_tooltip(p.stopLb, p.dir == 1 ? 'Close below the third valley' : 'Close above the third peak')
+        evt := 2
+    else if bar_index - p.confBar >= watchInput
+        evt := 4
+    evt
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Detection
+//---------------------------------------------------------------------------------------------------------------------{
+
+bool bullFormingAlert = false
+bool bearFormingAlert = false
+bool bullEarlyAlert   = false
+bool bullConfAlert    = false
+bool bearConfAlert    = false
+bool bullTargetAlert  = false
+bool bearTargetAlert  = false
+bool bullStopAlert    = false
+bool bearStopAlert    = false
+
+if barstate.isconfirmed
+    if not na(pivotHigh)
+        if pushSwing(pivotHigh, bar_index - swingLengthInput, 1) and showBearInput
+            Pattern candidate = tryDetect(-1)
+            if not na(candidate)
+                if not na(bearForming)
+                    bearForming.erase()
+                bearForming      := candidate
+                bearFormingAlert := true
+    if not na(pivotLow)
+        if pushSwing(pivotLow, bar_index - swingLengthInput, -1) and showBullInput
+            Pattern candidate = tryDetect(1)
+            if not na(candidate)
+                if not na(bullForming)
+                    bullForming.erase()
+                bullForming      := candidate
+                bullFormingAlert := true
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Tracking
+//---------------------------------------------------------------------------------------------------------------------{
+
+if barstate.isconfirmed
+    if not na(bullActive)
+        int evt = trackActive(bullActive)
+        bullTargetAlert := evt == 1
+        bullStopAlert   := evt == 2
+        if evt != 0
+            bullActive := na
+    if not na(bearActive)
+        int evt = trackActive(bearActive)
+        bearTargetAlert := evt == 1
+        bearStopAlert   := evt == 2
+        if evt != 0
+            bearActive := na
+    if not na(bullForming)
+        int evt = trackForming(bullForming)
+        bullEarlyAlert := evt == 3
+        if evt == 1
+            bullConfAlert := true
+            bullActive    := bullForming
+            bullForming   := na
+        else if evt == 2
+            bullForming := na
+    if not na(bearForming)
+        int evt = trackForming(bearForming)
+        if evt == 1
+            bearConfAlert := true
+            bearActive    := bearForming
+            bearForming   := na
+        else if evt == 2
+            bearForming := na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(bullFormingAlert, 'Three Rising Valleys Forming', 'Three rising valleys forming: third higher valley confirmed, awaiting a close above the highest peak')
+alertcondition(bearFormingAlert, 'Three Falling Peaks Forming', 'Three falling peaks forming: third lower peak confirmed, awaiting a close below the lowest valley')
+alertcondition(bullEarlyAlert, 'Three Rising Valleys Early Entry', 'Three rising valleys: close above the trendline across the two highest peaks (early entry)')
+alertcondition(bullConfAlert, 'Three Rising Valleys Confirmed', 'Three rising valleys confirmed: close above the highest peak in the pattern')
+alertcondition(bearConfAlert, 'Three Falling Peaks Confirmed', 'Three falling peaks confirmed: close below the lowest valley in the pattern')
+alertcondition(bullTargetAlert, 'Three Rising Valleys Target', 'Three rising valleys: measured target reached')
+alertcondition(bearTargetAlert, 'Three Falling Peaks Target', 'Three falling peaks: measured target reached')
+alertcondition(bullStopAlert, 'Three Rising Valleys Stop', 'Three rising valleys: close below the third valley')
+alertcondition(bearStopAlert, 'Three Falling Peaks Stop', 'Three falling peaks: close above the third peak')
+
+//---------------------------------------------------------------------------------------------------------------------}

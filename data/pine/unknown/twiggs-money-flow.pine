@@ -1,0 +1,103 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Twiggs Money Flow", shorttitle = "Twiggs Money Flow", overlay = false, format = format.price, precision = 3)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR        = #089981 // directional bullish color
+BEAR_COLOR        = #f23645 // directional bearish color
+LEVEL_COLOR       = #787b86 // threshold level color
+FILL_VALUE_TRANSP = 50      // gradient transparency at the TMF value
+FILL_ZERO_TRANSP  = 100     // gradient transparency at the zero line
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+lengthInput     = input.int(21, "Length", minval = 1, group = "Settings",
+     tooltip = "Window of the Wilder-style exponential smoothing applied to both the signed volume and the total volume before their ratio is taken. The classic setting is 21 periods - roughly one trading month on daily charts. Longer windows steady the line at the cost of extra lag; shorter ones react faster and whipsaw more around zero.")
+
+thresholdInput  = input.float(0.05, "Signal Threshold", minval = 0, maxval = 1, step = 0.01, group = "Settings",
+     tooltip = "Small positive level applied symmetrically around zero. The zero line is the practical bull/bear divide, but in ranges the line whipsaws near it, so many users only treat readings above this level as sustained accumulation and readings below its negative as sustained distribution. No single published value exists - set 0 to read the zero line alone.")
+
+bullColorInput  = input.color(BULL_COLOR, "Bullish", inline = "direction", group = "Style",
+     tooltip = "Color of the TMF line and gradient fill above the zero line - net accumulation, volume-weighted closes concentrating in the upper part of each bar's true range.")
+
+bearColorInput  = input.color(BEAR_COLOR, "Bearish", inline = "direction", group = "Style",
+     tooltip = "Color of the TMF line and gradient fill below the zero line - net distribution, volume-weighted closes concentrating in the lower part of each bar's true range.")
+
+levelColorInput = input.color(LEVEL_COLOR, "Levels", group = "Style",
+     tooltip = "Color of the dashed signal-threshold levels drawn at plus and minus the threshold.")
+
+gradientInput   = input.bool(true, "Gradient Fill", group = "Style",
+     tooltip = "Fills the area between the zero line and the TMF line with a vertical gradient, fully transparent at zero and strongest at the current value.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+// The study needs a genuine volume feed - on symbols without one the reading would be meaningless
+float cumulativeVolume = ta.cum(nz(volume))
+if barstate.islast and cumulativeVolume == 0
+    runtime.error("No volume is provided by the data vendor. Twiggs Money Flow requires volume data.")
+
+// True range endpoints per Wilder - the prior close is folded into the bar's range so gaps cannot slip through the
+// formula: a gap down that closes weak registers almost entirely as selling pressure
+float priorClose = nz(close[1], close)
+float trueHigh   = math.max(high, priorClose)
+float trueLow    = math.min(low, priorClose)
+float trueSpan   = trueHigh - trueLow
+
+// Close-location value measured inside the true range: +1 for a close at the true high (the full volume counts as
+// buying pressure), -1 at the true low (all of it as selling pressure), 0 at the midpoint. Zero-range bars carry no
+// close-location information and are zeroed
+float closeLocation = trueSpan > 0 ? ((close - trueLow) - (trueHigh - close)) / trueSpan : 0.0
+
+// Each bar's volume signed by where its close sits inside the true range; unreported volume counts as zero
+float vol        = nz(volume)
+float signedFlow = closeLocation * vol
+
+// Twiggs' refinement of Chaikin Money Flow - Wilder-style exponential smoothing of both numerator and denominator
+// replaces the lumpy rolling sums, so readings cannot jump when old bars drop out of the window. The ratio
+// oscillates around zero and is bounded between -1 and +1
+float smoothedFlow   = ta.rma(signedFlow, lengthInput)
+float smoothedVolume = ta.rma(vol, lengthInput)
+
+float tmf = smoothedVolume > 0 ? smoothedFlow / smoothedVolume : na
+
+// Signal grammar - zero-line regime changes plus entries and exits of the symmetric threshold levels
+bool zeroCrossUp       = ta.crossover(tmf, 0)
+bool zeroCrossDown     = ta.crossunder(tmf, 0)
+bool accumulationEntry = ta.crossover(tmf, thresholdInput)
+bool accumulationExit  = ta.crossunder(tmf, thresholdInput)
+bool distributionEntry = ta.crossunder(tmf, -thresholdInput)
+bool distributionExit  = ta.crossover(tmf, -thresholdInput)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+zeroPlotId = plot(0, "Zero Line", color = color.new(chart.fg_color, 90), linewidth = 1)
+
+tmfPlotId = plot(tmf, "TMF", color = tmf > 0 ? bullColorInput : bearColorInput, linewidth = 1)
+
+// Centered-oscillator gradient - fully transparent at the zero line, strongest at the TMF value
+fillTopColor    = tmf > 0 ? color.new(bullColorInput, FILL_VALUE_TRANSP) : color.new(bearColorInput, FILL_ZERO_TRANSP)
+fillBottomColor = tmf > 0 ? color.new(bullColorInput, FILL_ZERO_TRANSP) : color.new(bearColorInput, FILL_VALUE_TRANSP)
+
+fill(tmfPlotId, zeroPlotId, top_value = math.max(tmf, 0), bottom_value = math.min(tmf, 0), top_color = gradientInput ? fillTopColor : na, bottom_color = gradientInput ? fillBottomColor : na, title = "Zero-line Gradient Fill")
+
+// Dashed symmetric threshold levels - the sustained accumulation/distribution filter
+hline(thresholdInput, "Accumulation Threshold", levelColorInput, hline.style_dashed)
+hline(-thresholdInput, "Distribution Threshold", levelColorInput, hline.style_dashed)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(zeroCrossUp, "Bullish Zero Cross", "Twiggs Money Flow crossed above zero on {{ticker}} ({{interval}}) - volume-weighted closing pressure turned to net accumulation")
+alertcondition(zeroCrossDown, "Bearish Zero Cross", "Twiggs Money Flow crossed below zero on {{ticker}} ({{interval}}) - volume-weighted closing pressure turned to net distribution")
+alertcondition(accumulationEntry, "Accumulation Threshold Entry", "Twiggs Money Flow rose above its positive signal threshold on {{ticker}} ({{interval}}) - sustained accumulation reading")
+alertcondition(accumulationExit, "Accumulation Threshold Exit", "Twiggs Money Flow fell back below its positive signal threshold on {{ticker}} ({{interval}}) - the sustained accumulation reading no longer holds")
+alertcondition(distributionEntry, "Distribution Threshold Entry", "Twiggs Money Flow fell below its negative signal threshold on {{ticker}} ({{interval}}) - sustained distribution reading")
+alertcondition(distributionExit, "Distribution Threshold Exit", "Twiggs Money Flow rose back above its negative signal threshold on {{ticker}} ({{interval}}) - the sustained distribution reading no longer holds")
+
+//---------------------------------------------------------------------------------------------------------------------}

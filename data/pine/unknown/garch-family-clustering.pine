@@ -1,0 +1,454 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("GARCH-family Clustering", shorttitle = "GARCH-family Clustering", overlay = false, format = format.percent, precision = 2, max_lines_count = 500, max_labels_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+VOL_COLOR      = #787b86 // conditional volatility at the long-run level - blends toward calm or stressed with the ratio
+ANCHOR_COLOR   = #787b86 // long-run anchor reference
+EWMA_COLOR     = #787b86 // EWMA benchmark line - a comparison line, structure
+FORECAST_COLOR = #ff9800 // the one accent - the mean-reverting forecast path
+CALM_COLOR     = #089981 // calm regime shading and line color below the anchor
+STRESS_COLOR   = #f23645 // stressed regime shading, line color above the anchor and shock marks
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+RATIO_CALM_END   = 0.6 // conditional / long-run ratio at which the line is fully the calm color
+RATIO_STRESS_END = 1.6 // conditional / long-run ratio at which the line is fully the stressed color
+
+FILL_VALUE_TRANSP = 50  // gradient transparency at the volatility value
+FILL_ZERO_TRANSP  = 100 // gradient transparency at zero
+
+MIN_VARIANCE    = 1e-12 // numerical floor for the variance recursions
+LOG_VAR_MIN     = -60.0 // clamps for the EGARCH log-variance state
+LOG_VAR_MAX     = 30.0
+MAX_PERSISTENCE = 0.999 // stationarity cap used by the fit grids and the half-life readout
+
+ABS_Z_EXPECTED = math.sqrt(2.0 / math.pi) // E|z| of a standard normal shock, the centering term in EGARCH (Nelson, 1991)
+
+M_GARCH  = "GARCH(1,1)"
+M_GJR    = "GJR-GARCH(1,1)"
+M_EGARCH = "EGARCH(1,1)"
+
+PM_FITTED = "Fitted (rolling quasi-MLE grid)"
+PM_MANUAL = "Manual"
+
+RS_OFF      = "Off"
+RS_STRESSED = "Stressed"
+RS_BOTH     = "Calm & Stressed"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+modelInput = input.string(M_GARCH, "Model", options = [M_GARCH, M_GJR, M_EGARCH], group = "Calculation",
+     tooltip = "Conditional-variance recursion to run. GARCH(1,1) (Bollerslev, 1986) is the symmetric workhorse - the next variance blends a constant anchoring the long-run level, the latest squared return and the previous variance. GJR-GARCH (Glosten-Jagannathan-Runkle, 1993) adds a term that activates only after negative returns, and EGARCH (Nelson, 1991) models log variance, so both let sell-offs raise expected volatility more than rallies of the same size - the leverage effect documented in equities.")
+
+sourceInput = input.source(close, "Source", group = "Calculation",
+     tooltip = "Price series the log returns are computed from. The models work on close-to-close log returns of this source under the zero-mean convention standard in daily risk models such as RiskMetrics.")
+
+windowInput = input.int(250, "Window Length", minval = 50, maxval = 750, group = "Calculation",
+     tooltip = "Bars used for two jobs - the sample variance that pins the long-run anchor through variance targeting (Engle-Mezrich, 1996) and the sample the grid fit maximizes likelihood over. Longer windows steady the anchor and the coefficient estimates; shorter ones adapt faster to structural change.")
+
+annualizeInput = input.bool(true, "Annualize", group = "Calculation",
+     tooltip = "Scales per-bar conditional volatility by the square root of bars per year so readings compare across instruments and against options-market figures. Disable to read the raw per-bar volatility instead.")
+
+barsPerYearInput = input.int(252, "Bars Per Year", minval = 1, group = "Calculation",
+     tooltip = "Annualization constant. Daily equity data conventionally uses 252; some futures and forex tools use 260 or 365. Intraday charts must count bars per year - bars per session times trading days per year.")
+
+paramModeInput = input.string(PM_FITTED, "Parameters", options = [PM_FITTED, PM_MANUAL], group = "Estimation",
+     tooltip = "Fitted re-estimates the coefficients by maximizing the Gaussian quasi log-likelihood over the window on a coarse parameter grid, with the constant set by variance targeting so the model's long-run level matches the window's sample variance. Manual uses the coefficients below instead - useful for replicating published estimates or stress-testing persistence. Manual values also drive the recursion until the first fit completes.")
+
+refitEveryInput = input.int(500, "Refit Every (bars)", minval = 100, maxval = 5000, group = "Estimation",
+     tooltip = "Bars between re-estimations in fitted mode. The variance recursion keeps running between refits; each refit refreshes the coefficients from the most recent window - the usual rolling-estimation compromise between stability and adaptiveness.")
+
+alphaInput = input.float(0.10, "Alpha - News", minval = 0.0, maxval = 0.999, step = 0.01, group = "Estimation",
+     tooltip = "Weight of the latest squared return (for EGARCH, of the absolute standardized shock). Larger values make volatility react harder to each new surprise. Daily-frequency estimates typically land in the 0.05-0.15 range.")
+
+betaInput = input.float(0.85, "Beta - Persistence", minval = 0.0, maxval = 0.999, step = 0.01, group = "Estimation",
+     tooltip = "Weight of the previous conditional variance (for EGARCH, of the previous log variance). Values near one make volatility episodes long-lived - the clustering signature. Daily equity estimates usually land near 0.9.")
+
+gammaInput = input.float(0.05, "Gamma - Asymmetry", minval = -0.999, maxval = 0.999, step = 0.01, group = "Estimation",
+     tooltip = "Asymmetry coefficient. GJR: extra weight on squared returns that follow a negative return, so positive values mean sell-offs expand volatility more than rallies. EGARCH: the sign term - negative values (for example -0.10) encode the same leverage effect in log-variance space. Ignored by the symmetric GARCH(1,1).")
+
+showForecastInput = input.bool(true, "Show Forecast", inline = "forecast", group = "Forecast",
+     tooltip = "Projects the model's multi-step volatility forecast from the last bar as a dotted path decaying toward the long-run anchor - the mean-reverting forecast profile that separates GARCH from purely descriptive volatility measures.")
+
+horizonInput = input.int(20, "Horizon", minval = 1, maxval = 100, inline = "forecast", group = "Forecast",
+     tooltip = "Forecast steps to project. Each step pulls the forecast toward the long-run level at the persistence rate, so the path flattens once the current shock has mostly decayed.")
+
+showEwmaInput = input.bool(false, "EWMA Benchmark", inline = "ewma", group = "Benchmark & Shocks",
+     tooltip = "Overlays the RiskMetrics EWMA variance recursion - the boundary case with no long-run anchor, persistence exactly one. Running both shows how much mean reversion in volatility the data actually supports: the faster the conditional line peels away from EWMA after a shock, the stronger the pull of the anchor.")
+
+lambdaInput = input.float(0.94, "Lambda", minval = 0.5, maxval = 0.999, step = 0.005, inline = "ewma", group = "Benchmark & Shocks",
+     tooltip = "EWMA decay factor. The RiskMetrics technical document's published daily setting is 0.94; higher values remember shocks longer.")
+
+shockSigmaInput = input.float(2.0, "Shock Threshold (sigmas)", minval = 1.0, maxval = 5.0, step = 0.25, group = "Benchmark & Shocks",
+     tooltip = "Flags a volatility shock when a return exceeds this many conditional standard deviations. Two is the conventional cutoff; such bars are the news events whose aftermath the persistence term stretches over the following bars.")
+
+showShockInput = input.bool(false, "Mark Shocks", group = "Benchmark & Shocks",
+     tooltip = "Marks shock bars with circles on the volatility line. Off by default to keep the pane clean - the shock alert fires either way.")
+
+showDashInput = input.bool(true, "Show Dashboard", group = "Dashboard",
+     tooltip = "Displays the active coefficients, the persistence sum and its shock half-life, the long-run and current conditional volatility, and their ratio - the numbers behind the clustering the pane shows.")
+
+dashPosInput = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], inline = "dash", group = "Dashboard",
+     tooltip = "Corner of the pane the dashboard is anchored to.")
+
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], inline = "dash", group = "Dashboard",
+     tooltip = "Dashboard text size.")
+
+volColorInput = input.color(VOL_COLOR, "Conditional Volatility", group = "Style",
+     tooltip = "Color of the conditional volatility line and its gradient fill while it sits at the long-run level. The line blends toward the calm color below the anchor and the stressed color above it. Volatility measures movement size only and carries no directional information.")
+
+anchorColorInput = input.color(ANCHOR_COLOR, "Long-Run Level", group = "Style",
+     tooltip = "Color of the dotted long-run volatility anchor that forecasts revert toward.")
+
+forecastColorInput = input.color(FORECAST_COLOR, "Forecast", group = "Style",
+     tooltip = "Color of the dotted multi-step forecast path and its end label.")
+
+ewmaColorInput = input.color(EWMA_COLOR, "EWMA Benchmark", group = "Style",
+     tooltip = "Color of the EWMA benchmark line.")
+
+regimeShadeInput = input.string(RS_STRESSED, "Regime Shading", options = [RS_OFF, RS_STRESSED, RS_BOTH], group = "Style",
+     tooltip = "Background shading of volatility regimes - stretches where conditional volatility sits above (stressed) or below (calm) the long-run level. Shading whole stretches rather than single bars mirrors how clustering arrives in episodes.")
+
+stressColorInput = input.color(STRESS_COLOR, "Stressed", inline = "regime", group = "Style",
+     tooltip = "Shading color for stressed stretches and shock marks.")
+
+calmColorInput = input.color(CALM_COLOR, "Calm", inline = "regime", group = "Style",
+     tooltip = "Shading color for calm stretches.")
+
+gradientInput = input.bool(true, "Gradient Fill", group = "Style",
+     tooltip = "Fills the area between zero and the conditional volatility line with a vertical gradient - fully transparent at zero, strongest at the current value.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+getTablePosition(positionText) =>
+    switch positionText
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        => position.bottom_left
+
+getTextSize(sizeText) =>
+    switch sizeText
+        "Tiny"  => size.tiny
+        "Small" => size.small
+        => size.normal
+
+// Variance (per-bar, decimal) -> displayed volatility in percent, optionally annualized
+varToPercent(float varianceValue, float scaleFactor) =>
+    math.sqrt(math.max(varianceValue, 0.0)) * scaleFactor * 100.0
+
+// Negative Gaussian quasi log-likelihood of a GARCH/GJR recursion over the sample, up to constants:
+// sum of ln(sigma^2) + r^2 / sigma^2. Recursion: v(t) = omega + (alpha + gamma * 1[r(t-1) < 0]) * r(t-1)^2 + beta * v(t-1)
+garchNegLoglik(array<float> sampleArray, float omegaValue, float alphaValue, float gammaValue, float betaValue, float initVariance) =>
+    float variance = initVariance
+    float negLoglik = 0.0
+    int sampleSize = array.size(sampleArray)
+    if sampleSize > 1
+        for i = 1 to sampleSize - 1
+            float prevSample = array.get(sampleArray, i - 1)
+            float archWeight = alphaValue + (prevSample < 0 ? gammaValue : 0.0)
+            variance := omegaValue + archWeight * prevSample * prevSample + betaValue * variance
+            variance := math.max(variance, MIN_VARIANCE)
+            float curSample = array.get(sampleArray, i)
+            negLoglik += math.log(variance) + curSample * curSample / variance
+    negLoglik
+
+// Same criterion for the EGARCH log-variance recursion:
+// ln v(t) = omega + beta * ln v(t-1) + alpha * (|z(t-1)| - E|z|) + gamma * z(t-1), z = r / sigma
+egarchNegLoglik(array<float> sampleArray, float omegaValue, float alphaValue, float gammaValue, float betaValue, float initLogVariance) =>
+    float logVariance = initLogVariance
+    float negLoglik = 0.0
+    int sampleSize = array.size(sampleArray)
+    if sampleSize > 1
+        for i = 1 to sampleSize - 1
+            float prevSample = array.get(sampleArray, i - 1)
+            float sigma = math.sqrt(math.max(math.exp(logVariance), MIN_VARIANCE))
+            float shock = prevSample / sigma
+            logVariance := omegaValue + betaValue * logVariance + alphaValue * (math.abs(shock) - ABS_Z_EXPECTED) + gammaValue * shock
+            logVariance := math.min(math.max(logVariance, LOG_VAR_MIN), LOG_VAR_MAX)
+            float curSample = array.get(sampleArray, i)
+            negLoglik += logVariance + curSample * curSample / math.exp(logVariance)
+    negLoglik
+
+// Coarse quasi-MLE grids spanning the region where daily-frequency estimates typically land.
+// Omega is never searched - variance targeting pins it to the window's sample variance
+fitGarch(array<float> sampleArray, float sampleVariance) =>
+    float bestAlpha = 0.05
+    float bestBeta = 0.90
+    float bestNll = na
+    for aStep = 1 to 15
+        float candidateAlpha = 0.01 * aStep
+        for bStep = 0 to 19
+            float candidateBeta = 0.60 + 0.02 * bStep
+            if candidateAlpha + candidateBeta < MAX_PERSISTENCE
+                float candidateOmega = sampleVariance * (1.0 - candidateAlpha - candidateBeta)
+                float candidateNll = garchNegLoglik(sampleArray, candidateOmega, candidateAlpha, 0.0, candidateBeta, sampleVariance)
+                if not na(candidateNll) and (na(bestNll) or candidateNll < bestNll)
+                    bestNll := candidateNll
+                    bestAlpha := candidateAlpha
+                    bestBeta := candidateBeta
+    [bestAlpha, bestBeta]
+
+fitGjr(array<float> sampleArray, float sampleVariance) =>
+    float bestAlpha = 0.03
+    float bestGamma = 0.08
+    float bestBeta = 0.90
+    float bestNll = na
+    for aStep = 0 to 6
+        float candidateAlpha = 0.02 * aStep
+        for gStep = 0 to 6
+            float candidateGamma = 0.04 * gStep
+            for bStep = 0 to 12
+                float candidateBeta = 0.60 + 0.03 * bStep
+                float candidatePersistence = candidateAlpha + candidateBeta + candidateGamma / 2.0
+                if candidatePersistence < MAX_PERSISTENCE and candidateAlpha + candidateGamma > 0
+                    float candidateOmega = sampleVariance * (1.0 - candidatePersistence)
+                    float candidateNll = garchNegLoglik(sampleArray, candidateOmega, candidateAlpha, candidateGamma, candidateBeta, sampleVariance)
+                    if not na(candidateNll) and (na(bestNll) or candidateNll < bestNll)
+                        bestNll := candidateNll
+                        bestAlpha := candidateAlpha
+                        bestGamma := candidateGamma
+                        bestBeta := candidateBeta
+    [bestAlpha, bestGamma, bestBeta]
+
+fitEgarch(array<float> sampleArray, float sampleVariance) =>
+    float bestAlpha = 0.12
+    float bestGamma = -0.06
+    float bestBeta = 0.94
+    float bestNll = na
+    float initLogVariance = math.log(sampleVariance)
+    for aStep = 1 to 7
+        float candidateAlpha = 0.04 * aStep
+        for gStep = 0 to 6
+            float candidateGamma = -0.30 + 0.06 * gStep
+            for bStep = 0 to 6
+                float candidateBeta = 0.86 + 0.02 * bStep
+                float candidateOmega = (1.0 - candidateBeta) * initLogVariance
+                float candidateNll = egarchNegLoglik(sampleArray, candidateOmega, candidateAlpha, candidateGamma, candidateBeta, initLogVariance)
+                if not na(candidateNll) and (na(bestNll) or candidateNll < bestNll)
+                    bestNll := candidateNll
+                    bestAlpha := candidateAlpha
+                    bestGamma := candidateGamma
+                    bestBeta := candidateBeta
+    [bestAlpha, bestGamma, bestBeta]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+// Close-to-close log return under the zero-mean convention. Degenerate bars (missing or
+// non-positive prices) contribute a zero return instead of contaminating the recursions with na
+priceValid = not na(sourceInput) and not na(sourceInput[1])
+float logReturn = 0.0
+if priceValid and sourceInput > 0 and sourceInput[1] > 0
+    logReturn := math.log(sourceInput / sourceInput[1])
+squaredReturn = logReturn * logReturn
+
+// Rolling sample of the most recent returns - the window the grid fit maximizes likelihood over
+var array<float> returnsArray = array.new<float>()
+if bar_index > 0
+    array.push(returnsArray, logReturn)
+    while array.size(returnsArray) > windowInput
+        array.shift(returnsArray)
+
+// Variance targeting anchor - the window's mean squared return. Until the window fills, an
+// expanding mean seeds the recursions; the plot itself waits for the full window
+windowVariance    = ta.sma(squaredReturn, windowInput)
+expandingVariance = ta.cum(squaredReturn) / math.max(bar_index, 1)
+targetVariance    = math.max(nz(windowVariance, expandingVariance), MIN_VARIANCE)
+targetLogVariance = math.log(targetVariance)
+ready             = not na(windowVariance)
+
+// Rolling quasi-MLE refit - grids over the coefficients, omega pinned by variance targeting
+var float fitAlpha   = na
+var float fitGamma   = na
+var float fitBeta    = na
+var int   lastFitBar = na
+
+fittedMode = paramModeInput == PM_FITTED
+doRefit    = fittedMode and array.size(returnsArray) >= windowInput and (na(lastFitBar) or bar_index - lastFitBar >= refitEveryInput)
+
+if doRefit
+    float sumSquares = 0.0
+    int sampleSize = array.size(returnsArray)
+    for i = 0 to sampleSize - 1
+        float sampleReturn = array.get(returnsArray, i)
+        sumSquares += sampleReturn * sampleReturn
+    float sampleVariance = math.max(sumSquares / sampleSize, MIN_VARIANCE)
+    if modelInput == M_GARCH
+        [gAlpha, gBeta] = fitGarch(returnsArray, sampleVariance)
+        fitAlpha := gAlpha
+        fitGamma := 0.0
+        fitBeta  := gBeta
+    else if modelInput == M_GJR
+        [jAlpha, jGamma, jBeta] = fitGjr(returnsArray, sampleVariance)
+        fitAlpha := jAlpha
+        fitGamma := jGamma
+        fitBeta  := jBeta
+    else
+        [eAlpha, eGamma, eBeta] = fitEgarch(returnsArray, sampleVariance)
+        fitAlpha := eAlpha
+        fitGamma := eGamma
+        fitBeta  := eBeta
+    lastFitBar := bar_index
+
+// Active coefficients and the decay rate of shocks. Persistence: alpha + beta for GARCH,
+// alpha + beta + gamma/2 for GJR (symmetric innovations spend half their time negative),
+// beta alone for EGARCH where clustering lives in log variance
+useFitted  = fittedMode and not na(fitAlpha)
+alphaParam = useFitted ? fitAlpha : alphaInput
+gammaParam = useFitted ? fitGamma : modelInput == M_GARCH ? 0.0 : gammaInput
+betaParam  = useFitted ? fitBeta : betaInput
+
+persistence = modelInput == M_EGARCH ? betaParam : alphaParam + betaParam + (modelInput == M_GJR ? gammaParam / 2.0 : 0.0)
+omegaGarch  = targetVariance * math.max(1.0 - persistence, 0.0)
+omegaEgarch = (1.0 - betaParam) * targetLogVariance
+
+// Conditional-variance recursions. The value on bar t uses information through bar t-1 only
+// (previous return, previous variance), so the reading is fixed when the bar opens and does not repaint
+var float condVariance    = na
+var float condLogVariance = na
+
+prevReturn        = nz(logReturn[1])
+prevSquaredReturn = prevReturn * prevReturn
+prevVariance      = math.max(nz(condVariance[1], targetVariance), MIN_VARIANCE)
+prevLogVariance   = nz(condLogVariance[1], targetLogVariance)
+prevShock         = prevReturn / math.sqrt(math.max(math.exp(prevLogVariance), MIN_VARIANCE))
+
+garchVariance  = omegaGarch + (alphaParam + (prevReturn < 0 ? gammaParam : 0.0)) * prevSquaredReturn + betaParam * prevVariance
+newLogVariance = omegaEgarch + betaParam * prevLogVariance + alphaParam * (math.abs(prevShock) - ABS_Z_EXPECTED) + gammaParam * prevShock
+
+condLogVariance := math.min(math.max(newLogVariance, LOG_VAR_MIN), LOG_VAR_MAX)
+condVariance    := modelInput == M_EGARCH ? math.exp(condLogVariance) : math.max(garchVariance, MIN_VARIANCE)
+
+// RiskMetrics EWMA benchmark - the anchorless boundary case with persistence exactly one
+var float ewmaVariance = na
+ewmaVariance := lambdaInput * math.max(nz(ewmaVariance[1], targetVariance), MIN_VARIANCE) + (1.0 - lambdaInput) * prevSquaredReturn
+
+// Display conversion
+annualScale = annualizeInput ? math.sqrt(barsPerYearInput) : 1.0
+condVol     = ready ? varToPercent(condVariance, annualScale) : na
+anchorVol   = ready ? varToPercent(targetVariance, annualScale) : na
+ewmaVol     = ready ? varToPercent(ewmaVariance, annualScale) : na
+
+// Regime split against the long-run level, standardized-return shocks, and the decay half-life
+stressedRegime     = ready and condVariance > targetVariance
+standardizedReturn = logReturn / math.sqrt(math.max(condVariance, MIN_VARIANCE))
+volShock           = ready and math.abs(standardizedReturn) > shockSigmaInput
+halfLife           = persistence > 0 and persistence < MAX_PERSISTENCE ? math.log(0.5) / math.log(persistence) : na
+
+stressedEvent = ta.crossover(condVol, anchorVol)
+calmEvent     = ta.crossunder(condVol, anchorVol)
+
+// One-step-ahead forecast seeds using the just-observed return; further steps decay toward the
+// anchor at the persistence rate - E[v(t+h)] = vLR + p^(h-1) * (v(t+1) - vLR), and its log-space
+// analogue for EGARCH
+oneStepVariance    = omegaGarch + (alphaParam + (logReturn < 0 ? gammaParam : 0.0)) * squaredReturn + betaParam * condVariance
+oneStepLogVariance = omegaEgarch + betaParam * condLogVariance + alphaParam * (math.abs(standardizedReturn) - ABS_Z_EXPECTED) + gammaParam * standardizedReturn
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+// State coloring by the conditional / long-run ratio - calm below the anchor, stressed above it, the neutral color at parity
+volRatio = not na(condVol) and not na(anchorVol) and anchorVol > 0 ? condVol / anchorVol : 1.0
+volColor = volRatio <= 1.0 ? color.from_gradient(volRatio, RATIO_CALM_END, 1.0, calmColorInput, volColorInput) : color.from_gradient(volRatio, 1.0, RATIO_STRESS_END, volColorInput, stressColorInput)
+
+fillTopColor    = gradientInput ? color.new(volColor, FILL_VALUE_TRANSP) : na
+fillBottomColor = gradientInput ? color.new(volColor, FILL_ZERO_TRANSP) : na
+
+condVolPlotId = plot(condVol, "Conditional Volatility", color = volColor, linewidth = 2)
+zeroPlotId    = plot(0, "Zero Line", color = color.new(ANCHOR_COLOR, 70), linewidth = 1)
+
+fill(condVolPlotId, zeroPlotId, top_value = math.max(nz(condVol), 0), bottom_value = 0, top_color = fillTopColor, bottom_color = fillBottomColor, title = "Volatility Gradient Fill")
+
+plot(anchorVol, "Long-Run Volatility", color = color.new(anchorColorInput, 20), linewidth = 1, style = plot.style_circles)
+plot(showEwmaInput ? ewmaVol : na, "EWMA Benchmark", color = ewmaColorInput, linewidth = 1)
+plot(showShockInput and volShock ? condVol : na, "Volatility Shocks", color = stressColorInput, linewidth = 2, style = plot.style_circles)
+
+regimeShadeColor = not ready or regimeShadeInput == RS_OFF ? na : stressedRegime ? color.new(stressColorInput, 88) : regimeShadeInput == RS_BOTH ? color.new(calmColorInput, 92) : na
+bgcolor(regimeShadeColor, title = "Volatility Regime Shading")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Forecast Projection
+//---------------------------------------------------------------------------------------------------------------------{
+var array<line> forecastLineArray = array.new<line>()
+var line  anchorLineId    = na
+var label forecastLabelId = na
+
+if barstate.islast
+    if array.size(forecastLineArray) > 0
+        for lineId in forecastLineArray
+            line.delete(lineId)
+        array.clear(forecastLineArray)
+    line.delete(anchorLineId)
+    label.delete(forecastLabelId)
+    if showForecastInput and ready
+        float forecastVariance    = math.max(oneStepVariance, MIN_VARIANCE)
+        float forecastLogVariance = math.min(math.max(oneStepLogVariance, LOG_VAR_MIN), LOG_VAR_MAX)
+        float previousY = condVol
+        float forecastY = condVol
+        for step = 1 to horizonInput
+            forecastY := modelInput == M_EGARCH ? varToPercent(math.exp(forecastLogVariance), annualScale) : varToPercent(forecastVariance, annualScale)
+            array.push(forecastLineArray, line.new(bar_index + step - 1, previousY, bar_index + step, forecastY, color = forecastColorInput, style = line.style_dotted, width = 1))
+            previousY := forecastY
+            forecastVariance    := targetVariance + persistence * (forecastVariance - targetVariance)
+            forecastLogVariance := targetLogVariance + betaParam * (forecastLogVariance - targetLogVariance)
+        anchorLineId    := line.new(bar_index, anchorVol, bar_index + horizonInput, anchorVol, color = color.new(anchorColorInput, 30), style = line.style_dotted, width = 1)
+        forecastLabelId := label.new(bar_index + horizonInput, forecastY, str.tostring(forecastY, "#.##") + "%", style = label.style_label_left, color = #00000000, textcolor = forecastColorInput, size = size.small)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dashTable = na
+
+if barstate.isfirst and showDashInput
+    dashTable := table.new(getTablePosition(dashPosInput), 2, 10, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+if barstate.islast and showDashInput and not na(dashTable)
+    labelColor   = DASH_HEADER
+    dashTextSize = getTextSize(dashSizeInput)
+    modeText     = useFitted ? "Fitted (rolling)" : fittedMode ? "Fitted (warming up)" : "Manual"
+    gammaText    = modelInput == M_GARCH ? "-" : str.tostring(gammaParam, "#.###")
+    halfLifeText = persistence >= MAX_PERSISTENCE ? "Integrated" : na(halfLife) ? "-" : str.tostring(halfLife, "#.#") + " bars"
+    anchorText   = na(anchorVol) ? "-" : str.tostring(anchorVol, "#.##") + "%"
+    condText     = na(condVol) ? "-" : str.tostring(condVol, "#.##") + "%"
+    ratioText    = na(condVol) or na(anchorVol) or anchorVol == 0 ? "-" : str.tostring(condVol / anchorVol, "#.##") + "x"
+    regimeColor  = stressedRegime ? stressColorInput : calmColorInput
+    persistColor = color.from_gradient(persistence, 0.8, 1.0, DASH_TEXT, stressColorInput)
+    table.cell(dashTable, 0, 0, "Model", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 0, modelInput, text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 1, "Parameters", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 1, modeText, text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 2, "Alpha (news)", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 2, str.tostring(alphaParam, "#.###"), text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 3, "Beta (memory)", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 3, str.tostring(betaParam, "#.###"), text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 4, "Gamma (asymmetry)", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 4, gammaText, text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 5, "Persistence", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 5, str.tostring(persistence, "#.###"), text_color = persistColor, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 6, "Shock Half-Life", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 6, halfLifeText, text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 7, "Long-Run Vol", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 7, anchorText, text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 8, "Conditional Vol", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 8, condText, text_color = regimeColor, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 9, "vs Long-Run", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 9, ratioText, text_color = regimeColor, text_size = dashTextSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(stressedEvent, "Stressed Regime", "GARCH-family Clustering on {{ticker}} - conditional volatility crossed above the model's long-run level, entering a stressed regime where elevated volatility tends to persist ({{interval}})")
+alertcondition(calmEvent, "Calm Regime", "GARCH-family Clustering on {{ticker}} - conditional volatility decayed back below the model's long-run level, entering a calm regime ({{interval}})")
+alertcondition(volShock, "Volatility Shock", "GARCH-family Clustering on {{ticker}} - a return exceeded the shock threshold in conditional standard deviations, the kind of surprise whose effect the persistence term stretches over the following bars ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

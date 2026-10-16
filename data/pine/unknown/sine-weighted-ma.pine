@@ -1,0 +1,198 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Sine-weighted MA", shorttitle = "Sine-weighted MA", overlay = true, format = format.price, max_bars_back = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+NEUTRAL_COLOR = #787b86
+FAST_COLOR    = #ff9800 // the one accent - the fast line of the optional crossover pair
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+FILL_PRICE_TRANSP = 60  // gradient transparency at the price end of the fill
+FILL_LINE_TRANSP  = 100 // gradient transparency at the SWMA end of the fill
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+srcInput    = input.source(close, "Source", group = "Settings",
+     tooltip = "Price series the average smooths. Close is standard, and because the tapered window knocks down high-frequency noise, the smoothed line is also commonly used as a pre-smoothing stage feeding other studies.")
+
+lengthInput = input.int(20, "Length", minval = 2, maxval = 500, group = "Settings",
+     tooltip = "Number of bars N in the window. Bar i of the window is weighted by sin(pi * (i + 1) / (N + 1)), so weights are near zero at both the oldest and newest bars and largest mid-window, and the weighted sum is normalized by the sum of the weights. Emphasis sits mid-window, so expect lag of roughly half the window — (N - 1) / 2 bars — in exchange for the extra smoothness.")
+
+pairInput       = input.bool(false, "Fast SWMA", group = "Crossover Pair",
+     tooltip = "Adds a second, faster sine-weighted MA to form a crossover pair. The SWMA suits the slow leg of systems where whipsaw suppression matters more than early entry, with the faster average providing the timing — the pair alerts cover the crossings between the two lines.")
+
+pairLengthInput = input.int(10, "Fast SWMA Length", minval = 2, maxval = 500, group = "Crossover Pair",
+     tooltip = "Window length of the fast sine-weighted MA. Keep it shorter than the main length so the pair reads fast against slow — e.g. 10 against 20.")
+
+showDashboardInput     = input.bool(true, "Show Dashboard", group = "Dashboard",
+     tooltip = "Displays a compact panel with the window length(s), the (N - 1) / 2 bar lag of the half-sine window, the slope read, and price's position against the line.")
+
+dashboardLocationInput = input.string("Top Right", "Location", options = ["Top Right", "Bottom Right", "Bottom Left", "Top Left"], group = "Dashboard",
+     tooltip = "Chart corner the dashboard is anchored to.")
+
+dashboardSizeInput     = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = "Dashboard",
+     tooltip = "Text size of the dashboard.")
+
+trendColorInput   = input.bool(true, "Slope Trend Coloring", group = "Style",
+     tooltip = "Colors the SWMA by its slope — bullish while the line rises, bearish while it falls. The soft window edges suppress bar-to-bar jitter, so the slope flips rarely; disable to draw the line in the neutral color.")
+
+bullColorInput    = input.color(BULL_COLOR, "Bullish", inline = "direction", group = "Style",
+     tooltip = "Bullish color, used while the SWMA slopes upward and for bullish crossings/fill.")
+
+bearColorInput    = input.color(BEAR_COLOR, "Bearish", inline = "direction", group = "Style",
+     tooltip = "Bearish color, used while the SWMA slopes downward and for bearish crossings/fill.")
+
+neutralColorInput = input.color(NEUTRAL_COLOR, "Neutral", group = "Style",
+     tooltip = "Line color used when slope trend coloring is disabled, or when the slope is flat.")
+
+fastColorInput    = input.color(FAST_COLOR, "Fast SWMA", group = "Style",
+     tooltip = "Color of the fast sine-weighted MA of the crossover pair.")
+
+lineWidthInput    = input.int(2, "Line Width", minval = 1, maxval = 5, group = "Style",
+     tooltip = "Width of the main SWMA line.")
+
+showFillInput     = input.bool(true, "Price / SWMA Gradient Fill", group = "Style",
+     tooltip = "Fills the area between the source and the SWMA with a vertical gradient — bullish while price holds above the line, bearish while below — fading to fully transparent at the SWMA. Price's side of the baseline is one of its two classic low-jitter reads.")
+
+showMarkersInput  = input.bool(false, "Price Crossing Markers", group = "Style",
+     tooltip = "Displays small triangle markers when the source crosses over or under the SWMA. Off by default to keep the chart clean — the crossing alerts work regardless.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Half-sine window coefficients for position k = 0..N-1 across the lookback:
+//   w(k) = sin(pi * (k + 1) / (N + 1))
+// The weights trace half a sine cycle over the window — near zero at both the oldest and newest bars,
+// largest mid-window — and are symmetric, so chart-time orientation does not matter. They are normalized
+// to sum to one, so the average is the weighted sum divided by the sum of the weights.
+buildSineWeights(simple int length) =>
+    weightsArray = array.new_float(length, 0.0)
+    float weightSum = 0.0
+    for k = 0 to length - 1
+        float weight = math.sin(math.pi * (k + 1) / (length + 1))
+        array.set(weightsArray, k, weight)
+        weightSum += weight
+    if weightSum > 0
+        for k = 0 to length - 1
+            array.set(weightsArray, k, array.get(weightsArray, k) / weightSum)
+    weightsArray
+
+// Weighted sum of the last N source values under the normalized half-sine window — na until a full window exists
+sineWeightedAverage(float src, array<float> weightsArray) =>
+    int length  = array.size(weightsArray)
+    float value = na
+    if length > 0 and bar_index >= length - 1
+        float weightedSum = 0.0
+        bool  windowFull  = true
+        for k = 0 to length - 1
+            float sample = src[k]
+            if na(sample)
+                windowFull := false
+                break
+            weightedSum += sample * array.get(weightsArray, k)
+        value := windowFull ? weightedSum : na
+    value
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+// Weight profiles depend only on the inputs, so they are computed a single time
+var slowWeightsArray = buildSineWeights(lengthInput)
+var fastWeightsArray = buildSineWeights(pairLengthInput)
+
+// Both averages run on every bar so the pair alerts stay consistent even while the fast line is hidden
+swmaValue = sineWeightedAverage(srcInput, slowWeightsArray)
+fastValue = sineWeightedAverage(srcInput, fastWeightsArray)
+
+// Slope of the SWMA — the low-jitter trend read of the smoother
+slope = swmaValue - nz(swmaValue[1], swmaValue)
+
+slopeTurnUp   = slope > 0 and nz(slope[1]) <= 0
+slopeTurnDown = slope < 0 and nz(slope[1]) >= 0
+
+// Price crossings — price's side of the baseline, the other classic read
+crossUp   = ta.crossover(srcInput, swmaValue)
+crossDown = ta.crossunder(srcInput, swmaValue)
+
+// Crossings of the pair — the fast SWMA against the slow baseline
+pairCrossUp   = ta.crossover(fastValue, swmaValue)
+pairCrossDown = ta.crossunder(fastValue, swmaValue)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+swmaColor = trendColorInput ? (slope > 0 ? bullColorInput : slope < 0 ? bearColorInput : neutralColorInput) : neutralColorInput
+
+priceAbove      = srcInput > swmaValue
+fillTopColor    = showFillInput ? (priceAbove ? color.new(bullColorInput, FILL_PRICE_TRANSP) : color.new(bearColorInput, FILL_LINE_TRANSP)) : na
+fillBottomColor = showFillInput ? (priceAbove ? color.new(bullColorInput, FILL_LINE_TRANSP) : color.new(bearColorInput, FILL_PRICE_TRANSP)) : na
+
+srcPlotId  = plot(srcInput, "Source", color = na, editable = false, display = display.none)
+swmaPlotId = plot(swmaValue, "SWMA", color = swmaColor, linewidth = lineWidthInput)
+
+plot(pairInput ? fastValue : na, "Fast SWMA", color = fastColorInput, linewidth = 1)
+
+fill(srcPlotId, swmaPlotId, top_value = math.max(srcInput, swmaValue), bottom_value = math.min(srcInput, swmaValue), top_color = fillTopColor, bottom_color = fillBottomColor, title = "Price / SWMA Gradient Fill")
+
+plotshape(showMarkersInput and crossUp, "Bullish Price Cross", shape.triangleup, location.belowbar, color = bullColorInput, size = size.tiny)
+plotshape(showMarkersInput and crossDown, "Bearish Price Cross", shape.triangledown, location.abovebar, color = bearColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+dashboardLocation = switch dashboardLocationInput
+    "Top Right"    => position.top_right
+    "Bottom Right" => position.bottom_right
+    "Bottom Left"  => position.bottom_left
+    => position.top_left
+
+dashboardTextSize = switch dashboardSizeInput
+    "Tiny"  => size.tiny
+    "Small" => size.small
+    => size.normal
+
+var table dashboardTable = table.new(dashboardLocation, 2, 4, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+if barstate.islast and showDashboardInput
+    // The fixed cost of the center-weighted window — emphasis sits mid-window, so lag is about half the length
+    lengthText = str.tostring(lengthInput) + (pairInput ? " / " + str.tostring(pairLengthInput) : "")
+    lagText    = str.tostring((lengthInput - 1) / 2.0, "#.#") + (pairInput ? " / " + str.tostring((pairLengthInput - 1) / 2.0, "#.#") : "") + " bars"
+
+    slopeNow   = nz(slope)
+    slopeText  = slopeNow > 0 ? "Rising" : slopeNow < 0 ? "Falling" : "Flat"
+    slopeColor = slopeNow > 0 ? bullColorInput : slopeNow < 0 ? bearColorInput : neutralColorInput
+
+    aboveNow  = not na(swmaValue) and srcInput > swmaValue
+    biasText  = na(swmaValue) ? "—" : aboveNow ? "Above SWMA" : "Below SWMA"
+    biasColor = na(swmaValue) ? neutralColorInput : aboveNow ? bullColorInput : bearColorInput
+
+    table.cell(dashboardTable, 0, 0, "Length",   text_color = DASH_HEADER, text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 0, lengthText, text_color = DASH_TEXT, text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 1, "Lag",      text_color = DASH_HEADER, text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 1, lagText,    text_color = DASH_TEXT, text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 2, "Slope",    text_color = DASH_HEADER, text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 2, slopeText,  text_color = slopeColor,     text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 3, "Price",    text_color = DASH_HEADER, text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 3, biasText,   text_color = biasColor,      text_size = dashboardTextSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(crossUp, "Bullish Price Cross", "Price crossed above the sine-weighted MA on {{ticker}} ({{interval}})")
+alertcondition(crossDown, "Bearish Price Cross", "Price crossed below the sine-weighted MA on {{ticker}} ({{interval}})")
+alertcondition(slopeTurnUp, "SWMA Slope Up", "Sine-weighted MA slope turned upward on {{ticker}} ({{interval}})")
+alertcondition(slopeTurnDown, "SWMA Slope Down", "Sine-weighted MA slope turned downward on {{ticker}} ({{interval}})")
+alertcondition(pairInput and pairCrossUp, "Pair Bullish Cross", "Fast SWMA crossed above the slow SWMA on {{ticker}} ({{interval}})")
+alertcondition(pairInput and pairCrossDown, "Pair Bearish Cross", "Fast SWMA crossed below the slow SWMA on {{ticker}} ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

@@ -1,0 +1,376 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Market Maker Models", "Market Maker Models", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+//Model lifecycle: scanning -> original consolidation -> leg away (first half of the curve) -> return leg (second half)
+PHASE_SCAN   = 0
+PHASE_CONSOL = 1
+PHASE_AWAY   = 2
+PHASE_RETURN = 3
+
+SIDE_BOTH = "Both"
+SIDE_BUY  = "Buy Models (MMBM)"
+SIDE_SELL = "Sell Models (MMSM)"
+
+ZONE_BG_TRANSPARENCY     = 85
+ZONE_BORDER_TRANSPARENCY = 60
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+consolLengthInput = input.int(15, "Consolidation Length", minval = 5, group = "Model Detection",
+  tooltip = "Number of bars a sideways range must span to qualify as a consolidation. The first qualifying range becomes the original consolidation; qualifying ranges formed along the leg away become the interior consolidations of the curve.")
+
+rangeWidthInput = input.float(2.0, "Consolidation Width", minval = 0.1, step = 0.1, group = "Model Detection",
+  tooltip = "Maximum height of a qualifying range, expressed as a multiple of the Average True Range. Lower values only accept tighter, cleaner consolidations.")
+
+displacementInput = input.float(1.0, "Displacement Threshold", minval = 0.1, step = 0.1, group = "Model Detection",
+  tooltip = "Minimum candle body, as a multiple of the Average True Range, for a move to count as displacement. Required both for the leg leaving the original consolidation and for the reversal leg at the curve extreme.")
+
+swingLengthInput = input.int(5, "Swing Length", minval = 1, group = "Model Detection",
+  tooltip = "Bars to the left and right required to confirm a swing point. Confirmed swings define the liquidity swept at the curve extreme and the short-term structure the reversal leg must displace through.")
+
+minDepthInput = input.float(1.0, "Minimum Curve Depth", minval = 0, step = 0.25, group = "Model Detection",
+  tooltip = "Distance price must travel beyond the original consolidation before a smart money reversal can be considered, expressed as a multiple of the consolidation height. Filters shallow shakeouts that never ran an external objective.")
+
+atrLengthInput = input.int(200, "Volatility Length", minval = 1, group = "Model Detection",
+  tooltip = "Average True Range length used as the volatility reference for consolidation width and displacement.")
+
+sideInput = input.string(SIDE_BOTH, "Detect", options = [SIDE_BOTH, SIDE_BUY, SIDE_SELL], group = "Model Detection",
+  tooltip = "Which schematics to track. A buy model (MMBM) steps down into a sell-side objective then returns higher; a sell model (MMSM) is the mirror image around a high.")
+
+showDashboardInput = input.bool(true, "Show Dashboard", group = "Dashboard",
+  tooltip = "Display a summary of the model being tracked: which schematic is in play, the side of the curve currently being delivered, and progress through the return target ladder.")
+
+dashboardLocationInput = input.string("Top Right", "Location", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = "Dashboard",
+  tooltip = "Chart corner the dashboard is anchored to.")
+
+dashboardSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = "Dashboard",
+  tooltip = "Text size of the dashboard.")
+
+showLabelsInput = input.bool(true, "Show Phase Labels", group = "Style",
+  tooltip = "Label the phases of the model on the chart: the original consolidation, each interior consolidation (RD/RA), the smart money reversal (SMR), and the completion or invalidation of the read.")
+
+showCurveInput = input.bool(true, "Show Delivery Curve", group = "Style",
+  tooltip = "Trace the dotted delivery path of the model: out of the original consolidation, through each interior consolidation to the curve extreme, then back through the same zones as they are consumed on the return leg.")
+
+consolColorInput = input.color(#787b86, "Original Consolidation", group = "Style",
+  tooltip = "Color of the original consolidation zone the model is anchored to, and of invalidation markers.")
+
+bullColorInput = input.color(#089981, "Bullish", group = "Style",
+  tooltip = "Color of bullish elements: interior consolidations formed on a rising leg, upward curve segments, and the reversal, return targets and completion of a buy model.")
+
+bearColorInput = input.color(#f23645, "Bearish", group = "Style",
+  tooltip = "Color of bearish elements: interior consolidations formed on a falling leg, downward curve segments, and the reversal, return targets and completion of a sell model.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+//Draw a consolidation zone anchored at its detection window
+newZone(int leftBar, float top, float bottom, color zoneColor, string zoneText) =>
+    box.new(leftBar, top, bar_index, bottom
+      , border_color = color.new(zoneColor, ZONE_BORDER_TRANSPARENCY)
+      , border_width = 1
+      , bgcolor      = color.new(zoneColor, ZONE_BG_TRANSPARENCY)
+      , text         = zoneText
+      , text_size    = size.small
+      , text_color   = color.new(zoneColor, 25)
+      , text_halign  = text.align_center
+      , text_valign  = text.valign_top)
+
+//Dotted segment of the delivery curve connecting two nodes of the schematic
+curveSegment(int x1, float y1, int x2, float y2, color segmentColor) =>
+    if showCurveInput
+        line.new(x1, y1, x2, y2, color = segmentColor, style = line.style_dotted, width = 1)
+
+//Unobtrusive text marker for one-time phase events
+newMarker(int x, float y, string markerText, string tipText, color markerColor, bool anchorBelow) =>
+    if showLabelsInput
+        label.new(x, y, markerText
+          , style     = anchorBelow ? label.style_label_up : label.style_label_down
+          , color     = #00000000
+          , textcolor = markerColor
+          , size      = size.small
+          , tooltip   = tipText)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+//Volatility reference and rolling range window (evaluated on every bar)
+float atrValue   = ta.atr(atrLengthInput)
+float windowHigh = ta.highest(high, consolLengthInput)
+float windowLow  = ta.lowest(low, consolLengthInput)
+bool  isCompression = not na(atrValue) and not na(windowHigh) and not na(windowLow) and windowHigh - windowLow <= atrValue * rangeWidthInput
+
+//Confirmed swing structure (known swingLength bars after the fact)
+float pivotHighPrice = ta.pivothigh(swingLengthInput, swingLengthInput)
+float pivotLowPrice  = ta.pivotlow(swingLengthInput, swingLengthInput)
+
+var float lastSwingHigh = na
+var float lastSwingLow  = na
+if not na(pivotHighPrice)
+    lastSwingHigh := pivotHighPrice
+if not na(pivotLowPrice)
+    lastSwingLow := pivotLowPrice
+
+//Displacement candles - bodies large relative to volatility
+float bodySize         = math.abs(close - open)
+bool  displacementUp   = not na(atrValue) and close > open and bodySize >= atrValue * displacementInput
+bool  displacementDown = not na(atrValue) and close < open and bodySize >= atrValue * displacementInput
+
+//Model state
+var int   phase          = PHASE_SCAN
+var int   modelDirection = 0  //-1 = buy model (delivered lower first), +1 = sell model (delivered higher first)
+var float consolTop      = na
+var float consolBottom   = na
+var box   consolBox      = na
+var float curveExtreme    = na
+var int   curveExtremeBar = na
+var bool  objectiveSwept  = false
+var float sweepExtreme    = na
+var int   cooldownUntil   = 0
+var int   targetsReached  = 0
+
+//Interior consolidations mapped on the leg away (the return-trip target ladder)
+var array<float> interiorTopArray    = array.new<float>()
+var array<float> interiorBottomArray = array.new<float>()
+var array<box>   interiorBoxArray    = array.new<box>()
+var array<bool>  interiorHitArray    = array.new<bool>()
+var bool         interiorForming     = false
+
+//Last node of the delivery curve
+var int   nodeBar   = na
+var float nodePrice = na
+
+//Phase-transition events (consumed by the alert section)
+bool consolidationEvent = false
+bool buyModelEvent      = false
+bool sellModelEvent     = false
+bool interiorEvent      = false
+bool reversalBuyEvent   = false
+bool reversalSellEvent  = false
+bool targetEvent        = false
+bool completeBuyEvent   = false
+bool completeSellEvent  = false
+bool invalidationEvent  = false
+bool doReset            = false
+bool dropConsol         = false
+
+if barstate.isconfirmed
+    //Keep the origin zone and every unconsumed target extended while a model is being tracked
+    if phase != PHASE_SCAN and not na(consolBox)
+        box.set_right(consolBox, bar_index)
+        if array.size(interiorBoxArray) > 0
+            for i = 0 to array.size(interiorBoxArray) - 1
+                if not array.get(interiorHitArray, i)
+                    box.set_right(array.get(interiorBoxArray, i), bar_index)
+
+    if phase == PHASE_SCAN
+        //Step 1 - a clear sideways range is the candidate original consolidation
+        if bar_index > cooldownUntil and isCompression
+            consolTop    := windowHigh
+            consolBottom := windowLow
+            consolBox    := newZone(bar_index - consolLengthInput + 1, consolTop, consolBottom, consolColorInput, showLabelsInput ? "Original Consolidation" : "")
+            phase        := PHASE_CONSOL
+            consolidationEvent := true
+
+    else if phase == PHASE_CONSOL
+        //The range must be left with a displacement leg for a model to activate
+        if close > consolTop or close < consolBottom
+            bool breakDown   = close < consolBottom
+            bool sideAllowed = breakDown ? sideInput != SIDE_SELL : sideInput != SIDE_BUY
+            bool displaced   = breakDown ? displacementDown : displacementUp
+            if displaced and sideAllowed
+                modelDirection  := breakDown ? -1 : 1
+                curveExtreme    := breakDown ? low : high
+                curveExtremeBar := bar_index
+                nodeBar         := bar_index
+                nodePrice       := breakDown ? consolBottom : consolTop
+                phase           := PHASE_AWAY
+                buyModelEvent   := breakDown
+                sellModelEvent  := not breakDown
+            else
+                //Left without displacement (or a filtered direction) - not an original consolidation worth tracking
+                doReset    := true
+                dropConsol := true
+
+    else if phase == PHASE_AWAY
+        bool buyModel = modelDirection == -1
+
+        //Track the running extreme of the curve and whether it swept a confirmed swing (the draw on liquidity)
+        if buyModel ? low < curveExtreme : high > curveExtreme
+            curveExtreme    := buyModel ? low : high
+            curveExtremeBar := bar_index
+            if buyModel ? not na(lastSwingLow) and curveExtreme < lastSwingLow : not na(lastSwingHigh) and curveExtreme > lastSwingHigh
+                objectiveSwept := true
+
+        //Reclaiming the original consolidation from the wrong side voids the read
+        bool wrongSideReclaim = buyModel ? close > consolTop : close < consolBottom
+
+        //Smart money reversal - objective swept, then displacement back through the short-term structure of the leg
+        float consolHeight   = consolTop - consolBottom
+        bool  deepEnough     = (buyModel ? consolBottom - curveExtreme : curveExtreme - consolTop) >= consolHeight * minDepthInput
+        bool  structureShift = buyModel
+          ? not na(lastSwingHigh) and lastSwingHigh < consolBottom and close > lastSwingHigh and displacementUp
+          : not na(lastSwingLow) and lastSwingLow > consolTop and close < lastSwingLow and displacementDown
+        bool  reversal = deepEnough and objectiveSwept and structureShift
+
+        if wrongSideReclaim
+            newMarker(bar_index, close, "Invalidated", "Market maker model void - the original consolidation was reclaimed from the wrong side before any reversal", consolColorInput, not buyModel)
+            invalidationEvent := true
+            doReset           := true
+        else if reversal
+            sweepExtreme      := curveExtreme
+            phase             := PHASE_RETURN
+            interiorForming   := false
+            reversalBuyEvent  := buyModel
+            reversalSellEvent := not buyModel
+            newMarker(curveExtremeBar, curveExtreme, "SMR", "Smart money reversal - final sweep at the curve extreme followed by displacement back the other way", buyModel ? bullColorInput : bearColorInput, buyModel)
+            curveSegment(nodeBar, nodePrice, curveExtremeBar, curveExtreme, buyModel ? bearColorInput : bullColorInput)
+            nodeBar   := curveExtremeBar
+            nodePrice := curveExtreme
+        else
+            //Step 2 - label each smaller consolidation formed as price steps toward the objective
+            if interiorForming
+                int lastIndex = array.size(interiorTopArray) - 1
+                if lastIndex >= 0
+                    if close > array.get(interiorTopArray, lastIndex) or close < array.get(interiorBottomArray, lastIndex)
+                        interiorForming := false
+            else if isCompression
+                bool beyondOrigin = buyModel ? windowHigh < consolBottom : windowLow > consolTop
+                bool beyondLast   = true
+                if array.size(interiorTopArray) > 0
+                    beyondLast := buyModel
+                      ? windowHigh < array.get(interiorBottomArray, array.size(interiorBottomArray) - 1)
+                      : windowLow > array.get(interiorTopArray, array.size(interiorTopArray) - 1)
+                if beyondOrigin and beyondLast
+                    color  legColor = buyModel ? bearColorInput : bullColorInput
+                    string zoneTag  = (buyModel ? "RD " : "RA ") + str.tostring(array.size(interiorTopArray) + 1)
+                    array.push(interiorTopArray, windowHigh)
+                    array.push(interiorBottomArray, windowLow)
+                    array.push(interiorHitArray, false)
+                    array.push(interiorBoxArray, newZone(bar_index - consolLengthInput + 1, windowHigh, windowLow, legColor, showLabelsInput ? zoneTag : ""))
+                    interiorForming := true
+                    interiorEvent   := true
+                    float zoneMid = math.avg(windowHigh, windowLow)
+                    curveSegment(nodeBar, nodePrice, bar_index, zoneMid, legColor)
+                    nodeBar   := bar_index
+                    nodePrice := zoneMid
+
+    else if phase == PHASE_RETURN
+        bool buyModel = modelDirection == -1
+        //The read is void if price closes back through the sweep extreme
+        bool sweepViolated = buyModel ? close < sweepExtreme : close > sweepExtreme
+        if sweepViolated
+            newMarker(bar_index, close, "Invalidated", "Market maker model void - price closed back through the sweep extreme after the smart money reversal", consolColorInput, buyModel)
+            invalidationEvent := true
+            doReset           := true
+        else
+            color returnColor = buyModel ? bullColorInput : bearColorInput
+            //Step 5 - the consolidations mapped on the way in are consumed as targets on the way out, nearest first
+            int interiorCount = array.size(interiorTopArray)
+            if interiorCount > 0
+                for i = 0 to interiorCount - 1
+                    int j = interiorCount - 1 - i
+                    if not array.get(interiorHitArray, j)
+                        float targetLevel = buyModel ? array.get(interiorTopArray, j) : array.get(interiorBottomArray, j)
+                        bool  targetHit   = buyModel ? close > targetLevel : close < targetLevel
+                        if targetHit
+                            array.set(interiorHitArray, j, true)
+                            targetsReached += 1
+                            box hitBox = array.get(interiorBoxArray, j)
+                            box.set_right(hitBox, bar_index)
+                            box.set_border_color(hitBox, color.new(returnColor, ZONE_BORDER_TRANSPARENCY))
+                            if showLabelsInput
+                                box.set_text(hitBox, (buyModel ? "RD " : "RA ") + str.tostring(j + 1) + " ✓")
+                                box.set_text_color(hitBox, color.new(returnColor, 25))
+                            curveSegment(nodeBar, nodePrice, bar_index, targetLevel, returnColor)
+                            nodeBar     := bar_index
+                            nodePrice   := targetLevel
+                            targetEvent := true
+            //Completion - the return leg re-delivers price into the original consolidation
+            bool modelComplete = buyModel ? close >= consolBottom : close <= consolTop
+            if modelComplete
+                float originEdge = buyModel ? consolBottom : consolTop
+                curveSegment(nodeBar, nodePrice, bar_index, originEdge, returnColor)
+                newMarker(bar_index, originEdge, buyModel ? "MMBM Complete" : "MMSM Complete", "Market maker model complete - the return leg re-delivered price into the original consolidation", returnColor, buyModel)
+                completeBuyEvent  := buyModel
+                completeSellEvent := not buyModel
+                doReset           := true
+
+    //Clear the tracked state once a read ends; completed or invalidated drawings stay frozen on the chart
+    if doReset
+        if dropConsol and not na(consolBox)
+            box.delete(consolBox)
+        phase           := PHASE_SCAN
+        modelDirection  := 0
+        consolBox       := na
+        consolTop       := na
+        consolBottom    := na
+        curveExtreme    := na
+        curveExtremeBar := na
+        objectiveSwept  := false
+        sweepExtreme    := na
+        nodeBar         := na
+        nodePrice       := na
+        interiorForming := false
+        targetsReached  := 0
+        array.clear(interiorTopArray)
+        array.clear(interiorBottomArray)
+        array.clear(interiorBoxArray)
+        array.clear(interiorHitArray)
+        cooldownUntil   := bar_index + consolLengthInput
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dashboardTable = na
+
+if showDashboardInput and barstate.islast
+    if na(dashboardTable)
+        dashboardTable := table.new(dashboardLocationInput == "Top Right" ? position.top_right : dashboardLocationInput == "Top Left" ? position.top_left : dashboardLocationInput == "Bottom Right" ? position.bottom_right : position.bottom_left
+          , 2, 3, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+    string sizeConst      = dashboardSizeInput == "Tiny" ? size.tiny : dashboardSizeInput == "Small" ? size.small : size.normal
+    bool   buyModelActive = modelDirection == -1
+    bool   noModel        = phase == PHASE_SCAN or phase == PHASE_CONSOL
+    string modelText      = noModel ? "—" : buyModelActive ? "Buy Model (MMBM)" : "Sell Model (MMSM)"
+    string phaseText      = switch phase
+        PHASE_SCAN   => "Scanning"
+        PHASE_CONSOL => "Original Consolidation"
+        PHASE_AWAY   => buyModelActive ? "Sell Side of Curve" : "Buy Side of Curve"
+        =>              buyModelActive ? "Buy Side of Curve" : "Sell Side of Curve"
+    color phaseColor = phase == PHASE_SCAN ? DASH_HEADER : phase == PHASE_CONSOL ? consolColorInput : phase == PHASE_AWAY ? (buyModelActive ? bearColorInput : bullColorInput) : buyModelActive ? bullColorInput : bearColorInput
+    string targetsText = phase == PHASE_RETURN ? str.tostring(targetsReached) + " / " + str.tostring(array.size(interiorTopArray)) + " reached" : phase == PHASE_AWAY ? str.tostring(array.size(interiorTopArray)) + " mapped" : "—"
+
+    table.cell(dashboardTable, 0, 0, "Model", text_color = DASH_HEADER, text_size = sizeConst, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 0, modelText, text_color = noModel ? DASH_HEADER : buyModelActive ? bullColorInput : bearColorInput, text_size = sizeConst, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 1, "Phase", text_color = DASH_HEADER, text_size = sizeConst, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 1, phaseText, text_color = phaseColor, text_size = sizeConst, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 2, "Targets", text_color = DASH_HEADER, text_size = sizeConst, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 2, targetsText, text_color = DASH_TEXT, text_size = sizeConst, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(consolidationEvent, "Original Consolidation Detected", "Market Maker Models: a new original consolidation is forming - watch for a displacement leg away")
+alertcondition(buyModelEvent, "Buy Model Started (MMBM)", "Market Maker Models: price displaced below the original consolidation - sell side of the curve under way, buy model in play")
+alertcondition(sellModelEvent, "Sell Model Started (MMSM)", "Market Maker Models: price displaced above the original consolidation - buy side of the curve under way, sell model in play")
+alertcondition(interiorEvent, "Interior Consolidation Mapped", "Market Maker Models: a smaller consolidation formed on the leg away - added to the return target ladder")
+alertcondition(reversalBuyEvent, "Smart Money Reversal (Buy Model)", "Market Maker Models: sweep and displacement back up at the low of the curve - return leg targets the mapped consolidations above")
+alertcondition(reversalSellEvent, "Smart Money Reversal (Sell Model)", "Market Maker Models: sweep and displacement back down at the high of the curve - return leg targets the mapped consolidations below")
+alertcondition(targetEvent, "Return Target Reached", "Market Maker Models: the return leg consumed an interior consolidation - next objective is the following zone in the ladder")
+alertcondition(completeBuyEvent, "Buy Model Complete", "Market Maker Models: the return leg re-delivered price into the original consolidation - buy model complete")
+alertcondition(completeSellEvent, "Sell Model Complete", "Market Maker Models: the return leg re-delivered price into the original consolidation - sell model complete")
+alertcondition(invalidationEvent, "Model Invalidated", "Market Maker Models: the model read is void - price closed back through a defining extreme")
+
+//---------------------------------------------------------------------------------------------------------------------}

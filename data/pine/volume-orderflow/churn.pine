@@ -1,0 +1,415 @@
+// This work is licensed under Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Churn", shorttitle = "Churn", overlay = true
+  , max_boxes_count  = 500
+  , max_labels_count = 500
+  , max_bars_back    = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+CHURN_COLOR   = #ff9800 // churn, the one accent: heavy effort, no displacement
+BULL_COLOR    = #089981 // resolved upward
+BEAR_COLOR    = #f23645 // resolved downward
+NEUTRAL_COLOR = #787b86 // unresolved zones
+
+color COLOR_HIDDEN = #00000000
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+int CTX_RANGE = 0
+int CTX_ADV   = 1
+int CTX_DEC   = -1
+
+int ST_FORMING = 0
+int ST_WAITING = 1
+int ST_UP      = 2
+int ST_DOWN    = 3
+int ST_EXPIRED = 4
+
+int   MARKER_FADE = 45
+float LOG_FLOOR   = 0.05
+
+string TXT_NA = "-"
+
+string OPEX_QUARTERLY = "Quarterly"
+string OPEX_MONTHLY   = "Monthly"
+string OPEX_OFF       = "Off"
+
+string GRP_DETECT = "Churn Detection"
+string GRP_SEQ    = "Churn Sequences"
+string GRP_ZONE   = "Zones & Resolution"
+string GRP_CTX    = "Context"
+string GRP_DASH   = "Dashboard"
+string GRP_STYLE  = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+lengthInput = input.int(20, "Baseline Length", minval = 5, maxval = 200, group = GRP_DETECT
+  , tooltip = "Bars in the simple averages of volume and bar range that define normal activity. Effort is judged as relative volume against this baseline, never as an absolute share count.")
+
+volMultInput = input.float(1.5, "Volume Threshold", minval = 1, maxval = 10, step = 0.1, group = GRP_DETECT
+  , tooltip = "Minimum relative volume for a churn bar. The usual reading is 1.5x to 2x the recent average or more.")
+
+resultInput = input.float(0.7, "Result Threshold", minval = 0.1, maxval = 1, step = 0.05, group = GRP_DETECT
+  , tooltip = "Maximum bar range as a fraction of the range this much volume normally buys on this instrument. The expected range comes from the symbol's own volume-to-range relationship, fitted on recent bars, so a heavy bar only qualifies when it travels clearly less than similar-volume bars usually do.")
+
+fitInput = input.int(100, "Fit Lookback", minval = 30, maxval = 400, group = GRP_DETECT
+  , tooltip = "Bars used to fit the volume-to-range relationship (log range against log relative volume). Longer windows give a steadier expectation; shorter ones adapt faster to a new regime.")
+
+gapFilterInput = input.bool(true, "Exclude Gap Bars", inline = "gap", group = GRP_DETECT
+  , tooltip = "Skip sessions that open beyond the prior close by this multiple of the average range, the session after them, and sequences that contain either. Heavy, narrow trade right after an earnings or news gap is usually mechanical repositioning rather than informative churn.")
+gapMultInput = input.float(1.0, "", minval = 0.1, maxval = 10, step = 0.1, inline = "gap", group = GRP_DETECT)
+
+opexInput = input.string(OPEX_QUARTERLY, "Skip Expiration Fridays", options = [OPEX_QUARTERLY, OPEX_MONTHLY, OPEX_OFF], group = GRP_DETECT
+  , tooltip = "Skip the third Friday of the month, when option expiration and index rebalancing print heavy, narrow sessions on US equities. Quarterly skips March, June, September and December (quad witching and index rebalances), Monthly skips every expiration. Sequences containing a skipped day are ignored too.")
+
+seqInput = input.bool(true, "Detect Churn Sequences", group = GRP_SEQ
+  , tooltip = "Also flag loud consolidation: a run of bars with elevated turnover trapped inside a band tighter than such a run normally covers, even when no single bar qualifies on its own.")
+
+seqLenInput = input.int(5, "Sequence Length", minval = 3, maxval = 30, group = GRP_SEQ
+  , tooltip = "Bars in the rolling window tested for a churn sequence.")
+
+seqVolInput = input.float(1.25, "Sequence Volume", minval = 1, maxval = 5, step = 0.05, group = GRP_SEQ
+  , tooltip = "Minimum average relative volume across the window, measured against the baseline that ended before the window started.")
+
+seqBandInput = input.float(0.9, "Band Tightness", minval = 0.2, maxval = 2, step = 0.05, group = GRP_SEQ
+  , tooltip = "Maximum high-to-low span of the window as a multiple of average range times the square root of its length, roughly the span a run of that length covers on ordinary trade. Lower values demand a tighter band.")
+
+mergeInput = input.int(3, "Merge Gap", minval = 0, maxval = 20, group = GRP_ZONE
+  , tooltip = "Churn bars or sequences within this many bars of the previous one extend the same zone, so a grind of heavy two-sided trade reads as one event.")
+
+expansionInput = input.float(1.0, "Breakout Expansion", minval = 0.5, maxval = 5, step = 0.1, group = GRP_ZONE
+  , tooltip = "A zone resolves when a bar closes beyond it with a range of at least this multiple of the average range (a directional break with expanding range), or when a close clears it by a full average range. Churn names the opposition, the break names the winner.")
+
+waitInput = input.int(40, "Resolution Window", minval = 5, maxval = 300, group = GRP_ZONE
+  , tooltip = "Bars after the last churn print a zone waits for its break. Zones that never resolve are kept as unresolved.")
+
+ctxLenInput = input.int(20, "Context Lookback", minval = 5, maxval = 200, group = GRP_CTX
+  , tooltip = "Bars before a zone starts that define the move it interrupts. Churn after an advance is the classic distribution warning, after a decline it leans toward accumulation.")
+
+ctxMoveInput = input.float(3.0, "Trend Threshold", minval = 0.5, maxval = 20, step = 0.5, group = GRP_CTX
+  , tooltip = "Net move over the context lookback, in multiples of the average bar range, that counts as a prior advance or decline. Smaller moves grade the zone as inside a range.")
+
+showMarkersInput = input.bool(true, "Churn Bar Markers", group = GRP_STYLE
+  , tooltip = "Diamond above every churn bar. Prints at twice the volume threshold or more are drawn solid, lighter prints faded.")
+
+showZonesInput = input.bool(true, "Churn Zones", group = GRP_STYLE
+  , tooltip = "Box spanning the band the heavy trade was trapped in, extended until it resolves. It turns to the break's color on resolution and gray when the window lapses.")
+
+showLabelsInput = input.bool(true, "Zone Labels", group = GRP_STYLE
+  , tooltip = "Zone length, average relative volume and the context read, plus the verdict once the zone resolves. Hover a label for the close location of the churn prints.")
+
+showBreaksInput = input.bool(true, "Breakout Markers", group = GRP_STYLE
+  , tooltip = "Triangle on the bar that resolves a zone.")
+
+keepInput = input.int(25, "Zones Kept", minval = 1, maxval = 200, group = GRP_STYLE
+  , tooltip = "Most recent zones kept on the chart. The dashboard statistics keep counting every zone.")
+
+showDashInput = input.bool(true, "Show Dashboard", group = GRP_DASH
+  , tooltip = "Current bar's effort and result, the latest zone's status and context, and how every resolved zone on the chart broke, split by the context it formed in.")
+
+dashPosInput = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = GRP_DASH
+  , tooltip = "Dashboard position on the chart.")
+
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = GRP_DASH
+  , tooltip = "Dashboard text size.")
+
+churnColorInput   = input.color(CHURN_COLOR, "Churn", inline = "c1", group = GRP_STYLE)
+neutralColorInput = input.color(NEUTRAL_COLOR, "Unresolved", inline = "c1", group = GRP_STYLE)
+bullColorInput    = input.color(BULL_COLOR, "Broke Up", inline = "c2", group = GRP_STYLE)
+bearColorInput    = input.color(BEAR_COLOR, "Broke Down", inline = "c2", group = GRP_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types & Variables
+//---------------------------------------------------------------------------------------------------------------------{
+//One churn zone: the band heavy two-sided trade was trapped in, and what came of it
+type Zone
+    int   startBar
+    int   lastTrigger
+    float top
+    float bottom
+    int   triggers
+    float relVolSum
+    float clvSum
+    int   context
+    int   state
+    box   bx
+    label lb
+    int   endBar
+
+var array<Zone> zoneArray = array.new<Zone>()
+
+//Resolution tally by context: [up, down, unresolved] for advance, decline, range
+var array<int> advTally = array.new_int(3, 0)
+var array<int> decTally = array.new_int(3, 0)
+var array<int> rngTally = array.new_int(3, 0)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Effort & Result
+//---------------------------------------------------------------------------------------------------------------------{
+float barRange  = high - low
+float avgVolume = ta.sma(nz(volume), lengthInput)
+float avgRange  = ta.sma(barRange, lengthInput)
+float relVol    = avgVolume > 0 ? nz(volume) / avgVolume : na
+float relRange  = avgRange > 0 ? barRange / avgRange : na
+
+//The instrument's own volume-to-range relationship, fitted on prior bars: log(range) = a + b x log(volume)
+float logVol   = math.log(math.max(nz(relVol, 1.), LOG_FLOOR))
+float logRange = math.log(math.max(nz(relRange, 1.), LOG_FLOOR))
+float meanX    = ta.sma(logVol[1], fitInput)
+float meanY    = ta.sma(logRange[1], fitInput)
+float sdX      = ta.stdev(logVol[1], fitInput)
+float sdY      = ta.stdev(logRange[1], fitInput)
+float corrXY   = ta.correlation(logVol[1], logRange[1], fitInput)
+float slope    = sdX > 0 and not na(corrXY) ? corrXY * sdY / sdX : 1.
+float icpt     = meanY - slope * meanX
+
+//Range this bar's volume normally buys, and the share of it the bar actually traveled
+float expectedRange = na(icpt) ? na : math.exp(icpt + slope * logVol)
+float resultRatio   = not na(relRange) and expectedRange > 0 ? relRange / expectedRange : na
+
+bool gapBar = gapFilterInput and not na(avgRange[1]) and math.abs(open - close[1]) >= gapMultInput * avgRange[1]
+
+//Mechanical volume: option expiration and index rebalancing on the third Friday
+bool thirdFriday = dayofweek == dayofweek.friday and dayofmonth >= 15 and dayofmonth <= 21
+bool opexBar     = opexInput != OPEX_OFF and thirdFriday and (opexInput == OPEX_MONTHLY or month % 3 == 0)
+bool skipBar     = gapBar or gapBar[1] or opexBar
+
+//Churn bar: heavy effort, clearly less travel than that effort normally produces
+bool churnBar = barstate.isconfirmed and not na(resultRatio) and relVol >= volMultInput and resultRatio <= resultInput and not skipBar
+
+//Churn sequence: elevated turnover trapped in a band tighter than such a run normally covers
+float seqBaseVol   = avgVolume[seqLenInput]
+float seqBaseRange = avgRange[seqLenInput]
+float seqHigh      = ta.highest(high, seqLenInput)
+float seqLow       = ta.lowest(low, seqLenInput)
+float seqVol       = seqBaseVol > 0 ? math.sum(nz(volume), seqLenInput) / (seqLenInput * seqBaseVol) : na
+float seqSpan      = seqBaseRange > 0 ? (seqHigh - seqLow) / (seqBaseRange * math.sqrt(seqLenInput)) : na
+bool  seqHasGap    = math.sum(skipBar ? 1 : 0, seqLenInput) > 0
+bool  churnSeq     = seqInput and barstate.isconfirmed and not na(seqSpan) and seqVol >= seqVolInput and seqSpan <= seqBandInput and not seqHasGap
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+//Context phrase of a zone
+contextText(int ctx) =>
+    switch ctx
+        CTX_ADV => "after advance, supply risk"
+        CTX_DEC => "after decline, demand lean"
+        => "inside range, two-sided"
+
+//Compact context name for the dashboard
+contextShort(int ctx) =>
+    switch ctx
+        CTX_ADV => "After advance"
+        CTX_DEC => "After decline"
+        => "Inside range"
+
+//Color of a zone's state
+stateColor(int st) =>
+    switch st
+        ST_UP      => bullColorInput
+        ST_DOWN    => bearColorInput
+        ST_EXPIRED => neutralColorInput
+        => churnColorInput
+
+//Second label line: the context read while the zone is open, the context and the verdict once it is settled
+statusLine(Zone z) =>
+    string ctxName = z.context == CTX_ADV ? "after advance" : z.context == CTX_DEC ? "after decline" : "inside range"
+    switch z.state
+        ST_UP      => ctxName + " · broke up"
+        ST_DOWN    => ctxName + " · broke down"
+        ST_EXPIRED => ctxName + " · unresolved"
+        => contextText(z.context)
+
+//Redraws a zone's box and label from its state
+renderZone(Zone z) =>
+    color c = stateColor(z.state)
+    if not na(z.bx)
+        box.set_top(z.bx, z.top)
+        box.set_bottom(z.bx, z.bottom)
+        box.set_border_color(z.bx, color.new(c, z.state == ST_EXPIRED ? 40 : 20))
+        box.set_bgcolor(z.bx, color.new(c, z.state == ST_EXPIRED ? 90 : 82))
+        if z.state == ST_EXPIRED
+            box.set_border_style(z.bx, line.style_dashed)
+    if not na(z.lb)
+        int   barsLong = z.lastTrigger - z.startBar + 1
+        float avgRv    = z.triggers > 0 ? z.relVolSum / z.triggers : na
+        float avgClv   = z.triggers > 0 ? z.clvSum / z.triggers : na
+        //the label sits on the side price left from, so the follow-through never runs over it
+        bool below = z.state == ST_UP
+        label.set_xy(z.lb, z.startBar, below ? z.bottom : z.top)
+        label.set_style(z.lb, below ? label.style_label_upper_left : label.style_label_lower_left)
+        label.set_text(z.lb, "Churn · " + str.tostring(barsLong) + (barsLong == 1 ? " bar · " : " bars · ") + str.tostring(avgRv, "0.0") + "x vol\n" + statusLine(z))
+        label.set_textcolor(z.lb, c)
+        label.set_tooltip(z.lb, "Context: " + contextText(z.context) + "\nAverage relative volume of the churn prints: " + str.tostring(avgRv, "0.00") + "x\nAverage close location: " + str.tostring(avgClv * 100, "0") + "% of the bar range" + (avgClv < 0.4 ? " (closing off the highs)" : avgClv > 0.6 ? " (closing off the lows)" : "") + "\nBand: " + str.tostring(z.bottom, format.mintick) + " to " + str.tostring(z.top, format.mintick))
+
+//Adds a resolved or lapsed zone to the context tally
+tally(Zone z) =>
+    int slot = z.state == ST_UP ? 0 : z.state == ST_DOWN ? 1 : 2
+    if z.context == CTX_ADV
+        advTally.set(slot, advTally.get(slot) + 1)
+    else if z.context == CTX_DEC
+        decTally.set(slot, decTally.get(slot) + 1)
+    else
+        rngTally.set(slot, rngTally.get(slot) + 1)
+
+//Tally text of one context
+tallyText(array<int> t) =>
+    int total = t.get(0) + t.get(1) + t.get(2)
+    total == 0 ? TXT_NA : str.tostring(t.get(1)) + " down · " + str.tostring(t.get(0)) + " up" + (t.get(2) > 0 ? " · " + str.tostring(t.get(2)) + " open" : "")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Zones
+//---------------------------------------------------------------------------------------------------------------------{
+bool zoneEvent  = false
+bool advEvent   = false
+bool decEvent   = false
+bool breakUp    = false
+bool breakDown  = false
+
+bool  trigger  = churnBar or churnSeq
+float trigTop  = churnSeq ? math.max(seqHigh, high) : high
+float trigBot  = churnSeq ? math.min(seqLow, low) : low
+int   trigOff  = churnSeq ? seqLenInput - 1 : 0
+float clvNow   = barRange > 0 ? (close - low) / barRange : 0.5
+float trigRv   = churnSeq ? math.max(nz(seqVol), nz(relVol)) : relVol
+
+Zone last = na
+if zoneArray.size() > 0
+    last := zoneArray.get(zoneArray.size() - 1)
+
+int  trigStart = bar_index - trigOff
+bool lastOpen  = not na(last) and (last.state == ST_FORMING or last.state == ST_WAITING)
+//a print inside the merge gap, or a sequence window reaching back into the open zone, extends it
+bool joinsLast = lastOpen and trigStart <= last.lastTrigger + mergeInput + 1
+//a sequence window reaching back into a zone that already resolved would count the same bars twice
+bool overlapsResolved = not na(last) and not lastOpen and trigStart <= last.endBar
+
+if trigger and joinsLast
+    last.top         := math.max(last.top, trigTop)
+    last.bottom      := math.min(last.bottom, trigBot)
+    last.lastTrigger := bar_index
+    last.triggers    := last.triggers + 1
+    last.relVolSum   := last.relVolSum + trigRv
+    last.clvSum      := last.clvSum + clvNow
+    last.state       := ST_FORMING
+else if trigger and not overlapsResolved
+    if lastOpen and last.state == ST_FORMING
+        last.state := ST_WAITING
+    //the move the churn interrupts, measured up to the bar before the zone starts
+    float moveBefore = nz(avgRange[trigOff + 1]) > 0 ? (close[trigOff + 1] - close[trigOff + 1 + ctxLenInput]) / avgRange[trigOff + 1] : 0.
+    int   ctx        = moveBefore >= ctxMoveInput ? CTX_ADV : moveBefore <= -ctxMoveInput ? CTX_DEC : CTX_RANGE
+    Zone  z          = Zone.new(trigStart, bar_index, trigTop, trigBot, 1, trigRv, clvNow, ctx, ST_FORMING)
+    if showZonesInput
+        z.bx := box.new(z.startBar, z.top, bar_index, z.bottom, border_width = 1)
+    if showLabelsInput
+        z.lb := label.new(z.startBar, z.top, "", color = COLOR_HIDDEN, style = label.style_label_lower_left, size = size.small)
+    zoneArray.push(z)
+    zoneEvent := true
+    advEvent  := ctx == CTX_ADV
+    decEvent  := ctx == CTX_DEC
+    while zoneArray.size() > keepInput
+        Zone old = zoneArray.shift()
+        if old.state == ST_FORMING or old.state == ST_WAITING
+            old.state := ST_EXPIRED
+            tally(old)
+        if not na(old.bx)
+            box.delete(old.bx)
+        if not na(old.lb)
+            label.delete(old.lb)
+
+//Advance every open zone: lapse, break, or keep waiting
+for z in zoneArray
+    if z.state == ST_FORMING or z.state == ST_WAITING
+        bool justTriggered = trigger and z.lastTrigger == bar_index
+        if z.state == ST_FORMING and bar_index - z.lastTrigger > mergeInput
+            z.state := ST_WAITING
+        bool expanding = barRange >= expansionInput * avgRange
+        bool upBreak   = not justTriggered and barstate.isconfirmed and close > z.top and (expanding or close > z.top + avgRange)
+        bool dnBreak   = not justTriggered and barstate.isconfirmed and close < z.bottom and (expanding or close < z.bottom - avgRange)
+        if upBreak or dnBreak
+            z.state  := upBreak ? ST_UP : ST_DOWN
+            z.endBar := bar_index
+            breakUp   := breakUp or upBreak
+            breakDown := breakDown or dnBreak
+            tally(z)
+        else if bar_index - z.lastTrigger > waitInput
+            z.state  := ST_EXPIRED
+            z.endBar := bar_index
+            tally(z)
+        if not na(z.bx)
+            box.set_right(z.bx, bar_index)
+        renderZone(z)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+bool strongChurn = churnBar and relVol >= 2 * volMultInput
+
+plotshape(showMarkersInput and churnBar and strongChurn, "Churn Bar (Heavy)", shape.diamond, location.abovebar, churnColorInput, size = size.tiny)
+plotshape(showMarkersInput and churnBar and not strongChurn, "Churn Bar", shape.diamond, location.abovebar, color.new(churnColorInput, MARKER_FADE), size = size.tiny)
+plotshape(showBreaksInput and breakUp, "Churn Resolved Up", shape.triangleup, location.belowbar, bullColorInput, size = size.small)
+plotshape(showBreaksInput and breakDown, "Churn Resolved Down", shape.triangledown, location.abovebar, bearColorInput, size = size.small)
+
+plot(relVol, "Relative Volume", churnColorInput, display = display.data_window)
+plot(resultRatio, "Range vs Expected", churnColorInput, display = display.data_window)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+dashPosition = switch dashPosInput
+    "Top Left"     => position.top_left
+    "Bottom Right" => position.bottom_right
+    "Bottom Left"  => position.bottom_left
+    => position.top_right
+
+dashTextSize = switch dashSizeInput
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    => size.small
+
+var table dashTable = table.new(dashPosition, 2, 8, bgcolor = DASH_BG, frame_color = DASH_FRAME, frame_width = 1, border_width = 0)
+
+//One label/value row of the dashboard
+dashRow(int row, string name, string value, color nameColor, color valueColor, string tip) =>
+    table.cell(dashTable, 0, row, name, text_color = nameColor, text_size = dashTextSize, text_halign = text.align_left, tooltip = tip)
+    table.cell(dashTable, 1, row, value, text_color = valueColor, text_size = dashTextSize, text_halign = text.align_right)
+
+float cumVolume = ta.cum(nz(volume))
+
+if barstate.islast and showDashInput
+    Zone latest = na
+    if zoneArray.size() > 0
+        latest := zoneArray.get(zoneArray.size() - 1)
+    bool   hasVolume   = cumVolume > 0
+    string statusText  = not hasVolume ? "No volume data" : churnBar ? "Churn bar" : na(latest) ? "Quiet" : latest.state == ST_FORMING ? "Zone forming" : latest.state == ST_WAITING ? "Awaiting break" : latest.state == ST_UP ? "Broke up" : latest.state == ST_DOWN ? "Broke down" : "Unresolved"
+    color  statusColor = churnBar or (not na(latest) and latest.state <= ST_WAITING) ? churnColorInput : na(latest) ? DASH_TEXT : stateColor(latest.state)
+
+    dashRow(0, "Churn", str.tostring(lengthInput) + "-bar", DASH_TEXT, DASH_HEADER, "Baseline length of the volume and range averages.")
+    dashRow(1, "Effort", na(relVol) ? TXT_NA : str.tostring(relVol, "0.00") + "x", DASH_HEADER, not na(relVol) and relVol >= volMultInput ? churnColorInput : DASH_TEXT, "Relative volume: this bar's volume against its baseline average.")
+    dashRow(2, "Result", na(resultRatio) ? TXT_NA : str.tostring(resultRatio, "0.00") + "x", DASH_HEADER, not na(resultRatio) and resultRatio <= resultInput ? churnColorInput : DASH_TEXT, "This bar's range against the range its volume normally buys on this symbol: the result. Below the result threshold on heavy volume is churn.")
+    dashRow(3, "Status", statusText, DASH_HEADER, statusColor, "State of the latest churn zone. Churn names the opposition, not the winner: the break with expanding range is the verdict.")
+    dashRow(4, "Context", na(latest) ? TXT_NA : contextShort(latest.context), DASH_HEADER, DASH_TEXT, "The move the latest zone interrupted.")
+    dashRow(5, "After Advance", tallyText(advTally), DASH_HEADER, DASH_TEXT, "How churn zones that formed after an advance resolved on this chart.")
+    dashRow(6, "After Decline", tallyText(decTally), DASH_HEADER, DASH_TEXT, "How churn zones that formed after a decline resolved on this chart.")
+    dashRow(7, "Inside Range", tallyText(rngTally), DASH_HEADER, DASH_TEXT, "How churn zones that formed without a prior trend resolved on this chart.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(churnBar, "Churn Bar", "Churn on {{ticker}}: heavy volume with clearly less price travel than that volume normally produces ({{interval}})")
+alertcondition(zoneEvent, "Churn Zone", "New churn zone on {{ticker}}: heavy two-sided trade trapped in a tight band ({{interval}})")
+alertcondition(advEvent, "Churn After Advance", "Churn after an advance on {{ticker}}: heavy volume without progress, the classic distribution warning ({{interval}})")
+alertcondition(decEvent, "Churn After Decline", "Churn after a decline on {{ticker}}: heavy volume without progress, leaning toward accumulation ({{interval}})")
+alertcondition(breakUp, "Churn Resolved Up", "A churn zone on {{ticker}} resolved upward with expanding range ({{interval}})")
+alertcondition(breakDown, "Churn Resolved Down", "A churn zone on {{ticker}} resolved downward with expanding range ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

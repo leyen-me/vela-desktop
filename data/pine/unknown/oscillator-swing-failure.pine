@@ -1,0 +1,421 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Oscillator Swing Failure"
+  , shorttitle       = "Oscillator Swing Failure"
+  , overlay          = false
+  , format           = format.price
+  , precision        = 2
+  , max_lines_count  = 500
+  , max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+string OSC_RSI   = "RSI"
+string OSC_STOCH = "Stochastic"
+string OSC_CCI   = "CCI"
+string OSC_MFI   = "MFI"
+
+string AUTO_OPTION   = "Auto"
+string CUSTOM_OPTION = "Custom"
+
+string BOTH_OPTION = "Both"
+string BULL_OPTION = "Bullish Only"
+string BEAR_OPTION = "Bearish Only"
+
+string TOP_RIGHT_OPTION    = "Top Right"
+string TOP_LEFT_OPTION     = "Top Left"
+string BOTTOM_RIGHT_OPTION = "Bottom Right"
+string BOTTOM_LEFT_OPTION  = "Bottom Left"
+
+string TINY_OPTION   = "Tiny"
+string SMALL_OPTION  = "Small"
+string NORMAL_OPTION = "Normal"
+
+//Conventional extreme thresholds per oscillator: 70/30 for RSI, 80/20 for stochastics and MFI, +100/-100 for CCI
+float RSI_UPPER   = 70.0
+float RSI_LOWER   = 30.0
+float STOCH_UPPER = 80.0
+float STOCH_LOWER = 20.0
+float CCI_UPPER   = 100.0
+float CCI_LOWER   = -100.0
+
+//Failure-swing state machine stages: no pattern, extreme found (pullback under way), lower high in place (armed)
+int ST_IDLE     = 0
+int ST_PULLBACK = 1
+int ST_ARMED    = 2
+
+int FULL_TRANSP  = 100
+int HALF_TRANSP  = 50
+int WATCH_TRANSP = 40
+
+color TRANSP_COLOR = #00000000
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+string GROUP_OSC    = "Oscillator"
+string GROUP_DETECT = "Swing Failure"
+string GROUP_THRESH = "Extreme Thresholds"
+string GROUP_DASH   = "Dashboard"
+string GROUP_STYLE  = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+oscTypeInput = input.string(OSC_RSI, "Oscillator"
+  , options = [OSC_RSI, OSC_STOCH, OSC_CCI, OSC_MFI]
+  , group   = GROUP_OSC
+  , tooltip = "Momentum oscillator the failure swing is detected on. Wilder introduced the template on RSI, and traders have generalized it to stochastics, CCI, MFI and other oscillators - the pattern is self-contained on whichever oscillator is selected.")
+
+sourceInput = input.source(close, "Source"
+  , group   = GROUP_OSC
+  , tooltip = "Price series fed to RSI and CCI. The Stochastic always uses source/high/low and MFI always uses hlc3 with volume.")
+
+lengthInput = input.int(14, "Length"
+  , minval  = 2
+  , group   = GROUP_OSC
+  , tooltip = "Oscillator lookback: RSI length, %K length for the Stochastic, CCI length, or MFI length. 14 is the common default for all of them.")
+
+kSmoothInput = input.int(3, "%K Smoothing"
+  , minval  = 1
+  , group   = GROUP_OSC
+  , tooltip = "Stochastic only: moving average length applied to the raw %K line. 3 gives the classic slow stochastic, 1 the fast version.")
+
+pivotLenInput = input.int(3, "Swing Pivot Length"
+  , minval  = 1
+  , maxval  = 50
+  , group   = GROUP_DETECT
+  , tooltip = "Bars to the left and right an oscillator swing must dominate to count as a pivot. Smaller values catch the quick, tight failures the pattern favors; larger values filter noise but confirm swings later.")
+
+maxBarsInput = input.int(40, "Max Pattern Duration"
+  , minval  = 10
+  , maxval  = 500
+  , group   = GROUP_DETECT
+  , tooltip = "Maximum bars allowed between the initial extreme and the fail-point break. Failures that complete quickly carry more weight - a sprawling, slow pattern is usually just range noise, so it is discarded once this budget is exceeded.")
+
+insideThresholdInput = input.bool(false, "Retest Inside Threshold"
+  , group   = GROUP_DETECT
+  , tooltip = "When enabled, the bearish lower high must form at or below the overbought level (and the bullish higher low at or above the oversold level), keeping the failed re-extension out of the extreme zone.")
+
+directionInput = input.string(BOTH_OPTION, "Signals"
+  , options = [BOTH_OPTION, BULL_OPTION, BEAR_OPTION]
+  , group   = GROUP_DETECT
+  , tooltip = "Restrict detection to one side. In strong trends the pattern generates repeated false reversals, so many traders only act on failures aligned with the higher-timeframe direction.")
+
+thresholdModeInput = input.string(AUTO_OPTION, "Thresholds"
+  , options = [AUTO_OPTION, CUSTOM_OPTION]
+  , group   = GROUP_THRESH
+  , tooltip = "Auto applies the selected oscillator's convention - 70/30 for RSI, 80/20 for the Stochastic and MFI, +100/-100 for CCI. Custom uses the two levels below instead.")
+
+upperCustomInput = input.float(70, "Custom Overbought"
+  , step    = 1
+  , group   = GROUP_THRESH
+  , tooltip = "Overbought boundary used when Thresholds is set to Custom. The first peak of a bearish failure must form at or above it.")
+
+lowerCustomInput = input.float(30, "Custom Oversold"
+  , step    = 1
+  , group   = GROUP_THRESH
+  , tooltip = "Oversold boundary used when Thresholds is set to Custom. The first trough of a bullish failure must form at or below it.")
+
+showDashInput = input.bool(true, "Show Dashboard"
+  , group   = GROUP_DASH
+  , tooltip = "Compact panel with the live state of each side of the pattern and the extreme thresholds in force.")
+
+dashLocationInput = input.string(TOP_RIGHT_OPTION, "Location"
+  , options = [TOP_RIGHT_OPTION, TOP_LEFT_OPTION, BOTTOM_RIGHT_OPTION, BOTTOM_LEFT_OPTION]
+  , group   = GROUP_DASH
+  , tooltip = "Corner of the pane holding the dashboard.")
+
+dashSizeInput = input.string(SMALL_OPTION, "Size"
+  , options = [TINY_OPTION, SMALL_OPTION, NORMAL_OPTION]
+  , group   = GROUP_DASH
+  , tooltip = "Text size of the dashboard.")
+
+showPatternInput = input.bool(true, "Pattern Lines"
+  , group   = GROUP_STYLE
+  , tooltip = "Draws the completed extreme / fail point / retest structure on the oscillator, plus a dotted watch line at the fail point while a setup is armed.")
+
+showLabelsInput = input.bool(true, "Signal Labels"
+  , group   = GROUP_STYLE
+  , tooltip = "Marks the bar where the fail point breaks - the trigger many practitioners treat as the entry or confirmation moment.")
+
+bullColorInput = input.color(#089981, "Bullish Color", group = GROUP_STYLE)
+
+bearColorInput = input.color(#f23645, "Bearish Color", group = GROUP_STYLE)
+
+levelsColorInput = input.color(#787b86, "Levels Color", group = GROUP_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Oscillator
+//---------------------------------------------------------------------------------------------------------------------{
+
+//All candidate oscillators are computed on every bar so the ta.* calls never sit inside a branch
+float rawStoch   = ta.stoch(sourceInput, high, low, lengthInput)
+float stochValue = ta.sma(rawStoch, kSmoothInput)
+float rsiValue   = ta.rsi(sourceInput, lengthInput)
+float cciValue   = ta.cci(sourceInput, lengthInput)
+float mfiValue   = ta.mfi(hlc3, lengthInput)
+
+float osc = switch oscTypeInput
+    OSC_RSI   => rsiValue
+    OSC_STOCH => stochValue
+    OSC_CCI   => cciValue
+    => mfiValue
+
+//Extreme thresholds follow the selected oscillator's convention in Auto mode, custom levels otherwise
+float autoUpper = switch oscTypeInput
+    OSC_RSI => RSI_UPPER
+    OSC_CCI => CCI_UPPER
+    => STOCH_UPPER
+
+float autoLower = switch oscTypeInput
+    OSC_RSI => RSI_LOWER
+    OSC_CCI => CCI_LOWER
+    => STOCH_LOWER
+
+float upperThreshold = thresholdModeInput == AUTO_OPTION ? autoUpper : upperCustomInput
+float lowerThreshold = thresholdModeInput == AUTO_OPTION ? autoLower : lowerCustomInput
+float centerLevel    = (upperThreshold + lowerThreshold) / 2
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Swing Failure Detection
+//---------------------------------------------------------------------------------------------------------------------{
+
+//Oscillator swings - the pattern is defined purely on the indicator, so pivots are taken on the oscillator itself
+float pivotHighVal = ta.pivothigh(osc, pivotLenInput, pivotLenInput)
+float pivotLowVal  = ta.pivotlow(osc, pivotLenInput, pivotLenInput)
+bool  newPivotHigh = not na(pivotHighVal)
+bool  newPivotLow  = not na(pivotLowVal)
+int   pivotBar     = bar_index - pivotLenInput
+
+//Pivot-length delayed oscillator value, used to track the interim trough/peak without letting bars that come
+//after the retest swing contaminate the fail point
+float oscDelayed = osc[pivotLenInput]
+
+bool detectBearish = directionInput != BULL_OPTION
+bool detectBullish = directionInput != BEAR_OPTION
+
+//Bearish machine: overbought peak -> interim trough (fail point) -> lower high -> break below the fail point
+var int   bearState     = ST_IDLE
+var float bearPeakVal   = na
+var int   bearPeakBar   = na
+var float bearMinVal    = na
+var int   bearMinBar    = na
+var float bearRetestVal = na
+var int   bearRetestBar = na
+var float bearFailVal   = na
+var int   bearFailBar   = na
+
+bool bearSignal = false
+bool bearArmed  = false
+
+if detectBearish and not na(osc)
+    //Invalidation: momentum re-extends beyond the first extreme, or the pattern sprawls past its duration budget
+    if bearState != ST_IDLE and (osc > bearPeakVal or bar_index - bearPeakBar > maxBarsInput)
+        bearState := ST_IDLE
+
+    //Running interim trough between the extreme peak and the (future) lower high
+    if bearState == ST_PULLBACK and not na(oscDelayed) and oscDelayed < bearMinVal
+        bearMinVal := oscDelayed
+        bearMinBar := pivotBar
+
+    if newPivotHigh
+        if bearState == ST_IDLE and pivotHighVal >= upperThreshold
+            //Step 1: oscillator peak inside its overbought region seeds the pattern
+            bearPeakVal := pivotHighVal
+            bearPeakBar := pivotBar
+            bearMinVal  := pivotHighVal
+            bearMinBar  := pivotBar
+            bearState   := ST_PULLBACK
+        else if bearState == ST_PULLBACK
+            if pivotHighVal >= bearPeakVal
+                //The rally exceeded the prior extreme - no failure, restart from the fresh, higher peak
+                bearPeakVal := pivotHighVal
+                bearPeakBar := pivotBar
+                bearMinVal  := pivotHighVal
+                bearMinBar  := pivotBar
+            else if (not insideThresholdInput or pivotHighVal <= upperThreshold) and bearMinVal < pivotHighVal
+                //Step 3: the rally stalled below the first peak - lower high in place, fail point locked in
+                bearRetestVal := pivotHighVal
+                bearRetestBar := pivotBar
+                bearFailVal   := bearMinVal
+                bearFailBar   := bearMinBar
+                bearState     := ST_ARMED
+                bearArmed     := true
+
+    //Step 4: the signal triggers when the oscillator breaks below the fail point
+    if bearState == ST_ARMED and osc < bearFailVal
+        bearSignal := true
+        bearState  := ST_IDLE
+
+//Bullish machine: oversold trough -> interim peak (fail point) -> higher low -> break above the fail point
+var int   bullState     = ST_IDLE
+var float bullTroughVal = na
+var int   bullTroughBar = na
+var float bullMaxVal    = na
+var int   bullMaxBar    = na
+var float bullRetestVal = na
+var int   bullRetestBar = na
+var float bullFailVal   = na
+var int   bullFailBar   = na
+
+bool bullSignal = false
+bool bullArmed  = false
+
+if detectBullish and not na(osc)
+    if bullState != ST_IDLE and (osc < bullTroughVal or bar_index - bullTroughBar > maxBarsInput)
+        bullState := ST_IDLE
+
+    if bullState == ST_PULLBACK and not na(oscDelayed) and oscDelayed > bullMaxVal
+        bullMaxVal := oscDelayed
+        bullMaxBar := pivotBar
+
+    if newPivotLow
+        if bullState == ST_IDLE and pivotLowVal <= lowerThreshold
+            bullTroughVal := pivotLowVal
+            bullTroughBar := pivotBar
+            bullMaxVal    := pivotLowVal
+            bullMaxBar    := pivotBar
+            bullState     := ST_PULLBACK
+        else if bullState == ST_PULLBACK
+            if pivotLowVal <= bullTroughVal
+                bullTroughVal := pivotLowVal
+                bullTroughBar := pivotBar
+                bullMaxVal    := pivotLowVal
+                bullMaxBar    := pivotBar
+            else if (not insideThresholdInput or pivotLowVal >= lowerThreshold) and bullMaxVal > pivotLowVal
+                bullRetestVal := pivotLowVal
+                bullRetestBar := pivotBar
+                bullFailVal   := bullMaxVal
+                bullFailBar   := bullMaxBar
+                bullState     := ST_ARMED
+                bullArmed     := true
+
+    if bullState == ST_ARMED and osc > bullFailVal
+        bullSignal := true
+        bullState  := ST_IDLE
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+
+color oscColor = osc > centerLevel ? bullColorInput : bearColorInput
+
+oscPlotId = plot(osc, "Oscillator", oscColor, 1)
+
+centerPlotId = plot(centerLevel, "Center Anchor", editable = false, display = display.none)
+
+//Vertical gradient fill from the center of the extreme band to the oscillator value, fully transparent at the center
+fill(oscPlotId, centerPlotId
+  , top_value    = math.max(osc, centerLevel)
+  , bottom_value = math.min(osc, centerLevel)
+  , top_color    = osc > centerLevel ? color.new(bullColorInput, HALF_TRANSP) : color.new(bearColorInput, FULL_TRANSP)
+  , bottom_color = osc > centerLevel ? color.new(bullColorInput, FULL_TRANSP) : color.new(bearColorInput, HALF_TRANSP)
+  , title        = "Gradient Fill")
+
+//Dashed extreme thresholds and dotted center, drawn as lines because Auto mode derives them from the oscillator
+if barstate.isfirst
+    line.new(bar_index, upperThreshold, bar_index + 1, upperThreshold, extend = extend.both, color = levelsColorInput, style = line.style_dashed)
+    line.new(bar_index, lowerThreshold, bar_index + 1, lowerThreshold, extend = extend.both, color = levelsColorInput, style = line.style_dashed)
+    line.new(bar_index, centerLevel, bar_index + 1, centerLevel, extend = extend.both, color = color.new(levelsColorInput, HALF_TRANSP), style = line.style_dotted)
+
+//Completed pattern: extreme -> fail point -> lower high/higher low -> break, with the broken fail level dashed
+if bearSignal and showPatternInput
+    line.new(bearPeakBar, bearPeakVal, bearFailBar, bearFailVal, color = bearColorInput)
+    line.new(bearFailBar, bearFailVal, bearRetestBar, bearRetestVal, color = bearColorInput)
+    line.new(bearRetestBar, bearRetestVal, bar_index, osc, color = bearColorInput)
+    line.new(bearFailBar, bearFailVal, bar_index, bearFailVal, color = bearColorInput, style = line.style_dashed)
+
+if bullSignal and showPatternInput
+    line.new(bullTroughBar, bullTroughVal, bullFailBar, bullFailVal, color = bullColorInput)
+    line.new(bullFailBar, bullFailVal, bullRetestBar, bullRetestVal, color = bullColorInput)
+    line.new(bullRetestBar, bullRetestVal, bar_index, osc, color = bullColorInput)
+    line.new(bullFailBar, bullFailVal, bar_index, bullFailVal, color = bullColorInput, style = line.style_dashed)
+
+//Signal labels at the fail-point break, with the pattern's depth and speed - deeper extremes and quick
+//completions carry more weight
+if bearSignal and showLabelsInput
+    string bearTip = "Bearish swing failure on the " + oscTypeInput + ": peak " + str.tostring(bearPeakVal, "#.##")
+      + " in the extreme zone, lower high " + str.tostring(bearRetestVal, "#.##") + ", fail point "
+      + str.tostring(bearFailVal, "#.##") + " broken. Extreme depth " + str.tostring(bearPeakVal - upperThreshold, "#.##")
+      + ", completed in " + str.tostring(bar_index - bearPeakBar) + " bars."
+    label.new(bar_index, osc, "Swing Failure", color = TRANSP_COLOR, textcolor = bearColorInput, style = label.style_label_down, size = size.small, tooltip = bearTip)
+
+if bullSignal and showLabelsInput
+    string bullTip = "Bullish swing failure on the " + oscTypeInput + ": trough " + str.tostring(bullTroughVal, "#.##")
+      + " in the extreme zone, higher low " + str.tostring(bullRetestVal, "#.##") + ", fail point "
+      + str.tostring(bullFailVal, "#.##") + " broken. Extreme depth " + str.tostring(lowerThreshold - bullTroughVal, "#.##")
+      + ", completed in " + str.tostring(bar_index - bullTroughBar) + " bars."
+    label.new(bar_index, osc, "Swing Failure", color = TRANSP_COLOR, textcolor = bullColorInput, style = label.style_label_up, size = size.small, tooltip = bullTip)
+
+//Dotted watch line at the fail point while a setup is armed - the level whose break triggers the signal
+var line bearWatchLineId = na
+
+if bearState == ST_ARMED and showPatternInput
+    if na(bearWatchLineId)
+        bearWatchLineId := line.new(bearFailBar, bearFailVal, bar_index, bearFailVal, color = color.new(bearColorInput, WATCH_TRANSP), style = line.style_dotted)
+    else
+        line.set_x2(bearWatchLineId, bar_index)
+else if not na(bearWatchLineId)
+    line.delete(bearWatchLineId)
+    bearWatchLineId := na
+
+var line bullWatchLineId = na
+
+if bullState == ST_ARMED and showPatternInput
+    if na(bullWatchLineId)
+        bullWatchLineId := line.new(bullFailBar, bullFailVal, bar_index, bullFailVal, color = color.new(bullColorInput, WATCH_TRANSP), style = line.style_dotted)
+    else
+        line.set_x2(bullWatchLineId, bar_index)
+else if not na(bullWatchLineId)
+    line.delete(bullWatchLineId)
+    bullWatchLineId := na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+
+dashLocation = switch dashLocationInput
+    TOP_RIGHT_OPTION    => position.top_right
+    TOP_LEFT_OPTION     => position.top_left
+    BOTTOM_RIGHT_OPTION => position.bottom_right
+    => position.bottom_left
+
+dashTextSize = switch dashSizeInput
+    TINY_OPTION  => size.tiny
+    SMALL_OPTION => size.small
+    => size.normal
+
+var table dashTable = table.new(dashLocation, 2, 3, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+if showDashInput and barstate.islast
+    string bearStatus = not detectBearish ? "Off" : bearState == ST_ARMED ? "Armed < " + str.tostring(bearFailVal, "#.##") : bearState == ST_PULLBACK ? "Extreme Set" : "Idle"
+    string bullStatus = not detectBullish ? "Off" : bullState == ST_ARMED ? "Armed > " + str.tostring(bullFailVal, "#.##") : bullState == ST_PULLBACK ? "Extreme Set" : "Idle"
+
+    table.cell(dashTable, 0, 0, "Bearish", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left, tooltip = "Extreme Set - overbought peak found, waiting for the lower high. Armed - lower high in place, a break below the shown fail point triggers the signal.")
+    table.cell(dashTable, 1, 0, bearStatus, text_color = bearState == ST_ARMED ? bearColorInput : DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 1, "Bullish", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left, tooltip = "Extreme Set - oversold trough found, waiting for the higher low. Armed - higher low in place, a break above the shown fail point triggers the signal.")
+    table.cell(dashTable, 1, 1, bullStatus, text_color = bullState == ST_ARMED ? bullColorInput : DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 2, "Extremes", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left, tooltip = "Extreme thresholds in force for the selected oscillator.")
+    table.cell(dashTable, 1, 2, str.tostring(upperThreshold, "#.##") + " / " + str.tostring(lowerThreshold, "#.##"), text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(bearSignal, "Bearish Swing Failure", "Bearish oscillator swing failure on {{ticker}} ({{interval}}) - the oscillator peaked in overbought, made a lower high and broke below its fail point")
+
+alertcondition(bullSignal, "Bullish Swing Failure", "Bullish oscillator swing failure on {{ticker}} ({{interval}}) - the oscillator bottomed in oversold, made a higher low and broke above its fail point")
+
+alertcondition(bearArmed, "Bearish Swing Failure Armed", "Bearish swing failure armed on {{ticker}} ({{interval}}) - lower high in place, watching for a break below the fail point")
+
+alertcondition(bullArmed, "Bullish Swing Failure Armed", "Bullish swing failure armed on {{ticker}} ({{interval}}) - higher low in place, watching for a break above the fail point")
+
+//---------------------------------------------------------------------------------------------------------------------}

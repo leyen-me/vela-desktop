@@ -1,0 +1,276 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Hikkake", shorttitle = "Hikkake", overlay = true, format = format.price, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+NEUTRAL_COLOR = #787b86
+LABEL_BG      = #00000000
+
+TRIGGER_WICK  = "Wick"
+TRIGGER_CLOSE = "Close"
+
+STOP_BREAK  = "False Break Extreme"
+STOP_MOTHER = "Mother Bar Extreme"
+
+ZONE_BG_TRANSPARENCY     = 90
+ZONE_BORDER_TRANSPARENCY = 60
+MOTHER_TRANSPARENCY      = 40
+VOID_LINE_TRANSPARENCY   = 75
+VOID_BG_TRANSPARENCY     = 94
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+triggerWindowInput = input.int(3, "Trigger Window (Bars)", minval = 1, maxval = 20, group = "Pattern Detection",
+  tooltip = "Number of bars after the false break within which price must come back through the opposite extreme of the inside bar. If the trigger has not fired inside this window the setup is voided - a late trigger has usually lost the trap logic, because the trapped breakout traders have already had time to exit. The classic convention is roughly three bars.")
+
+triggerModeInput = input.string(TRIGGER_WICK, "Trigger Condition", options = [TRIGGER_WICK, TRIGGER_CLOSE], group = "Pattern Detection",
+  tooltip = "How the opposite extreme of the inside bar must be taken out. 'Wick' triggers as soon as price trades through the level, matching the resting stop order placed beyond the opposite extreme. 'Close' waits for a bar to close beyond the level, a stricter confirmation that filters marginal pokes.")
+
+maxInsideSizeInput = input.int(100, "Max Inside Bar Size %", minval = 10, maxval = 100, group = "Significance Filters",
+  tooltip = "Maximum inside bar range as a percentage of the mother bar range. The definition only requires containment, but tighter is better: a narrow inside bar represents genuine equilibrium, so its breakout attracts more committed orders and its failure traps them more decisively. 100 accepts any inside bar.")
+
+motherHoldInput = input.bool(false, "Cancel On Close Beyond Mother Bar", group = "Significance Filters",
+  tooltip = "Voids an armed setup once a bar closes beyond the mother bar extreme in the direction of the false break. Quality false breaks stall without even closing beyond the mother bar; a close beyond it says the break is following through rather than failing.")
+
+trendFilterInput = input.bool(false, "Trend Alignment", inline = "trend", group = "Significance Filters",
+  tooltip = "Only arm setups whose trigger direction agrees with the prevailing trend, measured as the close relative to a simple moving average at the inside bar. Many traders treat countertrend hikkakes as lower quality and only take those that resolve with the trend.")
+
+trendLenInput = input.int(50, "SMA Length", minval = 2, maxval = 500, inline = "trend", group = "Significance Filters",
+  tooltip = "Length of the simple moving average used by the trend alignment filter.")
+
+stopModeInput = input.string(STOP_BREAK, "Invalidation Level", options = [STOP_BREAK, STOP_MOTHER], group = "Trigger & Stop Levels",
+  tooltip = "Reference price for the invalidation level. 'False Break Extreme' keeps the standard stop just beyond the extreme reached by the failed break, since price returning there reopens the question the trap was supposed to settle. 'Mother Bar Extreme' is the conservative alternative at the far side of the mother bar.")
+
+showStopInput = input.bool(true, "Show Invalidation Level", group = "Trigger & Stop Levels",
+  tooltip = "Draw the invalidation level as a dashed line while the setup is armed and project it once the pattern triggers. It tracks the running extreme of the false break, or holds the mother bar extreme, per the selected reference.")
+
+showTargetInput = input.bool(false, "Show Projected Target", group = "Trigger & Stop Levels",
+  tooltip = "Once a hikkake triggers, project the mother bar's range from the trigger level - a common initial objective for the pattern. Further targets are context work: the next mapped level, or a trailing method once the move exceeds the pattern's own height.")
+
+extendInput = input.int(10, "Levels Extension", minval = 1, maxval = 250, group = "Trigger & Stop Levels",
+  tooltip = "Number of bars the trigger, stop and target levels extend to the right of the trigger bar.")
+
+showMotherLevelsInput = input.bool(true, "Mother Bar Levels", group = "Style",
+  tooltip = "Draw dotted reference lines at the mother bar high and low. Together with the inside bar extremes these are the four reference prices every later decision keys off.")
+
+showVoidedInput = input.bool(false, "Show Voided Setups", group = "Style",
+  tooltip = "Keep setups whose trigger never fired inside the window on the chart, greyed out. Disabled, voided setups are removed so only armed and triggered patterns remain.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "colors", group = "Style",
+  tooltip = "Color of bullish setups: zone, trigger level, pattern label and target.")
+
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "colors", group = "Style",
+  tooltip = "Color of bearish setups: zone, trigger level, pattern label and target.")
+
+neutralColorInput = input.color(NEUTRAL_COLOR, "Levels", inline = "colors", group = "Style",
+  tooltip = "Color of the mother bar reference levels, the invalidation level and voided setups.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types
+//---------------------------------------------------------------------------------------------------------------------{
+//One armed hikkake: the four reference prices, the false break excursion and the setup's reference-frame drawings
+type Setup
+    int   dir
+    int   breakIndex
+    float motherHigh
+    float motherLow
+    float insideHigh
+    float insideLow
+    float breakExtreme
+    box   zoneBox
+    line  triggerLine
+    line  stopLine
+    line  motherHighLine
+    line  motherLowLine
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+//Current invalidation price of a setup, per the selected reference
+stopPrice(Setup setup) =>
+    stopModeInput == STOP_MOTHER ? (setup.dir == 1 ? setup.motherLow : setup.motherHigh) : setup.breakExtreme
+
+//Build an armed setup and its reference frame once a one-sided false break of the inside bar confirms
+armSetup(int dir, float motherHigh, float motherLow, float insideHigh, float insideLow) =>
+    color setupColor   = dir == 1 ? bullColorInput : bearColorInput
+    float triggerLevel = dir == 1 ? insideHigh : insideLow
+    box zoneBox = box.new(bar_index - 1, insideHigh, bar_index, insideLow
+      , border_color = color.new(setupColor, ZONE_BORDER_TRANSPARENCY)
+      , border_width = 1
+      , bgcolor      = color.new(setupColor, ZONE_BG_TRANSPARENCY))
+    line triggerLine = line.new(bar_index - 1, triggerLevel, bar_index, triggerLevel, color = setupColor, width = 1)
+    line motherHighLine = showMotherLevelsInput ? line.new(bar_index - 2, motherHigh, bar_index, motherHigh, color = color.new(neutralColorInput, MOTHER_TRANSPARENCY), style = line.style_dotted) : line(na)
+    line motherLowLine  = showMotherLevelsInput ? line.new(bar_index - 2, motherLow, bar_index, motherLow, color = color.new(neutralColorInput, MOTHER_TRANSPARENCY), style = line.style_dotted) : line(na)
+    Setup setup = Setup.new(
+       dir            = dir
+     , breakIndex     = bar_index
+     , motherHigh     = motherHigh
+     , motherLow      = motherLow
+     , insideHigh     = insideHigh
+     , insideLow      = insideLow
+     , breakExtreme   = dir == 1 ? low : high
+     , zoneBox        = zoneBox
+     , triggerLine    = triggerLine
+     , stopLine       = line(na)
+     , motherHighLine = motherHighLine
+     , motherLowLine  = motherLowLine)
+    if showStopInput
+        float stopLevel = stopPrice(setup)
+        setup.stopLine := line.new(bar_index, stopLevel, bar_index, stopLevel, color = neutralColorInput, style = line.style_dashed)
+    setup
+
+//Advance a live setup's reference frame to the current bar and refresh the tracked false-break extreme
+extendSetup(Setup setup) =>
+    setup.breakExtreme := setup.dir == 1 ? math.min(setup.breakExtreme, low) : math.max(setup.breakExtreme, high)
+    box.set_right(setup.zoneBox, bar_index)
+    line.set_x2(setup.triggerLine, bar_index)
+    if not na(setup.stopLine)
+        float stopLevel = stopPrice(setup)
+        line.set_xy1(setup.stopLine, setup.breakIndex, stopLevel)
+        line.set_xy2(setup.stopLine, bar_index, stopLevel)
+    if not na(setup.motherHighLine)
+        line.set_x2(setup.motherHighLine, bar_index)
+    if not na(setup.motherLowLine)
+        line.set_x2(setup.motherLowLine, bar_index)
+
+//Resolve a triggered setup: freeze its frame, mark the trigger bar and project the trade levels forward
+fireSetup(Setup setup) =>
+    color  setupColor   = setup.dir == 1 ? bullColorInput : bearColorInput
+    float  triggerLevel = setup.dir == 1 ? setup.insideHigh : setup.insideLow
+    float  stopLevel    = stopPrice(setup)
+    int    projectIndex = bar_index + extendInput
+    int    elapsedBars  = bar_index - setup.breakIndex
+    box.set_right(setup.zoneBox, bar_index)
+    line.set_x2(setup.triggerLine, projectIndex)
+    if not na(setup.motherHighLine)
+        line.set_x2(setup.motherHighLine, bar_index)
+    if not na(setup.motherLowLine)
+        line.set_x2(setup.motherLowLine, bar_index)
+    label.new(projectIndex, triggerLevel, "Trigger", style = label.style_label_left, color = LABEL_BG, textcolor = setupColor, size = size.tiny)
+    if not na(setup.stopLine)
+        line.set_xy1(setup.stopLine, setup.breakIndex, stopLevel)
+        line.set_xy2(setup.stopLine, projectIndex, stopLevel)
+        label.new(projectIndex, stopLevel, "Stop", style = label.style_label_left, color = LABEL_BG, textcolor = neutralColorInput, size = size.tiny)
+    string targetText = ""
+    if showTargetInput
+        float motherSpan  = setup.motherHigh - setup.motherLow
+        float targetLevel = setup.dir == 1 ? triggerLevel + motherSpan : triggerLevel - motherSpan
+        line.new(bar_index, targetLevel, projectIndex, targetLevel, color = setupColor, style = line.style_dotted)
+        label.new(projectIndex, targetLevel, "Target", style = label.style_label_left, color = LABEL_BG, textcolor = setupColor, size = size.tiny)
+        targetText := "\nTarget: " + str.tostring(targetLevel, format.mintick)
+    string labelTip = (setup.dir == 1 ? "Bullish hikkake" : "Bearish hikkake")
+      + "\nFalse break " + (setup.dir == 1 ? "below" : "above") + " the inside bar failed at " + str.tostring(setup.breakExtreme, format.mintick)
+      + "\nTriggered " + str.tostring(elapsedBars) + (elapsedBars == 1 ? " bar" : " bars") + " after the false break"
+      + "\nTrigger: " + str.tostring(triggerLevel, format.mintick)
+      + "\nStop: " + str.tostring(stopLevel, format.mintick)
+    label.new(bar_index, na, "Hikkake"
+      , yloc      = setup.dir == 1 ? yloc.belowbar : yloc.abovebar
+      , style     = setup.dir == 1 ? label.style_label_up : label.style_label_down
+      , color     = setupColor
+      , textcolor = chart.bg_color
+      , size      = size.small
+      , tooltip   = labelTip)
+
+//Retire a setup whose trigger never fired: grey its frame out, or remove it to keep the chart clean
+voidSetup(Setup setup, int rightIndex) =>
+    if showVoidedInput
+        color fadedLine = color.new(neutralColorInput, VOID_LINE_TRANSPARENCY)
+        box.set_right(setup.zoneBox, rightIndex)
+        box.set_border_color(setup.zoneBox, fadedLine)
+        box.set_bgcolor(setup.zoneBox, color.new(neutralColorInput, VOID_BG_TRANSPARENCY))
+        line.set_x2(setup.triggerLine, rightIndex)
+        line.set_color(setup.triggerLine, fadedLine)
+        if not na(setup.stopLine)
+            line.set_x2(setup.stopLine, rightIndex)
+            line.set_color(setup.stopLine, fadedLine)
+        if not na(setup.motherHighLine)
+            line.set_x2(setup.motherHighLine, rightIndex)
+            line.set_color(setup.motherHighLine, fadedLine)
+        if not na(setup.motherLowLine)
+            line.set_x2(setup.motherLowLine, rightIndex)
+            line.set_color(setup.motherLowLine, fadedLine)
+    else
+        box.delete(setup.zoneBox)
+        line.delete(setup.triggerLine)
+        line.delete(setup.stopLine)
+        line.delete(setup.motherHighLine)
+        line.delete(setup.motherLowLine)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+var array<Setup> armedSetupsArray = array.new<Setup>()
+
+//Trend context, computed unconditionally on every bar and read at the inside bar
+float trendSma     = ta.sma(close, trendLenInput)
+float trendSmaPrev = trendSma[1]
+
+bool bullArmedEvent   = false
+bool bearArmedEvent   = false
+bool bullTriggerEvent = false
+bool bearTriggerEvent = false
+
+if barstate.isconfirmed
+    //Resolve live setups first: the opposite-extreme trigger, filter cancellation, then window expiry
+    int i = 0
+    while i < array.size(armedSetupsArray)
+        Setup setup      = array.get(armedSetupsArray, i)
+        bool  removeSetup = false
+        if bar_index - setup.breakIndex <= triggerWindowInput
+            extendSetup(setup)
+            float triggerLevel = setup.dir == 1 ? setup.insideHigh : setup.insideLow
+            bool  triggered    = false
+            if triggerModeInput == TRIGGER_WICK
+                triggered := setup.dir == 1 ? high > triggerLevel : low < triggerLevel
+            else
+                triggered := setup.dir == 1 ? close > triggerLevel : close < triggerLevel
+            bool cancelled = not triggered and motherHoldInput and (setup.dir == 1 ? close < setup.motherLow : close > setup.motherHigh)
+            if triggered
+                fireSetup(setup)
+                if setup.dir == 1
+                    bullTriggerEvent := true
+                else
+                    bearTriggerEvent := true
+                removeSetup := true
+            else if cancelled
+                voidSetup(setup, bar_index)
+                removeSetup := true
+        else
+            voidSetup(setup, setup.breakIndex + triggerWindowInput)
+            removeSetup := true
+        if removeSetup
+            array.remove(armedSetupsArray, i)
+        else
+            i += 1
+
+    //Fresh pattern geometry: an inside bar whose first break takes exactly one of its sides
+    bool insidePrev  = bar_index > 1 and high[1] < high[2] and low[1] > low[2]
+    bool sizeOk      = (high[1] - low[1]) <= (high[2] - low[2]) * maxInsideSizeInput / 100
+    bool bullTrendOk = not trendFilterInput or (not na(trendSmaPrev) and close[1] > trendSmaPrev)
+    bool bearTrendOk = not trendFilterInput or (not na(trendSmaPrev) and close[1] < trendSmaPrev)
+
+    //Direction follows the snap-back, not the bait: a break above arms a bearish trap and vice versa
+    bearArmedEvent := insidePrev and sizeOk and high > high[1] and low >= low[1] and bearTrendOk
+    bullArmedEvent := insidePrev and sizeOk and low < low[1] and high <= high[1] and bullTrendOk
+
+    if bearArmedEvent
+        array.push(armedSetupsArray, armSetup(-1, high[2], low[2], high[1], low[1]))
+    if bullArmedEvent
+        array.push(armedSetupsArray, armSetup(1, high[2], low[2], high[1], low[1]))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(bullArmedEvent, "Bullish Hikkake Armed", "Bullish hikkake setup armed on {{ticker}} ({{interval}}) - price broke below the inside bar; a snap back above the inside bar high within the window triggers the pattern")
+alertcondition(bearArmedEvent, "Bearish Hikkake Armed", "Bearish hikkake setup armed on {{ticker}} ({{interval}}) - price broke above the inside bar; a snap back below the inside bar low within the window triggers the pattern")
+alertcondition(bullTriggerEvent, "Bullish Hikkake Triggered", "Bullish hikkake triggered on {{ticker}} ({{interval}}) - price took out the inside bar high after the failed break below it")
+alertcondition(bearTriggerEvent, "Bearish Hikkake Triggered", "Bearish hikkake triggered on {{ticker}} ({{interval}}) - price took out the inside bar low after the failed break above it")
+alertcondition(bullTriggerEvent or bearTriggerEvent, "Any Hikkake Triggered", "Hikkake triggered on {{ticker}} ({{interval}}) - a failed inside bar break snapped back through the opposite extreme")
+
+//---------------------------------------------------------------------------------------------------------------------}

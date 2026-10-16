@@ -1,0 +1,424 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Expiration Effects"
+  , shorttitle       = "Expiration Effects"
+  , overlay          = true
+  , max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants & state
+//---------------------------------------------------------------------------------------------------------------------{
+NEUTRAL_COLOR = #787b86 // monthly OpEx - calendar structure, grey
+ACCENT_COLOR  = #ff9800 // quarterly witching - the one accent
+VIX_COLOR     = #DBDBDB // VIX expiry - light grey, kept apart from the OpEx grey by tone
+FLOW_COLOR    = #787b86 // post-expiration window
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+DASH_NA_TEXT = "—"
+
+// statistics buckets
+B_PRE        = 0
+B_OPEX       = 1
+B_WITCH      = 2
+B_VIX        = 3
+B_POST       = 4
+B_ALL        = 5
+BUCKET_COUNT = 6
+
+var array<string> monthNamesArray   = array.from("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+var array<string> weekdayNamesArray = array.from("Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed")
+
+// per-bucket accumulators: session true range %, absolute close-to-close change %, relative volume
+var array<float> trSumArray  = array.new<float>(BUCKET_COUNT, 0.0)
+var array<float> trCntArray  = array.new<float>(BUCKET_COUNT, 0.0)
+var array<float> retSumArray = array.new<float>(BUCKET_COUNT, 0.0)
+var array<float> retCntArray = array.new<float>(BUCKET_COUNT, 0.0)
+var array<float> rvSumArray  = array.new<float>(BUCKET_COUNT, 0.0)
+var array<float> rvCntArray  = array.new<float>(BUCKET_COUNT, 0.0)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Inputs
+//---------------------------------------------------------------------------------------------------------------------{
+showOpexInput = input.bool(true, "Monthly OpEx (3rd Friday)", group = "Expiration Calendar"
+  , tooltip = "Marks the monthly US equity and index option expiration session - the 3rd Friday of the month, or the last session before it when that Friday is a market holiday. Dates are evaluated on the symbol's exchange calendar.")
+
+showWitchingInput = input.bool(true, "Emphasize quarterly witching", group = "Expiration Calendar"
+  , tooltip = "Gives the March, June, September and December expirations their own color and label - the triple/quadruple witching dates when index futures, index options and stock options expire together on some of the year's heaviest volume.")
+
+showVixInput = input.bool(true, "VIX expiry (Wednesday)", group = "Expiration Calendar"
+  , tooltip = "Marks VIX derivative settlement sessions - the Wednesday timed 30 days before the following month's 3rd Friday, settled on a special morning opening print. Tracked separately because positioning into that print can affect volatility products and, indirectly, index behavior.")
+
+showWeekInput = input.bool(true, "Shade OpEx week", group = "Expiration Calendar"
+  , tooltip = "Shades Monday through Friday of the week containing the 3rd Friday - OpEx week, when dealer hedging flow concentrates around expiration and trends are often more muted.")
+
+showPostShadeInput = input.bool(false, "Shade post-expiration window", group = "Expiration Calendar"
+  , tooltip = "Shades the sessions after each monthly expiration, when hedges tied to the expired contracts are unwound or rolled and movement sometimes comes freer.")
+
+preLenInput = input.int(5, "Pre-expiration window (sessions)", minval = 1, maxval = 10, group = "Expiration Windows"
+  , tooltip = "Completed sessions immediately before each monthly expiration pooled into the 'Pre-expiry' statistics bucket - the window where dealer hedging often suppresses range. 5 sessions spans the OpEx week.")
+
+postLenInput = input.int(5, "Post-expiration window (sessions)", minval = 1, maxval = 10, group = "Expiration Windows"
+  , tooltip = "Sessions after each monthly expiration pooled into the 'Post-expiry' bucket - the window where the roll-off of expiring positions can release movement.")
+
+volLenInput = input.int(20, "Relative-volume baseline (sessions)", minval = 5, maxval = 60, group = "Expiration Windows"
+  , tooltip = "A session's relative volume is its volume divided by the average of this many prior sessions. Quarterly witching sessions print mechanically heavy volume, so spikes on those dates should not be read as ordinary conviction.")
+
+showDashboardInput = input.bool(true, "Show dashboard", group = "Dashboard"
+  , tooltip = "Upcoming expiration dates, today's calendar status, and per-bucket session statistics measured on this chart's own history.")
+
+showUpcomingInput = input.bool(true, "Upcoming expirations", group = "Dashboard"
+  , tooltip = "Lists the next monthly OpEx, quarterly witching and VIX expiry dates with a calendar-day countdown.")
+
+showStatsInput = input.bool(true, "Session statistics", group = "Dashboard"
+  , tooltip = "Compares average session true range, absolute change and relative volume across the pre-expiry window, expiration sessions, the post-expiry window and all sessions - a direct check of whether the classic expiration tendencies hold on this symbol's current data.")
+
+dashPositionInput = input.string("Top Right", "Position"
+  , options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left", "Middle Right", "Middle Left"]
+  , group   = "Dashboard"
+  , tooltip = "Dashboard placement on the chart.")
+
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = "Dashboard"
+  , tooltip = "Dashboard text size.")
+
+showLabelsInput = input.bool(true, "Event labels", group = "Style")
+
+shadeTranspInput = input.int(88, "Shading transparency", minval = 50, maxval = 98, group = "Style"
+  , tooltip = "Transparency of the OpEx week and post-expiration window shading. Expiration-day shading is drawn slightly stronger.")
+
+opexColorInput     = input.color(NEUTRAL_COLOR, "Monthly OpEx",           group = "Style")
+witchingColorInput = input.color(ACCENT_COLOR,  "Quarterly witching",     group = "Style")
+vixColorInput      = input.color(VIX_COLOR,     "VIX expiry",             group = "Style")
+postColorInput     = input.color(FLOW_COLOR,    "Post-expiration window", group = "Style")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+isQuarterlyMonth(int monthNumber) =>
+    monthNumber == 3 or monthNumber == 6 or monthNumber == 9 or monthNumber == 12
+
+// days since 1970-01-01 for a civil date (proleptic Gregorian); 1970-01-01 was a Thursday, so dayNum % 7 == 1 is a Friday
+daysFromCivilDate(int civilYear, int civilMonth, int civilDay) =>
+    int shiftedYear = civilMonth <= 2 ? civilYear - 1 : civilYear
+    int eraNumber   = math.floor(shiftedYear / 400)
+    int yearOfEra   = shiftedYear - eraNumber * 400
+    int monthPrime  = civilMonth > 2 ? civilMonth - 3 : civilMonth + 9
+    int dayOfYear   = math.floor((153 * monthPrime + 2) / 5) + civilDay - 1
+    int dayOfEra    = yearOfEra * 365 + math.floor(yearOfEra / 4) - math.floor(yearOfEra / 100) + dayOfYear
+    eraNumber * 146097 + dayOfEra - 719468
+
+// day number of the month's 3rd Friday - monthly OpEx, quarterly witching in Mar/Jun/Sep/Dec
+thirdFridayDayNum(int civilYear, int civilMonth) =>
+    int firstDayNum  = daysFromCivilDate(civilYear, civilMonth, 1)
+    int firstWeekday = firstDayNum % 7
+    firstDayNum + (1 - firstWeekday + 7) % 7 + 14
+
+// day number of the month's VIX expiration - the Wednesday 30 days before the following month's 3rd Friday
+vixExpiryDayNum(int civilYear, int civilMonth) =>
+    int nextYear  = civilMonth == 12 ? civilYear + 1 : civilYear
+    int nextMonth = civilMonth == 12 ? 1 : civilMonth + 1
+    thirdFridayDayNum(nextYear, nextMonth) - 30
+
+formatEventDate(int eventDayNum, int civilYear, int civilMonth) =>
+    int dayOfMonthNum = eventDayNum - daysFromCivilDate(civilYear, civilMonth, 1) + 1
+    weekdayNamesArray.get(eventDayNum % 7) + " " + str.tostring(dayOfMonthNum) + " " + monthNamesArray.get(civilMonth - 1) + " " + str.tostring(civilYear)
+
+formatUpcoming(int eventDayNum, int civilYear, int civilMonth, int todayDayNum) =>
+    string outText = DASH_NA_TEXT
+    if not na(eventDayNum)
+        outText := formatEventDate(eventDayNum, civilYear, civilMonth) + " · " + str.tostring(eventDayNum - todayDayNum) + "d"
+    outText
+
+formatPercent(float value) =>
+    na(value) ? DASH_NA_TEXT : str.tostring(value, "0.00") + "%"
+
+formatRelVolume(float value) =>
+    na(value) ? DASH_NA_TEXT : "×" + str.tostring(value, "0.00")
+
+addSessionToBucket(int bucketIdx, float trPctValue, float retPctValue, float relVolValue) =>
+    if not na(trPctValue)
+        trSumArray.set(bucketIdx, trSumArray.get(bucketIdx) + trPctValue)
+        trCntArray.set(bucketIdx, trCntArray.get(bucketIdx) + 1.0)
+    if not na(retPctValue)
+        retSumArray.set(bucketIdx, retSumArray.get(bucketIdx) + retPctValue)
+        retCntArray.set(bucketIdx, retCntArray.get(bucketIdx) + 1.0)
+    if not na(relVolValue)
+        rvSumArray.set(bucketIdx, rvSumArray.get(bucketIdx) + relVolValue)
+        rvCntArray.set(bucketIdx, rvCntArray.get(bucketIdx) + 1.0)
+
+bucketAverage(array<float> sumArray, array<float> cntArray, int bucketIdx) =>
+    float cntValue = cntArray.get(bucketIdx)
+    cntValue > 0 ? sumArray.get(bucketIdx) / cntValue : na
+
+// first monthly (or quarterly-only) expiration strictly after todayDayNum
+nextExpiryAfter(int todayDayNum, int startYear, int startMonth, bool quarterlyOnly) =>
+    int foundDayNum = na
+    int foundYear   = na
+    int foundMonth  = na
+    int scanYear    = startYear
+    int scanMonth   = startMonth
+    for scanIdx = 0 to 14
+        if na(foundDayNum)
+            int candidateDayNum = thirdFridayDayNum(scanYear, scanMonth)
+            if candidateDayNum > todayDayNum and (not quarterlyOnly or isQuarterlyMonth(scanMonth))
+                foundDayNum := candidateDayNum
+                foundYear   := scanYear
+                foundMonth  := scanMonth
+        if scanMonth == 12
+            scanYear  += 1
+            scanMonth := 1
+        else
+            scanMonth += 1
+    [foundDayNum, foundYear, foundMonth]
+
+// first VIX expiration strictly after todayDayNum
+nextVixAfter(int todayDayNum, int startYear, int startMonth) =>
+    int foundDayNum = na
+    int foundYear   = na
+    int foundMonth  = na
+    int scanYear    = startYear
+    int scanMonth   = startMonth
+    for scanIdx = 0 to 14
+        if na(foundDayNum)
+            int candidateDayNum = vixExpiryDayNum(scanYear, scanMonth)
+            if candidateDayNum > todayDayNum
+                foundDayNum := candidateDayNum
+                foundYear   := scanYear
+                foundMonth  := scanMonth
+        if scanMonth == 12
+            scanYear  += 1
+            scanMonth := 1
+        else
+            scanMonth += 1
+    [foundDayNum, foundYear, foundMonth]
+
+getTablePosition(string positionText) =>
+    switch positionText
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        "Bottom Left"  => position.bottom_left
+        "Middle Right" => position.middle_right
+        => position.middle_left
+
+getTextSize(string sizeText) =>
+    switch sizeText
+        "Tiny"  => size.tiny
+        "Small" => size.small
+        => size.normal
+
+renderStatRow(table targetTable, int rowIdx, string rowName, string rowTooltip, int bucketIdx, color rowColor, bool activeNow, string textSizeValue) =>
+    float trAvg        = bucketAverage(trSumArray, trCntArray, bucketIdx)
+    float retAvg       = bucketAverage(retSumArray, retCntArray, bucketIdx)
+    float rvAvg        = bucketAverage(rvSumArray, rvCntArray, bucketIdx)
+    float sessionCount = trCntArray.get(bucketIdx)
+    table.cell(targetTable, 0, rowIdx, rowName, text_halign = text.align_left, text_color = rowColor, text_size = textSizeValue, bgcolor = color.new(rowColor, activeNow ? 80 : 100), tooltip = rowTooltip)
+    table.cell(targetTable, 1, rowIdx, formatPercent(trAvg), text_color = DASH_TEXT, text_size = textSizeValue)
+    table.cell(targetTable, 2, rowIdx, formatPercent(retAvg), text_color = DASH_TEXT, text_size = textSizeValue)
+    table.cell(targetTable, 3, rowIdx, formatRelVolume(rvAvg), text_color = DASH_TEXT, text_size = textSizeValue)
+    table.cell(targetTable, 4, rowIdx, str.tostring(sessionCount, "0"), text_color = DASH_TEXT, text_size = textSizeValue)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Expiration calendar & session statistics
+//---------------------------------------------------------------------------------------------------------------------{
+int  curDayNum        = daysFromCivilDate(year, month, dayofmonth)
+int  curThirdFridayDn = thirdFridayDayNum(year, month)
+int  curVixDayNum     = vixExpiryDayNum(year, month)
+
+bool tfSupported     = timeframe.isintraday or timeframe.isdaily
+bool isOpexToday     = tfSupported and curDayNum == curThirdFridayDn
+bool isWitchingToday = isOpexToday and isQuarterlyMonth(month)
+bool isVixToday      = tfSupported and curDayNum == curVixDayNum
+bool inOpexWeek      = tfSupported and curDayNum >= curThirdFridayDn - 4 and curDayNum <= curThirdFridayDn
+bool newSession      = tfSupported and (na(curDayNum[1]) or curDayNum != curDayNum[1])
+
+// session trackers (one session = one exchange trading date, so intraday charts aggregate to day level)
+var int   postRemaining    = 0
+var int   sesDayNum        = na
+var int   sesYear          = na
+var int   sesMonth         = na
+var float sesVolume        = 0.0
+var float sesHigh          = na
+var float sesLow           = na
+var float sesClose         = na
+var float prevSessionClose = na
+
+// rolling buffers: recent completed sessions (pre-expiry window) and the relative-volume baseline
+var array<float> trBufArray   = array.new<float>()
+var array<float> retBufArray  = array.new<float>()
+var array<float> rvBufArray   = array.new<float>()
+var array<float> volBaseArray = array.new<float>()
+
+bool postWindowOpenedFlag = false
+
+if newSession
+    if not na(sesDayNum)
+        // finalize the completed session
+        float referenceClose = nz(prevSessionClose, sesClose)
+        float sessionRange   = math.max(sesHigh, referenceClose) - math.min(sesLow, referenceClose)
+        float trPct          = sesClose > 0 ? 100.0 * sessionRange / sesClose : na
+        float retPct         = not na(prevSessionClose) and prevSessionClose > 0 ? 100.0 * math.abs(sesClose - prevSessionClose) / prevSessionClose : na
+        float baseVolume     = volBaseArray.size() >= volLenInput ? volBaseArray.avg() : na
+        float relVolume      = not na(baseVolume) and baseVolume > 0 ? sesVolume / baseVolume : na
+        // classify it: an expiration session is the last session at or before the calendar date (handles holiday shifts)
+        int  sesThirdFridayDn = thirdFridayDayNum(sesYear, sesMonth)
+        int  sesVixDayNum     = vixExpiryDayNum(sesYear, sesMonth)
+        bool sesIsOpex        = sesDayNum == sesThirdFridayDn or (sesDayNum >= sesThirdFridayDn - 4 and sesDayNum < sesThirdFridayDn and curDayNum > sesThirdFridayDn)
+        bool sesIsWitching    = sesIsOpex and isQuarterlyMonth(sesMonth)
+        bool sesIsVix         = sesDayNum == sesVixDayNum or (sesDayNum >= sesVixDayNum - 3 and sesDayNum < sesVixDayNum and curDayNum > sesVixDayNum)
+        addSessionToBucket(B_ALL, trPct, retPct, relVolume)
+        if sesIsVix
+            addSessionToBucket(B_VIX, trPct, retPct, relVolume)
+            if showLabelsInput and showVixInput and sesDayNum != sesVixDayNum
+                label.new(bar_index - 1, na, "VIX exp", yloc = yloc.abovebar, style = label.style_label_down, color = #00000000, textcolor = vixColorInput, size = size.tiny)
+        if sesIsOpex
+            if trBufArray.size() > 0
+                for bufIdx = 0 to trBufArray.size() - 1
+                    addSessionToBucket(B_PRE, trBufArray.get(bufIdx), retBufArray.get(bufIdx), rvBufArray.get(bufIdx))
+            addSessionToBucket(B_OPEX, trPct, retPct, relVolume)
+            if sesIsWitching
+                addSessionToBucket(B_WITCH, trPct, retPct, relVolume)
+            postRemaining        := postLenInput
+            postWindowOpenedFlag := true
+            if showLabelsInput and showOpexInput and sesDayNum != sesThirdFridayDn
+                label.new(bar_index - 1, na, sesIsWitching and showWitchingInput ? "Witching" : "OpEx", yloc = yloc.abovebar, style = label.style_label_down, color = #00000000, textcolor = sesIsWitching and showWitchingInput ? witchingColorInput : opexColorInput, size = size.tiny)
+        else if postRemaining > 0
+            addSessionToBucket(B_POST, trPct, retPct, relVolume)
+            postRemaining -= 1
+        // roll the pre-expiry buffer and the volume baseline
+        trBufArray.push(trPct)
+        retBufArray.push(retPct)
+        rvBufArray.push(relVolume)
+        if trBufArray.size() > preLenInput
+            trBufArray.shift()
+            retBufArray.shift()
+            rvBufArray.shift()
+        volBaseArray.push(sesVolume)
+        if volBaseArray.size() > volLenInput
+            volBaseArray.shift()
+        prevSessionClose := sesClose
+    // start tracking the new session from this bar
+    sesDayNum := curDayNum
+    sesYear   := year
+    sesMonth  := month
+    sesVolume := nz(volume)
+    sesHigh   := high
+    sesLow    := low
+    sesClose  := close
+else if tfSupported
+    sesVolume += nz(volume)
+    sesHigh   := math.max(nz(sesHigh, high), high)
+    sesLow    := math.min(nz(sesLow, low), low)
+    sesClose  := close
+
+bool inPostWindow = tfSupported and postRemaining > 0
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visuals — calendar shading & event labels
+//---------------------------------------------------------------------------------------------------------------------{
+int dayShadeTransp = math.max(shadeTranspInput - 12, 40)
+
+color dayShadeColor  = isOpexToday and showOpexInput ? (isWitchingToday and showWitchingInput ? witchingColorInput : opexColorInput) : isVixToday and showVixInput ? vixColorInput : na
+color weekShadeColor = inOpexWeek and showWeekInput ? (isQuarterlyMonth(month) and showWitchingInput ? witchingColorInput : opexColorInput) : inPostWindow and showPostShadeInput ? postColorInput : na
+color shadeColor     = not na(dayShadeColor) ? color.new(dayShadeColor, dayShadeTransp) : not na(weekShadeColor) ? color.new(weekShadeColor, shadeTranspInput) : na
+
+bgcolor(shadeColor, title = "Expiration calendar shading")
+
+if showLabelsInput and newSession
+    if isOpexToday and showOpexInput
+        label.new(bar_index, na, isWitchingToday and showWitchingInput ? "Witching" : "OpEx", yloc = yloc.abovebar, style = label.style_label_down, color = #00000000, textcolor = isWitchingToday and showWitchingInput ? witchingColorInput : opexColorInput, size = size.tiny)
+    if isVixToday and showVixInput
+        label.new(bar_index, na, "VIX exp", yloc = yloc.abovebar, style = label.style_label_down, color = #00000000, textcolor = vixColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+string tableTextSize = getTextSize(dashSizeInput)
+
+var table dashTable = showDashboardInput ? table.new(getTablePosition(dashPositionInput), 5, 13
+  , bgcolor      = DASH_BG
+  , frame_color  = DASH_FRAME
+  , frame_width  = 1
+  , border_width = 0) : table(na)
+
+var bool dashMergedFlag = false
+
+if showDashboardInput and barstate.islast and not na(dashTable)
+    int rowIdx      = 0
+    int titleRowIdx = rowIdx
+    table.cell(dashTable, 0, rowIdx, "Expiration effects — US derivatives calendar", text_halign = text.align_left, text_color = DASH_TEXT, text_size = tableTextSize)
+    rowIdx += 1
+    int upcomingFirstRowIdx = rowIdx
+    if showUpcomingInput
+        [nextOpexDayNum, nextOpexYear, nextOpexMonth]    = nextExpiryAfter(curDayNum, year, month, false)
+        [nextWitchDayNum, nextWitchYear, nextWitchMonth] = nextExpiryAfter(curDayNum, year, month, true)
+        [nextVixDayNum, nextVixYear, nextVixMonth]       = nextVixAfter(curDayNum, year, month)
+        table.cell(dashTable, 0, rowIdx, "Next OpEx", text_halign = text.align_left, text_color = opexColorInput, text_size = tableTextSize, tooltip = "Next monthly option expiration - the 3rd Friday. When that Friday is a market holiday, expiration moves to the prior session.")
+        table.cell(dashTable, 1, rowIdx, formatUpcoming(nextOpexDayNum, nextOpexYear, nextOpexMonth, curDayNum), text_halign = text.align_left, text_color = DASH_TEXT, text_size = tableTextSize)
+        rowIdx += 1
+        table.cell(dashTable, 0, rowIdx, "Next witching", text_halign = text.align_left, text_color = witchingColorInput, text_size = tableTextSize, tooltip = "Next quarterly triple/quadruple witching - the 3rd Friday of March, June, September or December.")
+        table.cell(dashTable, 1, rowIdx, formatUpcoming(nextWitchDayNum, nextWitchYear, nextWitchMonth, curDayNum), text_halign = text.align_left, text_color = DASH_TEXT, text_size = tableTextSize)
+        rowIdx += 1
+        table.cell(dashTable, 0, rowIdx, "Next VIX expiry", text_halign = text.align_left, text_color = vixColorInput, text_size = tableTextSize, tooltip = "Next VIX settlement - the Wednesday 30 days before the following month's 3rd Friday, settled on a morning opening print.")
+        table.cell(dashTable, 1, rowIdx, formatUpcoming(nextVixDayNum, nextVixYear, nextVixMonth, curDayNum), text_halign = text.align_left, text_color = DASH_TEXT, text_size = tableTextSize)
+        rowIdx += 1
+    int statusRowIdx = na
+    if tfSupported
+        float liveBaseVolume = volBaseArray.size() >= volLenInput ? volBaseArray.avg() : na
+        float liveRelVolume  = not na(liveBaseVolume) and liveBaseVolume > 0 ? sesVolume / liveBaseVolume : na
+        string statusText = isWitchingToday ? "Today · quarterly witching expiration" : isOpexToday ? "Today · monthly OpEx" : isVixToday ? "Today · VIX expiry (AM settlement)" : inOpexWeek ? "Today · OpEx week" : inPostWindow ? "Today · post-expiration window" : "No expiration window today"
+        if not na(liveRelVolume)
+            statusText += " · session volume " + formatRelVolume(liveRelVolume)
+        statusRowIdx := rowIdx
+        table.cell(dashTable, 0, rowIdx, statusText, text_halign = text.align_left, text_color = DASH_TEXT, text_size = tableTextSize)
+        rowIdx += 1
+    if tfSupported and showStatsInput
+        table.cell(dashTable, 0, rowIdx, "Session bucket", text_halign = text.align_left, text_color = DASH_HEADER, text_size = tableTextSize)
+        table.cell(dashTable, 1, rowIdx, "TR%", text_color = DASH_HEADER, text_size = tableTextSize, tooltip = "Mean session true range as a percentage of the session close - gauges how suppressed or free movement is in each bucket.")
+        table.cell(dashTable, 2, rowIdx, "|Δ|%", text_color = DASH_HEADER, text_size = tableTextSize, tooltip = "Mean absolute close-to-close session change - movement without direction, since expiration effects are tendencies, not schedules for direction.")
+        table.cell(dashTable, 3, rowIdx, "RelVol", text_color = DASH_HEADER, text_size = tableTextSize, tooltip = "Mean session volume relative to the prior baseline average - witching sessions print mechanically heavy volume.")
+        table.cell(dashTable, 4, rowIdx, "N", text_color = DASH_HEADER, text_size = tableTextSize, tooltip = "Completed sessions measured in the bucket on this chart. Buckets can overlap (a VIX expiry can fall inside the post-expiration window).")
+        rowIdx += 1
+        renderStatRow(dashTable, rowIdx, "Pre-expiry (" + str.tostring(preLenInput) + "s)", "The " + str.tostring(preLenInput) + " completed sessions immediately before each monthly expiration - dealer hedging often suppresses range here.", B_PRE, opexColorInput, inOpexWeek and not isOpexToday, tableTextSize)
+        rowIdx += 1
+        renderStatRow(dashTable, rowIdx, "OpEx session", "Monthly option expiration sessions - the 3rd Friday, or the last session before it around holidays. Includes the quarterly witching sessions.", B_OPEX, opexColorInput, isOpexToday, tableTextSize)
+        rowIdx += 1
+        renderStatRow(dashTable, rowIdx, "Witching", "Quarterly expirations (Mar/Jun/Sep/Dec) when index futures, index options and stock options expire together - distinctive mainly for enormous volume.", B_WITCH, witchingColorInput, isWitchingToday, tableTextSize)
+        rowIdx += 1
+        renderStatRow(dashTable, rowIdx, "VIX expiry", "VIX settlement sessions - the Wednesday 30 days before the following month's 3rd Friday, settled on a morning print.", B_VIX, vixColorInput, isVixToday, tableTextSize)
+        rowIdx += 1
+        renderStatRow(dashTable, rowIdx, "Post-expiry (" + str.tostring(postLenInput) + "s)", "The " + str.tostring(postLenInput) + " sessions after each monthly expiration - expiring hedges are unwound or rolled, sometimes freeing movement.", B_POST, postColorInput, inPostWindow, tableTextSize)
+        rowIdx += 1
+        renderStatRow(dashTable, rowIdx, "All sessions", "Every completed session on the chart - the baseline the expiration buckets are compared against.", B_ALL, DASH_TEXT, false, tableTextSize)
+        rowIdx += 1
+    int footerRowIdx = rowIdx
+    string footerText = not tfSupported ? "Use a daily or intraday chart — expiration sessions are date-based" : timeframe.isintraday ? "Intraday history limits the sample — prefer a daily chart for the statistics" : "Tendencies, not schedules — 0DTE growth dilutes monthly OpEx stats, verify on recent data"
+    table.cell(dashTable, 0, footerRowIdx, footerText, text_halign = text.align_left, text_color = DASH_HEADER, text_size = size.tiny)
+    if not dashMergedFlag
+        table.merge_cells(dashTable, 0, titleRowIdx, 4, titleRowIdx)
+        if showUpcomingInput
+            table.merge_cells(dashTable, 1, upcomingFirstRowIdx, 4, upcomingFirstRowIdx)
+            table.merge_cells(dashTable, 1, upcomingFirstRowIdx + 1, 4, upcomingFirstRowIdx + 1)
+            table.merge_cells(dashTable, 1, upcomingFirstRowIdx + 2, 4, upcomingFirstRowIdx + 2)
+        if not na(statusRowIdx)
+            table.merge_cells(dashTable, 0, statusRowIdx, 4, statusRowIdx)
+        table.merge_cells(dashTable, 0, footerRowIdx, 4, footerRowIdx)
+        dashMergedFlag := true
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+bool opexWeekOpened = bar_index > 0 and inOpexWeek and not inOpexWeek[1]
+
+alertcondition(opexWeekOpened,                 "OpEx week opened",               "expiration effects: OpEx week has opened on {{ticker}}")
+alertcondition(newSession and isOpexToday,     "OpEx session started",           "expiration effects: monthly option expiration session has started on {{ticker}}")
+alertcondition(newSession and isWitchingToday, "Witching session started",       "expiration effects: quarterly witching expiration session has started on {{ticker}}")
+alertcondition(newSession and isVixToday,      "VIX expiry session started",     "expiration effects: VIX expiry session has started on {{ticker}}")
+alertcondition(postWindowOpenedFlag,           "Post-expiration window opened",  "expiration effects: post-expiration window has opened on {{ticker}} — hedge roll-off can free movement")
+
+//---------------------------------------------------------------------------------------------------------------------}

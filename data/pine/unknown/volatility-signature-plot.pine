@@ -1,0 +1,379 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Volatility Signature Plot", "Volatility Signature Plot", overlay = false,
+  format = format.price, precision = 2, max_lines_count = 100, max_labels_count = 100)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+NEUTRAL_COLOR   = #787b86 // flat, unbiased part of the signature - structure grey
+UP_BIAS_COLOR   = #f23645 // upward fine-end bias - bid-ask bounce inflating variance
+DOWN_BIAS_COLOR = #ff9800 // the one accent - downward fine-end bias, stale quotes
+SUGGEST_COLOR   = #089981 // suggested sampling interval - the actionable point
+REF_COLOR       = #787b86
+HIDDEN_COLOR    = #00000000
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+UNIT_ANN   = "Annualized Volatility %"
+UNIT_DAILY = "Daily Volatility %"
+UNIT_VAR   = "Daily Variance"
+
+GRID_GROUP    = "Sampling Grid"
+CALC_GROUP    = "Calculation"
+DISPLAY_GROUP = "Display"
+STYLE_GROUP   = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+enableTip   = "Include this sampling interval as one point of the signature."
+intervalTip = "Sampling interval 'h', in minutes, at which intraday returns are taken for this point. The classic diagnostic grid is 1, 5, 15 and 30 minutes, with a coarser point or two to anchor the flat region."
+
+on1Input = input.bool(true, "", inline = "i1", group = GRID_GROUP, tooltip = enableTip)
+m1Input  = input.int(1, "Interval 1 (min)", minval = 1, maxval = 1440, inline = "i1", group = GRID_GROUP, tooltip = intervalTip)
+on2Input = input.bool(true, "", inline = "i2", group = GRID_GROUP, tooltip = enableTip)
+m2Input  = input.int(3, "Interval 2 (min)", minval = 1, maxval = 1440, inline = "i2", group = GRID_GROUP, tooltip = intervalTip)
+on3Input = input.bool(true, "", inline = "i3", group = GRID_GROUP, tooltip = enableTip)
+m3Input  = input.int(5, "Interval 3 (min)", minval = 1, maxval = 1440, inline = "i3", group = GRID_GROUP, tooltip = intervalTip)
+on4Input = input.bool(true, "", inline = "i4", group = GRID_GROUP, tooltip = enableTip)
+m4Input  = input.int(15, "Interval 4 (min)", minval = 1, maxval = 1440, inline = "i4", group = GRID_GROUP, tooltip = intervalTip)
+on5Input = input.bool(true, "", inline = "i5", group = GRID_GROUP, tooltip = enableTip)
+m5Input  = input.int(30, "Interval 5 (min)", minval = 1, maxval = 1440, inline = "i5", group = GRID_GROUP, tooltip = intervalTip)
+on6Input = input.bool(true, "", inline = "i6", group = GRID_GROUP, tooltip = enableTip)
+m6Input  = input.int(60, "Interval 6 (min)", minval = 1, maxval = 1440, inline = "i6", group = GRID_GROUP, tooltip = intervalTip)
+
+dAvgInput = input.int(20, "Days To Average", minval = 2, maxval = 252, group = CALC_GROUP,
+  tooltip = "Number of completed days 'D' whose realized variances are averaged into each point. The literature recommends 20 or more - a single day's plot is dominated by noise. While history is still building, the average uses every completed day available; the dashboard reports the count actually used.")
+
+exclInput = input.bool(true, "Exclude Overnight Return", group = CALC_GROUP,
+  tooltip = "Skip the return spanning a session gap (previous close to the first intraday price of the day), so overnight jumps stay out of the intraday sampling question. Gap detection is automatic: continuous 24x7 sessions have no overnight gap, and their day-boundary return is kept.")
+
+tolInput = input.float(10, "Flatness Tolerance %", minval = 1, maxval = 50, step = 1, group = CALC_GROUP,
+  tooltip = "A point counts as flat when its volatility is within this percentage of the coarsest interval's level. Drives the suggested sampling interval (the finest flat point) and the fine-end bias diagnosis.")
+
+unitInput = input.string(UNIT_ANN, "Output Units", options = [UNIT_ANN, UNIT_DAILY, UNIT_VAR], group = CALC_GROUP,
+  tooltip = "Scale of the signature: the average daily realized variance SIG(h) itself, its square root as daily volatility, or the annualized square root.")
+
+annualInput = input.float(252, "Days Per Year", minval = 1, group = CALC_GROUP,
+  tooltip = "Days used to annualize the volatility. 252 fits instruments with a trading calendar; use 365 for 24x7 markets. Only affects the annualized unit.")
+
+spacingInput = input.int(8, "Point Spacing (bars)", minval = 3, maxval = 40, group = DISPLAY_GROUP,
+  tooltip = "Horizontal distance, in chart bars, between consecutive interval points of the drawn signature.")
+
+offsetInput = input.int(5, "Rightward Offset (bars)", minval = 1, maxval = 100, group = DISPLAY_GROUP,
+  tooltip = "Distance from the last chart bar to the finest-interval point. The signature is drawn in the empty space to the right of price.")
+
+showRefInput = input.bool(true, "Show Flat Reference Line", group = DISPLAY_GROUP,
+  tooltip = "Dotted line at the coarsest interval's level - the flat signature a frictionless market would draw. The bend of the curve away from it is the sampling bias.")
+
+showValuesInput = input.bool(true, "Show Point Values", group = DISPLAY_GROUP,
+  tooltip = "Print each point's value above its marker.")
+
+showTableInput = input.bool(true, "Show Dashboard", group = DISPLAY_GROUP,
+  tooltip = "Summarize each interval (value, deviation from the coarse level, days averaged) plus the fine-end bias diagnosis and the suggested sampling interval.")
+
+tablePosInput = input.string("Top Right", "Dashboard Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"],
+  group = DISPLAY_GROUP, tooltip = "Corner of the pane holding the dashboard.")
+
+tableSizeInput = input.string("Small", "Dashboard Size", options = ["Tiny", "Small", "Normal"], group = DISPLAY_GROUP,
+  tooltip = "Text size of the dashboard.")
+
+baseColorInput    = input.color(NEUTRAL_COLOR, "Signature Curve", group = STYLE_GROUP)
+upColorInput      = input.color(UP_BIAS_COLOR, "Upward Bias (bid-ask bounce)", group = STYLE_GROUP)
+downColorInput    = input.color(DOWN_BIAS_COLOR, "Downward Bias (stale quotes)", group = STYLE_GROUP)
+suggestColorInput = input.color(SUGGEST_COLOR, "Suggested Interval", group = STYLE_GROUP)
+refColorInput     = input.color(REF_COLOR, "Flat Reference", group = STYLE_GROUP)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types & Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// One point of the signature: a sampling interval with its averaged realized measure
+type SigPoint
+    int   mins
+    float vol  = na  // sqrt of the average daily realized variance (comparison scale)
+    float disp = na  // value in the selected output unit
+    int   days = 0
+
+// Runs inside a request.security() context at sampling interval 'h': realized variance per day from squared
+// intraday log returns, averaged over the last D completed days. Returns [average variance, days used].
+f_signature() =>
+    bool  newDay    = timeframe.change("D")
+    float dayCount  = ta.cum(newDay ? 1.0 : 0.0)
+    bool  started   = dayCount > 0
+    float logRet    = math.log(close / close[1])
+    int   jumpMs    = time - nz(time[1], time)
+    int   barMs     = time_close - time
+    bool  gapBar    = newDay and jumpMs > barMs * 3 / 2
+    bool  dropRet   = na(logRet) or not started or (exclInput and gapBar)
+    float sqRet     = dropRet ? 0.0 : logRet * logRet
+    float cumSqRet  = ta.cum(sqRet)
+    float endLast   = ta.valuewhen(newDay, cumSqRet[1], 0)
+    float endBack   = ta.valuewhen(newDay, cumSqRet[1], dAvgInput)
+    int   completed = math.max(math.round(dayCount) - 1, 0)
+    float sigVar    = completed >= dAvgInput and not na(endBack) ? (endLast - endBack) / dAvgInput :
+      completed >= 1 and not na(endLast) ? endLast / completed : na
+    [sigVar, math.min(completed, dAvgInput)]
+
+// Average daily realized variance expressed in the selected output unit
+f_display(float sigVar) =>
+    unitInput == UNIT_ANN ? math.sqrt(sigVar * annualInput) * 100 : unitInput == UNIT_DAILY ? math.sqrt(sigVar) * 100 : sigVar
+
+// Gradient from the flat level toward the bias colors, on the vol-ratio scale
+f_pointColor(float ratio, float tolFrac) =>
+    color pointColor = baseColorInput
+    if not na(ratio)
+        pointColor := ratio >= 1.0 ?
+          color.from_gradient(ratio, 1.0, 1.0 + 2 * tolFrac, baseColorInput, upColorInput) :
+          color.from_gradient(ratio, 1.0 - 2 * tolFrac, 1.0, downColorInput, baseColorInput)
+    pointColor
+
+// Points sorted by ascending interval, duplicates removed
+f_sorted(array<SigPoint> ptsArr) =>
+    array<SigPoint> sorted = array.new<SigPoint>()
+    int n = array.size(ptsArr)
+    if n > 0
+        array<bool> used = array.new_bool(n, false)
+        for _ = 0 to n - 1
+            int bestIdx  = -1
+            int bestMins = 0
+            for j = 0 to n - 1
+                if not array.get(used, j)
+                    SigPoint contender = array.get(ptsArr, j)
+                    if bestIdx == -1 or contender.mins < bestMins
+                        bestIdx  := j
+                        bestMins := contender.mins
+            array.set(used, bestIdx, true)
+            SigPoint candidate = array.get(ptsArr, bestIdx)
+            bool duplicate = false
+            for prior in sorted
+                if prior.mins == candidate.mins
+                    duplicate := true
+            if not duplicate
+                array.push(sorted, candidate)
+    sorted
+
+// "5m" / "1h" style tag for a sampling interval
+f_tfText(int mins) =>
+    mins % 60 == 0 ? str.tostring(mins / 60) + "h" : str.tostring(mins) + "m"
+
+f_fmt(float v) =>
+    na(v) ? "-" : unitInput == UNIT_VAR ? str.tostring(v, "0.00000000") : str.tostring(v, "0.00") + "%"
+
+f_unitShort() =>
+    unitInput == UNIT_ANN ? "Ann. Vol" : unitInput == UNIT_DAILY ? "Daily Vol" : "Daily Var"
+
+f_tablePos(string s) =>
+    switch s
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        "Bottom Left"  => position.bottom_left
+        => position.top_right
+
+f_textSize(string s) =>
+    switch s
+        "Tiny"   => size.tiny
+        "Normal" => size.normal
+        => size.small
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+tf1 = str.tostring(m1Input)
+tf2 = str.tostring(m2Input)
+tf3 = str.tostring(m3Input)
+tf4 = str.tostring(m4Input)
+tf5 = str.tostring(m5Input)
+tf6 = str.tostring(m6Input)
+
+[sigVar1, cnt1] = request.security(syminfo.tickerid, tf1, f_signature())
+[sigVar2, cnt2] = request.security(syminfo.tickerid, tf2, f_signature())
+[sigVar3, cnt3] = request.security(syminfo.tickerid, tf3, f_signature())
+[sigVar4, cnt4] = request.security(syminfo.tickerid, tf4, f_signature())
+[sigVar5, cnt5] = request.security(syminfo.tickerid, tf5, f_signature())
+[sigVar6, cnt6] = request.security(syminfo.tickerid, tf6, f_signature())
+
+float disp1 = f_display(sigVar1)
+float disp2 = f_display(sigVar2)
+float disp3 = f_display(sigVar3)
+float disp4 = f_display(sigVar4)
+float disp5 = f_display(sigVar5)
+float disp6 = f_display(sigVar6)
+
+array<SigPoint> rawPoints = array.new<SigPoint>()
+if on1Input
+    array.push(rawPoints, SigPoint.new(m1Input, math.sqrt(sigVar1), disp1, cnt1))
+if on2Input
+    array.push(rawPoints, SigPoint.new(m2Input, math.sqrt(sigVar2), disp2, cnt2))
+if on3Input
+    array.push(rawPoints, SigPoint.new(m3Input, math.sqrt(sigVar3), disp3, cnt3))
+if on4Input
+    array.push(rawPoints, SigPoint.new(m4Input, math.sqrt(sigVar4), disp4, cnt4))
+if on5Input
+    array.push(rawPoints, SigPoint.new(m5Input, math.sqrt(sigVar5), disp5, cnt5))
+if on6Input
+    array.push(rawPoints, SigPoint.new(m6Input, math.sqrt(sigVar6), disp6, cnt6))
+
+array<SigPoint> sigPoints = f_sorted(rawPoints)
+int nPoints = array.size(sigPoints)
+
+float tolFrac = tolInput / 100
+
+// Coarse reference (the presumed unbiased flat level) and finest valid point
+float refVol  = na
+int   refIdx  = -1
+float fineVol = na
+int   fineIdx = -1
+for [i, pt] in sigPoints
+    if not na(pt.vol)
+        if fineIdx == -1
+            fineIdx  := i
+            fineVol := pt.vol
+        refIdx := i
+        refVol := pt.vol
+
+float fineRatio = refIdx > fineIdx and not na(refVol) and refVol > 0 ? fineVol / refVol : na
+
+// Finest interval at which the plot has flattened: walk from the coarse anchor toward finer points
+int suggestIdx = refIdx
+if refIdx > 0
+    bool broken = false
+    for k = 1 to refIdx
+        int i = refIdx - k
+        SigPoint pt = array.get(sigPoints, i)
+        bool flatOk = not na(pt.vol) and refVol > 0 and math.abs(pt.vol / refVol - 1) <= tolFrac
+        if flatOk and not broken
+            suggestIdx := i
+        else
+            broken := true
+
+// Fine-end diagnosis in the page's vocabulary
+bool upBias   = not na(fineRatio) and fineRatio > 1 + tolFrac
+bool downBias = not na(fineRatio) and fineRatio < 1 - tolFrac
+bool flatAll  = not na(fineRatio) and not upBias and not downBias and suggestIdx == fineIdx
+
+bool upOnset   = upBias and not upBias[1]
+bool downOnset = downBias and not downBias[1]
+bool flatOnset = flatAll and not flatAll[1]
+
+string biasTxt = na(fineRatio) ? "-" : upBias ? "Upward (bid-ask bounce)" : downBias ? "Downward (stale quotes)" : "Flat"
+string suggestTxt = suggestIdx >= 0 ? f_tfText(array.get(sigPoints, suggestIdx).mins) : "-"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Signature Rendering & Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+// Invisible plots keep every signature point inside the pane's automatic scale and in the data window
+plot(on1Input ? disp1 : na, "Interval 1", HIDDEN_COLOR)
+plot(on2Input ? disp2 : na, "Interval 2", HIDDEN_COLOR)
+plot(on3Input ? disp3 : na, "Interval 3", HIDDEN_COLOR)
+plot(on4Input ? disp4 : na, "Interval 4", HIDDEN_COLOR)
+plot(on5Input ? disp5 : na, "Interval 5", HIDDEN_COLOR)
+plot(on6Input ? disp6 : na, "Interval 6", HIDDEN_COLOR)
+
+var array<line>  sigLines  = array.new<line>()
+var array<label> sigLabels = array.new<label>()
+
+var table dashTable = showTableInput ? table.new(f_tablePos(tablePosInput), 4, 9, bgcolor = DASH_BG, border_width = 0,
+  frame_color = DASH_FRAME, frame_width = 1) : na
+
+if barstate.islast
+    for oldLine in sigLines
+        line.delete(oldLine)
+    array.clear(sigLines)
+    for oldLabel in sigLabels
+        label.delete(oldLabel)
+    array.clear(sigLabels)
+
+    // Common floor for the interval axis tags
+    float floorVal = na
+    for pt in sigPoints
+        if not na(pt.disp)
+            floorVal := na(floorVal) ? pt.disp : math.min(floorVal, pt.disp)
+
+    int   xBase     = bar_index + offsetInput
+    int   prevX     = -1
+    float prevY     = na
+    float prevRatio = na
+    int   drawn     = 0
+
+    for [i, pt] in sigPoints
+        int xCur = xBase + i * spacingInput
+        if not na(pt.disp)
+            drawn += 1
+            float ratio = not na(refVol) and refVol > 0 ? pt.vol / refVol : na
+            bool  isSuggested = i == suggestIdx and refIdx > fineIdx
+            color pointColor  = isSuggested ? suggestColorInput : f_pointColor(ratio, tolFrac)
+            string pointTip = f_tfText(pt.mins) + " sampling - " + f_unitShort() + ": " + f_fmt(pt.disp) + " | avg of " +
+              str.tostring(pt.days) + " day(s)" + (isSuggested ? " | suggested: finest interval still within " +
+              str.tostring(tolInput, "0.#") + "% of the coarse flat level" : "")
+            if prevX >= 0
+                array.push(sigLines, line.new(prevX, prevY, xCur, pt.disp, xloc = xloc.bar_index,
+                  color = f_pointColor((nz(prevRatio, ratio) + nz(ratio, prevRatio)) / 2, tolFrac), width = 2))
+            array.push(sigLabels, label.new(xCur, pt.disp, "", xloc = xloc.bar_index, style = label.style_circle,
+              color = pointColor, size = isSuggested ? size.small : size.tiny, tooltip = pointTip))
+            if showValuesInput
+                array.push(sigLabels, label.new(xCur, pt.disp, f_fmt(pt.disp), xloc = xloc.bar_index,
+                  style = label.style_label_down, color = HIDDEN_COLOR, textcolor = pointColor, size = size.tiny))
+            array.push(sigLabels, label.new(xCur, floorVal, f_tfText(pt.mins), xloc = xloc.bar_index,
+              style = label.style_label_up, color = HIDDEN_COLOR, textcolor = DASH_HEADER,
+              size = size.tiny, tooltip = "Sampling interval: " + str.tostring(pt.mins) + " minute(s)"))
+            prevX     := xCur
+            prevY     := pt.disp
+            prevRatio := ratio
+
+    // Flat reference: the line a frictionless market would draw across the whole grid
+    if showRefInput and refIdx >= 0 and drawn >= 2
+        float refDisp = array.get(sigPoints, refIdx).disp
+        int   xRight  = xBase + (nPoints - 1) * spacingInput + 2
+        array.push(sigLines, line.new(xBase - 2, refDisp, xRight, refDisp, xloc = xloc.bar_index,
+          color = color.new(refColorInput, 25), style = line.style_dotted, width = 1))
+        array.push(sigLabels, label.new(xRight, refDisp, "flat", xloc = xloc.bar_index, style = label.style_label_left,
+          color = HIDDEN_COLOR, textcolor = color.new(refColorInput, 15), size = size.tiny,
+          tooltip = "Coarsest interval's level: in a frictionless market the signature would stay on this line"))
+
+    if drawn == 0
+        array.push(sigLabels, label.new(bar_index, 0.0, "volatility signature plot: waiting for enough intraday history",
+          xloc = xloc.bar_index, style = label.style_label_left, color = HIDDEN_COLOR,
+          textcolor = NEUTRAL_COLOR, size = size.small))
+
+    if showTableInput
+        string txtSize = f_textSize(tableSizeInput)
+        table.cell(dashTable, 0, 0, "Interval", text_color = DASH_HEADER, text_size = txtSize)
+        table.cell(dashTable, 1, 0, f_unitShort(), text_color = DASH_HEADER, text_size = txtSize,
+          tooltip = "Average realized measure over the days used, at this sampling interval")
+        table.cell(dashTable, 2, 0, "vs Coarse", text_color = DASH_HEADER, text_size = txtSize,
+          tooltip = "Deviation of this point's volatility from the coarsest interval's level")
+        table.cell(dashTable, 3, 0, "Days", text_color = DASH_HEADER, text_size = txtSize,
+          tooltip = "Completed days averaged at this interval. Short counts mean TradingView's intraday history limited the average.")
+        for [i, pt] in sigPoints
+            float ratio = not na(pt.vol) and not na(refVol) and refVol > 0 ? pt.vol / refVol : na
+            bool  isSuggested = i == suggestIdx and refIdx > fineIdx
+            color rowColor = isSuggested ? suggestColorInput : f_pointColor(ratio, tolFrac)
+            string deltaTxt = i == refIdx ? "ref" : na(ratio) ? "-" : (ratio >= 1 ? "+" : "") + str.tostring((ratio - 1) * 100, "0.0") + "%"
+            table.cell(dashTable, 0, i + 1, f_tfText(pt.mins), text_color = isSuggested ? suggestColorInput : DASH_TEXT,
+              text_size = txtSize, tooltip = isSuggested ? "Suggested sampling interval (finest flat point)" : "")
+            table.cell(dashTable, 1, i + 1, f_fmt(pt.disp), text_color = rowColor, text_size = txtSize)
+            table.cell(dashTable, 2, i + 1, deltaTxt, text_color = na(ratio) ? DASH_TEXT : rowColor, text_size = txtSize)
+            table.cell(dashTable, 3, i + 1, str.tostring(pt.days), text_size = txtSize,
+              text_color = pt.days < dAvgInput ? DOWN_BIAS_COLOR : DASH_TEXT)
+        table.cell(dashTable, 0, nPoints + 1, "Bias", text_color = DASH_HEADER, text_size = txtSize,
+          tooltip = "Fine-end read: upward slope flags bid-ask bounce inflating fine-sampled variance; downward slope flags stale quotes or thin trading")
+        table.cell(dashTable, 1, nPoints + 1, biasTxt, text_size = txtSize,
+          text_color = upBias ? upColorInput : downBias ? downColorInput : DASH_TEXT)
+        table.cell(dashTable, 0, nPoints + 2, "Suggested", text_color = DASH_HEADER, text_size = txtSize,
+          tooltip = "Finest interval at which the plot has flattened - keeps the most data without absorbing microstructure bias")
+        table.cell(dashTable, 1, nPoints + 2, suggestTxt, text_color = suggestColorInput, text_size = txtSize)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(upOnset, "Upward Fine-Interval Bias", "volatility signature plot: signature slopes upward at fine intervals on {{ticker}} ({{interval}}) - microstructure noise (bid-ask bounce) is inflating fine-sampled realized variance; prefer the suggested coarser sampling")
+alertcondition(downOnset, "Downward Fine-Interval Bias", "volatility signature plot: signature slopes downward at fine intervals on {{ticker}} ({{interval}}) - stale quotes or thin trading are smoothing fine-sampled returns; treat high-frequency analytics on this feed with care")
+alertcondition(flatOnset, "Flat Signature", "volatility signature plot: signature is flat across the whole sampling grid on {{ticker}} ({{interval}}) - realized volatility is insensitive to the sampling choice down to the finest interval")
+
+//---------------------------------------------------------------------------------------------------------------------}

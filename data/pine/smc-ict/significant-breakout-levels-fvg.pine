@@ -1,0 +1,151 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Quant
+
+//@version=6
+indicator("Significant Breakout Levels (FVG)", overlay = true, max_lines_count = 500, max_boxes_count = 500)
+
+// --- Inputs ---
+group_pivot = "Pivot Settings"
+leftLen     = input.int(10, "Pivot Left Bars", group = group_pivot)
+rightLen    = input.int(10, "Pivot Right Bars", group = group_pivot)
+maxLevels   = input.int(5, "Max Active Levels", group = group_pivot, tooltip = "Maximum number of active (unbroken) levels to track simultaneously.")
+
+group_breakout = "Breakout Settings"
+bodyMult       = input.float(0.5, "Breakout Strength Multiplier", group = group_breakout, step = 0.1, tooltip = "Multiplier for the 14-period ATR to determine strong breakout bodies.")
+boxExtend      = input.int(5, "FVG Box Extend Bars", group = group_breakout)
+maxLvlAge      = input.int(50, "Max Level Age (Bars)", group = group_breakout, tooltip = "Maximum number of bars since the pivot was formed for a breakout to be considered valid.")
+
+group_style = "Style"
+resColor    = input.color(color.new(#089981, 0), "Resistance/Bullish Color", group = group_style)
+supColor    = input.color(color.new(#f23645, 0), "Support/Bearish Color", group = group_style)
+expColor    = input.color(color.new(#787b86, 0), "Expired Breakout Color", group = group_style)
+boxBgTransp = input.int(85, "Box Background Transparency", group = group_style, minval=0, maxval=100)
+
+// --- Types & Variables ---
+type Level
+    line  lineId
+    float price
+    int   lvlType // 1 for resistance (high), -1 for support (low)
+    bool  isBroken
+    int   barIdx  // Bar index where the pivot occurred
+
+var array<Level> levels = array.new<Level>()
+
+// --- Core Logic ---
+// Pivot Detection
+ph = ta.pivothigh(high, leftLen, rightLen)
+pl = ta.pivotlow(low, leftLen, rightLen)
+
+// Body size condition for the breakout candle (which will be index 1 when checking FVG)
+bodySize   = math.abs(close[1] - open[1])
+strongBody = bodySize > (ta.atr(14)[1] * bodyMult)
+
+// FVG Conditions
+// Bullish FVG: Low of current bar is higher than High of 2 bars ago. The breakout candle is 1 bar ago.
+bullFVG = low > high[2] and close[1] > open[1]
+// Bearish FVG: High of current bar is lower than Low of 2 bars ago. The breakout candle is 1 bar ago.
+bearFVG = high < low[2] and close[1] < open[1]
+
+// Signal variables for plotting
+var bool resSignal = false
+var bool supSignal = false
+resSignal := false
+supSignal := false
+
+// Add new pivot highs to the tracking array
+if not na(ph)
+    pivotBar = bar_index - rightLen
+    lId = line.new(pivotBar, ph, bar_index, ph, color = resColor, style = line.style_dotted, width = 2)
+    array.push(levels, Level.new(lId, ph, 1, false, pivotBar))
+    
+    activeCount = 0
+    for i = array.size(levels) - 1 to 0
+        lvl = array.get(levels, i)
+        if not lvl.isBroken and lvl.lvlType == 1
+            activeCount += 1
+            if activeCount > maxLevels
+                line.delete(lvl.lineId)
+                array.remove(levels, i)
+
+// Add new pivot lows to the tracking array
+if not na(pl)
+    pivotBar = bar_index - rightLen
+    lId = line.new(pivotBar, pl, bar_index, pl, color = supColor, style = line.style_dotted, width = 2)
+    array.push(levels, Level.new(lId, pl, -1, false, pivotBar))
+    
+    activeCount = 0
+    for i = array.size(levels) - 1 to 0
+        lvl = array.get(levels, i)
+        if not lvl.isBroken and lvl.lvlType == -1
+            activeCount += 1
+            if activeCount > maxLevels
+                line.delete(lvl.lineId)
+                array.remove(levels, i)
+
+// Iterate through levels to extend them and check for breakouts
+if array.size(levels) > 0
+    for i = array.size(levels) - 1 to 0
+        lvl = array.get(levels, i)
+        
+        if not lvl.isBroken
+            // Extend the line to current bar
+            line.set_x2(lvl.lineId, bar_index)
+            
+            // Check if the level is too old
+            lvlAge = bar_index - lvl.barIdx
+            isValidAge = lvlAge <= maxLvlAge
+            
+            // Check for Resistance Breakout (Close crosses above level)
+            if lvl.lvlType == 1 and close[1] > lvl.price
+                lvl.isBroken := true // Any close above invalidates the level
+                if open[1] < lvl.price and strongBody and bullFVG
+                    line.set_style(lvl.lineId, line.style_solid)
+                    line.set_x2(lvl.lineId, bar_index - 1) // Connect to the breakout candle
+                    
+                    if isValidAge
+                        // Draw Active FVG Box & Signal
+                        box.new(left = bar_index - 1, top = low, right = bar_index + boxExtend, bottom = high[2], border_color = resColor, border_width = 2, bgcolor = color.new(resColor, boxBgTransp))
+                        resSignal := true
+                        alert("Resistance Breakout! Price broke above a significant resistance level with an FVG at price " + str.tostring(lvl.price), alert.freq_once_per_bar_close)
+                    else
+                        // Draw Expired FVG Box in Grey
+                        line.set_color(lvl.lineId, expColor)
+                        box.new(left = bar_index - 1, top = low, right = bar_index + boxExtend, bottom = high[2], border_color = expColor, border_width = 2, bgcolor = color.new(expColor, boxBgTransp))
+                    
+                    // Remove from tracking array since it's resolved
+                    array.remove(levels, i)
+                else
+                    line.delete(lvl.lineId) // Remove line if it was an invalid break
+                    array.remove(levels, i)
+            
+            // Check for Support Breakout (Close crosses below level)
+            if lvl.lvlType == -1 and close[1] < lvl.price
+                lvl.isBroken := true // Any close below invalidates the level
+                if open[1] > lvl.price and strongBody and bearFVG
+                    line.set_style(lvl.lineId, line.style_solid)
+                    line.set_x2(lvl.lineId, bar_index - 1) // Connect to the breakout candle
+                    
+                    if isValidAge
+                        // Draw Active FVG Box & Signal
+                        box.new(left = bar_index - 1, top = low[2], right = bar_index + boxExtend, bottom = high, border_color = supColor, border_width = 2, bgcolor = color.new(supColor, boxBgTransp))
+                        supSignal := true
+                        alert("Support Breakout! Price broke below a significant support level with an FVG at price " + str.tostring(lvl.price), alert.freq_once_per_bar_close)
+                    else
+                        // Draw Expired FVG Box in Grey
+                        line.set_color(lvl.lineId, expColor)
+                        box.new(left = bar_index - 1, top = low[2], right = bar_index + boxExtend, bottom = high, border_color = expColor, border_width = 2, bgcolor = color.new(expColor, boxBgTransp))
+                    
+                    // Remove from tracking array since it's resolved
+                    array.remove(levels, i)
+                else
+                    line.delete(lvl.lineId) // Remove line if it was an invalid break
+                    array.remove(levels, i)
+
+// --- Visual Elements ---
+// Plot signals (optional, kept for clarity)
+plotshape(resSignal, title = "Resistance Breakout", style = shape.triangleup, location = location.belowbar, color = #089981, size = size.small)
+plotshape(supSignal, title = "Support Breakout", style = shape.triangledown, location = location.abovebar, color = #f23645, size = size.small)
+
+// Alert conditions (for traditional alert setup)
+alertcondition(resSignal, title = "Resistance Breakout Alert", message = "Price broke above a significant resistance level with an FVG.")
+alertcondition(supSignal, title = "Support Breakout Alert", message = "Price broke below a significant support level with an FVG.")

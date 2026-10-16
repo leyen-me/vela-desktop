@@ -1,0 +1,239 @@
+// This work is licensed under Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Williams VIX Fix", shorttitle = "Williams VIX Fix", overlay = false, format = format.price, precision = 2)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+CALM_COLOR     = #5b9cf6 // non-directional volatility color, bottom of the scale
+ELEVATED_COLOR = #ff9800 // fear building toward the spike threshold
+SPIKE_COLOR    = #f23645 // panic: the VIX Fix at or above its spike threshold
+SIGNAL_COLOR   = #089981 // exhaustion: the spike has unwound and price confirmed
+LEVEL_COLOR    = #787b86 // threshold and reference lines
+
+float ELEVATED_SHARE = 0.75 // share of the spike threshold where a reading counts as elevated
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+string GRP_WVF    = "VIX Fix"
+string GRP_SPIKE  = "Spike Threshold"
+string GRP_SIGNAL = "Exhaustion Signal"
+string GRP_DASH   = "Dashboard"
+string GRP_STYLE  = "Style"
+
+string RULE_EITHER = "Either"
+string RULE_BOTH   = "Both"
+string RULE_BB     = "Bollinger Band"
+string RULE_RANGE  = "Range Percentile"
+
+string CONF_HIGH  = "Close Above Prior High"
+string CONF_CLOSE = "Close Above Prior Close"
+string CONF_NONE  = "None"
+
+string TXT_NA = "-"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+lengthInput = input.int(22, "Highest Close Lookback", minval = 2, group = GRP_WVF
+  , tooltip = "Bars searched for the highest close the current low is measured against. Larry Williams used 22 trading days, about one month, to mirror the 30 calendar days the VIX looks ahead.")
+
+pctLookbackInput = input.int(252, "Percentile Lookback", minval = 20, group = GRP_WVF
+  , tooltip = "Bars the current reading is percentile-ranked against. Raw VIX Fix values differ by market (a quiet utility and a crypto coin live on different scales), so the rank says how unusual today's fear is for this symbol. 252 daily bars is one year.")
+
+ruleInput = input.string(RULE_EITHER, "Spike Rule", options = [RULE_EITHER, RULE_BOTH, RULE_BB, RULE_RANGE], group = GRP_SPIKE
+  , tooltip = "How a spike is declared. Bollinger Band: the VIX Fix closes above its upper band. Range Percentile: it reaches a set share of its recent peak. Either fires on the first of the two (the most responsive), Both waits for the two to agree (the most selective). The plotted threshold is the level the active rule uses.")
+
+bbLengthInput = input.int(20, "Band Length", minval = 2, inline = "bb", group = GRP_SPIKE)
+bbMultInput   = input.float(2.0, "Mult", minval = 0.5, step = 0.1, inline = "bb", group = GRP_SPIKE
+  , tooltip = "Length and standard deviation multiplier of the Bollinger Band computed on the VIX Fix itself. A reading above the upper band is fear well outside its recent norm.")
+
+rangeLengthInput = input.int(50, "Range Lookback", minval = 5, inline = "rng", group = GRP_SPIKE)
+rangePctInput    = input.float(85, "Peak %", minval = 50, maxval = 100, step = 1, inline = "rng", group = GRP_SPIKE
+  , tooltip = "The range rule declares a spike when the VIX Fix reaches this share of its highest reading over the lookback. 85% over 50 bars is the widely shared default.")
+
+floorInput = input.float(80, "Fear Floor (Percentile)", minval = 0, maxval = 99, step = 1, group = GRP_SPIKE
+  , tooltip = "A spike must also rank at or above this percentile of the Percentile Lookback. The band and range rules are relative to the last few weeks, so in a quiet market an ordinary dip can clear them; the floor keeps spikes to fear that is unusual for the past year. Set 0 to use the rules alone.")
+
+showSignalInput = input.bool(true, "Show Exhaustion Signals", group = GRP_SIGNAL
+  , tooltip = "A spike marks fear, not the turn. The exhaustion signal waits for the VIX Fix to drop back below its threshold after a spike, for the bar to hold above the lowest low of the spike, and for price to confirm with the selected close: the bar a dip buyer acts on, with the spike low as the natural stop. Signals are final on the bar close.")
+
+windowInput = input.int(5, "Unwind Window", minval = 1, maxval = 20, group = GRP_SIGNAL
+  , tooltip = "Bars after the last spike bar within which the exhaustion must appear. A confirmation that arrives later belongs to a calmer market and is not counted.")
+
+confInput = input.string(CONF_HIGH, "Price Confirmation", options = [CONF_HIGH, CONF_CLOSE, CONF_NONE], group = GRP_SIGNAL
+  , tooltip = "Price behavior required on the exhaustion bar. Close Above Prior High is the strictest and keeps signals out of falling-knife bars; Close Above Prior Close is earlier; None signals on the unwind alone.")
+
+trendInput = input.bool(false, "Trend Filter", inline = "trend", group = GRP_SIGNAL)
+trendLenInput = input.int(200, "SMA", minval = 2, inline = "trend", group = GRP_SIGNAL
+  , tooltip = "When enabled, exhaustion signals print only while price closes above this simple moving average, keeping the tool to panic dips inside a rising market, the use Williams described.")
+
+showPriceInput = input.bool(true, "Mark Signals On Price", group = GRP_SIGNAL
+  , tooltip = "Repeats each exhaustion signal under its candle on the price chart, where the entry is taken.")
+
+showDashInput = input.bool(true, "Show Dashboard", group = GRP_DASH
+  , tooltip = "Current VIX Fix reading, its percentile rank, the active spike threshold, the state of the fear cycle and the bars since the last exhaustion signal.")
+
+dashPosInput = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], inline = "dash", group = GRP_DASH)
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], inline = "dash", group = GRP_DASH
+  , tooltip = "Dashboard position in the pane and text size.")
+
+calmColorInput     = input.color(CALM_COLOR, "Calm", inline = "col", group = GRP_STYLE)
+elevatedColorInput = input.color(ELEVATED_COLOR, "Elevated", inline = "col", group = GRP_STYLE)
+spikeColorInput    = input.color(SPIKE_COLOR, "Spike", inline = "col", group = GRP_STYLE
+  , tooltip = "Column colors: Calm below three quarters of the spike threshold, Elevated from there up to it, Spike at or above it.")
+signalColorInput   = input.color(SIGNAL_COLOR, "Exhaustion", inline = "sig", group = GRP_STYLE)
+levelColorInput    = input.color(LEVEL_COLOR, "Threshold", inline = "sig", group = GRP_STYLE
+  , tooltip = "Colors of the exhaustion signals and of the spike threshold line.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+//Williams VIX Fix: distance of the current low below the highest close of the lookback, in percent of that close
+float highestClose = ta.highest(close, lengthInput)
+float wvf          = highestClose > 0 ? (highestClose - low) / highestClose * 100 : na
+
+//Bollinger Band on the VIX Fix
+float bbBasis = ta.sma(wvf, bbLengthInput)
+float bbUpper = bbBasis + bbMultInput * ta.stdev(wvf, bbLengthInput)
+
+//Share of the recent peak reading
+float rangeHigh = ta.highest(wvf, rangeLengthInput) * rangePctInput / 100
+
+//Level the chosen rule must reach
+float ruleLevel = switch ruleInput
+    RULE_BB    => bbUpper
+    RULE_RANGE => rangeHigh
+    RULE_BOTH  => math.max(bbUpper, rangeHigh)
+    => math.min(bbUpper, rangeHigh)
+
+//Percentile rank of the reading against its own history, and the reading at the fear floor
+float pctRank    = ta.percentrank(wvf, pctLookbackInput)
+float floorRaw   = ta.percentile_nearest_rank(wvf, pctLookbackInput, math.max(floorInput, 1))
+float floorLevel = floorInput > 0 ? floorRaw : na
+
+//Active threshold: the rule level, raised to the fear floor when the floor is higher
+float threshold = na(floorLevel) ? ruleLevel : math.max(ruleLevel, floorLevel)
+
+bool spike = not na(wvf) and not na(threshold) and wvf >= threshold
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Fear Cycle & Exhaustion
+//---------------------------------------------------------------------------------------------------------------------{
+var int   lastSpikeBar  = na
+var float cyclePeak     = na
+var int   lastSignalBar = na
+var float lastPeak      = na
+var bool  cycleOpen     = false
+var float cycleLow      = na
+
+bool spikeStart = spike and not spike[1]
+
+//the lowest low of the open fear cycle, before this bar
+float priorCycleLow = cycleOpen ? cycleLow : na
+
+if spike
+    if not cycleOpen
+        cycleOpen     := true
+        cyclePeak     := wvf
+        cycleLow      := low
+    cyclePeak    := math.max(cyclePeak, wvf)
+    lastSpikeBar := bar_index
+
+bool inWindow = cycleOpen and not spike and bar_index - lastSpikeBar <= windowInput
+
+//price must hold above the spike low on the exhaustion bar
+bool heldLow = na(priorCycleLow) or low > priorCycleLow
+
+bool confirmed = switch confInput
+    CONF_HIGH  => close > high[1]
+    CONF_CLOSE => close > close[1]
+    => true
+
+float trendMa = ta.sma(close, trendLenInput)
+bool  trendOk = not trendInput or close > trendMa
+
+bool exhaustion = showSignalInput and inWindow and heldLow and confirmed and trendOk
+
+if cycleOpen
+    cycleLow := math.min(nz(cycleLow, low), low)
+
+if exhaustion
+    lastSignalBar := bar_index
+    lastPeak      := cyclePeak
+    cycleOpen     := false
+
+//the cycle lapses once the unwind window passes without a confirmation
+if cycleOpen and not spike and bar_index - lastSpikeBar > windowInput
+    cycleOpen := false
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Plots
+//---------------------------------------------------------------------------------------------------------------------{
+//three states: calm, elevated within a quarter of the threshold, spike at or above it
+bool  elevated = not spike and not na(threshold) and wvf >= ELEVATED_SHARE * threshold
+color wvfColor = spike ? spikeColorInput : elevated ? elevatedColorInput : calmColorInput
+
+plot(wvf, "VIX Fix", color.new(wvfColor, spike ? 0 : elevated ? 15 : 40), 1, plot.style_columns)
+plot(threshold, "Spike Threshold", color.new(levelColorInput, 20), 1, plot.style_line)
+plot(bbBasis, "Band Basis", color.new(levelColorInput, 65), 1, plot.style_line, display = display.data_window)
+
+//exhaustion marker at the reading that confirmed it
+plotshape(exhaustion ? wvf : na, "Exhaustion", shape.triangleup, location.absolute, signalColorInput, size = size.tiny)
+
+//price chart: the entry bar
+plotshape(showPriceInput and exhaustion, "Exhaustion On Price", shape.triangleup, location.belowbar, signalColorInput, size = size.small, force_overlay = true)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+dashPosition = switch dashPosInput
+    "Top Left"     => position.top_left
+    "Bottom Right" => position.bottom_right
+    "Bottom Left"  => position.bottom_left
+    => position.top_right
+
+dashTextSize = switch dashSizeInput
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    => size.small
+
+ordinal(float p) =>
+    int n = int(math.round(p))
+    int m = n % 100
+    string suffix = m >= 11 and m <= 13 ? "th" : n % 10 == 1 ? "st" : n % 10 == 2 ? "nd" : n % 10 == 3 ? "rd" : "th"
+    str.tostring(n) + suffix
+
+var table dashTable = na
+
+dashRow(int row, string name, string value, color valueColor, string tip) =>
+    table.cell(dashTable, 0, row, name, text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left, tooltip = tip)
+    table.cell(dashTable, 1, row, value, text_color = valueColor, text_size = dashTextSize, text_halign = text.align_right)
+
+if barstate.islast and showDashInput
+    if na(dashTable)
+        dashTable := table.new(dashPosition, 2, 6, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+    string stateText  = spike ? "Spike" : inWindow ? "Unwinding" : not na(lastSignalBar) and bar_index - lastSignalBar <= windowInput ? "Exhausted" : elevated ? "Elevated" : "Calm"
+    color  stateColor = spike ? spikeColorInput : stateText == "Exhausted" ? signalColorInput : stateText == "Unwinding" or stateText == "Elevated" ? elevatedColorInput : DASH_TEXT
+    string lastText   = na(lastSignalBar) ? "None yet" : str.tostring(bar_index - lastSignalBar) + " bars ago"
+    table.cell(dashTable, 0, 0, "Williams VIX Fix", text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 0, str.tostring(lengthInput) + " bars", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_right)
+    dashRow(1, "Reading", na(wvf) ? TXT_NA : str.tostring(wvf, "0.00"), wvfColor, "Current VIX Fix: how far the low sits below the highest close of the lookback, in percent.")
+    dashRow(2, "Percentile", na(pctRank) ? TXT_NA : ordinal(pctRank), DASH_TEXT, "Share of the last " + str.tostring(pctLookbackInput) + " readings at or below the current one.")
+    dashRow(3, "Threshold", na(threshold) ? TXT_NA : str.tostring(threshold, "0.00"), DASH_TEXT, "Spike threshold: the " + ruleInput + " rule" + (floorInput > 0 ? ", raised to the " + ordinal(floorInput) + " percentile reading when that is higher." : "."))
+    dashRow(4, "State", stateText, stateColor, "Calm, Elevated within a quarter of the threshold, Spike at or above the threshold, Unwinding inside the window after a spike, Exhausted once a signal printed.")
+    dashRow(5, "Last Signal", lastText, na(lastSignalBar) ? DASH_TEXT : signalColorInput, "Bars since the last exhaustion signal" + (na(lastPeak) ? "." : ", which followed a peak reading of " + str.tostring(lastPeak, "0.00") + "."))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(spikeStart, "VIX Fix Spike", "Williams VIX Fix spiked above its threshold on {{ticker}}: fear is at an extreme for this market")
+alertcondition(exhaustion, "Exhaustion Signal", "Williams VIX Fix exhaustion on {{ticker}}: the spike unwound and price confirmed")
+alertcondition(ta.crossover(pctRank, 95), "Reading Above 95th Percentile", "Williams VIX Fix reading above its 95th percentile on {{ticker}}")
+
+//---------------------------------------------------------------------------------------------------------------------}

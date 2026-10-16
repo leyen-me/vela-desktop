@@ -1,0 +1,263 @@
+// This work is licensed under Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Follow-through Day", shorttitle = "Follow-through Day", overlay = true, max_labels_count = 500, max_lines_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+color FTD_COLOR     = #089981
+color CORR_COLOR    = #f23645
+color WARN_COLOR    = #ff9800
+color NEUTRAL_COLOR = #787b86
+color HIDDEN_COLOR  = #00000000
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+int CELL_TRANSP = 80
+
+string GRP_CORR  = 'Correction'
+string GRP_RALLY = 'Rally Attempt'
+string GRP_FTD   = 'Follow-through Rules'
+string GRP_WATCH = 'After the Follow-through'
+string GRP_DASH  = 'Dashboard'
+string GRP_STYLE = 'Style'
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+corrInput = input.float(8.0, 'Correction Depth %', minval = 2, maxval = 50, step = 0.5, group = GRP_CORR, tooltip = 'A follow-through can only confirm the end of a correction, so the market is put in correction once the index closes this far below its highest close since the last uptrend began. A follow-through that fails also puts it back in correction. Apply the tool to a major index or an index ETF on daily bars: the rules are defined on the Nasdaq Composite and the S&P 500, and one index is enough.')
+
+refInput = input.string('Day 1 Low', 'Attempt Fails Below', options = ['Day 1 Low', 'Correction Low'], group = GRP_RALLY, tooltip = 'A rally attempt stays alive while the index holds above Day 1\'s low; an undercut restarts the count and a new Day 1 is sought. The Correction Low option keeps the attempt alive until the correction low itself is undercut, a looser reading some counters use.')
+
+upperHalfInput = input.bool(true, 'Day 1 on Upper-Half Reversal', group = GRP_RALLY, tooltip = 'Day 1 is the first session after the correction low that closes higher. IBD also accepts a session that undercuts the low and then closes in the upper half of its range.')
+
+minDayInput = input.int(4, 'Earliest Day', minval = 2, maxval = 20, group = GRP_FTD, tooltip = 'A follow-through can come on Day 4 of the rally attempt or later, so a big gain on Day 2 or 3 does not qualify. O\'Neil found the strongest follow-throughs on days 4 to 7.')
+
+maxDayInput = input.int(0, 'Latest Day (0 = none)', minval = 0, maxval = 100, group = GRP_FTD, tooltip = 'Optional cap on the rally-attempt day. The rule sets none: late follow-throughs still count, and their labels say how late they came.')
+
+gainInput = input.float(1.25, 'Minimum Gain %', minval = 0.1, maxval = 10, step = 0.05, group = GRP_FTD, tooltip = 'Close-to-close gain required on the follow-through day. O\'Neil\'s original rule used 1%, IBD applied 1.7% by the mid-2000s, and recent descriptions of IBD\'s rule commonly give about 1.25%.')
+
+watchInput = input.int(25, 'Failure Watch (sessions)', minval = 5, maxval = 200, group = GRP_WATCH, tooltip = 'Sessions after a follow-through during which an undercut of the rally attempt\'s low marks it as failed and distribution days are counted against it.')
+
+earlyLenInput = input.int(10, 'Early Distribution Window', minval = 2, maxval = 50, group = GRP_WATCH, tooltip = 'Distribution days (a 0.2% loss on higher volume) stacking up within this many sessions of the follow-through are an early sign the new uptrend is failing.')
+
+earlyCountInput = input.int(2, 'Early Distribution Warning At', minval = 1, maxval = 10, group = GRP_WATCH, tooltip = 'Number of distribution days inside the early window that flags the follow-through as under pressure.')
+
+showDashInput = input.bool(true, 'Show Dashboard', group = GRP_DASH)
+dashPosInput  = input.string('Bottom Right', 'Position', options = ['Top Right', 'Top Left', 'Bottom Right', 'Bottom Left'], inline = 'dash', group = GRP_DASH)
+dashSizeInput = input.string('Small', 'Size', options = ['Tiny', 'Small', 'Normal'], inline = 'dash', group = GRP_DASH)
+
+showDaysInput = input.bool(true, 'Number Rally Days', group = GRP_STYLE, tooltip = 'Print the rally-attempt day under each session of the live attempt. A failed attempt\'s numbers are cleared and its undercut is marked.')
+ftdColorInput  = input.color(FTD_COLOR, 'Follow-through', inline = 'c', group = GRP_STYLE)
+corrColorInput = input.color(CORR_COLOR, 'Correction', inline = 'c', group = GRP_STYLE)
+warnColorInput = input.color(WARN_COLOR, 'Warning', inline = 'c', group = GRP_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+
+float chgPct    = close[1] > 0 ? (close / close[1] - 1) * 100 : na
+bool  volUp     = nz(volume) > nz(volume[1]) and nz(volume[1]) > 0
+float volRatio  = nz(volume[1]) > 0 ? nz(volume) / volume[1] : na
+bool  upperHalf = high > low and (close - low) / (high - low) >= 0.5
+bool  distDay   = not na(chgPct) and chgPct <= -0.2 and volUp
+float atr14     = ta.atr(14)
+
+var bool volumeSeen = false
+if nz(volume) > 0
+    volumeSeen := true
+
+// state: 0 uptrend, 1 correction (rally attempts tracked), 2 uptrend confirmed by a follow-through
+var int   state    = 0
+var float peak     = na
+var int   peakBar  = na
+var float corrLow  = na
+var float corrPeak = na
+var int   day      = 0
+var int   day1Bar  = na
+var float refLow   = na
+var line  refLine  = na
+var array<label> dayMarks = array.new<label>()
+
+var int   ftdBar   = na
+var int   ftdDay   = na
+var float ftdGain  = na
+var float ftdVol   = na
+var float ftdClose = na
+var float failLvl  = na
+var line  failLine = na
+var int   earlyDD  = 0
+var bool  warned   = false
+var int   attempts = 0
+
+bool corrEvent   = false
+bool day1Event   = false
+bool undercutEvt = false
+bool ftdEvent    = false
+bool warnEvent   = false
+bool failEvent   = false
+
+clearAttempt() =>
+    int n = array.size(dayMarks)
+    if n > 0
+        for i = 0 to n - 1
+            label.delete(array.get(dayMarks, i))
+    array.clear(dayMarks)
+
+if barstate.isconfirmed and not na(chgPct)
+    bool enterCorr = false
+
+    // uptrend: watch for a correction, or for the follow-through failing
+    if state != 1
+        if na(peak) or close > peak
+            peak    := close
+            peakBar := bar_index
+        if state == 2 and bar_index - ftdBar <= watchInput
+            if not na(failLine)
+                line.set_x2(failLine, bar_index)
+            if bar_index - ftdBar <= earlyLenInput and distDay
+                earlyDD += 1
+                label dLbl = label.new(bar_index, high, 'D', style = label.style_label_down, color = HIDDEN_COLOR, textcolor = corrColorInput, size = size.small, tooltip = 'Distribution day ' + str.tostring(bar_index - ftdBar) + ' sessions after the follow-through: ' + str.tostring(chgPct, '#.##') + '% on higher volume')
+                if earlyDD >= earlyCountInput and not warned
+                    warned    := true
+                    warnEvent := true
+                    label.set_text(dLbl, 'D · under pressure')
+                    label.set_textcolor(dLbl, warnColorInput)
+            if low < failLvl
+                failEvent := true
+                enterCorr := true
+                label.new(bar_index, low, 'Follow-through failed', style = label.style_label_up, color = HIDDEN_COLOR, textcolor = corrColorInput, size = size.small, tooltip = 'The index undercut the rally attempt\'s low of ' + str.tostring(failLvl, format.mintick))
+        float dd = (close / peak - 1) * 100
+        if not enterCorr and dd <= -corrInput
+            enterCorr := true
+            corrEvent := true
+            label.new(bar_index, math.max(high, high[1], high[2], high[3], high[4]), 'Correction ' + str.tostring(dd, '#.#') + '%', style = label.style_label_down, color = HIDDEN_COLOR, textcolor = corrColorInput, size = size.small, tooltip = 'Close ' + str.tostring(math.abs(dd), '#.#') + '% below the highest close since the uptrend began: rally attempts are now tracked')
+        if enterCorr
+            // the correction low so far: lowest low since the peak, before this session
+            float lo = na
+            for k = 1 to math.max(1, bar_index - peakBar)
+                lo := na(lo) ? low[k] : math.min(lo, low[k])
+            state    := 1
+            corrLow  := failEvent ? math.min(nz(corrLow, lo), lo) : lo
+            corrPeak := failEvent ? nz(corrPeak, peak) : peak
+            day      := 0
+            clearAttempt()
+
+    // correction: count rally attempts from the low
+    if state == 1 and not ftdEvent
+        bool newLow  = low < corrLow
+        if newLow
+            corrLow := low
+        bool started = false
+
+        if day > 0
+            bool undercut = refInput == 'Day 1 Low' ? low < refLow : newLow
+            if undercut
+                undercutEvt := true
+                day := 0
+                clearAttempt()
+                if not na(refLine)
+                    line.delete(refLine)
+                if showDaysInput
+                    label.new(bar_index, low, '×', style = label.style_label_up, color = HIDDEN_COLOR, textcolor = NEUTRAL_COLOR, size = size.small, tooltip = 'Rally attempt undercut ' + (refInput == 'Day 1 Low' ? 'Day 1\'s low' : 'the correction low') + ': the count restarts')
+
+        if day == 0 and not enterCorr
+            if close > close[1] or (upperHalfInput and newLow and upperHalf)
+                day       := 1
+                day1Bar   := bar_index
+                refLow    := refInput == 'Day 1 Low' ? low : corrLow
+                started   := true
+                day1Event := true
+                attempts  += 1
+                refLine   := line.new(bar_index, refLow, bar_index, refLow, color = color.new(corrColorInput, 30), style = line.style_dashed)
+        else if day > 0
+            day += 1
+            if not na(refLine)
+                line.set_x2(refLine, bar_index)
+            if refInput == 'Correction Low'
+                refLow := corrLow
+            bool inWindow = day >= minDayInput and (maxDayInput == 0 or day <= maxDayInput)
+            if inWindow and chgPct >= gainInput and volUp
+                ftdEvent := true
+                state    := 2
+                ftdBar   := bar_index
+                ftdDay   := day
+                ftdGain  := chgPct
+                ftdVol   := volRatio
+                ftdClose := close
+                failLvl  := refLow
+                peak     := close
+                peakBar  := bar_index
+                earlyDD  := 0
+                warned   := false
+                if not na(refLine)
+                    line.delete(refLine)
+                failLine := line.new(day1Bar, failLvl, bar_index, failLvl, color = color.new(corrColorInput, 20), style = line.style_dashed)
+                label.new(day1Bar, failLvl, 'Rally low ' + str.tostring(failLvl, format.mintick), style = label.style_label_upper_left, color = HIDDEN_COLOR, textcolor = corrColorInput, size = size.small, tooltip = 'The follow-through fails if the index undercuts this low within ' + str.tostring(watchInput) + ' sessions')
+                string tip = 'Day ' + str.tostring(day) + ' of the rally attempt' + (day <= 7 ? ' (inside O\'Neil\'s day 4 to 7 window)' : ' (a late follow-through)') + '\nGain +' + str.tostring(chgPct, '#.##') + '% on volume ' + str.tostring(volRatio, '#.##') + 'x the prior session\nCorrection ' + str.tostring((corrLow / corrPeak - 1) * 100, '#.#') + '% from peak to low'
+                label.new(bar_index, math.min(low, low[1], low[2], low[3]) - 0.25 * atr14, 'Follow-through · day ' + str.tostring(day), style = label.style_label_up, color = ftdColorInput, textcolor = color.white, size = size.small, tooltip = tip)
+
+        if showDaysInput and day > 0 and not ftdEvent
+            array.push(dayMarks, label.new(bar_index, low, str.tostring(day), style = label.style_label_up, color = HIDDEN_COLOR, textcolor = day >= minDayInput ? ftdColorInput : NEUTRAL_COLOR, size = size.small, tooltip = 'Rally attempt day ' + str.tostring(day) + (day >= minDayInput ? ': a follow-through can qualify from here' : '')))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+
+plot(state == 1 ? day : na, 'Rally Attempt Day', color = na, display = display.data_window)
+
+var table dash = na
+
+if showDashInput and barstate.islast
+    string pos = switch dashPosInput
+        'Top Right'   => position.top_right
+        'Top Left'    => position.top_left
+        'Bottom Left' => position.bottom_left
+        => position.bottom_right
+
+    string sz = switch dashSizeInput
+        'Tiny'   => size.tiny
+        'Normal' => size.normal
+        => size.small
+
+    if na(dash)
+        dash := table.new(pos, 2, 7, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+        table.merge_cells(dash, 0, 0, 1, 0)
+
+    string statusTxt = not volumeSeen ? 'No volume data' : state == 1 ? (day > 0 ? 'Rally attempt · day ' + str.tostring(day) : 'Market in correction') : state == 2 ? (warned ? 'Uptrend under pressure' : 'Confirmed uptrend') : 'Uptrend'
+    color  statusCol = not volumeSeen ? DASH_HEADER : state == 1 ? corrColorInput : warned ? warnColorInput : ftdColorInput
+    float  sinceFtd  = na(ftdClose) ? na : (close / ftdClose - 1) * 100
+
+    table.cell(dash, 0, 0, 'Follow-through Day', text_color = DASH_TEXT, text_size = sz)
+    table.cell(dash, 0, 1, 'Status', text_color = DASH_HEADER, text_size = sz, text_halign = text.align_left)
+    table.cell(dash, 1, 1, statusTxt, text_color = statusCol, bgcolor = color.new(statusCol, CELL_TRANSP), text_size = sz)
+    table.cell(dash, 0, 2, 'Last correction', text_color = DASH_HEADER, text_size = sz, text_halign = text.align_left)
+    table.cell(dash, 1, 2, na(corrPeak) ? '-' : str.tostring((corrLow / corrPeak - 1) * 100, '#.#') + '% peak to low', text_color = DASH_TEXT, text_size = sz)
+    table.cell(dash, 0, 3, state == 1 ? 'Attempt fails below' : 'Follow-through fails below', text_color = DASH_HEADER, text_size = sz, text_halign = text.align_left)
+    table.cell(dash, 1, 3, state == 1 ? (day > 0 ? str.tostring(refLow, format.mintick) : 'awaiting Day 1') : state == 2 and bar_index - ftdBar <= watchInput ? str.tostring(failLvl, format.mintick) : '-', text_color = corrColorInput, text_size = sz)
+    table.cell(dash, 0, 4, 'Last follow-through', text_color = DASH_HEADER, text_size = sz, text_halign = text.align_left)
+    table.cell(dash, 1, 4, na(ftdBar) ? '-' : 'Day ' + str.tostring(ftdDay) + ' · +' + str.tostring(ftdGain, '#.##') + '% · ' + str.tostring(ftdVol, '#.##') + 'x vol', text_color = DASH_TEXT, text_size = sz)
+    table.cell(dash, 0, 5, 'Since follow-through', text_color = DASH_HEADER, text_size = sz, text_halign = text.align_left)
+    table.cell(dash, 1, 5, na(sinceFtd) ? '-' : (sinceFtd >= 0 ? '+' : '') + str.tostring(sinceFtd, '#.#') + '% in ' + str.tostring(bar_index - ftdBar) + ' sessions', text_color = DASH_TEXT, text_size = sz)
+    table.cell(dash, 0, 6, 'Early distribution', text_color = DASH_HEADER, text_size = sz, text_halign = text.align_left)
+    table.cell(dash, 1, 6, na(ftdBar) ? '-' : str.tostring(earlyDD) + ' in ' + str.tostring(earlyLenInput) + ' sessions', text_color = warned ? warnColorInput : DASH_TEXT, text_size = sz)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(corrEvent, 'Market in Correction', 'Follow-through day: {{ticker}} fell into correction, rally attempts are now tracked.')
+alertcondition(day1Event, 'Rally Attempt Day 1', 'Follow-through day: {{ticker}} started a rally attempt (Day 1).')
+alertcondition(undercutEvt, 'Rally Attempt Undercut', 'Follow-through day: {{ticker}} undercut the rally attempt low, the count restarts.')
+alertcondition(ftdEvent, 'Follow-through Day', 'Follow-through day: {{ticker}} posted a follow-through, a strong gain on higher volume on Day 4 or later of the rally attempt.')
+alertcondition(warnEvent, 'Follow-through Under Pressure', 'Follow-through day: distribution days are stacking up soon after the follow-through on {{ticker}}.')
+alertcondition(failEvent, 'Follow-through Failed', 'Follow-through day: {{ticker}} undercut the rally attempt low after the follow-through.')
+
+//---------------------------------------------------------------------------------------------------------------------}

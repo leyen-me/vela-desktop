@@ -1,0 +1,165 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Volatility Switch", shorttitle = "Volatility Switch", overlay = false, format = format.price, precision = 2)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+HIGH_VOL_COLOR = #f23645 // high-volatility regime - upper half of the scale
+LOW_VOL_COLOR  = #089981 // low-volatility regime - lower half of the scale
+LEVEL_COLOR    = #787b86 // 0.5 decision line and the 0/1 scale bounds
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+MID_LEVEL   = 0.5 // McEwan's published decision line
+UPPER_BOUND = 1.0
+LOWER_BOUND = 0.0
+
+MAX_RANK_LENGTH   = 500 // upper bound of the ranking window, sizes the history buffer
+FILL_VALUE_TRANSP = 50  // gradient transparency at the switch value
+FILL_MID_TRANSP   = 100 // gradient transparency at the 0.5 line
+BG_TRANSP         = 90  // regime background transparency
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+srcInput        = input.source(close, "Source", group = "Settings",
+     tooltip = "Price series the symmetric one-bar relative changes are measured from. McEwan's formula uses the close - the switch needs nothing else.")
+
+volLengthInput  = input.int(21, "Volatility Length", minval = 2, group = "Settings",
+     tooltip = "Window of the standard deviation of one-bar relative price changes - the short-horizon realized volatility estimate. The published default is 21 bars, roughly one month of daily data.")
+
+rankLengthInput = input.int(21, "Rank Length", minval = 2, maxval = MAX_RANK_LENGTH, group = "Settings",
+     tooltip = "Trailing history the current volatility estimate is percentile-ranked against. The output is the fraction of readings at or below the current one, which pins the scale between 0 and 1. Published default: 21 bars. Shorter windows change regime faster but flip more often; longer ones are steadier and slower.")
+
+tfInput         = input.timeframe("", "Timeframe", group = "Settings",
+     tooltip = "Timeframe the switch is computed on. Leave empty for the chart timeframe. Intraday, volatility follows the session clock and the rank can cycle with time of day - reading the switch from a higher timeframe is the common workaround. Higher-timeframe values come from completed bars only, so they do not repaint.")
+
+showDashInput   = input.bool(true, "Show Dashboard", group = "Dashboard",
+     tooltip = "Displays the current regime, the switch value, and how many chart bars the regime has persisted - the reading weighs a held side over single crossings. Also reports when there is not enough data to compute the switch.")
+
+dashPosInput    = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], inline = "dash", group = "Dashboard",
+     tooltip = "Corner of the pane the dashboard is anchored to.")
+
+dashSizeInput   = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], inline = "dash", group = "Dashboard",
+     tooltip = "Dashboard text size.")
+
+highColorInput  = input.color(HIGH_VOL_COLOR, "High Volatility", group = "Style",
+     tooltip = "Color while the switch holds above 0.5 - volatility elevated relative to its own recent history, the regime where mean-reversion tactics have the stronger claim.")
+
+lowColorInput   = input.color(LOW_VOL_COLOR, "Low Volatility", group = "Style",
+     tooltip = "Color while the switch holds below 0.5 - volatility subdued relative to its own recent history, the quiet regime in which trends are more likely to persist.")
+
+levelColorInput = input.color(LEVEL_COLOR, "Levels", group = "Style",
+     tooltip = "Color of the dashed 0.5 decision line and of the dotted 0 and 1 scale bounds.")
+
+showBgInput     = input.bool(false, "Regime Background", group = "Style",
+     tooltip = "Shades the pane background with the active regime color so regime stretches stand out at a glance. Off by default to keep the pane clean.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+getTablePosition(positionText) =>
+    switch positionText
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        => position.bottom_left
+
+getTextSize(sizeText) =>
+    switch sizeText
+        "Tiny"  => size.tiny
+        "Small" => size.small
+        => size.normal
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+// Symmetric one-bar relative change - each bar's move measured against the average of the current and prior price
+avgPrice  = (srcInput + srcInput[1]) / 2
+relChange = avgPrice != 0 ? (srcInput - srcInput[1]) / avgPrice : 0
+
+// Short-horizon realized volatility - standard deviation of the relative changes
+volEstimate = ta.stdev(relChange, volLengthInput)
+max_bars_back(volEstimate, MAX_RANK_LENGTH)
+
+// Percentile rank of the estimate within its own trailing history - the fraction of the last `rankLengthInput`
+// readings (current one included) sitting at or below the current one, bounding the output between 0 and 1
+float chartSwitch = na
+
+if not na(volEstimate) and not na(volEstimate[rankLengthInput - 1])
+    float atOrBelow = 0
+
+    for i = 0 to rankLengthInput - 1
+        if volEstimate[i] <= volEstimate
+            atOrBelow += 1
+
+    chartSwitch := atOrBelow / rankLengthInput
+
+// Optional higher timeframe - last completed higher-timeframe value only, so the switch does not repaint.
+// Chart-timeframe (or lower) selections read the chart's own series as-is
+requestTf  = tfInput == "" ? timeframe.period : tfInput
+useChartTf = timeframe.in_seconds(requestTf) <= timeframe.in_seconds(timeframe.period)
+htfSwitch  = request.security(syminfo.tickerid, requestTf, chartSwitch[1], lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+volSwitch  = useChartTf ? chartSwitch : htfSwitch
+
+// Regime side and persistence - level and how long it has been held, not single crossings
+regimeSide = na(volSwitch) ? 0 : volSwitch > MID_LEVEL ? 1 : -1
+
+var int regimeBars = 0
+regimeBars := regimeSide == 0 ? 0 : regimeSide == nz(regimeSide[1]) ? regimeBars + 1 : 1
+
+crossedHigh = ta.crossover(volSwitch, MID_LEVEL)
+crossedLow  = ta.crossunder(volSwitch, MID_LEVEL)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+regimeColor = regimeSide == 1 ? highColorInput : regimeSide == -1 ? lowColorInput : color(na)
+
+switchPlotId = plot(volSwitch, "Volatility Switch", color = regimeColor, linewidth = 1)
+midPlotId    = plot(MID_LEVEL, "Fill Anchor", color = color(na), editable = false, display = display.none)
+
+fill(switchPlotId, midPlotId, top_value = math.max(volSwitch, MID_LEVEL), bottom_value = math.min(volSwitch, MID_LEVEL), top_color = regimeSide == 1 ? color.new(highColorInput, FILL_VALUE_TRANSP) : color.new(lowColorInput, FILL_MID_TRANSP), bottom_color = regimeSide == 1 ? color.new(highColorInput, FILL_MID_TRANSP) : color.new(lowColorInput, FILL_VALUE_TRANSP), title = "Regime Gradient Fill")
+
+hline(MID_LEVEL, "Decision Line (0.5)", color = levelColorInput, linestyle = hline.style_dashed)
+hline(UPPER_BOUND, "Upper Bound", color = color.new(levelColorInput, 50), linestyle = hline.style_dotted)
+hline(LOWER_BOUND, "Lower Bound", color = color.new(levelColorInput, 50), linestyle = hline.style_dotted)
+
+bgcolor(showBgInput and regimeSide != 0 ? color.new(regimeColor, BG_TRANSP) : na, title = "Regime Background")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dashTable = na
+
+if barstate.isfirst
+    dashTable := table.new(getTablePosition(dashPosInput), 2, 3, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+if barstate.islast and not na(dashTable)
+    table.clear(dashTable, 0, 0, 1, 2)
+    labelColor   = DASH_HEADER
+    dashTextSize = getTextSize(dashSizeInput)
+
+    if regimeSide == 0
+        table.cell(dashTable, 0, 0, "Volatility Switch", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+        table.cell(dashTable, 1, 0, "Insufficient data", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_right)
+    else if showDashInput
+        table.cell(dashTable, 0, 0, "Regime", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+        table.cell(dashTable, 1, 0, regimeSide == 1 ? "High Volatility" : "Low Volatility", text_color = regimeSide == 1 ? highColorInput : lowColorInput, text_size = dashTextSize, text_halign = text.align_right)
+        table.cell(dashTable, 0, 1, "Switch Value", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+        table.cell(dashTable, 1, 1, str.tostring(volSwitch, "0.00"), text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+        table.cell(dashTable, 0, 2, "Bars in Regime", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+        table.cell(dashTable, 1, 2, str.tostring(regimeBars) + (regimeBars == 1 ? " bar" : " bars"), text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(crossedHigh, "High Volatility Regime", "Volatility Switch crossed above 0.5 on {{ticker}} - volatility elevated relative to its recent history, conditions favor mean reversion ({{interval}})")
+alertcondition(crossedLow, "Low Volatility Regime", "Volatility Switch crossed below 0.5 on {{ticker}} - volatility subdued relative to its recent history, conditions favor trend following ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

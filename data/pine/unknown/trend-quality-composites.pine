@@ -1,0 +1,366 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Trend-quality Composites", shorttitle = "Trend-quality Composites", overlay = false, format = format.price, precision = 1)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+COMPOSITE_GROUP  = "Composite"
+COMPONENTS_GROUP = "Components"
+TIERS_GROUP      = "Quality Tiers"
+DASH_GROUP       = "Dashboard"
+STYLE_GROUP      = "Style"
+
+TOP_RIGHT    = "Top Right"
+TOP_LEFT     = "Top Left"
+BOTTOM_RIGHT = "Bottom Right"
+BOTTOM_LEFT  = "Bottom Left"
+MIDDLE_RIGHT = "Middle Right"
+
+TINY_SIZE   = "Tiny"
+SMALL_SIZE  = "Small"
+NORMAL_SIZE = "Normal"
+
+TIER_NONE = -1      // composite not formed yet (chart start)
+TIER_LOW  = 0       // low-quality: range conditions, mean-reversion or stand aside
+TIER_MID  = 1       // transitional read between the two thresholds
+TIER_HIGH = 2       // high-quality: regime gate open for trend-following
+
+SCORE_COLOR = #787b86       // transitional tier - between the thresholds the read is neutral
+BULL_COLOR  = #089981       // high-quality tier - regime gate open
+BEAR_COLOR  = #f23645       // low-quality tier - range conditions
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+ZONE_TRANSP = 92            // transparency of the soft tier-zone shading
+
+FILL_VALUE_TRANSP = 50      // gradient transparency at the composite value
+FILL_ZERO_TRANSP  = 100     // gradient transparency at the zero line
+BAR_SEGMENTS      = 5       // blocks of the dashboard strength bars
+COMPONENT_COUNT   = 5       // ingredients blended into the composite
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+srcInput = input.source(close, "Source"
+  , group   = COMPOSITE_GROUP
+  , tooltip = "Price series the quality ingredients are measured on. The ATR used by the volatility-adjusted slope always reads the true range of the chart symbol, per its standard definition.")
+
+qualityLengthInput = input.int(14, "Quality Window", minval = 2, maxval = 200
+  , group   = COMPOSITE_GROUP
+  , tooltip = "Shared lookback of the price-action ingredients: Efficiency Ratio, Directional Consistency, R-squared and the volatility-adjusted slope with its ATR. One shared window keeps every ingredient describing the same stretch of price, mirroring the 14-bar convention of regime tools such as the ADX.")
+
+normLengthInput = input.int(100, "Normalization Window", minval = 20, maxval = 1000
+  , group   = COMPOSITE_GROUP
+  , tooltip = "History used to express the unbounded ingredients (the RAVI spread and the volatility-adjusted slope) as a 0-100 percentile rank of their own past values, so the composite adapts to any symbol and timeframe instead of relying on fixed levels.")
+
+smoothingInput = input.int(3, "Score Smoothing", minval = 1, maxval = 50
+  , group   = COMPOSITE_GROUP
+  , tooltip = "EMA length applied to the blended score so the tier read does not flicker at the band edges. Set to 1 to read the raw, unsmoothed composite.")
+
+raviEnableInput = input.bool(true, "MA Spread (RAVI)", inline = "ravi"
+  , group   = COMPONENTS_GROUP
+  , tooltip = "Include the moving-average spread in the blend.")
+
+raviWeightInput = input.float(1, "", minval = 0, maxval = 10, step = 0.5, inline = "ravi"
+  , group   = COMPONENTS_GROUP
+  , tooltip = "Strength ingredient - Chande's Range Action Verification Index: the absolute gap between a short and a long simple moving average as a percentage of the long one, ranked against its own history. Widening spreads argue for trending conditions, narrow ones for range trade. The number sets the component weight in the blend.")
+
+raviFastInput = input.int(7, "RAVI Fast/Slow", minval = 1, inline = "raviLen"
+  , group   = COMPONENTS_GROUP
+  , tooltip = "Short simple moving average of the RAVI spread. 7 and 65 are the usual pair.")
+
+raviSlowInput = input.int(65, "", minval = 1, inline = "raviLen"
+  , group   = COMPONENTS_GROUP
+  , tooltip = "Short and long simple moving average lengths of the RAVI spread, 7 and 65 by default.")
+
+erEnableInput = input.bool(true, "Efficiency Ratio", inline = "er"
+  , group   = COMPONENTS_GROUP
+  , tooltip = "Include the Kaufman Efficiency Ratio in the blend.")
+
+erWeightInput = input.float(1, "", minval = 0, maxval = 10, step = 0.5, inline = "er"
+  , group   = COMPONENTS_GROUP
+  , tooltip = "Noise ingredient - Kaufman Efficiency Ratio: the net change over the quality window divided by the sum of absolute bar-to-bar travel. 100 is a perfectly straight path; low readings mean the same distance was covered through whipsaw. The number sets the component weight in the blend.")
+
+consistencyEnableInput = input.bool(true, "Directional Consistency", inline = "consistency"
+  , group   = COMPONENTS_GROUP
+  , tooltip = "Include the directional consistency of closes in the blend.")
+
+consistencyWeightInput = input.float(1, "", minval = 0, maxval = 10, step = 0.5, inline = "consistency"
+  , group   = COMPONENTS_GROUP
+  , tooltip = "Direction ingredient: how one-sided the bar-to-bar closes are over the quality window - 100 when every close pushes the same way, 0 when up and down closes balance out. The number sets the component weight in the blend.")
+
+rsqEnableInput = input.bool(true, "R-squared Fit", inline = "rsq"
+  , group   = COMPONENTS_GROUP
+  , tooltip = "Include the R-squared of price against time in the blend.")
+
+rsqWeightInput = input.float(1, "", minval = 0, maxval = 10, step = 0.5, inline = "rsq"
+  , group   = COMPONENTS_GROUP
+  , tooltip = "Smoothness ingredient: the squared correlation of price with bar time over the quality window, the fit of a straight trendline - 100 is a clean linear grind, 0 a directionless scatter. The number sets the component weight in the blend.")
+
+slopeEnableInput = input.bool(true, "Vol-adjusted Slope", inline = "slope"
+  , group   = COMPONENTS_GROUP
+  , tooltip = "Include the volatility-adjusted regression slope in the blend.")
+
+slopeWeightInput = input.float(1, "", minval = 0, maxval = 10, step = 0.5, inline = "slope"
+  , group   = COMPONENTS_GROUP
+  , tooltip = "Volatility-context ingredient: the per-bar slope of the regression line over the quality window divided by the ATR, ranked against its own history - progress only scores once it clears the noise floor of bar-to-bar volatility. The number sets the component weight in the blend.")
+
+highTierInput = input.int(60, "High Quality Threshold", minval = 0, maxval = 100
+  , group   = TIERS_GROUP
+  , tooltip = "Score at or above this level rates the trend high-quality: the regime gate for trend-following entries is open, and signals route to breakout and pullback logic. Also usable as a graded weight - scale position size or signal confidence by the score instead of treating every trend as equal.")
+
+lowTierInput = input.int(40, "Low Quality Threshold", minval = 0, maxval = 100
+  , group   = TIERS_GROUP
+  , tooltip = "Score at or below this level rates the market low-quality: range conditions where signals route to mean-reversion logic or to standing aside. Between the two thresholds the read is transitional.")
+
+showDashboardInput = input.bool(true, "Show Dashboard"
+  , group   = DASH_GROUP
+  , tooltip = "Component dashboard listing each ingredient with the trend dimension it measures, its 0-100 score and weight, plus the blended composite, its quality tier, the direction of the measured move and the state of the trend-following gate.")
+
+dashboardLocationInput = input.string(TOP_RIGHT, "Location", options = [TOP_RIGHT, TOP_LEFT, BOTTOM_RIGHT, BOTTOM_LEFT, MIDDLE_RIGHT], inline = "dash"
+  , group   = DASH_GROUP
+  , tooltip = "Corner of the pane the dashboard is anchored to.")
+
+dashboardSizeInput = input.string(SMALL_SIZE, "Size", options = [TINY_SIZE, SMALL_SIZE, NORMAL_SIZE], inline = "dash"
+  , group   = DASH_GROUP
+  , tooltip = "Dashboard text size.")
+
+scoreColorInput = input.color(SCORE_COLOR, "Score"
+  , group   = STYLE_GROUP
+  , tooltip = "Color of the composite line and its gradient between the two thresholds while the directional tint is off. Trend quality is non-directional, so the line blends from this neutral tone toward the high-quality color above the midpoint and toward the low-quality color below it.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "colors"
+  , group   = STYLE_GROUP
+  , tooltip = "Color of up-direction elements and of the high-quality accents: tier level, dashboard highlights and background tint.")
+
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "colors"
+  , group   = STYLE_GROUP
+  , tooltip = "Color of down-direction elements and of the low-quality accents: tier level, dashboard highlights and background tint.")
+
+tintInput = input.bool(false, "Directional Tint"
+  , group   = STYLE_GROUP
+  , tooltip = "Colors the composite and its gradient by the direction of the net change over the quality window. The score itself stays non-directional - the tint only shows which way the measured move points.")
+
+gradientFillInput = input.bool(true, "Gradient Fill"
+  , group   = STYLE_GROUP
+  , tooltip = "Vertical gradient between the zero line and the composite - fully transparent at zero, more opaque at the value.")
+
+backgroundInput = input.bool(false, "Tier Background"
+  , group   = STYLE_GROUP
+  , tooltip = "Tints the pane background while the score sits in the high- or low-quality tier, marking the regime intervals.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Dashboard anchor from the position option
+getLocation(string positionText) =>
+    switch positionText
+        TOP_RIGHT    => position.top_right
+        TOP_LEFT     => position.top_left
+        BOTTOM_RIGHT => position.bottom_right
+        BOTTOM_LEFT  => position.bottom_left
+        => position.middle_right
+
+// Dashboard text size from the size option
+getTextSize(string sizeText) =>
+    switch sizeText
+        TINY_SIZE  => size.tiny
+        SMALL_SIZE => size.small
+        => size.normal
+
+// Five-block strength bar for a 0-100 score
+scoreBar(float value) =>
+    float clamped = math.min(math.max(value, 0), 100)
+    int filled    = math.round(clamped * BAR_SEGMENTS / 100)
+    string filledPart = filled > 0 ? str.repeat("▰", filled) : ""
+    string emptyPart  = filled < BAR_SEGMENTS ? str.repeat("▱", BAR_SEGMENTS - filled) : ""
+    filledPart + emptyPart
+
+// Score formatted with its strength bar for the dashboard
+formatScore(float value) =>
+    na(value) ? "n/a" : scoreBar(value) + " " + str.tostring(value, "#.#")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Quality Components
+//---------------------------------------------------------------------------------------------------------------------{
+// Every ingredient is computed on every bar - the toggles only remove a component from the blend.
+// Bounded ingredients live on 0-100 natively; unbounded ones are ranked against their own history.
+
+// Strength - Chande's RAVI: absolute gap between the short and long simple moving averages,
+// as a percentage of the long one (7/65 classic pair), then percentile-ranked to 0-100
+raviFastValue = ta.sma(srcInput, raviFastInput)
+raviSlowValue = ta.sma(srcInput, raviSlowInput)
+raviValue     = na(raviFastValue) or na(raviSlowValue) or raviSlowValue == 0 ? float(na) : 100 * math.abs(raviFastValue - raviSlowValue) / math.abs(raviSlowValue)
+raviScore     = ta.percentrank(raviValue, normLengthInput)
+
+// Noise - Kaufman Efficiency Ratio: net change over the sum of absolute bar-to-bar travel
+travelValue = math.abs(ta.change(srcInput))
+travelSum   = math.sum(travelValue, qualityLengthInput)
+netChange   = srcInput - srcInput[qualityLengthInput]
+erScore     = na(travelSum) or na(netChange) ? float(na) : travelSum > 0 ? 100 * math.abs(netChange) / travelSum : 0.
+
+// Direction - one-sidedness of closes: the imbalance between up and down closes over the window
+float upFlag   = na(srcInput) or na(srcInput[1]) ? na : srcInput > srcInput[1] ? 1. : 0.
+float downFlag = na(srcInput) or na(srcInput[1]) ? na : srcInput < srcInput[1] ? 1. : 0.
+upCloses         = math.sum(upFlag, qualityLengthInput)
+downCloses       = math.sum(downFlag, qualityLengthInput)
+consistencyScore = na(upCloses) or na(downCloses) ? float(na) : 100 * math.abs(upCloses - downCloses) / qualityLengthInput
+
+// Smoothness - R-squared of price against time: fit of a straight trendline through the window
+corrValue = ta.correlation(srcInput, bar_index, qualityLengthInput)
+rsqScore  = na(corrValue) ? float(na) : 100 * corrValue * corrValue
+
+// Volatility context - per-bar regression slope in ATR units, percentile-ranked to 0-100:
+// drift only scores once it clears the noise floor of the bar-to-bar volatility
+slopeValue    = ta.linreg(srcInput, qualityLengthInput, 0) - ta.linreg(srcInput, qualityLengthInput, 1)
+atrValue      = ta.atr(qualityLengthInput)
+volSlopeValue = na(slopeValue) or na(atrValue) ? float(na) : atrValue > 0 ? math.abs(slopeValue) / atrValue : 0.
+slopeScore    = ta.percentrank(volSlopeValue, normLengthInput)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Composite Score
+//---------------------------------------------------------------------------------------------------------------------{
+scoresArray  = array.from(raviScore, erScore, consistencyScore, rsqScore, slopeScore)
+weightsArray = array.from(raviWeightInput, erWeightInput, consistencyWeightInput, rsqWeightInput, slopeWeightInput)
+enabledArray = array.from(raviEnableInput, erEnableInput, consistencyEnableInput, rsqEnableInput, slopeEnableInput)
+
+// Weighted average of the enabled components - a component joins the blend once its history is ready
+float weightSum   = 0.
+float weightedSum = 0.
+int   activeCount = 0
+
+if array.size(scoresArray) > 0
+    for i = 0 to array.size(scoresArray) - 1
+        if array.get(enabledArray, i) and not na(array.get(scoresArray, i))
+            componentWeight = array.get(weightsArray, i)
+            weightSum   += componentWeight
+            weightedSum += componentWeight * array.get(scoresArray, i)
+            activeCount += 1
+
+rawScore = weightSum > 0 ? weightedSum / weightSum : float(na)
+score    = ta.ema(rawScore, smoothingInput)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Tier Engine
+//---------------------------------------------------------------------------------------------------------------------{
+highLevel = math.max(highTierInput, lowTierInput)
+lowLevel  = math.min(highTierInput, lowTierInput)
+
+tier         = na(score) ? TIER_NONE : score >= highLevel ? TIER_HIGH : score <= lowLevel ? TIER_LOW : TIER_MID
+previousTier = nz(tier[1], TIER_NONE)
+
+// Tier transitions - the first tier assigned after warmup does not count as a transition
+enteredHighTier = tier == TIER_HIGH and previousTier != TIER_HIGH and previousTier != TIER_NONE
+exitedHighTier  = previousTier == TIER_HIGH and tier != TIER_HIGH and tier != TIER_NONE
+enteredLowTier  = tier == TIER_LOW and previousTier != TIER_LOW and previousTier != TIER_NONE
+exitedLowTier   = previousTier == TIER_LOW and tier != TIER_LOW and tier != TIER_NONE
+
+// Direction of the measured move - shown in the dashboard and used by the optional tint,
+// the composite itself measures quality, not direction
+netDirection = na(netChange) ? 0 : netChange > 0 ? 1 : netChange < 0 ? -1 : 0
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+// State coloring across the tiers - low-quality color at and below the low level, neutral midway, high-quality color at and above the high level
+midLevel   = (highLevel + lowLevel) / 2
+tierColor  = na(score) ? scoreColorInput : score <= midLevel ? color.from_gradient(score, lowLevel, midLevel, bearColorInput, scoreColorInput) : color.from_gradient(score, midLevel, highLevel, scoreColorInput, bullColorInput)
+
+scoreLineColor = tintInput ? (netDirection > 0 ? bullColorInput : netDirection < 0 ? bearColorInput : scoreColorInput) : tierColor
+
+hline(highLevel, "High Quality Level", color = color.new(bullColorInput, 50), linestyle = hline.style_dashed)
+hline(50, "Midline", color = SCORE_COLOR, linestyle = hline.style_dotted)
+hline(lowLevel, "Low Quality Level", color = color.new(bearColorInput, 50), linestyle = hline.style_dashed)
+
+// Soft tier shading - high-quality zone above the high level, low-quality zone below the low level
+highZoneId     = plot(highLevel, "High Zone Anchor", color(na), editable = false, display = display.none)
+lowZoneId      = plot(lowLevel, "Low Zone Anchor", color(na), editable = false, display = display.none)
+topAnchorId    = plot(100, "Top Anchor", color(na), editable = false, display = display.none)
+bottomAnchorId = plot(0, "Bottom Anchor", color(na), editable = false, display = display.none)
+
+fill(highZoneId, topAnchorId, color.new(bullColorInput, ZONE_TRANSP), title = "High Quality Zone")
+fill(lowZoneId, bottomAnchorId, color.new(bearColorInput, ZONE_TRANSP), title = "Low Quality Zone")
+
+scorePlotId = plot(score, "Composite Quality Score", scoreLineColor, 1)
+zeroPlotId  = plot(0, "Zero Anchor", color = na, editable = false, display = display.none)
+
+fill(scorePlotId, zeroPlotId
+  , top_value    = score
+  , bottom_value = 0
+  , top_color    = gradientFillInput ? color.new(scoreLineColor, FILL_VALUE_TRANSP) : na
+  , bottom_color = gradientFillInput ? color.new(scoreLineColor, FILL_ZERO_TRANSP) : na
+  , title = "Quality Gradient")
+
+bgcolor(backgroundInput and tier == TIER_HIGH ? color.new(bullColorInput, 95) : backgroundInput and tier == TIER_LOW ? color.new(bearColorInput, 95) : na, title = "Tier Background")
+
+// Blend internals in the data window, keeping the pane itself clean
+plot(rawScore, "Raw Composite", color.new(SCORE_COLOR, 0), editable = false, display = display.data_window)
+plot(raviScore, "MA Spread (RAVI) Score", color.new(SCORE_COLOR, 0), editable = false, display = display.data_window)
+plot(erScore, "Efficiency Ratio Score", color.new(SCORE_COLOR, 0), editable = false, display = display.data_window)
+plot(consistencyScore, "Directional Consistency Score", color.new(SCORE_COLOR, 0), editable = false, display = display.data_window)
+plot(rsqScore, "R-squared Score", color.new(SCORE_COLOR, 0), editable = false, display = display.data_window)
+plot(slopeScore, "Vol-adjusted Slope Score", color.new(SCORE_COLOR, 0), editable = false, display = display.data_window)
+plot(raviValue, "RAVI %", color.new(SCORE_COLOR, 0), editable = false, display = display.data_window)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var string[] componentNamesArray = array.from("MA Spread (RAVI)", "Efficiency Ratio", "Directional Consistency", "R-squared Fit", "Vol-adjusted Slope")
+var string[] componentDimsArray  = array.from("Strength", "Noise", "Direction", "Smoothness", "Volatility")
+
+var table dashboardTable = table.new(getLocation(dashboardLocationInput), 4, 8, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+if showDashboardInput and barstate.islast
+    textSize  = getTextSize(dashboardSizeInput)
+    textColor = DASH_TEXT
+    dimColor  = DASH_HEADER
+    summaryBg = DASH_BG
+
+    table.cell(dashboardTable, 0, 0, "Component", text_color = dimColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 0, "Dimension", text_color = dimColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 2, 0, "Score", text_color = dimColor, text_size = textSize)
+    table.cell(dashboardTable, 3, 0, "Weight", text_color = dimColor, text_size = textSize)
+
+    if array.size(componentNamesArray) > 0
+        for i = 0 to array.size(componentNamesArray) - 1
+            bool  rowEnabled = array.get(enabledArray, i)
+            float rowScore   = array.get(scoresArray, i)
+            string scoreText  = not rowEnabled ? "off" : formatScore(rowScore)
+            string weightText = not rowEnabled ? "off" : str.tostring(array.get(weightsArray, i), "#.##")
+            color rowScoreColor = not rowEnabled or na(rowScore) ? dimColor : rowScore >= highLevel ? bullColorInput : rowScore <= lowLevel ? bearColorInput : textColor
+            table.cell(dashboardTable, 0, i + 1, array.get(componentNamesArray, i), text_color = rowEnabled ? textColor : dimColor, text_size = textSize, text_halign = text.align_left)
+            table.cell(dashboardTable, 1, i + 1, array.get(componentDimsArray, i), text_color = dimColor, text_size = textSize, text_halign = text.align_left)
+            table.cell(dashboardTable, 2, i + 1, scoreText, text_color = rowScoreColor, text_size = textSize, text_halign = text.align_right)
+            table.cell(dashboardTable, 3, i + 1, weightText, text_color = rowEnabled ? textColor : dimColor, text_size = textSize)
+
+    string tierText      = tier == TIER_HIGH ? "High" : tier == TIER_LOW ? "Low" : tier == TIER_MID ? "Medium" : "n/a"
+    color  tierTextColor = tier == TIER_HIGH ? bullColorInput : tier == TIER_LOW ? bearColorInput : tier == TIER_MID ? textColor : dimColor
+    string directionText  = netDirection > 0 ? "▲ Up" : netDirection < 0 ? "▼ Down" : "— Flat"
+    color  directionColor = netDirection > 0 ? bullColorInput : netDirection < 0 ? bearColorInput : dimColor
+    string gateText  = tier == TIER_NONE ? "n/a" : tier == TIER_HIGH ? "Open" : "Closed"
+    color  gateColor = tier == TIER_HIGH ? bullColorInput : dimColor
+
+    table.cell(dashboardTable, 0, 6, "Composite", text_color = dimColor, text_size = textSize, text_halign = text.align_left, bgcolor = summaryBg, tooltip = str.tostring(activeCount) + " of " + str.tostring(COMPONENT_COUNT) + " components active in the blend")
+    table.cell(dashboardTable, 1, 6, formatScore(score), text_color = tierTextColor, text_size = textSize, text_halign = text.align_left, bgcolor = summaryBg)
+    table.cell(dashboardTable, 2, 6, "Tier", text_color = dimColor, text_size = textSize, bgcolor = summaryBg)
+    table.cell(dashboardTable, 3, 6, tierText, text_color = tierTextColor, text_size = textSize, bgcolor = summaryBg)
+    table.cell(dashboardTable, 0, 7, "Direction", text_color = dimColor, text_size = textSize, text_halign = text.align_left, bgcolor = summaryBg)
+    table.cell(dashboardTable, 1, 7, directionText, text_color = directionColor, text_size = textSize, text_halign = text.align_left, bgcolor = summaryBg)
+    table.cell(dashboardTable, 2, 7, "Gate", text_color = dimColor, text_size = textSize, bgcolor = summaryBg)
+    table.cell(dashboardTable, 3, 7, gateText, text_color = gateColor, text_size = textSize, bgcolor = summaryBg)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(enteredHighTier, "High Quality Tier", "Trend-quality Composites: score entered the high-quality tier on {{ticker}} - regime gate open, trend-following conditions ({{interval}})")
+alertcondition(exitedHighTier, "High Quality Tier Lost", "Trend-quality Composites: score left the high-quality tier on {{ticker}} - regime gate closed ({{interval}})")
+alertcondition(enteredLowTier, "Low Quality Tier", "Trend-quality Composites: score entered the low-quality tier on {{ticker}} - range conditions, favor mean-reversion or stand aside ({{interval}})")
+alertcondition(exitedLowTier, "Low Quality Tier Exited", "Trend-quality Composites: score climbed out of the low-quality tier on {{ticker}} - trend quality improving ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

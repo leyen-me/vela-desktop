@@ -1,0 +1,292 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Consequent Encroachment"
+  , shorttitle       = "Consequent Encroachment"
+  , overlay          = true
+  , max_lines_count  = 500
+  , max_labels_count = 500
+  , max_boxes_count  = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR      = #089981
+BEAR_COLOR      = #f23645
+COMPLETED_COLOR = #787b86
+LABEL_BG        = #00000000
+
+ATR_LENGTH = 14
+
+ZONE_FILL_TRANSPARENCY      = 90
+COMPLETED_FILL_TRANSPARENCY = 96
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+CE_GROUP    = "Consequent Encroachment"
+WICK_GROUP  = "Wick CE"
+STYLE_GROUP = "Style"
+
+minGapWidthInput = input.float(0, "Minimum Gap Width", minval = 0, step = 0.1, group = CE_GROUP
+  , tooltip = "Ignores fair value gaps whose height is below this multiple of the 14 period ATR, so a CE is only tracked inside gaps large enough to matter. Keep at 0 to place a midpoint on every gap.")
+
+showLastInput = input.int(10, "Show Last", minval = 1, maxval = 100, group = CE_GROUP
+  , tooltip = "Maximum number of gap midpoints kept on the chart. The same cap applies separately to wick midpoints. Older levels are removed first.")
+
+removeCompletedInput = input.bool(true, "Remove Completed CEs", group = CE_GROUP
+  , tooltip = "Deletes a level once its role is over - the gap has fully filled, or a wick midpoint has been revisited. Disable to keep completed levels on the chart, frozen and recolored.")
+
+showWickCeInput = input.bool(true, "Wick Midpoints", group = WICK_GROUP
+  , tooltip = "Also tracks the midpoint of prominent candle wicks - the same CE read applied to the small single candle inefficiency a long wick leaves behind, watched as a reaction level or partial fill target.")
+
+minWickPercentInput = input.float(50, "Minimum Wick %", minval = 10, maxval = 95, step = 5, group = WICK_GROUP
+  , tooltip = "A wick only earns a midpoint when it makes up at least this percentage of the full candle range. When both wicks of a candle qualify, only the longer one is used.")
+
+minWickSizeInput = input.float(0, "Minimum Wick Size", minval = 0, step = 0.1, group = WICK_GROUP
+  , tooltip = "Additional absolute filter: the wick must also span at least this multiple of the 14 period ATR. Keep at 0 to disable.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "direction", group = STYLE_GROUP
+  , tooltip = "Color of bullish CEs: midpoints watched below price, inside bullish fair value gaps and prominent lower wicks.")
+
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "direction", group = STYLE_GROUP
+  , tooltip = "Color of bearish CEs: midpoints watched above price, inside bearish fair value gaps and prominent upper wicks.")
+
+completedColorInput = input.color(COMPLETED_COLOR, "Completed", group = STYLE_GROUP
+  , tooltip = "Color of completed levels kept on the chart when Remove Completed CEs is disabled.")
+
+showZonesInput = input.bool(true, "Show Gap Zones", group = STYLE_GROUP
+  , tooltip = "Shades the fair value gap area behind each midpoint, showing the two halves the CE splits the imbalance into.")
+
+showLabelsInput = input.bool(true, "CE Labels", group = STYLE_GROUP
+  , tooltip = "Prints a small CE tag at the right end of each tracked midpoint.")
+
+lineWidthInput = input.int(1, "Line Width", minval = 1, maxval = 4, group = STYLE_GROUP
+  , tooltip = "Width of the midpoint lines. Gap CEs print solid, turn dashed once a close trades through them, and wick CEs print dotted.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types & Variables
+//---------------------------------------------------------------------------------------------------------------------{
+//One consequent encroachment: the 50% line of a fair value gap, or of a prominent candle wick
+type CeLevel
+    line  ceLine
+    box   zoneBox
+    label ceLabel
+    float midpoint
+    float farEdge
+    bool  isBull
+    int   formIndex
+    bool  tested
+    bool  breached
+    bool  completed
+
+var array<CeLevel> gapCeArray  = array.new<CeLevel>()
+var array<CeLevel> wickCeArray = array.new<CeLevel>()
+
+float atrValue = ta.atr(ATR_LENGTH)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+//Removes every drawing of a level
+deleteLevel(CeLevel ceLevel) =>
+    ceLevel.ceLine.delete()
+    if not na(ceLevel.zoneBox)
+        ceLevel.zoneBox.delete()
+    if not na(ceLevel.ceLabel)
+        ceLevel.ceLabel.delete()
+
+//Freezes a completed level kept on the chart in the completed color
+dimLevel(CeLevel ceLevel) =>
+    ceLevel.ceLine.set_color(completedColorInput)
+    if not na(ceLevel.zoneBox)
+        ceLevel.zoneBox.set_bgcolor(color.new(completedColorInput, COMPLETED_FILL_TRANSPARENCY))
+    if not na(ceLevel.ceLabel)
+        ceLevel.ceLabel.set_textcolor(completedColorInput)
+
+//Extends the drawings of an active level to the current bar
+extendLevel(CeLevel ceLevel) =>
+    ceLevel.ceLine.set_x2(bar_index)
+    if not na(ceLevel.zoneBox)
+        ceLevel.zoneBox.set_right(bar_index)
+    if not na(ceLevel.ceLabel)
+        ceLevel.ceLabel.set_x(bar_index)
+
+//True when a gap passes the minimum width filter
+gapQualifies(float gapWidth) =>
+    minGapWidthInput <= 0 or (not na(atrValue) and gapWidth >= minGapWidthInput * atrValue)
+
+//True when a wick passes both prominence filters
+wickQualifies(float wickSize, float candleRange) =>
+    bool percentOk = candleRange > 0 and wickSize / candleRange * 100 >= minWickPercentInput
+    bool sizeOk    = minWickSizeInput <= 0 or (not na(atrValue) and wickSize >= minWickSizeInput * atrValue)
+    percentOk and sizeOk
+
+//Draws the CE of a confirmed fair value gap from its middle candle and registers it for tracking
+createGapCe(bool isBull, float nearEdge, float farEdge) =>
+    float midpoint  = math.avg(nearEdge, farEdge)
+    color baseColor = isBull ? bullColorInput : bearColorInput
+    line ceLine = line.new(bar_index - 1, midpoint, bar_index, midpoint, color = baseColor, width = lineWidthInput)
+    box zoneBox = showZonesInput ? box.new(bar_index - 1, math.max(nearEdge, farEdge), bar_index, math.min(nearEdge, farEdge)
+      , border_color = color(na)
+      , bgcolor      = color.new(baseColor, ZONE_FILL_TRANSPARENCY)) : box(na)
+    label ceLabel = showLabelsInput ? label.new(bar_index, midpoint, "CE"
+      , color     = LABEL_BG
+      , style     = label.style_label_left
+      , textcolor = baseColor
+      , size      = size.tiny) : label(na)
+    gapCeArray.push(CeLevel.new(ceLine, zoneBox, ceLabel, midpoint, farEdge, isBull, bar_index, false, false, false))
+    if gapCeArray.size() > showLastInput
+        CeLevel oldest = gapCeArray.shift()
+        deleteLevel(oldest)
+
+//Draws the CE of a prominent wick and registers it for tracking
+createWickCe(bool isBull, float wickTop, float wickBottom) =>
+    float midpoint  = math.avg(wickTop, wickBottom)
+    color baseColor = isBull ? bullColorInput : bearColorInput
+    line ceLine = line.new(bar_index, midpoint, bar_index, midpoint, color = baseColor, width = lineWidthInput
+      , style = line.style_dotted)
+    label ceLabel = showLabelsInput ? label.new(bar_index, midpoint, "CE"
+      , color     = LABEL_BG
+      , style     = label.style_label_left
+      , textcolor = baseColor
+      , size      = size.tiny) : label(na)
+    wickCeArray.push(CeLevel.new(ceLine, box(na), ceLabel, midpoint, na, isBull, bar_index, false, false, false))
+    if wickCeArray.size() > showLastInput
+        CeLevel oldest = wickCeArray.shift()
+        deleteLevel(oldest)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Consequent Encroachment Detection
+//---------------------------------------------------------------------------------------------------------------------{
+bool bullFormedEvent     = false
+bool bearFormedEvent     = false
+bool bullTestedEvent     = false
+bool bearTestedEvent     = false
+bool bullBreachedEvent   = false
+bool bearBreachedEvent   = false
+bool bullWickTestedEvent = false
+bool bearWickTestedEvent = false
+
+//Standard three-candle fair value gaps: a void left between the 1st candle's extreme and the 3rd candle's
+bool bullFvg = not na(high[2]) and low > high[2]
+bool bearFvg = not na(low[2]) and high < low[2]
+
+if barstate.isconfirmed
+    //A confirmed bullish gap: its 50% line is a bullish CE, watched below price
+    if bullFvg and gapQualifies(low - high[2])
+        createGapCe(true, low, high[2])
+        bullFormedEvent := true
+
+    //A confirmed bearish gap: its 50% line is a bearish CE, watched above price
+    if bearFvg and gapQualifies(low[2] - high)
+        createGapCe(false, high, low[2])
+        bearFormedEvent := true
+
+    //Prominent wick midpoints: the same 50% read applied to a single candle inefficiency
+    if showWickCeInput
+        float candleRange = high - low
+        float bodyTop     = math.max(open, close)
+        float bodyBottom  = math.min(open, close)
+        float upperWick   = high - bodyTop
+        float lowerWick   = bodyBottom - low
+
+        bool upperOk = wickQualifies(upperWick, candleRange)
+        bool lowerOk = wickQualifies(lowerWick, candleRange)
+
+        //When both wicks qualify only the dominant one is kept
+        if upperOk and lowerOk
+            upperOk := upperWick >= lowerWick
+            lowerOk := not upperOk
+
+        if lowerOk
+            createWickCe(true, bodyBottom, low)
+        if upperOk
+            createWickCe(false, high, bodyTop)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Level Tracking
+//---------------------------------------------------------------------------------------------------------------------{
+//Gap midpoints: tested on a touch, weakened on a close through, completed on a full fill
+int levelIndex = 0
+while levelIndex < gapCeArray.size()
+    CeLevel ceLevel = gapCeArray.get(levelIndex)
+    bool removeLevel = false
+
+    if not ceLevel.completed
+        extendLevel(ceLevel)
+
+        if barstate.isconfirmed and bar_index > ceLevel.formIndex
+            //Touch of the midpoint: half the inefficiency is rebalanced, the reaction spot entries wait for
+            if not ceLevel.tested and (ceLevel.isBull ? low <= ceLevel.midpoint : high >= ceLevel.midpoint)
+                ceLevel.tested := true
+                if ceLevel.isBull
+                    bullTestedEvent := true
+                else
+                    bearTestedEvent := true
+
+            //Close through the midpoint: the gap no longer reads as respected
+            if not ceLevel.breached and (ceLevel.isBull ? close < ceLevel.midpoint : close > ceLevel.midpoint)
+                ceLevel.breached := true
+                ceLevel.ceLine.set_style(line.style_dashed)
+                if ceLevel.isBull
+                    bullBreachedEvent := true
+                else
+                    bearBreachedEvent := true
+
+            //Trade through the far edge: the gap has fully filled and the CE role is complete
+            if (ceLevel.isBull ? low <= ceLevel.farEdge : high >= ceLevel.farEdge)
+                ceLevel.completed := true
+                if removeCompletedInput
+                    deleteLevel(ceLevel)
+                    removeLevel := true
+                else
+                    dimLevel(ceLevel)
+
+    if removeLevel
+        gapCeArray.remove(levelIndex)
+    else
+        levelIndex += 1
+
+//Wick midpoints: completed on the half-revisit the level anticipates
+int wickIndex = 0
+while wickIndex < wickCeArray.size()
+    CeLevel wickLevel = wickCeArray.get(wickIndex)
+    bool removeWick = false
+
+    if not wickLevel.completed
+        extendLevel(wickLevel)
+
+        if barstate.isconfirmed and bar_index > wickLevel.formIndex
+            if (wickLevel.isBull ? low <= wickLevel.midpoint : high >= wickLevel.midpoint)
+                wickLevel.tested    := true
+                wickLevel.completed := true
+                if wickLevel.isBull
+                    bullWickTestedEvent := true
+                else
+                    bearWickTestedEvent := true
+                if removeCompletedInput
+                    deleteLevel(wickLevel)
+                    removeWick := true
+                else
+                    dimLevel(wickLevel)
+
+    if removeWick
+        wickCeArray.remove(wickIndex)
+    else
+        wickIndex += 1
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(bullFormedEvent, "Bullish CE Formed", "A bullish fair value gap confirmed - its consequent encroachment (50% line) is now tracked below price.")
+alertcondition(bearFormedEvent, "Bearish CE Formed", "A bearish fair value gap confirmed - its consequent encroachment (50% line) is now tracked above price.")
+alertcondition(bullTestedEvent, "Bullish CE Tested", "Price reached the consequent encroachment of a bullish fair value gap - half the inefficiency is rebalanced, a common spot to look for a rejection.")
+alertcondition(bearTestedEvent, "Bearish CE Tested", "Price reached the consequent encroachment of a bearish fair value gap - half the inefficiency is rebalanced, a common spot to look for a rejection.")
+alertcondition(bullBreachedEvent, "Bullish CE Breached", "A candle closed below the consequent encroachment of a bullish fair value gap - the gap reads as weakened and expectation shifts toward a full fill.")
+alertcondition(bearBreachedEvent, "Bearish CE Breached", "A candle closed above the consequent encroachment of a bearish fair value gap - the gap reads as weakened and expectation shifts toward a full fill.")
+alertcondition(bullWickTestedEvent, "Lower Wick CE Tested", "Price returned to the consequent encroachment of a prominent lower wick - the half-revisit this level anticipates.")
+alertcondition(bearWickTestedEvent, "Upper Wick CE Tested", "Price returned to the consequent encroachment of a prominent upper wick - the half-revisit this level anticipates.")
+
+//---------------------------------------------------------------------------------------------------------------------}

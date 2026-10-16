@@ -1,0 +1,307 @@
+// This work is licensed under Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Overnight vs Intraday Returns", shorttitle = "Overnight vs Intraday", overlay = false, format = format.price, precision = 2
+  , max_boxes_count  = 500
+  , max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+NIGHT_COLOR = #5b9cf6 // the overnight leg: prior close to open
+DAY_COLOR   = #ff9800 // the intraday leg: open to close
+HOLD_COLOR  = #787b86 // buy and hold, the sum of both legs
+BULL_COLOR  = #089981
+BEAR_COLOR  = #f23645
+
+color COLOR_HIDDEN = #00000000
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+string TZ_EXCHANGE = "Exchange"
+string TXT_NA      = "-"
+
+string GRP_SPLIT = "Return Split"
+string GRP_PRICE = "Legs On Price"
+string GRP_DASH  = "Dashboard"
+string GRP_STYLE = "Style"
+
+int MAX_SESSIONS = 5000
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+sessionInput = input.session("0930-1600", "Regular Session", group = GRP_SPLIT
+  , tooltip = "Intraday charts only. The regular session whose open and close split each day: the overnight leg runs from the prior session's close to this session's open, the intraday leg from the open to the close. Extended-hours bars are part of the overnight leg. On daily and higher charts each bar is a session and its own open and close are used.")
+
+tzInput = input.string(TZ_EXCHANGE, "Timezone", options = [TZ_EXCHANGE, "America/New_York", "America/Chicago", "Europe/London", "Europe/Berlin", "Asia/Tokyo", "Asia/Hong_Kong", "Australia/Sydney", "UTC"], group = GRP_SPLIT
+  , tooltip = "Timezone the Regular Session is expressed in. Exchange uses the symbol's own timezone, correct for listed stocks and ETFs.")
+
+scaleInput = input.string("Compounded", "Return Scale", options = ["Compounded", "Log"], group = GRP_SPLIT
+  , tooltip = "How returns are shown in the pane, the dashboard and the labels. Compounded: the percent a position holding that leg would have made. Log: the sum of log returns in percent, in which the overnight and intraday lines add up exactly to buy and hold, the form the split is defined in.")
+
+lookbackInput = input.int(0, "Statistics Window (Sessions)", minval = 0, maxval = MAX_SESSIONS, group = GRP_SPLIT
+  , tooltip = "Completed sessions the dashboard statistics are measured over. 0 uses every session on the chart, the same span the cumulative lines cover. The overnight effect is a long-run average, so short windows are dominated by a few large gaps.")
+
+showHoldInput = input.bool(true, "Buy & Hold Line", group = GRP_SPLIT
+  , tooltip = "Plot the cumulative return of holding through both legs. In log terms it is exactly the sum of the overnight and intraday lines.")
+
+showLegsInput = input.bool(true, "Show Legs On Price", group = GRP_PRICE
+  , tooltip = "Intraday charts only. Box each overnight gap from the prior close to the open and each session from its open to its close on the price chart, so the two trades the split compares (long at the close and out at the open, long at the open and out at the close) are visible bar by bar.")
+
+showLegLabelsInput = input.bool(true, "Leg Returns", group = GRP_PRICE
+  , tooltip = "Print each leg's return next to its box.")
+
+keepInput = input.int(10, "Sessions Kept", minval = 1, maxval = 100, group = GRP_PRICE
+  , tooltip = "Most recent sessions whose boxes stay on the price chart. The lines and the dashboard keep counting every session.")
+
+showDashInput = input.bool(true, "Show Dashboard", group = GRP_DASH
+  , tooltip = "Cumulative and average return of each leg, buy and hold, the average night minus day difference with its t-statistic, the weekend share of the overnight leg and the latest session's split.")
+
+dashPosInput = input.string("Bottom Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], inline = "dash", group = GRP_DASH)
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], inline = "dash", group = GRP_DASH
+  , tooltip = "Dashboard position on the price chart and text size. It sits on the price chart so the cumulative lines keep their whole pane.")
+
+nightColorInput = input.color(NIGHT_COLOR, "Overnight", inline = "leg", group = GRP_STYLE)
+dayColorInput   = input.color(DAY_COLOR, "Intraday", inline = "leg", group = GRP_STYLE)
+holdColorInput  = input.color(HOLD_COLOR, "Buy & Hold", inline = "leg", group = GRP_STYLE
+  , tooltip = "Colors of the two legs and of buy and hold, in the pane and on the price chart.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types & Variables
+//---------------------------------------------------------------------------------------------------------------------{
+//Price-chart drawings of one session
+type SessionDraw
+    box   nightBox
+    label nightTag
+    box   dayBox
+    label dayTag
+
+var array<SessionDraw> drawArray = array.new<SessionDraw>()
+var SessionDraw        cur       = na
+
+//Completed sessions, newest first: the overnight leg that opened each one and its intraday leg, log returns
+var array<float> nightArray   = array.new_float()
+var array<float> dayArray     = array.new_float()
+var array<bool>  weekendArray = array.new_bool()
+
+//Cumulative log returns of completed legs
+var float cumNight = 0.
+var float cumDay   = 0.
+
+//Session state
+var bool  sessActive  = false
+var float sessOpen    = na
+var float sessClose   = na
+var int   sessEndTime = na
+var int   sessEndBar  = na
+var float lastNight   = na
+var float lastDay     = na
+var float curNight    = na
+var bool  curWeekend  = false
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+//A log return in the display scale, in percent
+toPct(float lr) =>
+    scaleInput == "Log" ? lr * 100 : (math.exp(lr) - 1) * 100
+
+//Percent text of a log return
+pctText(float lr) =>
+    float v = toPct(lr)
+    (v >= 0 ? "+" : "") + str.tostring(v, "0.00") + "%"
+
+//Basis points text of a log return
+bpText(float lr) =>
+    float v = toPct(lr) * 100
+    (v >= 0 ? "+" : "") + str.tostring(v, "0.0") + " bp"
+
+//Sample mean and standard deviation of the first n values of an array
+meanSd(array<float> a, int n) =>
+    float m = 0.
+    float s = 0.
+    if n > 0
+        for i = 0 to n - 1
+            m += a.get(i)
+        m /= n
+    if n > 1
+        for i = 0 to n - 1
+            s += math.pow(a.get(i) - m, 2)
+        s := math.sqrt(s / (n - 1))
+    [m, s]
+
+dropSession(SessionDraw d) =>
+    if not na(d.nightBox)
+        box.delete(d.nightBox)
+    if not na(d.nightTag)
+        label.delete(d.nightTag)
+    if not na(d.dayBox)
+        box.delete(d.dayBox)
+    if not na(d.dayTag)
+        label.delete(d.dayTag)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Session Split
+//---------------------------------------------------------------------------------------------------------------------{
+string tz        = tzInput == TZ_EXCHANGE ? syminfo.timezone : tzInput
+bool   intraday  = timeframe.isintraday
+bool   inSession = intraday ? not na(time(timeframe.period, sessionInput, tz)) : true
+bool   sessStart = intraday ? inSession and (not inSession[1] or timeframe.change("D")) : true
+
+bool nightUp   = false
+bool nightDown = false
+
+//A session ends when the next one starts or the bars leave the session window
+if sessActive and (sessStart or not inSession)
+    float dayLeg = math.log(sessClose / sessOpen)
+    cumDay  += dayLeg
+    lastDay := dayLeg
+    //sessions with a known overnight leg enter the statistics as pairs
+    if not na(curNight)
+        nightArray.unshift(curNight)
+        dayArray.unshift(dayLeg)
+        weekendArray.unshift(curWeekend)
+        if nightArray.size() > MAX_SESSIONS
+            nightArray.pop()
+            dayArray.pop()
+            weekendArray.pop()
+    sessActive := false
+
+if sessStart
+    //overnight leg from the previous session's close
+    if not na(sessClose)
+        float nightLeg = math.log(open / sessClose)
+        bool  weekend  = time - sessEndTime > 86400000
+        cumNight   += nightLeg
+        lastNight  := nightLeg
+        curNight   := nightLeg
+        curWeekend := weekend
+        nightUp    := nightLeg > 0
+        nightDown  := nightLeg < 0
+        if intraday and showLegsInput
+            cur := SessionDraw.new()
+            cur.nightBox := box.new(sessEndBar, math.max(open, sessClose), bar_index, math.min(open, sessClose), border_color = nightColorInput, border_width = 1, bgcolor = color.new(nightColorInput, 55), force_overlay = true)
+            if showLegLabelsInput
+                cur.nightTag := label.new(bar_index, nightLeg >= 0 ? math.max(open, sessClose) : math.min(open, sessClose), "Night " + pctText(nightLeg), color = COLOR_HIDDEN
+                  , style = nightLeg >= 0 ? label.style_label_lower_right : label.style_label_upper_right, textcolor = nightColorInput, size = size.small, force_overlay = true
+                  , tooltip = (weekend ? "Weekend or holiday gap" : "Overnight gap") + " from the prior close " + str.tostring(sessClose, format.mintick) + " to the open " + str.tostring(open, format.mintick))
+    else if intraday and showLegsInput
+        cur := SessionDraw.new()
+    if intraday and showLegsInput and not na(cur)
+        cur.dayBox := box.new(bar_index, open, bar_index, close, border_color = color.new(dayColorInput, 55), border_width = 1, border_style = line.style_dotted, bgcolor = color.new(dayColorInput, 94), force_overlay = true)
+        if showLegLabelsInput
+            cur.dayTag := label.new(bar_index, close, "", color = COLOR_HIDDEN, style = label.style_label_left, textcolor = dayColorInput, size = size.small, force_overlay = true)
+        drawArray.push(cur)
+        while drawArray.size() > keepInput
+            dropSession(drawArray.shift())
+    sessActive := true
+    sessOpen   := open
+
+if sessActive and inSession
+    sessClose   := close
+    sessEndTime := time
+    sessEndBar  := bar_index
+    //developing intraday box and its label
+    if intraday and showLegsInput and not na(cur) and not na(cur.dayBox)
+        box.set_right(cur.dayBox, bar_index)
+        box.set_top(cur.dayBox, math.max(sessOpen, close))
+        box.set_bottom(cur.dayBox, math.min(sessOpen, close))
+        if not na(cur.dayTag)
+            float dl = math.log(close / sessOpen)
+            label.set_xy(cur.dayTag, bar_index, close)
+            label.set_text(cur.dayTag, "Day " + pctText(dl))
+            label.set_style(cur.dayTag, dl >= 0 ? label.style_label_lower_left : label.style_label_upper_left)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Cumulative Lines
+//---------------------------------------------------------------------------------------------------------------------{
+//the live session's intraday leg is counted as it develops
+float liveDay  = sessActive ? math.log(close / sessOpen) : 0.
+float nightPct = toPct(cumNight)
+float dayPct   = toPct(cumDay + liveDay)
+float holdPct  = toPct(cumNight + cumDay + liveDay)
+
+nightPlot = plot(nightPct, "Overnight (Cumulative)", nightColorInput, 2)
+dayPlot   = plot(dayPct, "Intraday (Cumulative)", dayColorInput, 2)
+plot(showHoldInput ? holdPct : na, "Buy & Hold", color.new(holdColorInput, 30), 1)
+hline(0, "Zero", color.new(HOLD_COLOR, 50), hline.style_dashed)
+
+fill(nightPlot, dayPlot, nightPct > dayPct ? color.new(nightColorInput, 92) : color.new(dayColorInput, 92), title = "Leader Fill")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+dashPosition = switch dashPosInput
+    "Top Right"    => position.top_right
+    "Top Left"     => position.top_left
+    "Bottom Left"  => position.bottom_left
+    => position.bottom_right
+
+dashTextSize = switch dashSizeInput
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    => size.small
+
+var table dashTable = na
+
+cell(int col, int row, string txt, color c, string tip = "") =>
+    table.cell(dashTable, col, row, txt, text_color = c, text_size = dashTextSize, text_halign = col == 0 ? text.align_left : text.align_right, tooltip = tip)
+
+if barstate.islast and showDashInput
+    if na(dashTable)
+        dashTable := table.new(dashPosition, 3, 7, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1, force_overlay = true)
+    int n = nightArray.size()
+    if lookbackInput > 0
+        n := math.min(n, lookbackInput)
+    float sumN = 0.
+    float sumD = 0.
+    float sumW = 0.
+    array<float> diffArray = array.new_float()
+    if n > 0
+        for i = 0 to n - 1
+            float nl = nightArray.get(i)
+            float dl = dayArray.get(i)
+            sumN += nl
+            sumD += dl
+            if weekendArray.get(i)
+                sumW += nl
+            diffArray.push(nl - dl)
+    [mDiff, sDiff] = meanSd(diffArray, n)
+    float tStat = n > 1 and sDiff > 0 ? mDiff / (sDiff / math.sqrt(n)) : na
+
+    cell(0, 0, "Overnight vs Intraday", DASH_TEXT)
+    cell(1, 0, "Total", DASH_HEADER, "Compounded return of each leg over the window.")
+    cell(2, 0, "Avg", DASH_HEADER, "Average return per session of each leg.")
+    cell(0, 1, "Overnight", nightColorInput, "Prior close to open: long at the close, out at the open.")
+    cell(1, 1, n > 0 ? pctText(sumN) : TXT_NA, sumN >= 0 ? BULL_COLOR : BEAR_COLOR)
+    cell(2, 1, n > 0 ? bpText(sumN / n) : TXT_NA, DASH_TEXT)
+    cell(0, 2, "Intraday", dayColorInput, "Open to close: long at the open, out at the close.")
+    cell(1, 2, n > 0 ? pctText(sumD) : TXT_NA, sumD >= 0 ? BULL_COLOR : BEAR_COLOR)
+    cell(2, 2, n > 0 ? bpText(sumD / n) : TXT_NA, DASH_TEXT)
+    cell(0, 3, "Buy & Hold", holdColorInput, "Both legs held.")
+    cell(1, 3, n > 0 ? pctText(sumN + sumD) : TXT_NA, sumN + sumD >= 0 ? BULL_COLOR : BEAR_COLOR)
+    cell(2, 3, str.tostring(n) + " sess.", DASH_HEADER, "Completed sessions in the statistics window.")
+    cell(0, 4, "Night - Day", DASH_HEADER, "Average difference between the overnight and the intraday leg of the same session, and its t-statistic. A t-statistic beyond about 2 in absolute value says the difference is unlikely to be noise on this sample; returns are fat-tailed, so read it as a guide, not a test result.")
+    cell(1, 4, n > 0 ? bpText(mDiff) : TXT_NA, mDiff >= 0 ? nightColorInput : dayColorInput)
+    cell(2, 4, na(tStat) ? TXT_NA : "t " + str.tostring(tStat, "0.0"), DASH_TEXT)
+    cell(0, 5, "Weekends", DASH_HEADER, "Return of the overnight legs that spanned a weekend or holiday, part of the overnight total.")
+    cell(1, 5, n > 0 ? pctText(sumW) : TXT_NA, DASH_TEXT)
+    cell(2, 5, "", DASH_TEXT)
+    cell(0, 6, "Latest", DASH_HEADER, "The latest session: its overnight leg and its intraday leg so far.")
+    cell(1, 6, na(lastNight) ? TXT_NA : pctText(lastNight), nightColorInput)
+    cell(2, 6, sessActive ? pctText(liveDay) : na(lastDay) ? TXT_NA : pctText(lastDay), dayColorInput)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(nightUp, "Overnight Leg Up", "{{ticker}} opened above the prior session's close: positive overnight leg")
+alertcondition(nightDown, "Overnight Leg Down", "{{ticker}} opened below the prior session's close: negative overnight leg")
+alertcondition(ta.crossover(nightPct, dayPct), "Overnight Takes The Lead", "{{ticker}}: the cumulative overnight return crossed above the cumulative intraday return")
+alertcondition(ta.crossunder(nightPct, dayPct), "Intraday Takes The Lead", "{{ticker}}: the cumulative intraday return crossed above the cumulative overnight return")
+
+//---------------------------------------------------------------------------------------------------------------------}

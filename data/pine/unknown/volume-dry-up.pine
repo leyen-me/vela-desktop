@@ -1,0 +1,223 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Volume Dry-up", shorttitle = "Volume Dry-up", overlay = false, format = format.volume, precision = 0)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+DRY_COLOR     = #ff9800 // the one accent - quiet sessions, the dry-up read
+BULL_COLOR    = #089981 // decisive expansion resolving upward
+BEAR_COLOR    = #f23645 // heavy volume breaking downward
+NEUTRAL_COLOR = #787b86 // baselines and unremarkable sessions
+
+DRYUP_TRANSPARENCY = 45 // regular dry-up columns; the lightest-of-base prints stay fully opaque
+LEVEL_TRANSPARENCY = 40 // dry-up threshold line
+EXPAN_TRANSPARENCY = 55 // expansion threshold line
+TINT_TRANSPARENCY  = 90 // price chart tint on qualified quiet sessions
+
+TXT_NA = "-"
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+averageLengthInput = input.int(50, "Volume Baseline", minval = 2, maxval = 500, group = "Dry-up Detection",
+  tooltip = "Bars in the simple moving average of volume (and of bar spread) that stands in for normal activity. The reference the growth-stock tradition quotes is the 50-day average - a dry-up is always judged against the instrument's own recent turnover, never an absolute share count.")
+
+dryThresholdInput = input.float(0.5, "Dry-up Threshold", minval = 0.05, maxval = 1, step = 0.05, group = "Dry-up Detection",
+  tooltip = "Fraction of the volume baseline at or below which a session qualifies as a dry-up. 0.5 demands half of normal turnover; lower values demand the deeper quiet of a mature base - relative volume at a small fraction of normal.")
+
+baseLookbackInput = input.int(50, "Base Lookback", minval = 2, maxval = 500, group = "Dry-up Detection",
+  tooltip = "Window standing in for the base under construction. A qualified session printing the lightest volume of this many bars earns the extreme dry-up tag (Minervini's VDU) - the quietest trade of the whole structure. The same window anchors the pivot proximity filter and the dashboard's dry-up count.")
+
+spreadConfirmInput = input.bool(true, "Range Contraction", inline = "spread", group = "Dry-up Detection",
+  tooltip = "Require the bar's high-low spread to contract alongside its volume - the pairing that separates genuine dormancy from a quiet bar that still travels. The spread must sit at or below the fraction of its own average set on the right; 1 asks only for a narrower-than-normal session, lower values demand genuinely tight ones.")
+
+spreadThresholdInput = input.float(1, "", minval = 0.1, maxval = 2, step = 0.05, inline = "spread", group = "Dry-up Detection",
+  tooltip = "Maximum bar spread as a fraction of the average spread for the contraction check.")
+
+pivotFilterInput = input.bool(false, "Pivot Proximity Filter", inline = "pivot", group = "Dry-up Detection",
+  tooltip = "Only qualify quiet sessions with price holding near the top of the base lookback - the constructive location, quiet near the pivot rather than sagging away from it. Leave disabled to also surface pullback dry-ups in uptrends and Wyckoff-style quiet retests of a low, where location is read from the chart instead.")
+
+pivotDistanceInput = input.float(5, "", minval = 0.5, maxval = 50, step = 0.5, inline = "pivot", group = "Dry-up Detection",
+  tooltip = "Maximum close distance below the lookback high for the proximity filter, as a percentage of that high.")
+
+expansionMultInput = input.float(1.5, "Expansion Multiple", minval = 1, step = 0.1, group = "Resolution",
+  tooltip = "Multiple of the volume baseline at or above which turnover counts as decisive expansion - the classic breakout guideline asks for volume at least 40-50% above normal. A dry-up by itself is dormancy, not a signal; the trigger is this expansion following it.")
+
+resolutionWindowInput = input.int(5, "Resolution Window", minval = 1, maxval = 100, group = "Resolution",
+  tooltip = "Bars after the last qualified dry-up within which an expansion is linked to it. An up close on expanding turnover resolves the quiet constructively; a down close on heavy volume answers the supply question the other way and invalidates the read.")
+
+showDashInput = input.bool(true, "Show Dashboard", group = "Dashboard",
+  tooltip = "Displays the live reading: volume and bar spread as a share of their baselines, how many sessions of the lookback qualified as dry-ups, and the current state of the quiet-then-expansion sequence.")
+
+dashPosInput = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = "Dashboard",
+  tooltip = "Dashboard position on the pane.")
+
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = "Dashboard",
+  tooltip = "Dashboard text size.")
+
+dryColorInput = input.color(DRY_COLOR, "Dry-up", group = "Style",
+  tooltip = "Color of qualified quiet sessions: the dry-up columns, the threshold line, the chart tint and the VDU marker. Extreme dry-ups print fully opaque, regular ones lighter.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish Expansion", inline = "resolution", group = "Style",
+  tooltip = "Color of decisive expansion with an up close inside the resolution window - the constructive resolution the quiet was setting up.")
+
+bearColorInput = input.color(BEAR_COLOR, " Bearish Break", inline = "resolution", group = "Style",
+  tooltip = "Color of heavy volume with a down close inside the resolution window - supply answering the test, the invalidation.")
+
+normalColorInput = input.color(color.new(NEUTRAL_COLOR, 65), "Normal Volume", inline = "context", group = "Style",
+  tooltip = "Color of sessions that qualify as neither dry-up nor linked expansion.")
+
+averageColorInput = input.color(NEUTRAL_COLOR, " Volume Average", inline = "context", group = "Style",
+  tooltip = "Color of the volume baseline; the expansion threshold line uses a faded version of it.")
+
+markersInput = input.bool(true, "Chart Markers", group = "Style",
+  tooltip = "Mark the concept's events on the price chart: a dot under extreme dry-ups (VDU) and triangles on the linked expansion or break that resolves the quiet.")
+
+tintInput = input.bool(true, "Chart Dry-up Tint", group = "Style",
+  tooltip = "Shade qualified quiet sessions on the price chart so the dry-up zone is read in its price location - holding a pivot, drying up a pullback, or starving a rally attempt.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dry-up Detection
+//---------------------------------------------------------------------------------------------------------------------{
+float barSpread = high - low
+
+//baselines, computed unconditionally on every bar
+float volumeAverage = ta.sma(volume, averageLengthInput)
+float spreadAverage = ta.sma(barSpread, averageLengthInput)
+float lowestVolume  = ta.lowest(volume, baseLookbackInput)
+float baseHigh      = ta.highest(high, baseLookbackInput)
+
+bool hasVolume = not na(volume) and not na(volumeAverage) and volumeAverage > 0
+
+//qualification levels drawn in the pane
+float dryUpLevel     = volumeAverage * dryThresholdInput
+float expansionLevel = volumeAverage * expansionMultInput
+
+//relative measures - the dry-up is earned against the instrument's own recent prints
+float relativeVolume = hasVolume ? volume / volumeAverage : na
+float relativeSpread = not na(spreadAverage) and spreadAverage > 0 ? barSpread / spreadAverage : na
+
+//shrinking spread paired with shrinking volume, and optionally price holding the pivot area
+bool spreadOk = not spreadConfirmInput or (not na(spreadAverage) and barSpread <= spreadAverage * spreadThresholdInput)
+bool pivotOk  = not pivotFilterInput or (not na(baseHigh) and close >= baseHigh * (1 - pivotDistanceInput / 100))
+
+//qualified dry-up: a confirmed session trading at a small fraction of normal turnover
+bool dryUpBar = hasVolume and volume > 0 and volume <= dryUpLevel and spreadOk and pivotOk and barstate.isconfirmed
+
+//extreme dry-up: also the lightest print of the whole lookback - the VDU read
+bool extremeDryUp = dryUpBar and not na(lowestVolume) and volume <= lowestVolume
+
+//how much of the lookback has gone dormant - the screening count
+float dryUpCount = math.sum(dryUpBar ? 1 : 0, baseLookbackInput)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Resolution
+//---------------------------------------------------------------------------------------------------------------------{
+var int  lastDryUpIndex     = na
+var bool awaitingResolution = false
+
+//a linking window that lapses without expansion retires the episode
+if awaitingResolution and not na(lastDryUpIndex) and bar_index - lastDryUpIndex > resolutionWindowInput
+    awaitingResolution := false
+
+if dryUpBar
+    lastDryUpIndex     := bar_index
+    awaitingResolution := true
+
+//decisive expansion printed inside the window that follows the last qualified dry-up
+bool expansionVolume = hasVolume and volume >= expansionLevel and barstate.isconfirmed
+bool linkedToDryUp   = awaitingResolution and not na(lastDryUpIndex) and bar_index > lastDryUpIndex and bar_index - lastDryUpIndex <= resolutionWindowInput
+
+bool bullishExpansion = expansionVolume and close > open and linkedToDryUp
+bool bearishBreak     = expansionVolume and close < open and linkedToDryUp
+
+if bullishExpansion or bearishBreak
+    awaitingResolution := false
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+//volume columns, state colored: quiet sessions in the dry-up color (opaque when lightest of the base), linked resolutions in their event colors, everything else muted
+color columnColor = bullishExpansion ? bullColorInput : bearishBreak ? bearColorInput : extremeDryUp ? dryColorInput : dryUpBar ? color.new(dryColorInput, DRYUP_TRANSPARENCY) : normalColorInput
+
+plot(volume, "Volume", color = columnColor, style = plot.style_columns)
+plot(volumeAverage, "Volume Average", color = averageColorInput, linewidth = 1)
+plot(dryUpLevel, "Dry-up Threshold", color = color.new(dryColorInput, LEVEL_TRANSPARENCY), linewidth = 1)
+plot(expansionLevel, "Expansion Threshold", color = color.new(averageColorInput, EXPAN_TRANSPARENCY), linewidth = 1)
+
+//relative measures reported in the data window
+plot(relativeVolume, "Relative Volume", color = DRY_COLOR, display = display.data_window)
+plot(relativeSpread, "Relative Spread", color = DRY_COLOR, display = display.data_window)
+
+//quiet sessions shaded on the price chart - the dry-up zone read in its price location
+bgcolor(tintInput and dryUpBar ? color.new(dryColorInput, TINT_TRANSPARENCY) : na, title = "Dry-up Session Tint", force_overlay = true)
+
+//event markers on the price chart: the lightest-of-base dry-up and the linked resolutions
+plotshape(markersInput and extremeDryUp, "Extreme Dry-up (VDU)", shape.circle, location.belowbar, color.new(dryColorInput, 0), size = size.tiny, force_overlay = true)
+plotshape(markersInput and bullishExpansion, "Bullish Expansion", shape.triangleup, location.belowbar, color.new(bullColorInput, 0), size = size.tiny, force_overlay = true)
+plotshape(markersInput and bearishBreak, "Bearish Break", shape.triangledown, location.abovebar, color.new(bearColorInput, 0), size = size.tiny, force_overlay = true)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+dashPosition = switch dashPosInput
+    "Top Left"     => position.top_left
+    "Bottom Right" => position.bottom_right
+    "Bottom Left"  => position.bottom_left
+    =>                position.top_right
+
+dashTextSize = switch dashSizeInput
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    =>          size.small
+
+var table dashTable = table.new(dashPosition, 2, 5
+  , bgcolor      = DASH_BG
+  , frame_color  = DASH_FRAME
+  , frame_width  = 1
+  , border_width = 0)
+
+if barstate.islast and showDashInput
+    color labelColor = DASH_HEADER
+    color valueColor = DASH_TEXT
+
+    string headerText  = "≤ " + str.tostring(100 * dryThresholdInput, "#") + "% of " + str.tostring(averageLengthInput) + "-bar avg"
+    string relVolText  = na(relativeVolume) ? TXT_NA : str.tostring(100 * relativeVolume, "#") + "% of avg"
+    color  relVolColor = na(relativeVolume) ? valueColor : relativeVolume <= dryThresholdInput ? dryColorInput : valueColor
+    string spreadText  = na(relativeSpread) ? TXT_NA : str.tostring(100 * relativeSpread, "#") + "% of avg"
+    string countText   = na(dryUpCount) ? TXT_NA : str.tostring(dryUpCount, "#") + " of " + str.tostring(baseLookbackInput)
+
+    string statusText  = not hasVolume ? "No volume data" : bullishExpansion ? "Bullish expansion" : bearishBreak ? "Bearish break" : extremeDryUp ? "Extreme dry-up (VDU)" : dryUpBar ? "Dry-up" : awaitingResolution ? "Awaiting expansion" : "Neutral"
+    color  statusColor = not hasVolume ? valueColor : bullishExpansion ? bullColorInput : bearishBreak ? bearColorInput : extremeDryUp or dryUpBar or awaitingResolution ? dryColorInput : valueColor
+
+    table.cell(dashTable, 0, 0, "Volume Dry-up", text_color = DASH_TEXT, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 0, headerText, text_color = DASH_HEADER, text_halign = text.align_right, text_size = dashTextSize)
+
+    table.cell(dashTable, 0, 1, "Relative Volume", text_color = labelColor, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 1, relVolText, text_color = relVolColor, text_halign = text.align_right, text_size = dashTextSize)
+
+    table.cell(dashTable, 0, 2, "Bar Spread", text_color = labelColor, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 2, spreadText, text_color = valueColor, text_halign = text.align_right, text_size = dashTextSize)
+
+    table.cell(dashTable, 0, 3, "Dry-ups in Lookback", text_color = labelColor, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 3, countText, text_color = valueColor, text_halign = text.align_right, text_size = dashTextSize)
+
+    table.cell(dashTable, 0, 4, "Status", text_color = labelColor, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 4, statusText, text_color = statusColor, text_halign = text.align_right, text_size = dashTextSize)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(dryUpBar, "Volume Dry-up", "Volume dry-up on {{ticker}} - session volume contracted to a small fraction of its average ({{interval}})")
+alertcondition(extremeDryUp, "Extreme Volume Dry-up (VDU)", "Extreme volume dry-up on {{ticker}} - the lightest volume of the whole lookback, the VDU read ({{interval}})")
+alertcondition(bullishExpansion, "Bullish Expansion after Dry-up", "Volume expanded decisively out of the dry-up on {{ticker}} with an up close - the resolution the quiet was setting up ({{interval}})")
+alertcondition(bearishBreak, "Bearish Break after Dry-up", "Heavy volume broke downward out of the dry-up on {{ticker}} - supply answered the test, the constructive read is invalidated ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

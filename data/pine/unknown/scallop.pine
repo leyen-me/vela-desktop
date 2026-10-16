@@ -1,0 +1,529 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Scallop"
+  , shorttitle       = "Scallop"
+  , overlay          = true
+  , max_lines_count  = 500
+  , max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+color BULL_COLOR = #089981
+color BEAR_COLOR = #f23645
+
+int   MAX_CANDIDATES = 6    // curve-start swings kept per direction
+int   MAX_SEGMENTS   = 24   // line segments used to trace a fitted curve
+float BOTTOM_ZONE    = 0.25 // share of the depth defining the rounded-turn zone
+float TURN_MIN_POS   = 0.15 // the rounded turn must sit inside this central share of the span
+float TURN_MAX_POS   = 0.85
+int   KEEP_LINES     = 440  // retained drawing budget for completed patterns
+int   KEEP_LABELS    = 120
+
+int STATE_ARMED = 1  // candidate can attempt completion on the next carry beyond its start
+int STATE_WAIT  = 0  // candidate must first trade back inside the curve to re-arm
+int STATE_DEAD  = -1 // candidate voided permanently (curve grew too deep)
+
+string G_PATTERN = "Pattern"
+string G_CURVE   = "Curve Fit"
+string G_FILTERS = "Filters"
+string G_TARGET  = "Target & Stop"
+string G_STYLE   = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+showAscInput = input.bool(true, "Ascending Scallops", group = G_PATTERN, tooltip = "Detect the bullish form: a rounded J-shaped dip inside an advance, completed when price carries back above the curve's starting high.")
+
+showDescInput = input.bool(true, "Descending Scallops", group = G_PATTERN, tooltip = "Detect the bearish form: the mirrored J inside a decline, completed when price carries back below the curve's starting low.")
+
+swingInput = input.int(5, "Swing Detection Length", minval = 2, maxval = 25, group = G_PATTERN, tooltip = "Bars required on each side to confirm the swing high (low) a curve declines (rises) from - the pattern's starting lip. Larger values anchor curves to more significant swings.")
+
+minLenInput = input.int(15, "Curve Length  Min", minval = 8, maxval = 150, inline = "clen", group = G_PATTERN, tooltip = "Minimum curve duration in bars, from the starting lip to the completing carry beyond it. Typical daily-chart scallops span weeks to a few months.")
+
+maxLenInput = input.int(100, "Max", minval = 20, maxval = 300, inline = "clen", group = G_PATTERN, tooltip = "Maximum curve duration in bars. Candidates older than this are dropped - a longer rounded structure reads as a major base rather than a mid-trend scallop.")
+
+minDepthInput = input.float(3, "Curve Depth %  Min", minval = 0.5, maxval = 50, step = 0.5, inline = "cdep", group = G_PATTERN, tooltip = "Minimum distance from the starting lip to the rounded turn, as a percentage of the lip price. Separates a recognizable curve from flat drift.")
+
+maxDepthInput = input.float(25, "Max", minval = 1, maxval = 90, step = 0.5, inline = "cdep", group = G_PATTERN, tooltip = "Maximum curve depth as a percentage of the lip price - the retrace should stay a modest fraction of the trend, mid-trend scale rather than a standalone reversal base.")
+
+srcInput = input.source(close, "Curve Source", group = G_CURVE, tooltip = "Price series the quadratic curve is fitted to across the pattern span.")
+
+fitR2Input = input.float(0.8, "Curve Fit Quality (R²)", minval = 0.5, maxval = 0.99, step = 0.01, group = G_CURVE, tooltip = "Minimum coefficient of determination of the quadratic fitted across the span. The defining feature of a scallop is the smooth rounded turn; higher values demand a cleaner curve. Because curved patterns have no objective boundary line, this threshold is the main subjectivity dial.")
+
+roundShareInput = input.float(30, "Roundedness %", minval = 10, maxval = 60, step = 1, group = G_CURVE, tooltip = "Minimum share of the pattern's bars trading inside the quarter of the depth nearest the rounded turn. A gradual turn keeps price near its extreme far longer than a sharp V-shaped correction, which this check rejects.")
+
+trendFilterInput = input.bool(true, "Trend Filter", group = G_FILTERS, tooltip = "Require the trend context the pattern continues: at the curve's start, price above a rising trend average for ascending scallops, and the mirror for descending. Scallops are mid-trend continuation features, not bases.")
+
+trendLenInput = input.int(50, "Trend Average Length", minval = 10, maxval = 200, group = G_FILTERS, tooltip = "Length of the simple moving average used as the trend reference by the trend filter.")
+
+volFilterInput = input.bool(false, "Require Volume Curve", group = G_FILTERS, tooltip = "Require volume to follow the curve - heavier over the pattern's edges and quieter through the rounded turn. The signature is typical rather than mandatory, so by default it is reported in the pattern tooltip only. Ignored when the symbol provides no volume.")
+
+targetFracInput = input.float(50, "Target Projection %", minval = 10, maxval = 100, step = 5, group = G_TARGET, tooltip = "Fraction of the curve's height projected beyond the completion level, in the spirit of the measure rule. Pattern statistics argue for tempering full-height projections, especially late in a trend.")
+
+showTargetInput = input.bool(true, "Show Target Level", group = G_TARGET, tooltip = "Draw the projected target level from each completed scallop.")
+
+showStopInput = input.bool(true, "Show Stop Level", group = G_TARGET, tooltip = "Draw the reference stop level beyond the rounded turn of each completed scallop.")
+
+showLabelsInput = input.bool(true, "Show Labels", group = G_STYLE, tooltip = "Label each completed scallop. The label tooltip carries the curve's measurements, fit quality, target and stop, volume read, and the comparison against the previous scallop in the series.")
+
+previewInput = input.bool(true, "Show Developing Curve", group = G_STYLE, tooltip = "On the live bar, trace the curve forming from the most recent candidate start once its rounded turn is in place, along with the level it must carry beyond - the earlier, more ambiguous entry some traders take inside the curve. Updates with every bar and can disappear if the shape degrades.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "col", group = G_STYLE)
+
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "col", group = G_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Rolling Series & Storage
+//---------------------------------------------------------------------------------------------------------------------{
+float trendMaValue = ta.sma(close, trendLenInput)
+float phPrice     = ta.pivothigh(swingInput, swingInput)
+float plPrice     = ta.pivotlow(swingInput, swingInput)
+
+var bool volumeAvailable = false
+if not na(volume) and volume > 0
+    volumeAvailable := true
+
+int trendBack  = math.max(1, int(math.floor(trendLenInput / 4.0)))
+int bufferBars = maxLenInput + trendLenInput + swingInput + 10
+
+// Per-bar rolling windows, deep enough for the longest curve plus the trend reference behind its start
+var array<float> srcArray   = array.new<float>()
+var array<float> highArray  = array.new<float>()
+var array<float> lowArray   = array.new<float>()
+var array<float> closeArray = array.new<float>()
+var array<float> volArray   = array.new<float>()
+var array<float> maArray    = array.new<float>()
+
+array.push(srcArray, nz(srcInput, close))
+array.push(highArray, high)
+array.push(lowArray, low)
+array.push(closeArray, close)
+array.push(volArray, nz(volume))
+array.push(maArray, trendMaValue)
+if array.size(srcArray) > bufferBars
+    array.shift(srcArray)
+    array.shift(highArray)
+    array.shift(lowArray)
+    array.shift(closeArray)
+    array.shift(volArray)
+    array.shift(maArray)
+
+// Candidate curve starts per direction: bar, price and attempt state of each stored lip
+var array<int>   ascBarArray    = array.new<int>()
+var array<float> ascPriceArray  = array.new<float>()
+var array<int>   ascStateArray  = array.new<int>()
+var array<int>   descBarArray   = array.new<int>()
+var array<float> descPriceArray = array.new<float>()
+var array<int>   descStateArray = array.new<int>()
+
+// Previous completed scallop per direction, for the series (maturing trend) comparison
+var float prevAscDepthPct  = na
+var int   prevAscLen       = na
+var int   prevAscEndBar    = na
+var int   ascSeriesCount   = 0
+var float prevDescDepthPct = na
+var int   prevDescLen      = na
+var int   prevDescEndBar   = na
+var int   descSeriesCount  = 0
+
+// Drawing stores
+var array<line>  patternLineArray  = array.new<line>()
+var array<label> patternLabelArray = array.new<label>()
+var array<line>  previewLineArray  = array.new<line>()
+var array<label> previewLabelArray = array.new<label>()
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Average of the stored values over array indices [fromIdx .. toIdx]
+averageRange(array<float> valsArray, int fromIdx, int toIdx) =>
+    float total = 0.0
+    int   count = 0
+    if fromIdx <= toIdx
+        for k = fromIdx to toIdx
+            if k >= 0 and k < array.size(valsArray)
+                total += array.get(valsArray, k)
+                count += 1
+    count > 0 ? total / count : na
+
+// Least-squares quadratic y = a + b·x + c·x² over `cnt` stored values starting at `startIdx`,
+// with x counted in bars from the curve start. Returns [a, b, c, r2].
+fitQuadratic(array<float> ysArray, int startIdx, int cnt) =>
+    float aCoef = na
+    float bCoef = na
+    float cCoef = na
+    float r2Val = na
+    if cnt >= 4 and startIdx >= 0 and startIdx + cnt <= array.size(ysArray)
+        float s0 = cnt
+        float s1 = 0.0
+        float s2 = 0.0
+        float s3 = 0.0
+        float s4 = 0.0
+        float t0 = 0.0
+        float t1 = 0.0
+        float t2 = 0.0
+        for k = 0 to cnt - 1
+            float xv = k
+            float yv = array.get(ysArray, startIdx + k)
+            float x2 = xv * xv
+            s1 += xv
+            s2 += x2
+            s3 += x2 * xv
+            s4 += x2 * x2
+            t0 += yv
+            t1 += xv * yv
+            t2 += x2 * yv
+        float detD = s0 * (s2 * s4 - s3 * s3) - s1 * (s1 * s4 - s3 * s2) + s2 * (s1 * s3 - s2 * s2)
+        if not na(detD) and math.abs(detD) > 1e-6
+            aCoef := (t0 * (s2 * s4 - s3 * s3) - s1 * (t1 * s4 - s3 * t2) + s2 * (t1 * s3 - s2 * t2)) / detD
+            bCoef := (s0 * (t1 * s4 - s3 * t2) - t0 * (s1 * s4 - s3 * s2) + s2 * (s1 * t2 - s2 * t1)) / detD
+            cCoef := (s0 * (s2 * t2 - t1 * s3) - s1 * (s1 * t2 - t1 * s2) + t0 * (s1 * s3 - s2 * s2)) / detD
+            float meanY = t0 / s0
+            float sse   = 0.0
+            float sst   = 0.0
+            for k = 0 to cnt - 1
+                float xv   = k
+                float yv   = array.get(ysArray, startIdx + k)
+                float fitY = aCoef + (bCoef + cCoef * xv) * xv
+                sse += (yv - fitY) * (yv - fitY)
+                sst += (yv - meanY) * (yv - meanY)
+            r2Val := sst > 0 ? 1 - sse / sst : 0.0
+    [aCoef, bCoef, cCoef, r2Val]
+
+// Grade the curve running from `lipBar` to the current bar against the page's identify steps.
+// Preview mode relaxes the length floor and demands only that the rounded turn is in and price is curling away.
+// Returns [valid, dead, depthPct, extremePrice, extremeBar, aCoef, bCoef, cCoef, r2, volState].
+validateCurve(bool isBull, int lipBar, float lipPrice, bool previewMode) =>
+    int sizeA    = array.size(srcArray)
+    int spanBars = bar_index - lipBar
+    int startIdx = sizeA - 1 - spanBars
+    int cnt      = spanBars + 1
+    int spanMin  = previewMode ? math.max(6, int(math.floor(minLenInput / 2.0))) : minLenInput
+    bool  valid        = false
+    bool  dead         = false
+    float depthPct     = na
+    float extremePrice = na
+    int   extremeBar   = na
+    float aCoef        = na
+    float bCoef        = na
+    float cCoef        = na
+    float r2Val        = na
+    int   volState     = -1
+    if startIdx >= 0 and spanBars >= 2 and not na(lipPrice) and lipPrice > 0
+        // Rounded-turn extreme: lowest low of the span for the bullish J, highest high for the bearish mirror
+        int extremeIdx = -1
+        for k = startIdx to sizeA - 1
+            float px = isBull ? array.get(lowArray, k) : array.get(highArray, k)
+            if extremeIdx < 0 or (isBull ? px < extremePrice : px > extremePrice)
+                extremePrice := px
+                extremeIdx   := k
+        extremeBar := bar_index - (sizeA - 1 - extremeIdx)
+        float depthAbs = isBull ? lipPrice - extremePrice : extremePrice - lipPrice
+        depthPct := 100 * depthAbs / lipPrice
+        dead     := depthPct > maxDepthInput
+        bool spanOk  = spanBars >= spanMin and spanBars <= maxLenInput
+        bool depthOk = depthPct >= minDepthInput and not dead
+        // The turn must sit inside the span, not on either edge
+        float posFrac = (extremeIdx - startIdx) * 1.0 / spanBars
+        bool  posOk   = posFrac >= TURN_MIN_POS and posFrac <= TURN_MAX_POS
+        // Time share near the turn: a gradual rounded turn holds price there, a sharp V does not
+        bool roundOk = false
+        if depthAbs > 0
+            int zoneCount = 0
+            for k = startIdx to sizeA - 1
+                float px     = isBull ? array.get(lowArray, k) : array.get(highArray, k)
+                bool  inZone = isBull ? px <= extremePrice + BOTTOM_ZONE * depthAbs : px >= extremePrice - BOTTOM_ZONE * depthAbs
+                if inZone
+                    zoneCount += 1
+            roundOk := zoneCount * 1.0 / cnt >= roundShareInput / 100
+        // Smoothness: the span must trace a single curve of the right curvature
+        bool fitOk = false
+        if spanOk and depthOk and posOk and roundOk
+            [aFit, bFit, cFit, r2Fit] = fitQuadratic(srcArray, startIdx, cnt)
+            aCoef := aFit
+            bCoef := bFit
+            cCoef := cFit
+            r2Val := r2Fit
+            fitOk := not na(r2Fit) and r2Fit >= fitR2Input and (isBull ? cFit > 0 : cFit < 0)
+        // Trend context at the curve start: ascending scallops belong in advances, descending in declines
+        bool trendOk = true
+        if trendFilterInput
+            trendOk := false
+            int backIdx = startIdx - trendBack
+            if backIdx >= 0
+                float maLip    = array.get(maArray, startIdx)
+                float maBack   = array.get(maArray, backIdx)
+                float closeLip = array.get(closeArray, startIdx)
+                if not na(maLip) and not na(maBack) and not na(closeLip)
+                    trendOk := isBull ? closeLip > maLip and maLip > maBack : closeLip < maLip and maLip < maBack
+        // Volume curve: heavier over the edges, quieter through the rounded turn
+        int   third    = math.max(1, int(math.floor(cnt / 3.0)))
+        float firstAvg = averageRange(volArray, startIdx, startIdx + third - 1)
+        float lastAvg  = averageRange(volArray, sizeA - third, sizeA - 1)
+        float midAvg   = averageRange(volArray, startIdx + third, sizeA - 1 - third)
+        if volumeAvailable and not na(firstAvg) and not na(lastAvg) and not na(midAvg)
+            volState := midAvg <= (firstAvg + lastAvg) / 2 ? 1 : 0
+        bool volOk = not volFilterInput or volState != 0
+        // A developing curve must already be curling away from its turn
+        bool turnOk = true
+        if previewMode
+            turnOk := isBull ? close >= extremePrice + BOTTOM_ZONE * depthAbs : close <= extremePrice - BOTTOM_ZONE * depthAbs
+        valid := spanOk and depthOk and posOk and roundOk and fitOk and trendOk and volOk and turnOk
+    [valid, dead, depthPct, extremePrice, extremeBar, aCoef, bCoef, cCoef, r2Val, volState]
+
+// Trace the fitted curve from the lip to the current bar as chained line segments pushed into `sinkArray`
+drawCurve(int lipBar, int spanBars, float aCoef, float bCoef, float cCoef, color lineColor, string lineStyle, int lineWidth, array<line> sinkArray) =>
+    if spanBars > 0 and not na(aCoef) and not na(bCoef) and not na(cCoef)
+        int   segStep  = math.max(1, int(math.ceil(spanBars / (MAX_SEGMENTS * 1.0))))
+        int   segCount = int(math.ceil(spanBars * 1.0 / segStep))
+        int   xPrev    = 0
+        float yPrev    = aCoef
+        for s = 1 to segCount
+            int   xCur = math.min(s * segStep, spanBars)
+            float yCur = aCoef + (bCoef + cCoef * xCur) * xCur
+            array.push(sinkArray, line.new(lipBar + xPrev, yPrev, lipBar + xCur, yCur, color = lineColor, style = lineStyle, width = lineWidth))
+            xPrev := xCur
+            yPrev := yCur
+
+trimLines(array<line> linesArray, int keepCount) =>
+    while array.size(linesArray) > keepCount
+        line.delete(array.shift(linesArray))
+
+trimLabels(array<label> labelsArray, int keepCount) =>
+    while array.size(labelsArray) > keepCount
+        label.delete(array.shift(labelsArray))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Detection
+//---------------------------------------------------------------------------------------------------------------------{
+bool ascCompletedEvent  = false
+bool descCompletedEvent = false
+bool ascShrinkEvent     = false
+bool descShrinkEvent    = false
+
+if barstate.isconfirmed
+    // Drop candidates whose curve has overrun the maximum length (stored oldest first)
+    while array.size(ascBarArray) > 0 and bar_index - array.get(ascBarArray, 0) > maxLenInput
+        array.shift(ascBarArray)
+        array.shift(ascPriceArray)
+        array.shift(ascStateArray)
+    while array.size(descBarArray) > 0 and bar_index - array.get(descBarArray, 0) > maxLenInput
+        array.shift(descBarArray)
+        array.shift(descPriceArray)
+        array.shift(descStateArray)
+
+    // Confirmed swings become candidate curve starts
+    if showAscInput and not na(phPrice)
+        array.push(ascBarArray, bar_index - swingInput)
+        array.push(ascPriceArray, phPrice)
+        array.push(ascStateArray, STATE_ARMED)
+        if array.size(ascBarArray) > MAX_CANDIDATES
+            array.shift(ascBarArray)
+            array.shift(ascPriceArray)
+            array.shift(ascStateArray)
+    if showDescInput and not na(plPrice)
+        array.push(descBarArray, bar_index - swingInput)
+        array.push(descPriceArray, plPrice)
+        array.push(descStateArray, STATE_ARMED)
+        if array.size(descBarArray) > MAX_CANDIDATES
+            array.shift(descBarArray)
+            array.shift(descPriceArray)
+            array.shift(descStateArray)
+
+    // Ascending completion: the first close carrying above a candidate's starting high grades the whole curve
+    bool  ascDone         = false
+    int   candLipBarA     = na
+    float candLipPriceA   = na
+    float candDepthPctA   = na
+    float candExtremeA    = na
+    int   candExtremeBarA = na
+    float candCoefA0      = na
+    float candCoefA1      = na
+    float candCoefA2      = na
+    float candR2A         = na
+    int   candVolA        = -1
+    if showAscInput and array.size(ascBarArray) > 0
+        for k = 0 to array.size(ascBarArray) - 1
+            if not ascDone
+                int   stateK    = array.get(ascStateArray, k)
+                int   lipBarK   = array.get(ascBarArray, k)
+                float lipPriceK = array.get(ascPriceArray, k)
+                if stateK == STATE_WAIT and close <= lipPriceK
+                    array.set(ascStateArray, k, STATE_ARMED)
+                else if stateK == STATE_ARMED and close > lipPriceK
+                    [validK, deadK, depthPctK, extremeK, extremeBarK, aK, bK, cK, r2K, volK] = validateCurve(true, lipBarK, lipPriceK, false)
+                    if validK
+                        ascDone         := true
+                        candLipBarA     := lipBarK
+                        candLipPriceA   := lipPriceK
+                        candDepthPctA   := depthPctK
+                        candExtremeA    := extremeK
+                        candExtremeBarA := extremeBarK
+                        candCoefA0      := aK
+                        candCoefA1      := bK
+                        candCoefA2      := cK
+                        candR2A         := r2K
+                        candVolA        := volK
+                    else
+                        array.set(ascStateArray, k, deadK ? STATE_DEAD : STATE_WAIT)
+    if ascDone
+        int   spanBarsA   = bar_index - candLipBarA
+        float depthAbsA   = candLipPriceA - candExtremeA
+        float targetA     = candLipPriceA + targetFracInput / 100 * depthAbsA
+        int   extendBarsA = math.max(5, int(math.floor(spanBarsA / 4.0)))
+        drawCurve(candLipBarA, spanBarsA, candCoefA0, candCoefA1, candCoefA2, bullColorInput, line.style_solid, 2, patternLineArray)
+        if showTargetInput
+            array.push(patternLineArray, line.new(bar_index, targetA, bar_index + extendBarsA, targetA, color = color.new(bullColorInput, 20), style = line.style_dotted))
+        if showStopInput
+            array.push(patternLineArray, line.new(candExtremeBarA, candExtremeA, bar_index + extendBarsA, candExtremeA, color = color.new(bearColorInput, 50), style = line.style_dashed))
+        // Series comparison: successive scallops shrinking in height and length hint at a maturing trend
+        bool sameSeriesA = not na(prevAscEndBar) and candLipBarA - prevAscEndBar <= maxLenInput
+        bool shrinkingA  = sameSeriesA and not na(prevAscDepthPct) and candDepthPctA < prevAscDepthPct and spanBarsA < prevAscLen
+        ascSeriesCount := sameSeriesA ? ascSeriesCount + 1 : 1
+        if showLabelsInput
+            string volTextA = candVolA == 1 ? "edges heavier (typical)" : candVolA == 0 ? "not confirmed" : "no volume data"
+            string tipTextA = "Ascending scallop - uptrend continuation"
+            tipTextA += "\nCurve: " + str.tostring(spanBarsA) + " bars, " + str.tostring(candDepthPctA, "#.##") + "% deep"
+            tipTextA += "\nFit R²: " + str.tostring(candR2A, "#.###")
+            tipTextA += "\nCompletion (curve start): " + str.tostring(candLipPriceA, format.mintick)
+            tipTextA += "\nTarget (" + str.tostring(targetFracInput, "#.#") + "% of height): " + str.tostring(targetA, format.mintick)
+            tipTextA += "\nStop (rounded low): " + str.tostring(candExtremeA, format.mintick)
+            tipTextA += "\nVolume curve: " + volTextA
+            if sameSeriesA
+                tipTextA += "\n#" + str.tostring(ascSeriesCount) + " in series - previous: " + str.tostring(prevAscDepthPct, "#.##") + "% deep, " + str.tostring(prevAscLen) + " bars"
+            if shrinkingA
+                tipTextA += "\nShorter and shallower than the last one - maturing-trend hint"
+            array.push(patternLabelArray, label.new(bar_index, low, "Ascending Scallop" + (shrinkingA ? " (shrinking)" : ""), style = label.style_label_up, color = color.new(bullColorInput, 0), textcolor = chart.bg_color, size = size.small, tooltip = tipTextA))
+        prevAscDepthPct := candDepthPctA
+        prevAscLen      := spanBarsA
+        prevAscEndBar   := bar_index
+        ascCompletedEvent := true
+        ascShrinkEvent    := shrinkingA
+        array.clear(ascBarArray)
+        array.clear(ascPriceArray)
+        array.clear(ascStateArray)
+
+    // Descending completion: the first close carrying below a candidate's starting low grades the whole curve
+    bool  descDone        = false
+    int   candLipBarD     = na
+    float candLipPriceD   = na
+    float candDepthPctD   = na
+    float candExtremeD    = na
+    int   candExtremeBarD = na
+    float candCoefD0      = na
+    float candCoefD1      = na
+    float candCoefD2      = na
+    float candR2D         = na
+    int   candVolD        = -1
+    if showDescInput and array.size(descBarArray) > 0
+        for k = 0 to array.size(descBarArray) - 1
+            if not descDone
+                int   stateK    = array.get(descStateArray, k)
+                int   lipBarK   = array.get(descBarArray, k)
+                float lipPriceK = array.get(descPriceArray, k)
+                if stateK == STATE_WAIT and close >= lipPriceK
+                    array.set(descStateArray, k, STATE_ARMED)
+                else if stateK == STATE_ARMED and close < lipPriceK
+                    [validK, deadK, depthPctK, extremeK, extremeBarK, aK, bK, cK, r2K, volK] = validateCurve(false, lipBarK, lipPriceK, false)
+                    if validK
+                        descDone        := true
+                        candLipBarD     := lipBarK
+                        candLipPriceD   := lipPriceK
+                        candDepthPctD   := depthPctK
+                        candExtremeD    := extremeK
+                        candExtremeBarD := extremeBarK
+                        candCoefD0      := aK
+                        candCoefD1      := bK
+                        candCoefD2      := cK
+                        candR2D         := r2K
+                        candVolD        := volK
+                    else
+                        array.set(descStateArray, k, deadK ? STATE_DEAD : STATE_WAIT)
+    if descDone
+        int   spanBarsD   = bar_index - candLipBarD
+        float depthAbsD   = candExtremeD - candLipPriceD
+        float targetD     = candLipPriceD - targetFracInput / 100 * depthAbsD
+        int   extendBarsD = math.max(5, int(math.floor(spanBarsD / 4.0)))
+        drawCurve(candLipBarD, spanBarsD, candCoefD0, candCoefD1, candCoefD2, bearColorInput, line.style_solid, 2, patternLineArray)
+        if showTargetInput
+            array.push(patternLineArray, line.new(bar_index, targetD, bar_index + extendBarsD, targetD, color = color.new(bearColorInput, 20), style = line.style_dotted))
+        if showStopInput
+            array.push(patternLineArray, line.new(candExtremeBarD, candExtremeD, bar_index + extendBarsD, candExtremeD, color = color.new(bullColorInput, 50), style = line.style_dashed))
+        bool sameSeriesD = not na(prevDescEndBar) and candLipBarD - prevDescEndBar <= maxLenInput
+        bool shrinkingD  = sameSeriesD and not na(prevDescDepthPct) and candDepthPctD < prevDescDepthPct and spanBarsD < prevDescLen
+        descSeriesCount := sameSeriesD ? descSeriesCount + 1 : 1
+        if showLabelsInput
+            string volTextD = candVolD == 1 ? "edges heavier (typical)" : candVolD == 0 ? "not confirmed" : "no volume data"
+            string tipTextD = "Descending scallop - downtrend continuation"
+            tipTextD += "\nCurve: " + str.tostring(spanBarsD) + " bars, " + str.tostring(candDepthPctD, "#.##") + "% deep"
+            tipTextD += "\nFit R²: " + str.tostring(candR2D, "#.###")
+            tipTextD += "\nCompletion (curve start): " + str.tostring(candLipPriceD, format.mintick)
+            tipTextD += "\nTarget (" + str.tostring(targetFracInput, "#.#") + "% of height): " + str.tostring(targetD, format.mintick)
+            tipTextD += "\nStop (rounded high): " + str.tostring(candExtremeD, format.mintick)
+            tipTextD += "\nVolume curve: " + volTextD
+            if sameSeriesD
+                tipTextD += "\n#" + str.tostring(descSeriesCount) + " in series - previous: " + str.tostring(prevDescDepthPct, "#.##") + "% deep, " + str.tostring(prevDescLen) + " bars"
+            if shrinkingD
+                tipTextD += "\nShorter and shallower than the last one - maturing-trend hint"
+            array.push(patternLabelArray, label.new(bar_index, high, "Descending Scallop" + (shrinkingD ? " (shrinking)" : ""), style = label.style_label_down, color = color.new(bearColorInput, 0), textcolor = chart.bg_color, size = size.small, tooltip = tipTextD))
+        prevDescDepthPct := candDepthPctD
+        prevDescLen      := spanBarsD
+        prevDescEndBar   := bar_index
+        descCompletedEvent := true
+        descShrinkEvent    := shrinkingD
+        array.clear(descBarArray)
+        array.clear(descPriceArray)
+        array.clear(descStateArray)
+
+    trimLines(patternLineArray, KEEP_LINES)
+    trimLabels(patternLabelArray, KEEP_LABELS)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Developing Curve
+//---------------------------------------------------------------------------------------------------------------------{
+if barstate.islast
+    if array.size(previewLineArray) > 0
+        for k = 0 to array.size(previewLineArray) - 1
+            line.delete(array.get(previewLineArray, k))
+        array.clear(previewLineArray)
+    if array.size(previewLabelArray) > 0
+        for k = 0 to array.size(previewLabelArray) - 1
+            label.delete(array.get(previewLabelArray, k))
+        array.clear(previewLabelArray)
+    if previewInput
+        if showAscInput and array.size(ascBarArray) > 0
+            int   pvLipBar   = array.get(ascBarArray, array.size(ascBarArray) - 1)
+            float pvLipPrice = array.get(ascPriceArray, array.size(ascPriceArray) - 1)
+            int   pvState    = array.get(ascStateArray, array.size(ascStateArray) - 1)
+            if pvState != STATE_DEAD and close < pvLipPrice
+                [pvValid, pvDead, pvDepthPct, pvExtreme, pvExtremeBar, pvA, pvB, pvC, pvR2, pvVol] = validateCurve(true, pvLipBar, pvLipPrice, true)
+                if pvValid
+                    drawCurve(pvLipBar, bar_index - pvLipBar, pvA, pvB, pvC, color.new(bullColorInput, 30), line.style_dotted, 1, previewLineArray)
+                    array.push(previewLineArray, line.new(pvLipBar, pvLipPrice, bar_index + 5, pvLipPrice, color = color.new(bullColorInput, 40), style = line.style_dotted))
+                    array.push(previewLabelArray, label.new(bar_index + 5, pvLipPrice, "curve start", style = label.style_label_left, color = #00000000, textcolor = color.new(bullColorInput, 30), size = size.tiny, tooltip = "Developing ascending scallop: the rounded low is in and price is curling up. It completes only if price carries above this level."))
+        if showDescInput and array.size(descBarArray) > 0
+            int   dvLipBar   = array.get(descBarArray, array.size(descBarArray) - 1)
+            float dvLipPrice = array.get(descPriceArray, array.size(descPriceArray) - 1)
+            int   dvState    = array.get(descStateArray, array.size(descStateArray) - 1)
+            if dvState != STATE_DEAD and close > dvLipPrice
+                [dvValid, dvDead, dvDepthPct, dvExtreme, dvExtremeBar, dvA, dvB, dvC, dvR2, dvVol] = validateCurve(false, dvLipBar, dvLipPrice, true)
+                if dvValid
+                    drawCurve(dvLipBar, bar_index - dvLipBar, dvA, dvB, dvC, color.new(bearColorInput, 30), line.style_dotted, 1, previewLineArray)
+                    array.push(previewLineArray, line.new(dvLipBar, dvLipPrice, bar_index + 5, dvLipPrice, color = color.new(bearColorInput, 40), style = line.style_dotted))
+                    array.push(previewLabelArray, label.new(bar_index + 5, dvLipPrice, "curve start", style = label.style_label_left, color = #00000000, textcolor = color.new(bearColorInput, 30), size = size.tiny, tooltip = "Developing descending scallop: the rounded high is in and price is curling down. It completes only if price carries below this level."))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(ascCompletedEvent, "Ascending Scallop Completed", "Ascending scallop completed on {{ticker}} ({{interval}}): price carried above the curve's starting high, confirming the uptrend continuation")
+
+alertcondition(descCompletedEvent, "Descending Scallop Completed", "Descending scallop completed on {{ticker}} ({{interval}}): price carried below the curve's starting low, confirming the downtrend continuation")
+
+alertcondition(ascShrinkEvent, "Shrinking Ascending Scallop", "Ascending scallop completed on {{ticker}} ({{interval}}) shorter and shallower than the previous one in its series - a maturing-trend hint")
+
+alertcondition(descShrinkEvent, "Shrinking Descending Scallop", "Descending scallop completed on {{ticker}} ({{interval}}) shorter and shallower than the previous one in its series - a maturing-trend hint")
+
+//---------------------------------------------------------------------------------------------------------------------}

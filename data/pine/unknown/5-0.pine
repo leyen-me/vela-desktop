@@ -1,0 +1,388 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("5-0", "5-0", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 100)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+int MAX_SWINGS = 12
+
+// the defining 0.50 retracement of BC, the source of the pattern name
+float RATIO_D = 0.5
+
+int STATUS_NONE      = -1
+int STATUS_AWAITING  = 0
+int STATUS_COMPLETED = 1
+int STATUS_INVALID   = 2
+int STATUS_TARGET    = 3
+
+string DETECTION_GROUP = 'Swing Detection'
+string RULES_GROUP     = '5-0 Rules'
+string STYLE_GROUP     = 'Style'
+
+color TRANSPARENT_COLOR = #00000000
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Inputs
+//---------------------------------------------------------------------------------------------------------------------{
+
+swingLengthInput = input.int(8, 'Swing Length', minval = 2, maxval = 50, group = DETECTION_GROUP, tooltip = 'Pivot length used to detect the swing points forming the 0, X, A, B and C points. Larger values return larger and rarer 5-0 structures.')
+
+abXaMinInput = input.float(1.13, 'AB / XA Range', inline = 'abxa', minval = 1, step = 0.01, group = RULES_GROUP, tooltip = 'Lower bound of the AB extension relative to XA. AB must travel beyond X, with the reference range at 1.13 to 1.618; a move short of X voids the pattern.')
+abXaMaxInput = input.float(1.618, '', inline = 'abxa', minval = 1, step = 0.01, group = RULES_GROUP, tooltip = 'Upper bound of the AB extension relative to XA.')
+
+bcAbMinInput = input.float(1.618, 'BC / AB Range', inline = 'bcab', minval = 1, step = 0.01, group = RULES_GROUP, tooltip = 'Lower bound of the BC extension relative to AB. The reference range is 1.618 to 2.24, an even longer leg that establishes the new direction.')
+bcAbMaxInput = input.float(2.24, '', inline = 'bcab', minval = 1, step = 0.01, group = RULES_GROUP, tooltip = 'Upper bound of the BC extension relative to AB.')
+
+invalidationInput = input.float(0.618, 'Invalidation Retracement', minval = 0.5, maxval = 1, step = 0.001, group = RULES_GROUP, tooltip = 'Retracement of BC whose decisive break, a close beyond it, invalidates the D zone. The 0.618 retracement of BC is the common reference.')
+
+reciprocalCheckInput = input.bool(true, 'Reciprocal AB=CD Check', group = RULES_GROUP, tooltip = 'Requires the projected CD leg, 50% of BC, to roughly equal the AB leg in price distance, the reciprocal AB=CD that sits inside every 5-0.')
+reciprocalTolInput   = input.float(15, 'Reciprocal Tolerance %', minval = 0, maxval = 50, step = 1, group = RULES_GROUP, tooltip = 'Maximum deviation between the projected CD leg and the AB leg, as a percentage of AB, for the reciprocal AB=CD cross-check.')
+
+structureBreakInput = input.bool(false, 'Require C Beyond Point 0', group = RULES_GROUP, tooltip = 'Requires the BC leg to extend beyond the pattern origin at point 0, enforcing that the new direction has actually broken the prior trend structure before the D zone is trusted.')
+
+bullColorInput    = input.color(#089981, 'Bullish Patterns', group = STYLE_GROUP, inline = 'colors')
+bearColorInput    = input.color(#f23645, 'Bearish Patterns', group = STYLE_GROUP, inline = 'colors')
+invalidColorInput = input.color(#787b86, 'Invalidated', group = STYLE_GROUP)
+
+showLabelsInput = input.bool(true, 'Point Labels', group = STYLE_GROUP)
+showRatiosInput = input.bool(true, 'Ratio Labels', group = STYLE_GROUP)
+showTargetInput = input.bool(true, 'Target Line', group = STYLE_GROUP)
+
+showSwingsInput = input.bool(true, 'Show Swings', group = STYLE_GROUP, inline = 'swings')
+swingColorInput = input.color(color.new(#787b86, 50), '', group = STYLE_GROUP, inline = 'swings')
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+// registers a confirmed pivot into the swing zigzag, returns 0 = no change, 1 = new swing point, 2 = last swing point extended
+f_addPivot(array<float> priceArray, array<int> barArray, array<int> dirArray, float pivotPrice, int pivotBar, int pivotDir, int maxSize) =>
+    int changeType = 0
+    int n = array.size(priceArray)
+    if n == 0
+        array.push(priceArray, pivotPrice)
+        array.push(barArray, pivotBar)
+        array.push(dirArray, pivotDir)
+        changeType := 1
+    else
+        if pivotDir == array.get(dirArray, n - 1)
+            float lastPrice = array.get(priceArray, n - 1)
+            if (pivotDir == 1 and pivotPrice >= lastPrice) or (pivotDir == -1 and pivotPrice <= lastPrice)
+                array.set(priceArray, n - 1, pivotPrice)
+                array.set(barArray, n - 1, pivotBar)
+                changeType := 2
+        else
+            array.push(priceArray, pivotPrice)
+            array.push(barArray, pivotBar)
+            array.push(dirArray, pivotDir)
+            changeType := 1
+            if array.size(priceArray) > maxSize
+                array.shift(priceArray)
+                array.shift(barArray)
+                array.shift(dirArray)
+    changeType
+
+// draws or extends the faint zigzag segment joining the two most recent swing points
+f_swingSegment(array<float> priceArray, array<int> barArray, int changeType, line previousSegment) =>
+    line segment = previousSegment
+    if showSwingsInput
+        int n = array.size(priceArray)
+        if changeType == 1 and n >= 2
+            segment := line.new(array.get(barArray, n - 2), array.get(priceArray, n - 2), array.get(barArray, n - 1), array.get(priceArray, n - 1), color = swingColorInput, style = line.style_dotted)
+        else if changeType == 2 and not na(previousSegment)
+            line.set_xy2(previousSegment, array.get(barArray, n - 1), array.get(priceArray, n - 1))
+    segment
+
+// removes every drawing belonging to a projection that never completed
+f_deleteDrawings(array<line> lineArray, array<label> labelArray, box zoneBox, label zoneLabel, line targetLine) =>
+    int lineCount = array.size(lineArray)
+    if lineCount > 0
+        for i = 0 to lineCount - 1
+            line.delete(array.get(lineArray, i))
+    int labelCount = array.size(labelArray)
+    if labelCount > 0
+        for i = 0 to labelCount - 1
+            label.delete(array.get(labelArray, i))
+    array.clear(lineArray)
+    array.clear(labelArray)
+    if not na(zoneBox)
+        box.delete(zoneBox)
+    if not na(zoneLabel)
+        label.delete(zoneLabel)
+    if not na(targetLine)
+        line.delete(targetLine)
+
+// draws the CD leg, the D label and the target line once price completes the pattern at the 0.5 retracement of BC
+f_drawCompletion(array<line> lineArray, array<label> labelArray, int barC, float priceC, int barD, float lvlD, bool isBull, color patternColor) =>
+    array.push(lineArray, line.new(barC, priceC, barD, lvlD, color = patternColor, width = 2))
+    if showLabelsInput
+        array.push(labelArray, label.new(barD, lvlD, 'D', color = TRANSPARENT_COLOR, textcolor = patternColor, style = isBull ? label.style_label_up : label.style_label_down, size = size.small))
+    line targetLine = na
+    if showTargetInput
+        targetLine := line.new(barD, priceC, bar_index, priceC, color = color.new(patternColor, 30), style = line.style_dotted)
+    targetLine
+
+// redraws the D zone in the invalidation color once price closes decisively through the invalidation retracement
+f_invalidBox(box zoneBox, int leftBar, float lvl50, float lvlInv) =>
+    if not na(zoneBox)
+        box.delete(zoneBox)
+    box.new(leftBar, math.max(lvl50, lvlInv), bar_index, math.min(lvl50, lvlInv), border_color = color.new(invalidColorInput, 60), border_style = line.style_dashed, bgcolor = color.new(invalidColorInput, 90))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Swing Detection
+//---------------------------------------------------------------------------------------------------------------------{
+
+var array<float> swingPriceArray = array.new<float>()
+var array<int>   swingBarArray   = array.new<int>()
+var array<int>   swingDirArray   = array.new<int>()
+
+var line lastSwingSegment = na
+
+float pivotHigh = ta.pivothigh(swingLengthInput, swingLengthInput)
+float pivotLow  = ta.pivotlow(swingLengthInput, swingLengthInput)
+
+int swingChange = 0
+if not na(pivotHigh)
+    int changeType = f_addPivot(swingPriceArray, swingBarArray, swingDirArray, pivotHigh, bar_index - swingLengthInput, 1, MAX_SWINGS)
+    if changeType != 0
+        swingChange := changeType
+        lastSwingSegment := f_swingSegment(swingPriceArray, swingBarArray, changeType, lastSwingSegment)
+if not na(pivotLow)
+    int changeType = f_addPivot(swingPriceArray, swingBarArray, swingDirArray, pivotLow, bar_index - swingLengthInput, -1, MAX_SWINGS)
+    if changeType != 0
+        swingChange := changeType
+        lastSwingSegment := f_swingSegment(swingPriceArray, swingBarArray, changeType, lastSwingSegment)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Pattern Detection
+//---------------------------------------------------------------------------------------------------------------------{
+
+var int   patStatus  = STATUS_NONE
+var int   patKey     = -1
+var bool  patIsBull  = false
+var float patPriceC  = na
+var int   patBarC    = na
+var float patLvl50   = na
+var float patLvlInv  = na
+var int   patBarD    = na
+var bool  patReacted = false
+
+var array<line>  patLineArray  = array.new<line>()
+var array<label> patLabelArray = array.new<label>()
+
+var box   patZoneBox    = na
+var label patZoneLabel  = na
+var line  patTargetLine = na
+
+bool bullSetupAlert    = false
+bool bearSetupAlert    = false
+bool bullCompleteAlert = false
+bool bearCompleteAlert = false
+bool bullReactionAlert = false
+bool bearReactionAlert = false
+bool bullInvalidAlert  = false
+bool bearInvalidAlert  = false
+bool bullTargetAlert   = false
+bool bearTargetAlert   = false
+
+if swingChange != 0 and array.size(swingPriceArray) >= 5
+    int n = array.size(swingPriceArray)
+    float p0 = array.get(swingPriceArray, n - 5)
+    float pX = array.get(swingPriceArray, n - 4)
+    float pA = array.get(swingPriceArray, n - 3)
+    float pB = array.get(swingPriceArray, n - 2)
+    float pC = array.get(swingPriceArray, n - 1)
+    int   b0 = array.get(swingBarArray, n - 5)
+    int   bX = array.get(swingBarArray, n - 4)
+    int   bA = array.get(swingBarArray, n - 3)
+    int   bB = array.get(swingBarArray, n - 2)
+    int   bC = array.get(swingBarArray, n - 1)
+    bool  isBull = array.get(swingDirArray, n - 1) == 1
+    float s = isBull ? 1 : -1
+
+    // legs measured as positive price distances, the sign flips with the pattern direction
+    float legXa = s * (pA - pX)
+    float legAb = s * (pA - pB)
+    float legBc = s * (pC - pB)
+
+    // an initial swing into X, positive legs throughout, and an AB leg that travels beyond X
+    bool geometryOk = s * (p0 - pX) > 0 and legXa > 0 and legAb > 0 and legBc > 0 and s * (pX - pB) > 0
+
+    if geometryOk
+        float abXa = legAb / legXa
+        float bcAb = legBc / legAb
+        float cdAb = RATIO_D * legBc / legAb
+
+        bool ratiosOk     = abXa >= abXaMinInput and abXa <= abXaMaxInput and bcAb >= bcAbMinInput and bcAb <= bcAbMaxInput
+        bool reciprocalOk = not reciprocalCheckInput or math.abs(cdAb - 1) <= reciprocalTolInput / 100
+        bool structureOk  = not structureBreakInput or s * (pC - p0) > 0
+
+        int setupKey = bB * 2 + (isBull ? 1 : 0)
+
+        if ratiosOk and reciprocalOk and structureOk and not (setupKey == patKey and patStatus >= STATUS_COMPLETED)
+            // a stale awaiting projection is removed, anything already resolved stays on the chart
+            if patStatus == STATUS_AWAITING
+                f_deleteDrawings(patLineArray, patLabelArray, patZoneBox, patZoneLabel, patTargetLine)
+            else
+                array.clear(patLineArray)
+                array.clear(patLabelArray)
+            patZoneBox    := na
+            patZoneLabel  := na
+            patTargetLine := na
+
+            color patternColor = isBull ? bullColorInput : bearColorInput
+
+            patIsBull  := isBull
+            patPriceC  := pC
+            patBarC    := bC
+            patLvl50   := pC - s * RATIO_D * legBc
+            patLvlInv  := pC - s * invalidationInput * legBc
+            patBarD    := na
+            patReacted := false
+            patStatus  := STATUS_AWAITING
+
+            array.push(patLineArray, line.new(b0, p0, bX, pX, color = patternColor, width = 2))
+            array.push(patLineArray, line.new(bX, pX, bA, pA, color = patternColor, width = 2))
+            array.push(patLineArray, line.new(bA, pA, bB, pB, color = patternColor, width = 2))
+            array.push(patLineArray, line.new(bB, pB, bC, pC, color = patternColor, width = 2))
+
+            if showLabelsInput
+                string cSideStyle = isBull ? label.style_label_down : label.style_label_up
+                string dSideStyle = isBull ? label.style_label_up : label.style_label_down
+                array.push(patLabelArray, label.new(b0, p0, '0', color = TRANSPARENT_COLOR, textcolor = patternColor, style = cSideStyle, size = size.small))
+                array.push(patLabelArray, label.new(bX, pX, 'X', color = TRANSPARENT_COLOR, textcolor = patternColor, style = dSideStyle, size = size.small))
+                array.push(patLabelArray, label.new(bA, pA, 'A', color = TRANSPARENT_COLOR, textcolor = patternColor, style = cSideStyle, size = size.small))
+                array.push(patLabelArray, label.new(bB, pB, 'B', color = TRANSPARENT_COLOR, textcolor = patternColor, style = dSideStyle, size = size.small))
+                array.push(patLabelArray, label.new(bC, pC, 'C', color = TRANSPARENT_COLOR, textcolor = patternColor, style = cSideStyle, size = size.small))
+
+            if showRatiosInput
+                array.push(patLabelArray, label.new(math.round(math.avg(bA, bB)), math.avg(pA, pB), str.tostring(abXa, '#.###') + ' × XA', color = TRANSPARENT_COLOR, textcolor = color.new(patternColor, 20), style = label.style_label_center, size = size.tiny))
+                array.push(patLabelArray, label.new(math.round(math.avg(bB, bC)), math.avg(pB, pC), str.tostring(bcAb, '#.###') + ' × AB', color = TRANSPARENT_COLOR, textcolor = color.new(patternColor, 20), style = label.style_label_center, size = size.tiny))
+
+            patZoneBox := box.new(bC, math.max(patLvl50, patLvlInv), bar_index, math.min(patLvl50, patLvlInv), border_color = color.new(patternColor, 60), border_style = line.style_dashed, bgcolor = color.new(patternColor, 85))
+            if showRatiosInput
+                patZoneLabel := label.new(bar_index, patLvl50, str.tostring(RATIO_D, '#.##') + ' × BC\nCD ≈ ' + str.tostring(cdAb, '#.##') + ' × AB', color = TRANSPARENT_COLOR, textcolor = color.new(patternColor, 20), style = label.style_label_left, size = size.tiny)
+
+            if setupKey != patKey
+                bullSetupAlert := isBull
+                bearSetupAlert := not isBull
+            patKey := setupKey
+
+            // events that already played out inside the pivot confirmation lag
+            int  scanStatus  = STATUS_AWAITING
+            int  scanBarD    = na
+            bool scanReacted = false
+            for j = 1 to swingLengthInput - 1
+                int off = swingLengthInput - j
+                if scanStatus == STATUS_AWAITING and (isBull ? low[off] <= patLvl50 : high[off] >= patLvl50)
+                    scanStatus := STATUS_COMPLETED
+                    scanBarD   := bar_index - off
+                if scanStatus == STATUS_COMPLETED
+                    if isBull ? close[off] < patLvlInv : close[off] > patLvlInv
+                        scanStatus := STATUS_INVALID
+                    else
+                        if not scanReacted and (isBull ? close[off] > patLvl50 : close[off] < patLvl50)
+                            scanReacted := true
+                        if isBull ? high[off] >= patPriceC : low[off] <= patPriceC
+                            scanStatus := STATUS_TARGET
+
+            if scanStatus >= STATUS_COMPLETED
+                patStatus  := scanStatus
+                patBarD    := scanBarD
+                patReacted := scanReacted
+                patTargetLine := f_drawCompletion(patLineArray, patLabelArray, patBarC, patPriceC, patBarD, patLvl50, patIsBull, patternColor)
+                bullCompleteAlert := isBull
+                bearCompleteAlert := not isBull
+                if patReacted
+                    bullReactionAlert := isBull
+                    bearReactionAlert := not isBull
+                if patStatus == STATUS_INVALID
+                    patZoneBox := f_invalidBox(patZoneBox, patBarC, patLvl50, patLvlInv)
+                    bullInvalidAlert := isBull
+                    bearInvalidAlert := not isBull
+                if patStatus == STATUS_TARGET
+                    bullTargetAlert := isBull
+                    bearTargetAlert := not isBull
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Pattern Monitoring
+//---------------------------------------------------------------------------------------------------------------------{
+
+// keep the active projection anchored to the latest bar
+if patStatus == STATUS_AWAITING or patStatus == STATUS_COMPLETED
+    if not na(patZoneBox)
+        box.set_right(patZoneBox, bar_index)
+    if not na(patZoneLabel)
+        label.set_x(patZoneLabel, bar_index)
+    if not na(patTargetLine)
+        line.set_x2(patTargetLine, bar_index)
+
+if patStatus == STATUS_AWAITING
+    bool touched      = patIsBull ? low <= patLvl50 : high >= patLvl50
+    bool invalidClose = patIsBull ? close < patLvlInv : close > patLvlInv
+    bool beyondC      = patIsBull ? high > patPriceC : low < patPriceC
+    if touched
+        color activeColor = patIsBull ? bullColorInput : bearColorInput
+        patStatus := STATUS_COMPLETED
+        patBarD   := bar_index
+        patTargetLine := f_drawCompletion(patLineArray, patLabelArray, patBarC, patPriceC, patBarD, patLvl50, patIsBull, activeColor)
+        bullCompleteAlert := patIsBull
+        bearCompleteAlert := not patIsBull
+        if invalidClose
+            patStatus  := STATUS_INVALID
+            patZoneBox := f_invalidBox(patZoneBox, patBarC, patLvl50, patLvlInv)
+            bullInvalidAlert := patIsBull
+            bearInvalidAlert := not patIsBull
+        else
+            if patIsBull ? close > patLvl50 : close < patLvl50
+                patReacted := true
+                bullReactionAlert := patIsBull
+                bearReactionAlert := not patIsBull
+            if patIsBull ? high >= patPriceC : low <= patPriceC
+                patStatus := STATUS_TARGET
+                bullTargetAlert := patIsBull
+                bearTargetAlert := not patIsBull
+    else if beyondC
+        // price ran beyond C before pulling back into the zone, the projection is stale
+        f_deleteDrawings(patLineArray, patLabelArray, patZoneBox, patZoneLabel, patTargetLine)
+        patZoneBox    := na
+        patZoneLabel  := na
+        patTargetLine := na
+        patStatus     := STATUS_NONE
+else if patStatus == STATUS_COMPLETED
+    bool invalidClose = patIsBull ? close < patLvlInv : close > patLvlInv
+    if invalidClose
+        patStatus  := STATUS_INVALID
+        patZoneBox := f_invalidBox(patZoneBox, patBarC, patLvl50, patLvlInv)
+        bullInvalidAlert := patIsBull
+        bearInvalidAlert := not patIsBull
+    else
+        if not patReacted and (patIsBull ? close > patLvl50 : close < patLvl50)
+            patReacted := true
+            bullReactionAlert := patIsBull
+            bearReactionAlert := not patIsBull
+        if patIsBull ? high >= patPriceC : low <= patPriceC
+            patStatus := STATUS_TARGET
+            bullTargetAlert := patIsBull
+            bearTargetAlert := not patIsBull
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(bullSetupAlert, 'Bullish 5-0 Setup', 'Bullish 5-0: AB and BC legs qualified, D zone projected at the 0.5 retracement of BC')
+alertcondition(bearSetupAlert, 'Bearish 5-0 Setup', 'Bearish 5-0: AB and BC legs qualified, D zone projected at the 0.5 retracement of BC')
+alertcondition(bullCompleteAlert, 'Bullish 5-0 Completion', 'Bullish 5-0 completed: price traded into the D zone at the 0.5 retracement of BC')
+alertcondition(bearCompleteAlert, 'Bearish 5-0 Completion', 'Bearish 5-0 completed: price traded into the D zone at the 0.5 retracement of BC')
+alertcondition(bullReactionAlert, 'Bullish 5-0 Reaction', 'Bullish 5-0 reaction: price is holding the D zone and closing back in the direction of the BC leg')
+alertcondition(bearReactionAlert, 'Bearish 5-0 Reaction', 'Bearish 5-0 reaction: price is holding the D zone and closing back in the direction of the BC leg')
+alertcondition(bullInvalidAlert, 'Bullish 5-0 Invalidation', 'Bullish 5-0 invalidated: decisive close through the invalidation retracement of BC')
+alertcondition(bearInvalidAlert, 'Bearish 5-0 Invalidation', 'Bearish 5-0 invalidated: decisive close through the invalidation retracement of BC')
+alertcondition(bullTargetAlert, 'Bullish 5-0 Target', 'Bullish 5-0 target reached: price returned to the C extreme')
+alertcondition(bearTargetAlert, 'Bearish 5-0 Target', 'Bearish 5-0 target reached: price returned to the C extreme')
+
+//---------------------------------------------------------------------------------------------------------------------}

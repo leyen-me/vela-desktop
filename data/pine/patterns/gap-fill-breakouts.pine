@@ -1,0 +1,160 @@
+//@version=6
+indicator("Gap Fill Breakouts", overlay = true, max_boxes_count = 500, max_lines_count = 500)
+
+// --- Inputs ---
+atrMult      = input.float(1.0, "ATR Multiplier for FVG Size", step = 0.1, tooltip = "Minimum size of the Fair Value Gap relative to ATR. A value of 1.0 means the gap must be at least the size of 1 ATR.")
+pivotLength  = input.int(5, "Pivot Length", tooltip = "Length used to detect structural support and resistance levels before the gap.")
+maxBarsBack  = input.int(200, "Max Bars Back for Signal", tooltip = "Maximum number of bars since the FVG was formed for a signal to be valid.")
+maxGaps      = input.int(5, "Number of Gaps Shown", minval = 1, tooltip = "Maximum number of recent gaps to display on the chart.")
+
+// --- Style Inputs ---
+bullFvgColor = input.color(color.new(#089981, 80), "Bullish FVG Color", group = "Style")
+bearFvgColor = input.color(color.new(#f23645, 80), "Bearish FVG Color", group = "Style")
+lineColor    = input.color(color.new(#ffeb3b, 0), "Support/Resistance Line Color", group = "Style")
+
+// --- Alert Inputs ---
+alertBullish = input.bool(true, "Bullish Breakout Alerts", group = "Alerts")
+alertBearish = input.bool(true, "Bearish Breakout Alerts", group = "Alerts")
+
+// --- Types ---
+type FVG
+    float top
+    float bottom
+    bool  isBullish
+    box   boxId
+    float srLevel
+    line  srLineId
+    bool  isActive
+    int   creationBar
+    array<box> boxHistory
+
+// --- Variables ---
+var fvgArray = array.new<FVG>()
+var atrLength = 14
+
+// --- Functions ---
+manageGaps(arr, max) =>
+    if arr.size() > max
+        oldFvg = arr.shift()
+        for bx in oldFvg.boxHistory
+            box.delete(bx)
+        if not na(oldFvg.srLineId)
+            line.delete(oldFvg.srLineId)
+
+// --- Volatility Filter ---
+atr = ta.atr(atrLength)
+minGapSize = atr * atrMult
+
+// --- FVG Detection ---
+isBullishFvg = low[0] > high[2]
+isBearishFvg = high[0] < low[2]
+
+bullFvgSize = isBullishFvg ? (low[0] - high[2]) : 0
+bearFvgSize = isBearishFvg ? (low[2] - high[0]) : 0
+
+if isBullishFvg and bullFvgSize >= minGapSize
+    b = box.new(bar_index - 2, low[0], bar_index, high[2], border_color = na, bgcolor = bullFvgColor, extend = extend.right)
+    bHist = array.new<box>()
+    bHist.push(b)
+    fvgArray.push(FVG.new(low[0], high[2], true, b, na, na, true, bar_index, bHist))
+    manageGaps(fvgArray, maxGaps)
+
+if isBearishFvg and bearFvgSize >= minGapSize
+    b = box.new(bar_index - 2, low[2], bar_index, high[0], border_color = na, bgcolor = bearFvgColor, extend = extend.right)
+    bHist = array.new<box>()
+    bHist.push(b)
+    fvgArray.push(FVG.new(low[2], high[0], false, b, na, na, true, bar_index, bHist))
+    manageGaps(fvgArray, maxGaps)
+
+// --- Pivot Detection (Based on Closes/Opens) ---
+bodyHigh = math.max(close, open)
+bodyLow  = math.min(close, open)
+
+ph = ta.pivothigh(bodyHigh, pivotLength, pivotLength)
+pl = ta.pivotlow(bodyLow, pivotLength, pivotLength)
+
+bool bullBreakout = false
+bool bearBreakout = false
+
+// --- Core Logic ---
+if fvgArray.size() > 0
+    for i = fvgArray.size() - 1 to 0
+        fvg = fvgArray.get(i)
+            
+        if not fvg.isActive
+            continue
+            
+        if fvg.isBullish
+            // FVG Mitigation (Adaptive Stair-Step Adjustment)
+            if low < fvg.top
+                // Stop current box
+                box.set_right(fvg.boxId, bar_index)
+                box.set_extend(fvg.boxId, extend.none)
+                
+                fvg.top := low
+                if fvg.top <= fvg.bottom
+                    fvg.isActive := false
+                    if not na(fvg.srLineId)
+                        line.set_x2(fvg.srLineId, bar_index)
+                        line.set_extend(fvg.srLineId, extend.none)
+                    continue
+                else
+                    // Create new box for remaining gap
+                    fvg.boxId := box.new(bar_index, fvg.top, bar_index, fvg.bottom, border_color = na, bgcolor = bullFvgColor, extend = extend.right)
+                    fvg.boxHistory.push(fvg.boxId)
+                
+            // Structural Support Update
+            if na(fvg.srLineId) and not na(pl) and pl > fvg.top
+                fvg.srLevel := pl
+                fvg.srLineId := line.new(bar_index - pivotLength, pl, bar_index, pl, color = lineColor, extend = extend.right)
+                    
+            // Breakout Signal
+            if not na(fvg.srLevel) and close < fvg.srLevel and close[1] >= fvg.srLevel
+                if (bar_index - fvg.creationBar) <= maxBarsBack
+                    bearBreakout := true
+                fvg.srLevel := na // Prevent continuous firing
+                if not na(fvg.srLineId)
+                    line.set_style(fvg.srLineId, line.style_dashed)
+                    
+        else // Bearish
+            // FVG Mitigation (Adaptive Stair-Step Adjustment)
+            if high > fvg.bottom
+                // Stop current box
+                box.set_right(fvg.boxId, bar_index)
+                box.set_extend(fvg.boxId, extend.none)
+                
+                fvg.bottom := high
+                if fvg.bottom >= fvg.top
+                    fvg.isActive := false
+                    if not na(fvg.srLineId)
+                        line.set_x2(fvg.srLineId, bar_index)
+                        line.set_extend(fvg.srLineId, extend.none)
+                    continue
+                else
+                    // Create new box for remaining gap
+                    fvg.boxId := box.new(bar_index, fvg.top, bar_index, fvg.bottom, border_color = na, bgcolor = bearFvgColor, extend = extend.right)
+                    fvg.boxHistory.push(fvg.boxId)
+                
+            // Structural Resistance Update
+            if na(fvg.srLineId) and not na(ph) and ph < fvg.bottom
+                fvg.srLevel := ph
+                fvg.srLineId := line.new(bar_index - pivotLength, ph, bar_index, ph, color = lineColor, extend = extend.right)
+                    
+            // Breakout Signal
+            if not na(fvg.srLevel) and close > fvg.srLevel and close[1] <= fvg.srLevel
+                if (bar_index - fvg.creationBar) <= maxBarsBack
+                    bullBreakout := true
+                fvg.srLevel := na // Prevent continuous firing
+                if not na(fvg.srLineId)
+                    line.set_style(fvg.srLineId, line.style_dashed)
+
+// --- Visuals ---
+plotshape(bullBreakout, "Bullish Breakout", shape.triangleup, location.belowbar, color = color.new(#089981, 0), size = size.small)
+plotshape(bearBreakout, "Bearish Breakout", shape.triangledown, location.abovebar, color = color.new(#f23645, 0), size = size.small)
+
+// --- Alerts ---
+if bullBreakout and alertBullish
+    alert("Bullish Adaptive FVG Breakout on " + syminfo.ticker, alert.freq_once_per_bar_close)
+
+if bearBreakout and alertBearish
+    alert("Bearish Adaptive FVG Breakout on " + syminfo.ticker, alert.freq_once_per_bar_close)

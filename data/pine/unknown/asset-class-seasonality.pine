@@ -1,0 +1,317 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Asset-class Seasonality"
+  , shorttitle       = "Asset-class Seasonality"
+  , overlay          = true
+  , max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+CLASS_EQUITIES = "Equities"
+CLASS_GRAINS   = "Commodities · Grains"
+CLASS_NATGAS   = "Commodities · Natural Gas"
+CLASS_GASOLINE = "Commodities · Gasoline"
+CLASS_YEN      = "FX · Yen Pairs"
+CLASS_FXFLOWS  = "FX · Month-End Flows"
+CLASS_CUSTOM   = "Custom Window"
+
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+NEUTRAL_COLOR = #5b9cf6
+ACCENT_COLOR  = #ff9800
+FLOW_COLOR    = #787b86
+
+DASH_NA_TEXT = "—"
+
+var array<string> monthNamesArray = array.from("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Inputs
+//---------------------------------------------------------------------------------------------------------------------{
+assetClassInput = input.string(CLASS_EQUITIES, "Asset class"
+  , options = [CLASS_EQUITIES, CLASS_GRAINS, CLASS_NATGAS, CLASS_GASOLINE, CLASS_YEN, CLASS_FXFLOWS, CLASS_CUSTOM]
+  , group   = "Asset Class"
+  , tooltip = "Driver template applied to the chart. Equities use flow and fiscal-calendar windows (sell-in-May weak half, turn-of-month rebalancing), commodity templates use physical supply-demand windows (weather premium, harvest pressure, heating and injection seasons, driving season), FX templates use Japanese fiscal year-end repatriation and month-end fixing flows. Pick the template matching the charted symbol - the same calendar shape means different things under different drivers. Best used on a daily chart with long history.")
+
+customUseAnnualInput = input.bool(true, "Annual window", group = "Custom Window"
+  , tooltip = "Enables the user-defined annual window below. All settings in this group apply only when the asset class is set to 'Custom Window'.")
+
+customNameInput = input.string("Custom driver window", "Window name", group = "Custom Window"
+  , tooltip = "Driver label shown on the chart and in the dashboard, e.g. 'Monsoon premium' or 'Tax-loss selling'.")
+
+customStartMonthInput = input.int(4, "Start month", minval = 1, maxval = 12, group = "Custom Window"
+  , tooltip = "Month the custom annual window opens. Windows may wrap the turn of the year, e.g. November through March.")
+
+customStartDayInput = input.int(1, "Start day", minval = 1, maxval = 31, group = "Custom Window"
+  , tooltip = "Day of the start month on which the custom annual window opens.")
+
+customEndMonthInput = input.int(7, "End month", minval = 1, maxval = 12, group = "Custom Window"
+  , tooltip = "Month the custom annual window closes.")
+
+customEndDayInput = input.int(31, "End day", minval = 1, maxval = 31, group = "Custom Window"
+  , tooltip = "Day of the end month on which the custom annual window closes (inclusive).")
+
+customMonthEndInput = input.bool(false, "Month-end window", group = "Custom Window"
+  , tooltip = "Adds a recurring month-end flow window measured in calendar days, e.g. for rebalancing-fix pressure.")
+
+customLastDaysInput = input.int(3, "Last days of month", minval = 0, maxval = 10, group = "Custom Window"
+  , tooltip = "Final calendar days of each month included in the custom month-end window.")
+
+customFirstDaysInput = input.int(0, "First days of next month", minval = 0, maxval = 10, group = "Custom Window"
+  , tooltip = "Opening calendar days of the following month included in the custom month-end window, e.g. 3 to form a turn-of-month span.")
+
+smallSampleInput = input.int(10, "Flag samples below", minval = 1, maxval = 100, group = "Statistics"
+  , tooltip = "Occurrence counts below this threshold are tinted orange in the dashboard. Annual windows accrue one observation per year, so even decades of history remain a small sample.")
+
+showTableInput = input.bool(true, "Show dashboard", group = "Dashboard"
+  , tooltip = "Per-window statistics: completed occurrences, mean window return, hit rate, an older-half versus newer-half stability split, and the running return of any open window.")
+
+tablePositionInput = input.string("Top Right", "Position"
+  , options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left", "Middle Right", "Middle Left"]
+  , group   = "Dashboard"
+  , tooltip = "Dashboard placement on the chart.")
+
+tableSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = "Dashboard"
+  , tooltip = "Dashboard text size.")
+
+showShadingInput = input.bool(true, "Window shading", group = "Style"
+  , tooltip = "Shades the chart background inside each seasonal window.")
+
+showLabelsInput = input.bool(true, "Driver labels", group = "Style"
+  , tooltip = "Names the seasonal driver at each annual window entry.")
+
+shadeTranspInput = input.int(88, "Shading transparency", minval = 50, maxval = 98, group = "Style"
+  , tooltip = "Transparency of the seasonal window shading.")
+
+w1ColorInput  = input.color(NEUTRAL_COLOR, "Primary window",     group = "Style")
+w2ColorInput  = input.color(ACCENT_COLOR,  "Secondary window",   group = "Style")
+meColorInput  = input.color(FLOW_COLOR,    "Month-end window",   group = "Style")
+posColorInput = input.color(BULL_COLOR,    "Positive statistic", group = "Style")
+negColorInput = input.color(BEAR_COLOR,    "Negative statistic", group = "Style")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+monthNameOf(int monthNumber) =>
+    monthNamesArray.get(monthNumber - 1)
+
+daysInMonth(int yearNumber, int monthNumber) =>
+    bool leapYear       = yearNumber % 4 == 0 and (yearNumber % 100 != 0 or yearNumber % 400 == 0)
+    bool thirtyDayMonth = monthNumber == 4 or monthNumber == 6 or monthNumber == 9 or monthNumber == 11
+    monthNumber == 2 ? (leapYear ? 29 : 28) : thirtyDayMonth ? 30 : 31
+
+inAnnualWindow(int startMonth, int startDay, int endMonth, int endDay) =>
+    if na(startMonth) or na(startDay) or na(endMonth) or na(endDay)
+        false
+    else
+        bool afterStart = month > startMonth or (month == startMonth and dayofmonth >= startDay)
+        bool beforeEnd  = month < endMonth   or (month == endMonth   and dayofmonth <= endDay)
+        bool wrapsYear  = startMonth > endMonth or (startMonth == endMonth and startDay > endDay)
+        wrapsYear ? (afterStart or beforeEnd) : (afterStart and beforeEnd)
+
+inMonthEndWindow(int lastDays, int firstDays) =>
+    if na(lastDays) or na(firstDays)
+        false
+    else
+        int monthLength    = daysInMonth(year, month)
+        bool inClosingDays = lastDays  > 0 and dayofmonth > monthLength - lastDays
+        bool inOpeningDays = firstDays > 0 and dayofmonth <= firstDays
+        inClosingDays or inOpeningDays
+
+trackWindow(bool isActive) =>
+    var array<float> returnsArray = array.new<float>()
+    var float baseClose = na
+    bool entered = bar_index > 0 and isActive and not isActive[1]
+    bool exited  = bar_index > 0 and not isActive and isActive[1]
+    if entered and not na(close[1])
+        baseClose := close[1]
+    if exited
+        if not na(baseClose)
+            returnsArray.push((close[1] - baseClose) / baseClose * 100)
+        baseClose := na
+    float liveReturn = isActive and not na(baseClose) ? (close - baseClose) / baseClose * 100 : na
+    [returnsArray, liveReturn, entered, exited]
+
+sliceMean(array<float> valuesArray, int fromIdx, int toIdx) =>
+    float totalValue = 0.0
+    int countValue   = 0
+    int firstIdx     = math.max(fromIdx, 0)
+    int lastIdx      = math.min(toIdx, valuesArray.size() - 1)
+    if valuesArray.size() > 0 and firstIdx <= lastIdx
+        for i = firstIdx to lastIdx
+            totalValue += valuesArray.get(i)
+            countValue += 1
+    countValue > 0 ? totalValue / countValue : na
+
+hitRate(array<float> valuesArray) =>
+    int winCount   = 0
+    int totalCount = valuesArray.size()
+    if totalCount > 0
+        for i = 0 to totalCount - 1
+            if valuesArray.get(i) > 0
+                winCount += 1
+    totalCount > 0 ? 100.0 * winCount / totalCount : na
+
+shortNameOf(string fullName) =>
+    array<string> nameParts = str.split(fullName, " · ")
+    nameParts.size() > 0 ? nameParts.get(0) : fullName
+
+formatPercent(float value) =>
+    na(value) ? DASH_NA_TEXT : str.tostring(value, "0.00") + "%"
+
+signColorOf(float value) =>
+    na(value) ? chart.fg_color : value > 0 ? posColorInput : value < 0 ? negColorInput : chart.fg_color
+
+spanTextAnnual(int startMonth, int startDay, int endMonth, int endDay) =>
+    monthNameOf(startMonth) + " " + str.tostring(startDay, "00") + " → " + monthNameOf(endMonth) + " " + str.tostring(endDay, "00")
+
+spanTextMonthly(int lastDays, int firstDays) =>
+    string spanText = na
+    if lastDays > 0 and firstDays > 0
+        spanText := "Last " + str.tostring(lastDays) + "d → first " + str.tostring(firstDays) + "d"
+    else if lastDays > 0
+        spanText := "Last " + str.tostring(lastDays) + "d of month"
+    else
+        spanText := "First " + str.tostring(firstDays) + "d of month"
+    spanText
+
+getTablePosition(string positionText) =>
+    switch positionText
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        "Bottom Left"  => position.bottom_left
+        "Middle Right" => position.middle_right
+        => position.middle_left
+
+getTextSize(string sizeText) =>
+    switch sizeText
+        "Tiny"  => size.tiny
+        "Small" => size.small
+        => size.normal
+
+renderRow(table targetTable, int rowIdx, string windowName, string spanText, array<float> returnsArray, float liveReturn, bool activeNow, color windowColor, string textSizeValue) =>
+    int occurrenceCount = returnsArray.size()
+    float avgReturn     = sliceMean(returnsArray, 0, occurrenceCount - 1)
+    float winRate       = hitRate(returnsArray)
+    int halfCount       = int(math.floor(occurrenceCount / 2.0))
+    float earlyMean     = occurrenceCount >= 4 ? sliceMean(returnsArray, 0, halfCount - 1) : na
+    float lateMean      = occurrenceCount >= 4 ? sliceMean(returnsArray, halfCount, occurrenceCount - 1) : na
+    bool smallSample    = occurrenceCount < smallSampleInput
+    table.cell(targetTable, 0, rowIdx, windowName, text_halign = text.align_left, text_color = windowColor, text_size = textSizeValue, bgcolor = color.new(windowColor, activeNow ? 80 : 100))
+    table.cell(targetTable, 1, rowIdx, spanText, text_halign = text.align_left, text_color = chart.fg_color, text_size = textSizeValue)
+    table.cell(targetTable, 2, rowIdx, str.tostring(occurrenceCount), text_color = chart.fg_color, text_size = textSizeValue, bgcolor = smallSample ? color.new(ACCENT_COLOR, 75) : color(na), tooltip = smallSample ? "Small sample - annual windows accrue one observation per year" : "")
+    table.cell(targetTable, 3, rowIdx, formatPercent(avgReturn), text_color = signColorOf(avgReturn), text_size = textSizeValue)
+    table.cell(targetTable, 4, rowIdx, na(winRate) ? DASH_NA_TEXT : str.tostring(winRate, "0") + "%", text_color = chart.fg_color, text_size = textSizeValue)
+    table.cell(targetTable, 5, rowIdx, formatPercent(earlyMean), text_color = signColorOf(earlyMean), text_size = textSizeValue)
+    table.cell(targetTable, 6, rowIdx, formatPercent(lateMean), text_color = signColorOf(lateMean), text_size = textSizeValue)
+    table.cell(targetTable, 7, rowIdx, activeNow ? formatPercent(liveReturn) : DASH_NA_TEXT, text_color = activeNow ? signColorOf(liveReturn) : chart.fg_color, text_size = textSizeValue)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Seasonal window templates & tracking
+//---------------------------------------------------------------------------------------------------------------------{
+[w1Name, w1StartMonth, w1StartDay, w1EndMonth, w1EndDay] = switch assetClassInput
+    CLASS_EQUITIES => ["Sell-in-May half · flow-driven",           5,  1, 10, 31]
+    CLASS_GRAINS   => ["Weather premium · planting→pollination",   4,  1,  7, 15]
+    CLASS_NATGAS   => ["Heating demand · withdrawal season",      11,  1,  3, 31]
+    CLASS_GASOLINE => ["Driving-season build · demand ramp",       2,  1,  5, 31]
+    CLASS_YEN      => ["JP fiscal year-end · repatriation",        3,  1,  3, 31]
+    CLASS_FXFLOWS  => [string(na), int(na), int(na), int(na), int(na)]
+    => [customUseAnnualInput ? customNameInput : string(na), customStartMonthInput, customStartDayInput, customEndMonthInput, customEndDayInput]
+
+[w2Name, w2StartMonth, w2StartDay, w2EndMonth, w2EndDay] = switch assetClassInput
+    CLASS_GRAINS   => ["Harvest pressure · new-crop supply", 9, 1, 11, 30]
+    CLASS_NATGAS   => ["Injection season · storage builds",  4, 1, 10, 31]
+    CLASS_GASOLINE => ["Driving season · peak demand",       6, 1,  8, 31]
+    => [string(na), int(na), int(na), int(na), int(na)]
+
+[meName, meLastDays, meFirstDays] = switch assetClassInput
+    CLASS_EQUITIES => ["Turn of month · rebalancing flows", 3, 3]
+    CLASS_YEN      => ["Month-end rebalancing fix",         3, 0]
+    CLASS_FXFLOWS  => ["Month-end rebalancing fix",         3, 0]
+    CLASS_CUSTOM   => [customMonthEndInput ? "Custom month-end flows" : string(na), customLastDaysInput, customFirstDaysInput]
+    => [string(na), int(na), int(na)]
+
+bool w1Defined = not na(w1Name)
+bool w2Defined = not na(w2Name)
+bool meDefined = not na(meName) and (nz(meLastDays) > 0 or nz(meFirstDays) > 0)
+
+bool w1Active = w1Defined and inAnnualWindow(w1StartMonth, w1StartDay, w1EndMonth, w1EndDay)
+bool w2Active = w2Defined and inAnnualWindow(w2StartMonth, w2StartDay, w2EndMonth, w2EndDay)
+bool meActive = meDefined and inMonthEndWindow(nz(meLastDays), nz(meFirstDays))
+
+[w1ReturnsArray, w1LiveReturn, w1Entered, w1Exited] = trackWindow(w1Active)
+[w2ReturnsArray, w2LiveReturn, w2Entered, w2Exited] = trackWindow(w2Active)
+[meReturnsArray, meLiveReturn, meEntered, meExited] = trackWindow(meActive)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visuals — window shading & driver labels
+//---------------------------------------------------------------------------------------------------------------------{
+color w1ShadeColor = color.new(w1ColorInput, shadeTranspInput)
+color w2ShadeColor = color.new(w2ColorInput, shadeTranspInput)
+color meShadeColor = color.new(meColorInput, shadeTranspInput)
+color shadeColor   = meActive ? meShadeColor : w1Active ? w1ShadeColor : w2Active ? w2ShadeColor : na
+
+bgcolor(showShadingInput ? shadeColor : na, title = "Seasonal window shading")
+
+if showLabelsInput and w1Entered
+    label.new(bar_index, na, shortNameOf(w1Name), yloc = yloc.abovebar, style = label.style_label_down, color = #00000000, textcolor = w1ColorInput, size = size.tiny)
+
+if showLabelsInput and w2Entered
+    label.new(bar_index, na, shortNameOf(w2Name), yloc = yloc.abovebar, style = label.style_label_down, color = #00000000, textcolor = w2ColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+string tableTextSize = getTextSize(tableSizeInput)
+
+var table dashTable = showTableInput ? table.new(getTablePosition(tablePositionInput), 8, 6
+  , bgcolor      = color.new(chart.bg_color, 20)
+  , frame_color  = color.new(chart.fg_color, 80)
+  , frame_width  = 1
+  , border_color = color.new(chart.fg_color, 90)
+  , border_width = 1) : table(na)
+
+var bool tableMergedFlag = false
+
+if showTableInput and barstate.islast and not na(dashTable)
+    table.cell(dashTable, 0, 0, "Asset-class seasonality — " + assetClassInput, text_halign = text.align_left, text_color = chart.fg_color, text_size = tableTextSize, bgcolor = color.new(chart.fg_color, 90))
+    table.cell(dashTable, 0, 1, "Window", text_halign = text.align_left, text_color = chart.fg_color, text_size = tableTextSize, tooltip = "Seasonal windows of the selected asset-class template, each named after its driver.")
+    table.cell(dashTable, 1, 1, "Span", text_halign = text.align_left, text_color = chart.fg_color, text_size = tableTextSize, tooltip = "Annual windows use exchange-time calendar dates, month-end windows use calendar days around the month boundary.")
+    table.cell(dashTable, 2, 1, "N", text_color = chart.fg_color, text_size = tableTextSize, tooltip = "Completed occurrences on this chart. Annual windows accrue one observation per year, so treat small samples with caution.")
+    table.cell(dashTable, 3, 1, "Avg %", text_color = chart.fg_color, text_size = tableTextSize, tooltip = "Mean close-to-close return from the bar before the window opens to its final bar.")
+    table.cell(dashTable, 4, 1, "Win %", text_color = chart.fg_color, text_size = tableTextSize, tooltip = "Share of occurrences with a positive window return.")
+    table.cell(dashTable, 5, 1, "1st half", text_color = chart.fg_color, text_size = tableTextSize, tooltip = "Mean window return over the older half of the sample. A stable pattern keeps the same sign in both halves.")
+    table.cell(dashTable, 6, 1, "2nd half", text_color = chart.fg_color, text_size = tableTextSize, tooltip = "Mean window return over the newer half of the sample. A stable pattern keeps the same sign in both halves.")
+    table.cell(dashTable, 7, 1, "Now", text_color = chart.fg_color, text_size = tableTextSize, tooltip = "Running return of the currently open window.")
+    int rowIdx = 2
+    if w1Defined
+        renderRow(dashTable, rowIdx, w1Name, spanTextAnnual(w1StartMonth, w1StartDay, w1EndMonth, w1EndDay), w1ReturnsArray, w1LiveReturn, w1Active, w1ColorInput, tableTextSize)
+        rowIdx += 1
+    if w2Defined
+        renderRow(dashTable, rowIdx, w2Name, spanTextAnnual(w2StartMonth, w2StartDay, w2EndMonth, w2EndDay), w2ReturnsArray, w2LiveReturn, w2Active, w2ColorInput, tableTextSize)
+        rowIdx += 1
+    if meDefined
+        renderRow(dashTable, rowIdx, meName, spanTextMonthly(nz(meLastDays), nz(meFirstDays)), meReturnsArray, meLiveReturn, meActive, meColorInput, tableTextSize)
+        rowIdx += 1
+    string footerText = rowIdx == 2 ? "No seasonal windows enabled — enable a window in the Custom Window group" : timeframe.isintraday ? "Intraday chart — use daily history for meaningful seasonal samples" : "Calendar context only — confirm the driver still operates before leaning on the stats"
+    table.cell(dashTable, 0, rowIdx, footerText, text_halign = text.align_left, text_color = color.new(chart.fg_color, 40), text_size = size.tiny, bgcolor = color.new(chart.fg_color, 95))
+    if not tableMergedFlag
+        table.merge_cells(dashTable, 0, 0, 7, 0)
+        table.merge_cells(dashTable, 0, rowIdx, 7, rowIdx)
+        tableMergedFlag := true
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(w1Entered, "Primary window opened",   "asset-class seasonality: primary seasonal window opened on {{ticker}}")
+alertcondition(w1Exited,  "Primary window closed",   "asset-class seasonality: primary seasonal window closed on {{ticker}}")
+alertcondition(w2Entered, "Secondary window opened", "asset-class seasonality: secondary seasonal window opened on {{ticker}}")
+alertcondition(w2Exited,  "Secondary window closed", "asset-class seasonality: secondary seasonal window closed on {{ticker}}")
+alertcondition(meEntered, "Month-end window opened", "asset-class seasonality: month-end flow window opened on {{ticker}}")
+alertcondition(meExited,  "Month-end window closed", "asset-class seasonality: month-end flow window closed on {{ticker}}")
+
+//---------------------------------------------------------------------------------------------------------------------}

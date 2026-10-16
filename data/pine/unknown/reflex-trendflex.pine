@@ -1,0 +1,199 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Reflex/Trendflex", "Reflex/Trendflex", overlay = false, precision = 2, max_lines_count = 500, max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+float NORM_ALPHA = 0.04  // Ehlers' fixed mean-square normalization constant
+float SS_COEF    = 1.414 // SuperSmoother damping coefficient from Ehlers' published version
+
+color BULL_COLOR    = #089981
+color BEAR_COLOR    = #f23645
+color NEUTRAL_COLOR = #787b86 // zero line and typical bands - structure
+color ACCENT_COLOR  = #ff9800 // the one accent - Trendflex, so the regime line reads apart from the state-colored Reflex
+color HIDDEN_COLOR  = #00000000
+
+string SET_GROUP   = "Settings"
+string DIV_GROUP   = "Divergences"
+string STYLE_GROUP = "Style"
+
+string REFLEX_OPT    = "Reflex"
+string TRENDFLEX_OPT = "Trendflex"
+string FILL_BOTH     = "Both"
+string FILL_NONE     = "None"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+lengthInput = input.int(20, "Length", minval = 4, maxval = 200, group = SET_GROUP,
+  tooltip = "Lookback window (n). The straight-line reference and both deviation averages span this many bars, and the SuperSmoother pre-filter runs at half this period. Shorter windows respond faster but raise the false-cross count roughly in proportion.")
+
+sourceInput = input.source(close, "Source", group = SET_GROUP,
+  tooltip = "Price series run through the SuperSmoother filter before deviations from each reference are measured.")
+
+showDivergencesInput = input.bool(false, "Show Divergences", group = DIV_GROUP,
+  tooltip = "Draw regular divergences between the selected oscillator and price extremes. A divergence is a warning rather than a signal.")
+
+divergenceSourceInput = input.string(REFLEX_OPT, "Divergence Oscillator", options = [REFLEX_OPT, TRENDFLEX_OPT], group = DIV_GROUP,
+  tooltip = "Oscillator inspected for divergences against price highs and lows.")
+
+pivotLengthInput = input.int(5, "Pivot Lookback", minval = 1, maxval = 50, group = DIV_GROUP,
+  tooltip = "Bars required on each side to confirm an oscillator pivot. Divergence detection lags by this many bars.")
+
+showReflexInput = input.bool(true, "Reflex", inline = "reflex", group = STYLE_GROUP)
+reflexBullInput = input.color(BULL_COLOR, "", inline = "reflex", group = STYLE_GROUP)
+reflexBearInput = input.color(BEAR_COLOR, "", inline = "reflex", group = STYLE_GROUP)
+
+showTrendflexInput  = input.bool(true, "Trendflex", inline = "trendflex", group = STYLE_GROUP)
+trendflexColorInput = input.color(ACCENT_COLOR, "", inline = "trendflex", group = STYLE_GROUP)
+
+fillModeInput = input.string(REFLEX_OPT, "Gradient Fill", options = [REFLEX_OPT, TRENDFLEX_OPT, FILL_BOTH, FILL_NONE], group = STYLE_GROUP,
+  tooltip = "Oscillator receiving the zero-anchored gradient fill.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Ehlers SuperSmoother, a 2-pole low-pass filter stripping high-frequency noise from the source
+superSmoother(float src, float period) =>
+    a1 = math.exp(-SS_COEF * math.pi / period)
+    b1 = 2 * a1 * math.cos(SS_COEF * math.pi / period)
+    c2 = b1
+    c3 = -a1 * a1
+    c1 = 1 - c2 - c3
+    float smooth = na
+    smooth := c1 * (src + nz(src[1], src)) / 2 + c2 * nz(smooth[1], src) + c3 * nz(smooth[2], src)
+
+// Normalizes a raw deviation average by the square root of its own exponentially averaged mean square
+selfNormalize(float raw) =>
+    float meanSquare = na
+    meanSquare := na(raw) ? meanSquare[1] : NORM_ALPHA * raw * raw + (1 - NORM_ALPHA) * nz(meanSquare[1])
+    na(raw) ? float(na) : meanSquare > 0 ? raw / math.sqrt(meanSquare) : 0.0
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+
+float filt = superSmoother(sourceInput, lengthInput / 2.0)
+max_bars_back(filt, 500)
+
+// Per-bar change of the straight line connecting the current filter value with the value a full lookback ago
+float slope = (filt[lengthInput] - filt) / lengthInput
+
+float reflexSum    = 0.0
+float trendflexSum = 0.0
+
+for i = 1 to lengthInput
+    reflexSum    += filt + i * slope - filt[i]
+    trendflexSum += filt - filt[i]
+
+float reflexRaw    = reflexSum / lengthInput
+float trendflexRaw = trendflexSum / lengthInput
+
+float reflex    = selfNormalize(reflexRaw)
+float trendflex = selfNormalize(trendflexRaw)
+
+bool reflexCrossUp      = ta.crossover(reflex, 0)
+bool reflexCrossDown    = ta.crossunder(reflex, 0)
+bool trendflexCrossUp   = ta.crossover(trendflex, 0)
+bool trendflexCrossDown = ta.crossunder(trendflex, 0)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Divergences
+//---------------------------------------------------------------------------------------------------------------------{
+
+float divergenceOsc = divergenceSourceInput == REFLEX_OPT ? reflex : trendflex
+
+float pivotHigh = ta.pivothigh(divergenceOsc, pivotLengthInput, pivotLengthInput)
+float pivotLow  = ta.pivotlow(divergenceOsc, pivotLengthInput, pivotLengthInput)
+
+var float lastHighOsc   = na
+var float lastHighPrice = na
+var int   lastHighBar   = na
+var float lastLowOsc    = na
+var float lastLowPrice  = na
+var int   lastLowBar    = na
+
+bool bearishDivergence = false
+bool bullishDivergence = false
+
+if not na(pivotHigh)
+    float highPivotOsc   = divergenceOsc[pivotLengthInput]
+    float highPivotPrice = high[pivotLengthInput]
+    int   highPivotBar   = bar_index - pivotLengthInput
+
+    if not na(lastHighOsc) and highPivotPrice > lastHighPrice and highPivotOsc < lastHighOsc
+        bearishDivergence := true
+
+        if showDivergencesInput
+            line.new(lastHighBar, lastHighOsc, highPivotBar, highPivotOsc, color = reflexBearInput, style = line.style_dashed)
+            label.new(highPivotBar, highPivotOsc, "Bear", color = HIDDEN_COLOR, textcolor = reflexBearInput, style = label.style_label_down, size = size.tiny)
+
+    lastHighOsc   := highPivotOsc
+    lastHighPrice := highPivotPrice
+    lastHighBar   := highPivotBar
+
+if not na(pivotLow)
+    float lowPivotOsc   = divergenceOsc[pivotLengthInput]
+    float lowPivotPrice = low[pivotLengthInput]
+    int   lowPivotBar   = bar_index - pivotLengthInput
+
+    if not na(lastLowOsc) and lowPivotPrice < lastLowPrice and lowPivotOsc > lastLowOsc
+        bullishDivergence := true
+
+        if showDivergencesInput
+            line.new(lastLowBar, lastLowOsc, lowPivotBar, lowPivotOsc, color = reflexBullInput, style = line.style_dashed)
+            label.new(lowPivotBar, lowPivotOsc, "Bull", color = HIDDEN_COLOR, textcolor = reflexBullInput, style = label.style_label_up, size = size.tiny)
+
+    lastLowOsc   := lowPivotOsc
+    lastLowPrice := lowPivotPrice
+    lastLowBar   := lowPivotBar
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visualization
+//---------------------------------------------------------------------------------------------------------------------{
+
+bool reflexFillEnabled    = showReflexInput and (fillModeInput == REFLEX_OPT or fillModeInput == FILL_BOTH)
+bool trendflexFillEnabled = showTrendflexInput and (fillModeInput == TRENDFLEX_OPT or fillModeInput == FILL_BOTH)
+
+hline(2, "Upper Typical Band", color.new(NEUTRAL_COLOR, 50), hline.style_dotted)
+hline(0, "Zero Line", NEUTRAL_COLOR, hline.style_dashed)
+hline(-2, "Lower Typical Band", color.new(NEUTRAL_COLOR, 50), hline.style_dotted)
+
+reflexPlotId    = plot(showReflexInput ? reflex : na, "Reflex", reflex > 0 ? reflexBullInput : reflexBearInput, 2)
+trendflexPlotId = plot(showTrendflexInput ? trendflex : na, "Trendflex", trendflexColorInput)
+zeroPlotId      = plot(0, "Zero Anchor", color = na, editable = false, display = display.none)
+
+fill(reflexPlotId, zeroPlotId,
+  top_value    = reflexFillEnabled ? math.max(reflex, 0) : na,
+  bottom_value = reflexFillEnabled ? math.min(reflex, 0) : na,
+  top_color    = reflex > 0 ? color.new(reflexBullInput, 50) : color.new(reflexBearInput, 100),
+  bottom_color = reflex > 0 ? color.new(reflexBullInput, 100) : color.new(reflexBearInput, 50),
+  title        = "Reflex Gradient")
+
+fill(trendflexPlotId, zeroPlotId,
+  top_value    = trendflexFillEnabled ? math.max(trendflex, 0) : na,
+  bottom_value = trendflexFillEnabled ? math.min(trendflex, 0) : na,
+  top_color    = trendflex > 0 ? color.new(trendflexColorInput, 50) : color.new(trendflexColorInput, 100),
+  bottom_color = trendflex > 0 ? color.new(trendflexColorInput, 100) : color.new(trendflexColorInput, 50),
+  title        = "Trendflex Gradient")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(reflexCrossUp, "Reflex Cross Above Zero", "Reflex crossed above zero (bullish cycle inflection)")
+alertcondition(reflexCrossDown, "Reflex Cross Below Zero", "Reflex crossed below zero (bearish cycle inflection)")
+alertcondition(trendflexCrossUp, "Trendflex Cross Above Zero", "Trendflex crossed above zero (bullish regime)")
+alertcondition(trendflexCrossDown, "Trendflex Cross Below Zero", "Trendflex crossed below zero (bearish regime)")
+alertcondition(reflexCrossUp and trendflex > 0, "Trend-Aligned Bullish Signal", "Reflex crossed above zero while Trendflex is positive (trend-aligned bullish cycle signal)")
+alertcondition(reflexCrossDown and trendflex < 0, "Trend-Aligned Bearish Signal", "Reflex crossed below zero while Trendflex is negative (trend-aligned bearish cycle signal)")
+alertcondition(bullishDivergence, "Bullish Divergence", "Bullish divergence detected between price lows and the selected oscillator")
+alertcondition(bearishDivergence, "Bearish Divergence", "Bearish divergence detected between price highs and the selected oscillator")
+
+//---------------------------------------------------------------------------------------------------------------------}

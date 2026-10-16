@@ -1,0 +1,195 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Round Numbers", "Round Numbers", overlay = true, format = format.price, max_lines_count = 500, max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+color TRANSPARENT = #00000000
+color LEVEL_COLOR = #787b86 // round-number grid - structure, graded by transparency per roundness tier
+
+// hard cap on rendered grid levels, recentered on the visible range midpoint when exceeded
+int MAX_LEVELS = 300
+
+string GRID_GROUP  = "Grid"
+string ALERT_GROUP = "Alerts"
+string STYLE_GROUP = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+stepModeInput = input.string("Auto (Instrument)", "Figure Step", options = ["Auto (Instrument)", "Manual"], group = GRID_GROUP, tooltip = "Auto derives the big-figure step from the symbol: 100 pips in forex (the 00 levels), and a power of ten scaled to the price's magnitude elsewhere - whole dollars on low-priced stocks, ten-dollar marks higher up, hundreds on indices, thousands on bitcoin-scale prices. Manual uses the step size below.")
+
+manualStepInput = input.float(1, "Manual Step Size", minval = 0.0000001, group = GRID_GROUP, tooltip = "Price distance between consecutive figures when Figure Step is Manual. Examples: 0.01 for a forex big figure, 1 for whole dollars, 1000 for thousand-dollar marks.")
+
+showHalvesInput = input.bool(true, "Half Levels (50)", group = GRID_GROUP, tooltip = "Draw the half-figure midway between figures - 1.1050 in forex, the half dollar on a whole-dollar grid. Conventionally the strongest of the minor levels.")
+
+showQuartersInput = input.bool(true, "Quarter Levels (25 / 75)", group = GRID_GROUP, tooltip = "Draw the 25 and 75 quarter levels between figures, the finer intraday grid. The finest tier and the first one thinned when the grid would crowd the chart.")
+
+lineBudgetInput = input.int(40, "Line Budget", minval = 8, maxval = 200, group = GRID_GROUP, tooltip = "Most grid lines allowed across the visible price range. When the full grid would exceed it, finer subdivisions are dropped first - quarters, then halves, then single figures - so the levels with the most trailing zeros always survive.")
+
+approachPctInput = input.float(10, "Approach Distance %", minval = 1, maxval = 50, group = ALERT_GROUP, tooltip = "Distance from the nearest figure, as a percentage of the figure step, that arms the approach alert. 10% of a 100-pip step is 10 pips from the figure.")
+
+zonePctInput = input.float(5, "Figure Zone Width %", minval = 0.5, maxval = 25, step = 0.5, group = ALERT_GROUP, tooltip = "Half-width of the zone treated as the figure itself, as a percentage of the step. Round numbers behave as zones rather than exact lines - sweeps often run a few ticks past the mark - so test alerts fire when the bar's range reaches this zone.")
+
+figureColorInput = input.color(LEVEL_COLOR, "Figures (00)", group = STYLE_GROUP, tooltip = "Color of the big-figure lines. Every tenth figure - one more trailing zero - is drawn one width thicker, since more trailing zeros generally means more attention.")
+
+halfColorInput = input.color(color.new(LEVEL_COLOR, 45), "Halves (50)", group = STYLE_GROUP, tooltip = "Color of the half-figure lines, drawn dashed as the intermediate roundness tier.")
+
+quarterColorInput = input.color(color.new(LEVEL_COLOR, 70), "Quarters (25 / 75)", group = STYLE_GROUP, tooltip = "Color of the quarter-level lines, drawn dotted as the least prominent roundness tier.")
+
+figureWidthInput = input.int(1, "Figure Line Width", minval = 1, maxval = 4, group = STYLE_GROUP, tooltip = "Line width of big-figure lines. Decade figures add one width on top. Halves and quarters are always one pixel.")
+
+showLabelsInput = input.bool(true, "Figure Labels", group = STYLE_GROUP, tooltip = "Print each figure's price at the right edge of the grid.")
+
+extendInput = input.string("Right", "Line Extension", options = ["Right", "Both", "Visible Range"], group = STYLE_GROUP, tooltip = "Right runs the grid from the left of the view into future space, Both across the entire chart, Visible Range only across the bars currently in view.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Big-figure step for the symbol. Forex uses the 100-pip figure (JPY-style quotes detected from the
+// price scale), other markets a power of ten one order of magnitude below price, never below whole
+// units for dollar-quoted equities
+getFigureStep(float price) =>
+    string marketKind = syminfo.type
+    float step = na
+    if marketKind == "forex"
+        float pipSize = syminfo.pricescale >= 10000 ? 0.0001 : 0.01
+        step := pipSize * 100
+    else
+        float magnitude = math.max(math.abs(price), syminfo.mintick)
+        step := math.pow(10, math.floor(math.log10(magnitude)) - 1)
+        if marketKind == "stock" or marketKind == "fund"
+            step := math.max(step, 1)
+    step
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Figure Math & Alert Events
+//---------------------------------------------------------------------------------------------------------------------{
+
+// highest and lowest price among the bars currently in view - the script recalculates whenever the
+// visible chart range changes, so the grid always spans what is on screen
+var float visibleHigh = na
+var float visibleLow  = na
+
+if time >= chart.left_visible_bar_time and time <= chart.right_visible_bar_time
+    visibleHigh := math.max(nz(visibleHigh, high), high)
+    visibleLow  := math.min(nz(visibleLow,  low),  low)
+
+float manualStep = math.max(manualStepInput, syminfo.mintick)
+float autoStep   = getFigureStep(close)
+float alertStep  = stepModeInput == "Manual" ? manualStep : autoStep
+
+float nearestFigure  = math.round(close / alertStep) * alertStep
+float figureDistance = math.abs(close - nearestFigure)
+
+// approach - price comes within the approach distance of the nearest figure
+bool inApproachZone = figureDistance <= alertStep * approachPctInput / 100
+bool wasApproaching = na(inApproachZone[1]) ? false : inApproachZone[1]
+bool newApproach    = inApproachZone and not wasApproaching
+
+// test - the bar's range reaches the zone around the figure (figures act as zones, not lines)
+float zoneHalfWidth = alertStep * zonePctInput / 100
+bool  inFigureZone  = high >= nearestFigure - zoneHalfWidth and low <= nearestFigure + zoneHalfWidth
+bool  wasInZone     = na(inFigureZone[1]) ? false : inFigureZone[1]
+bool  newTest       = inFigureZone and not wasInZone
+
+// break - close crossed a figure, both closes measured on the current grid so a step-size change
+// between bars cannot fake a cross
+int  figureCountNow  = math.floor(close / alertStep)
+int  figureCountPrev = math.floor(nz(close[1], close) / alertStep)
+bool brokeAbove      = figureCountNow > figureCountPrev
+bool brokeBelow      = figureCountNow < figureCountPrev
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Grid Rendering
+//---------------------------------------------------------------------------------------------------------------------{
+
+var array<line>  gridLineArray  = array.new<line>()
+var array<label> gridLabelArray = array.new<label>()
+
+if barstate.islast
+    for eachLine in gridLineArray
+        line.delete(eachLine)
+    for eachLabel in gridLabelArray
+        label.delete(eachLabel)
+    array.clear(gridLineArray)
+    array.clear(gridLabelArray)
+
+    float rangeHigh = nz(visibleHigh, high)
+    float rangeLow  = nz(visibleLow,  low)
+    float drawStep  = stepModeInput == "Manual" ? manualStep : getFigureStep((rangeHigh + rangeLow) / 2)
+
+    float quarterStep = drawStep / 4
+    float span        = math.max(rangeHigh - rangeLow, syminfo.mintick)
+
+    // thinning ladder - finer subdivisions go first, levels with more trailing zeros stay
+    float fineStep = na
+    array<float> stepLadder = array.new<float>()
+    if showQuartersInput
+        array.push(stepLadder, drawStep / 4)
+    if showHalvesInput
+        array.push(stepLadder, drawStep / 2)
+    array.push(stepLadder, drawStep)
+    array.push(stepLadder, drawStep * 10)
+    array.push(stepLadder, drawStep * 100)
+    array.push(stepLadder, drawStep * 1000)
+
+    for eachStep in stepLadder
+        if na(fineStep) and span / eachStep + 1 <= lineBudgetInput
+            fineStep := eachStep
+    fineStep := na(fineStep) ? drawStep * 1000 : fineStep
+
+    int leftTime  = chart.left_visible_bar_time
+    int rightTime = math.max(chart.right_visible_bar_time, leftTime + 1)
+
+    string extendMode = extendInput == "Both" ? extend.both : extendInput == "Right" ? extend.right : extend.none
+
+    int kStart = math.ceil((rangeLow - fineStep) / fineStep)
+    int kEnd   = math.floor((rangeHigh + fineStep) / fineStep)
+
+    if kEnd - kStart > MAX_LEVELS
+        int kMid = math.round((rangeHigh + rangeLow) / 2 / fineStep)
+        kStart := kMid - MAX_LEVELS / 2
+        kEnd   := kMid + MAX_LEVELS / 2
+
+    if kEnd >= kStart
+        for k = kStart to kEnd
+            float levelPrice   = k * fineStep
+            int   quarterIndex = math.round(levelPrice / quarterStep)
+
+            bool isFigure  = quarterIndex % 4 == 0
+            bool isHalf    = quarterIndex % 2 == 0 and not isFigure
+            bool isQuarter = not isFigure and not isHalf
+            bool isDecade  = quarterIndex % 40 == 0
+
+            if (isHalf and not showHalvesInput) or (isQuarter and not showQuartersInput)
+                continue
+
+            color  levelColor = isFigure ? figureColorInput : isHalf ? halfColorInput : quarterColorInput
+            string levelStyle = isFigure ? line.style_solid : isHalf ? line.style_dashed : line.style_dotted
+            int    levelWidth = isDecade ? figureWidthInput + 1 : isFigure ? figureWidthInput : 1
+
+            array.push(gridLineArray, line.new(leftTime, levelPrice, rightTime, levelPrice, xloc = xloc.bar_time, extend = extendMode, color = levelColor, style = levelStyle, width = levelWidth))
+
+            if isFigure and showLabelsInput
+                array.push(gridLabelArray, label.new(rightTime, levelPrice, str.tostring(levelPrice, format.mintick), xloc = xloc.bar_time, color = TRANSPARENT, style = label.style_label_right, textcolor = color.new(levelColor, 0), size = size.small))
+
+plot(nearestFigure, "Nearest Figure", LEVEL_COLOR, display = display.data_window)
+plot(figureDistance, "Distance To Figure", color.new(LEVEL_COLOR, 40), display = display.data_window)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(newApproach, "Round Number Approach", "Price is within the approach distance of the nearest major round number")
+alertcondition(newTest, "Round Number Test", "Price is testing the zone around a major round number")
+alertcondition(brokeAbove, "Round Number Break Up", "Price closed through a major round number to the upside - stops beyond the figure can fuel continuation")
+alertcondition(brokeBelow, "Round Number Break Down", "Price closed through a major round number to the downside - stops beyond the figure can fuel continuation")
+
+//---------------------------------------------------------------------------------------------------------------------}

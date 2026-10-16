@@ -1,0 +1,258 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("MA of MA", shorttitle = "MA of MA", overlay = true, format = format.price)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+SMA_TYPE  = "SMA"
+EMA_TYPE  = "EMA"
+WMA_TYPE  = "WMA"
+RMA_TYPE  = "RMA (Wilder)"
+HMA_TYPE  = "HMA"
+VWMA_TYPE = "VWMA"
+
+FILL_NONE_MODE  = "None"
+FILL_MA_MODE    = "First MA ↔ MA of MA"
+FILL_PRICE_MODE = "Price ↔ MA of MA"
+
+TOP_RIGHT    = "Top Right"
+TOP_LEFT     = "Top Left"
+BOTTOM_RIGHT = "Bottom Right"
+BOTTOM_LEFT  = "Bottom Left"
+
+TINY_SIZE   = "Tiny"
+SMALL_SIZE  = "Small"
+NORMAL_SIZE = "Normal"
+
+BULL_COLOR        = #089981
+BEAR_COLOR        = #f23645
+NEUTRAL_COLOR     = #787b86
+FIRST_MA_COLOR    = #787b86
+LAG_REDUCED_COLOR = #ff9800 // the one accent - the optional lag-reduced line
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+FILL_FAST_TRANSP = 70  // gradient transparency at the fast-series end of the fill
+FILL_BASE_TRANSP = 100 // gradient transparency at the MA-of-MA end of the fill
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+srcInput = input.source(close, "Source", group = "Moving Averages",
+     tooltip = "Series fed into the first average. Series too jagged for a single pass — volume, breadth counts, raw oscillator values — are routinely smoothed twice by selecting them here.")
+
+type1Input = input.string(EMA_TYPE, "First Pass", options = [SMA_TYPE, EMA_TYPE, WMA_TYPE, RMA_TYPE, HMA_TYPE, VWMA_TYPE], inline = "pass1", group = "Moving Averages",
+     tooltip = "Moving average applied directly to the source, and its length. This is the faster line that the second pass smooths again.")
+
+len1Input = input.int(20, "", minval = 1, inline = "pass1", group = "Moving Averages",
+     tooltip = "Length of the first-pass average.")
+
+type2Input = input.string(EMA_TYPE, "Second Pass", options = [SMA_TYPE, EMA_TYPE, WMA_TYPE, RMA_TYPE, HMA_TYPE, VWMA_TYPE], inline = "pass2", group = "Moving Averages",
+     tooltip = "Moving average applied to the FIRST average rather than to price, and its length. Types and lengths need not match — each pass compounds the smoothing, and the component lags roughly add.")
+
+len2Input = input.int(20, "", minval = 1, inline = "pass2", group = "Moving Averages",
+     tooltip = "Length of the second-pass average.")
+
+showLagReducedInput = input.bool(false, "Lag-Reduced Line (2 × MA − MA of MA)", group = "Moving Averages",
+     tooltip = "DEMA-style combination of the same two passes: twice the first average minus its smoothed copy. The subtraction cancels most of the compounded lag, turning the cascade into a faster line instead of a smoother one.")
+
+showDashboardInput = input.bool(true, "Show Dashboard", group = "Dashboard",
+     tooltip = "Summarizes each pass and its nominal lag. An N-period simple average sits about (N−1)/2 bars behind price, and cascaded lags roughly add — exactly for simple averages, approximately for recursive ones like the EMA.")
+
+dashboardPositionInput = input.string(TOP_RIGHT, "Position", options = [TOP_RIGHT, TOP_LEFT, BOTTOM_RIGHT, BOTTOM_LEFT], group = "Dashboard",
+     tooltip = "Chart corner the dashboard is anchored to.")
+
+dashboardSizeInput = input.string(SMALL_SIZE, "Size", options = [TINY_SIZE, SMALL_SIZE, NORMAL_SIZE], group = "Dashboard",
+     tooltip = "Dashboard text size.")
+
+trendColorInput = input.bool(true, "Slope Trend Coloring", group = "Style",
+     tooltip = "Colors the MA of MA by its own slope — the slow regime read. Because the line is double-smoothed, its slope changes state rarely. Disable to draw it in the neutral color.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "direction", group = "Style",
+     tooltip = "Color used while the MA of MA slope is rising, and for bullish crossings and the bullish side of the fill.")
+
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "direction", group = "Style",
+     tooltip = "Color used while the MA of MA slope is falling, and for bearish crossings and the bearish side of the fill.")
+
+neutralColorInput = input.color(NEUTRAL_COLOR, "Neutral", group = "Style",
+     tooltip = "MA of MA color when slope trend coloring is disabled or the slope is flat.")
+
+firstMaColorInput = input.color(FIRST_MA_COLOR, "First MA", group = "Style",
+     tooltip = "Color of the first-pass average — the faster reference line the second pass smooths.")
+
+lagReducedColorInput = input.color(LAG_REDUCED_COLOR, "Lag-Reduced", group = "Style",
+     tooltip = "Color of the optional lag-reduced (2 × MA − MA of MA) line.")
+
+fillModeInput = input.string(FILL_MA_MODE, "Gradient Fill", options = [FILL_NONE_MODE, FILL_MA_MODE, FILL_PRICE_MODE], group = "Style",
+     tooltip = "Vertical gradient across the gap to the double-smoothed baseline — the gap widens as a trend accelerates. Fill from the first average or straight from the source, fading to fully transparent at the MA of MA.")
+
+showMarkersInput = input.bool(false, "MA Crossing Markers", group = "Style",
+     tooltip = "Small triangles where the first average crosses its double-smoothed copy — the turn-detector read, approximating a slope change of the first average. Off by default to keep the chart clean; the crossing alerts work regardless.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Nominal lag (group delay) of one average in bars, from the standard center-of-mass values:
+// SMA and EMA (alpha = 2/(N+1)) sit (N−1)/2 bars behind, WMA (N−1)/3, Wilder's RMA (alpha = 1/N) N−1.
+// HMA combines WMA terms so most of the delay cancels; VWMA is shown with the SMA value (uniform-volume approximation).
+nominalLag(simple string maType, simple int length) =>
+    l = float(length)
+    switch maType
+        SMA_TYPE => (l - 1) / 2
+        EMA_TYPE => (l - 1) / 2
+        WMA_TYPE => (l - 1) / 3
+        RMA_TYPE => l - 1
+        HMA_TYPE =>
+            h       = math.max(l, 2)
+            halfLen = math.floor(h / 2)
+            rootLen = math.round(math.sqrt(h))
+            (2.0 * (halfLen - 1) - (h - 1) + (rootLen - 1)) / 3
+        => (l - 1) / 2
+
+// Table corner from the dashboard position option
+tableLocation(string positionText) =>
+    switch
+        positionText == TOP_RIGHT    => position.top_right
+        positionText == TOP_LEFT     => position.top_left
+        positionText == BOTTOM_RIGHT => position.bottom_right
+        => position.bottom_left
+
+// Table text size from the dashboard size option
+tableTextSize(string sizeText) =>
+    switch
+        sizeText == TINY_SIZE  => size.tiny
+        sizeText == SMALL_SIZE => size.small
+        => size.normal
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+// HMA needs at least 2 periods for its internal half-length window
+hmaLen1 = math.max(len1Input, 2)
+hmaLen2 = math.max(len2Input, 2)
+
+// Pass 1 — every average variant of the source runs unconditionally on every bar
+sma1  = ta.sma(srcInput, len1Input)
+ema1  = ta.ema(srcInput, len1Input)
+wma1  = ta.wma(srcInput, len1Input)
+rma1  = ta.rma(srcInput, len1Input)
+hma1  = ta.hma(srcInput, hmaLen1)
+vwma1 = ta.vwma(srcInput, len1Input)
+
+firstMa = switch type1Input
+    SMA_TYPE => sma1
+    EMA_TYPE => ema1
+    WMA_TYPE => wma1
+    RMA_TYPE => rma1
+    HMA_TYPE => hma1
+    => vwma1
+
+// Pass 2 — the second average is fed the FIRST average, not price
+sma2  = ta.sma(firstMa, len2Input)
+ema2  = ta.ema(firstMa, len2Input)
+wma2  = ta.wma(firstMa, len2Input)
+rma2  = ta.rma(firstMa, len2Input)
+hma2  = ta.hma(firstMa, hmaLen2)
+vwma2 = ta.vwma(firstMa, len2Input)
+
+maOfMa = switch type2Input
+    SMA_TYPE => sma2
+    EMA_TYPE => ema2
+    WMA_TYPE => wma2
+    RMA_TYPE => rma2
+    HMA_TYPE => hma2
+    => vwma2
+
+// DEMA-style lag compensation built from the same two passes: 2 × MA − MA(MA)
+lagReduced = 2 * firstMa - maOfMa
+
+// Slope of the double-smoothed line — the slow regime read
+slope = maOfMa - nz(maOfMa[1], maOfMa)
+
+// Turn detector — the first average crossing its own smoothed copy
+maCrossUp   = ta.crossover(firstMa, maOfMa)
+maCrossDown = ta.crossunder(firstMa, maOfMa)
+
+// Slow baseline — the source crossing the double-smoothed reference
+srcCrossUp   = ta.crossover(srcInput, maOfMa)
+srcCrossDown = ta.crossunder(srcInput, maOfMa)
+
+// Slope regime flips of the MA of MA
+slopeTurnUp   = slope > 0 and nz(slope[1]) <= 0
+slopeTurnDown = slope < 0 and nz(slope[1]) >= 0
+
+// Nominal lag bookkeeping — component lags roughly add in cascade
+lag1     = nominalLag(type1Input, len1Input)
+lag2     = nominalLag(type2Input, len2Input)
+totalLag = lag1 + lag2
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+maOfMaColor = trendColorInput ? (slope > 0 ? bullColorInput : slope < 0 ? bearColorInput : neutralColorInput) : neutralColorInput
+
+// Gap fill between the selected fast series and the double-smoothed baseline
+fillFast  = fillModeInput == FILL_PRICE_MODE ? srcInput : firstMa
+fastAbove = fillFast > maOfMa
+fillOn    = fillModeInput != FILL_NONE_MODE
+
+fillTopColor    = fillOn ? (fastAbove ? color.new(bullColorInput, FILL_FAST_TRANSP) : color.new(bearColorInput, FILL_BASE_TRANSP)) : na
+fillBottomColor = fillOn ? (fastAbove ? color.new(bullColorInput, FILL_BASE_TRANSP) : color.new(bearColorInput, FILL_FAST_TRANSP)) : na
+
+plot(firstMa, "First MA", color = firstMaColorInput, linewidth = 1)
+maOfMaPlotId = plot(maOfMa, "MA of MA", color = maOfMaColor, linewidth = 2)
+plot(showLagReducedInput ? lagReduced : na, "Lag-Reduced (2 × MA − MA of MA)", color = lagReducedColorInput, linewidth = 1)
+fillAnchorPlotId = plot(fillFast, "Fill Anchor", color = na, editable = false, display = display.none)
+
+fill(fillAnchorPlotId, maOfMaPlotId, top_value = math.max(fillFast, maOfMa), bottom_value = math.min(fillFast, maOfMa), top_color = fillTopColor, bottom_color = fillBottomColor, title = "Gap Gradient Fill")
+
+plotshape(showMarkersInput and maCrossUp, "Bullish MA Cross", shape.triangleup, location.belowbar, color = bullColorInput, size = size.tiny)
+plotshape(showMarkersInput and maCrossDown, "Bearish MA Cross", shape.triangledown, location.abovebar, color = bearColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dashboardTable = na
+
+if barstate.islast and showDashboardInput
+    if na(dashboardTable)
+        dashboardTable := table.new(tableLocation(dashboardPositionInput), 2, 5, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+    string textSize  = tableTextSize(dashboardSizeInput)
+    color labelColor = DASH_HEADER
+    color valueColor = DASH_TEXT
+
+    string pass1Label = "Pass 1 · " + type1Input + " " + str.tostring(len1Input)
+    string pass2Label = "Pass 2 · " + type2Input + " " + str.tostring(len2Input)
+    string slopeText  = slope > 0 ? "Rising" : slope < 0 ? "Falling" : "Flat"
+    color slopeColor  = slope > 0 ? bullColorInput : slope < 0 ? bearColorInput : neutralColorInput
+
+    table.cell(dashboardTable, 0, 0, pass1Label, text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 0, "lag ≈ " + str.tostring(lag1, "#.#") + " bars", text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 1, pass2Label, text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 1, "+ " + str.tostring(lag2, "#.#") + " bars", text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 2, "Effective Lag", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 2, "≈ " + str.tostring(totalLag, "#.#") + " bars", text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 3, "MA of MA Slope", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 3, slopeText, text_color = slopeColor, text_size = textSize, text_halign = text.align_right)
+
+    if showLagReducedInput
+        table.cell(dashboardTable, 0, 4, "Lag-Reduced", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+        table.cell(dashboardTable, 1, 4, "≈ " + str.tostring(lag1 - lag2, "#.#") + " bars", text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(maCrossUp, "First MA Crossed Above MA of MA", "First MA crossed above its double-smoothed copy — turn up on the first average — on {{ticker}} ({{interval}})")
+alertcondition(maCrossDown, "First MA Crossed Below MA of MA", "First MA crossed below its double-smoothed copy — turn down on the first average — on {{ticker}} ({{interval}})")
+alertcondition(srcCrossUp, "Source Crossed Above MA of MA", "Source crossed above the MA of MA slow baseline on {{ticker}} ({{interval}})")
+alertcondition(srcCrossDown, "Source Crossed Below MA of MA", "Source crossed below the MA of MA slow baseline on {{ticker}} ({{interval}})")
+alertcondition(slopeTurnUp, "MA of MA Slope Up", "MA of MA slope turned upward — slow trend regime now rising — on {{ticker}} ({{interval}})")
+alertcondition(slopeTurnDown, "MA of MA Slope Down", "MA of MA slope turned downward — slow trend regime now falling — on {{ticker}} ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

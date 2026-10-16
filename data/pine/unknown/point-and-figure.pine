@@ -1,0 +1,448 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Point & Figure", "Point & Figure", overlay = true, max_boxes_count = 500, max_lines_count = 100, max_labels_count = 100)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+float EPS_F        = 0.0001 // floating point fudge (fraction of a box) for grid arithmetic
+int   MAX_STORED   = 250  // completed columns kept in memory
+int   CELL_BUDGET  = 480  // max rendered X/O cells (max_boxes_count safety)
+int   COL_CELL_CAP = 400  // max rendered cells for a single column
+int   X_LIMIT      = 480  // max future-bar span used by the rendering
+int   TL_SEGMENTS  = 8    // max rendered 45-degree trendline segments
+int   HC_MAX_WIDTH = 50   // max columns scanned for a horizontal count
+
+string GRP1 = "Point & Figure"
+string GRP2 = "Signals & Objectives"
+string GRP3 = "Display"
+string GRP4 = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+string srcMethodInput = input.string("High/Low", "Construction", options = ["High/Low", "Close"], group = GRP1, tooltip = "Price stream used to build the columns. 'High/Low' uses the bar high to extend rising X columns and the bar low to extend falling O columns (the classic chartist method); 'Close' uses closing prices only. This changes what prints, especially intraday.")
+string boxMethodInput = input.string("ATR", "Box Size Method", options = ["ATR", "Percent", "Fixed"], group = GRP1, tooltip = "How the box size — the minimum move required to print a new mark — is determined. 'ATR' scales boxes to recent volatility, 'Percent' sizes boxes as a percentage of price, 'Fixed' uses a constant price increment. ATR and Percent box sizes are locked at the birth of each column, so every box within a column is uniform.")
+int    atrLengthInput = input.int(14, "ATR Length", minval = 1, group = GRP1, tooltip = "Averaging length of the ATR used when the box size method is 'ATR'.")
+float  percentInput   = input.float(1.0, "Percent Box (%)", minval = 0.01, step = 0.1, group = GRP1, tooltip = "Box size as a percentage of price, applied when the box size method is 'Percent'.")
+float  fixedInput     = input.float(1.0, "Fixed Box", minval = 0.0000001, group = GRP1, tooltip = "Box size as a fixed price increment, applied when the box size method is 'Fixed'.")
+int    reversalInput  = input.int(3, "Reversal Boxes", minval = 1, maxval = 10, group = GRP1, tooltip = "Boxes price must retrace from the current column's extreme before a new column starts in the opposite direction. Three boxes is the classic convention; raising it filters more noise and produces slower, longer columns.")
+
+bool showSignalsInput  = input.bool(true, "Highlight Breakout Boxes", group = GRP2, tooltip = "Fills the box where a double or triple top/bottom breakout printed inside the Point & Figure chart.")
+bool showMarkersInput  = input.bool(true, "Chart Signal Markers", group = GRP2, tooltip = "Marks the price bar where a Point & Figure breakout printed — triangles for double top/bottom signals, diamonds for triple top/bottom signals.")
+bool showRevMarkInput  = input.bool(false, "Column Reversal Markers", group = GRP2, tooltip = "Marks the price bar where a new column started. Off by default to keep the chart clean; the reversal alerts cover these events.")
+bool showTrendInput    = input.bool(true, "45° Trendlines", group = GRP2, tooltip = "Draws the trendlines conventional on three-box charts: a bullish support line rising one box per column from a bottom, and a bearish resistance line falling one box per column from a top, flipping when a column pierces the active line.")
+bool showVCountInput   = input.bool(true, "Vertical Counts", group = GRP2, tooltip = "Projects a price objective from the latest breakout column once it completes: column height in boxes × box size × reversal count, measured from the column's origin. The level is removed once reached or negated. Counts are estimates, not promises.")
+bool showHCountInput   = input.bool(true, "Horizontal Counts", group = GRP2, tooltip = "Projects a price objective from the width of the congestion a breakout escapes: pattern width in columns × box size × reversal count, measured from the pattern's opposite extreme. The level is removed once reached or negated. Counts are estimates, not promises.")
+
+int    maxColsInput   = input.int(40, "Max Columns", minval = 5, maxval = 100, group = GRP3, tooltip = "Maximum number of most recent Point & Figure columns rendered to the right of the last bar.")
+int    colWidthInput  = input.int(2, "Column Width", minval = 1, maxval = 6, group = GRP3, tooltip = "Width of each rendered column, in chart bars.")
+int    offsetInput    = input.int(4, "Offset", minval = 1, maxval = 50, group = GRP3, tooltip = "Distance, in chart bars, between the last price bar and the Point & Figure chart.")
+string markStyleInput = input.string("X / O", "Marks", options = ["X / O", "Blocks"], group = GRP3, tooltip = "Draws each box as the classic X and O letters, or as filled blocks.")
+bool   showDashInput  = input.bool(true, "Dashboard", group = GRP3, tooltip = "Shows a summary panel with the active box size, reversal setting, current column state, and the last breakout signal.")
+
+color bullColorInput = input.color(#089981, "Rising Columns (X)", group = GRP4, tooltip = "Color of rising X columns, bullish breakout signals, bullish objectives, and the 45° support line.")
+color bearColorInput = input.color(#f23645, "Falling Columns (O)", group = GRP4, tooltip = "Color of falling O columns, bearish breakout signals, bearish objectives, and the 45° resistance line.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// State
+//---------------------------------------------------------------------------------------------------------------------{
+// current (live) column
+var int   curDir   = 0  // 1 = X column, -1 = O column, 0 = not initialized
+var float curBox   = na // box size locked at the column's birth
+var float curTop   = na // highest box level of the current column
+var float curBot   = na // lowest box level of the current column
+var int   curSig   = 0  // breakout fired in the current column: 0 none, 1 double top, 2 triple top, -1 double bottom, -2 triple bottom
+var float curSigPx = na // box level where the breakout printed
+
+// completed columns (strictly alternating X/O)
+var dirArray   = array.new<int>()
+var topArray   = array.new<float>()
+var botArray   = array.new<float>()
+var boxArray   = array.new<float>()
+var sigArray   = array.new<int>()
+var sigPxArray = array.new<float>()
+
+// price objectives (na = inactive)
+var float bullVTarget = na
+var float bullVAnchor = na
+var float bullHTarget = na
+var float bullHAnchor = na
+var float bearVTarget = na
+var float bearVAnchor = na
+var float bearHTarget = na
+var float bearHAnchor = na
+
+// dashboard memory
+var string lastSignalTxt   = "—"
+var color  lastSignalColor = chart.fg_color
+
+// drawing object stores
+var pnfBoxes  = array.new<box>()
+var pnfLines  = array.new<line>()
+var pnfLabels = array.new<label>()
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// number of columns including the live one
+colCnt() =>
+    array.size(dirArray) + (curDir != 0 ? 1 : 0)
+
+// column accessors — index i in [0, colCnt() - 1], the last index is the live column
+colDir(int i) =>
+    i < array.size(dirArray) ? array.get(dirArray, i) : curDir
+
+colTop(int i) =>
+    i < array.size(topArray) ? array.get(topArray, i) : curTop
+
+colBot(int i) =>
+    i < array.size(botArray) ? array.get(botArray, i) : curBot
+
+colBox(int i) =>
+    i < array.size(boxArray) ? array.get(boxArray, i) : curBox
+
+colSig(int i) =>
+    i < array.size(sigArray) ? array.get(sigArray, i) : curSig
+
+colSigPx(int i) =>
+    i < array.size(sigPxArray) ? array.get(sigPxArray, i) : curSigPx
+
+// marks printed in a column
+colCells(int i) =>
+    math.round((colTop(i) - colBot(i)) / colBox(i)) + 1
+
+fmtPrice(float p) =>
+    str.tostring(p, format.mintick)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Point & Figure Engine
+//---------------------------------------------------------------------------------------------------------------------{
+float atrValue = ta.atr(atrLengthInput)
+float boxNow   = boxMethodInput == "ATR" ? atrValue : boxMethodInput == "Percent" ? close * percentInput / 100 : fixedInput
+
+float upPrice = srcMethodInput == "Close" ? close : high
+float dnPrice = srcMethodInput == "Close" ? close : low
+
+// per-bar events
+bool newXCol = false
+bool newOCol = false
+bool dtBuy   = false
+bool ttBuy   = false
+bool dbSell  = false
+bool tbSell  = false
+
+if curDir == 0
+    // seed the first column once a valid box size is available
+    if not na(boxNow) and boxNow > 0
+        curBox := boxNow
+        float seed = math.round(close / curBox) * curBox
+        curDir := 1
+        curTop := seed
+        curBot := seed
+else
+    if curDir == 1
+        // rising X column — extension has priority over reversal (classic high/low rule)
+        int ext = math.floor((upPrice - curTop) / curBox + EPS_F)
+        if ext >= 1
+            curTop := curTop + ext * curBox
+        else
+            int rev = math.floor((curTop - dnPrice) / curBox + EPS_F)
+            if rev >= reversalInput
+                // complete the X column
+                array.push(dirArray, 1)
+                array.push(topArray, curTop)
+                array.push(botArray, curBot)
+                array.push(boxArray, curBox)
+                array.push(sigArray, curSig)
+                array.push(sigPxArray, curSigPx)
+                // vertical count off a completed bullish breakout column
+                if curSig > 0
+                    int cnt = math.round((curTop - curBot) / curBox) + 1
+                    bullVTarget := curBot + cnt * curBox * reversalInput
+                    bullVAnchor := curBot
+                // start the O column one box below the old top
+                float newBoxO = na(boxNow) or boxNow <= 0 ? curBox : boxNow
+                float newTopO = curTop - curBox
+                int   dropO   = math.max(0, math.floor((newTopO - dnPrice) / newBoxO + EPS_F))
+                curDir   := -1
+                curTop   := newTopO
+                curBot   := newTopO - dropO * newBoxO
+                curBox   := newBoxO
+                curSig   := 0
+                curSigPx := na
+                newOCol  := true
+    else
+        // falling O column — extension has priority over reversal (classic high/low rule)
+        int ext = math.floor((curBot - dnPrice) / curBox + EPS_F)
+        if ext >= 1
+            curBot := curBot - ext * curBox
+        else
+            int rev = math.floor((upPrice - curBot) / curBox + EPS_F)
+            if rev >= reversalInput
+                // complete the O column
+                array.push(dirArray, -1)
+                array.push(topArray, curTop)
+                array.push(botArray, curBot)
+                array.push(boxArray, curBox)
+                array.push(sigArray, curSig)
+                array.push(sigPxArray, curSigPx)
+                // vertical count off a completed bearish breakdown column
+                if curSig < 0
+                    int cnt = math.round((curTop - curBot) / curBox) + 1
+                    bearVTarget := curTop - cnt * curBox * reversalInput
+                    bearVAnchor := curTop
+                // start the X column one box above the old bottom
+                float newBoxX = na(boxNow) or boxNow <= 0 ? curBox : boxNow
+                float newBotX = curBot + curBox
+                int   riseX   = math.max(0, math.floor((upPrice - newBotX) / newBoxX + EPS_F))
+                curDir   := 1
+                curBot   := newBotX
+                curTop   := newBotX + riseX * newBoxX
+                curBox   := newBoxX
+                curSig   := 0
+                curSigPx := na
+                newXCol  := true
+    // bound stored history
+    if array.size(dirArray) > MAX_STORED
+        array.shift(dirArray)
+        array.shift(topArray)
+        array.shift(botArray)
+        array.shift(boxArray)
+        array.shift(sigArray)
+        array.shift(sigPxArray)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Breakout Signals & Price Objectives
+//---------------------------------------------------------------------------------------------------------------------{
+float eps   = nz(curBox) * 0.05
+int   nCols = array.size(dirArray)
+
+// double / triple top breakout — the live X column prints one box above the previous X column's high
+if curDir == 1 and curSig == 0 and nCols >= 2
+    float prevXTop = array.get(topArray, nCols - 2)
+    if curTop > prevXTop + eps
+        bool isTriple = nCols >= 4 and math.abs(array.get(topArray, nCols - 4) - prevXTop) <= eps
+        int  over     = math.max(0, math.ceil((curTop - prevXTop) / curBox - EPS_F) - 1)
+        curSig   := isTriple ? 2 : 1
+        curSigPx := curTop - over * curBox
+        ttBuy    := isTriple
+        dtBuy    := not isTriple
+        lastSignalTxt   := isTriple ? "Triple Top" : "Double Top"
+        lastSignalColor := bullColorInput
+        // horizontal count — width of the congestion capped by the broken row
+        float patLow  = curBot
+        int   spanned = 0
+        bool  walled  = false
+        for k = 0 to HC_MAX_WIDTH - 1
+            int j = nCols - 1 - k
+            if j < 0 or walled
+                break
+            if array.get(topArray, j) <= prevXTop + eps
+                spanned += 1
+                patLow  := math.min(patLow, array.get(botArray, j))
+            else
+                walled := true
+        bullHTarget := patLow + (spanned + 1) * curBox * reversalInput
+        bullHAnchor := patLow
+
+// double / triple bottom breakdown — the live O column prints one box below the previous O column's low
+if curDir == -1 and curSig == 0 and nCols >= 2
+    float prevOBot = array.get(botArray, nCols - 2)
+    if curBot < prevOBot - eps
+        bool isTriple = nCols >= 4 and math.abs(array.get(botArray, nCols - 4) - prevOBot) <= eps
+        int  over     = math.max(0, math.ceil((prevOBot - curBot) / curBox - EPS_F) - 1)
+        curSig   := isTriple ? -2 : -1
+        curSigPx := curBot + over * curBox
+        tbSell   := isTriple
+        dbSell   := not isTriple
+        lastSignalTxt   := isTriple ? "Triple Bottom" : "Double Bottom"
+        lastSignalColor := bearColorInput
+        // horizontal count — width of the congestion capped by the broken row
+        float patHigh = curTop
+        int   spanned = 0
+        bool  walled  = false
+        for k = 0 to HC_MAX_WIDTH - 1
+            int j = nCols - 1 - k
+            if j < 0 or walled
+                break
+            if array.get(botArray, j) >= prevOBot - eps
+                spanned += 1
+                patHigh := math.max(patHigh, array.get(topArray, j))
+            else
+                walled := true
+        bearHTarget := patHigh - (spanned + 1) * curBox * reversalInput
+        bearHAnchor := patHigh
+
+// retire objectives once reached, or negate them when price violates the pattern origin
+if curDir != 0
+    if not na(bullVTarget) and (curTop >= bullVTarget - eps or curBot < bullVAnchor - eps)
+        bullVTarget := na
+    if not na(bullHTarget) and (curTop >= bullHTarget - eps or curBot < bullHAnchor - eps)
+        bullHTarget := na
+    if not na(bearVTarget) and (curBot <= bearVTarget + eps or curTop > bearVAnchor + eps)
+        bearVTarget := na
+    if not na(bearHTarget) and (curBot <= bearHTarget + eps or curTop > bearHAnchor + eps)
+        bearHTarget := na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Rendering — time-compressed Point & Figure chart
+//---------------------------------------------------------------------------------------------------------------------{
+bool letterMode = markStyleInput == "X / O"
+
+if barstate.islast and curDir != 0
+    // wipe previous pass
+    for bx in pnfBoxes
+        box.delete(bx)
+    array.clear(pnfBoxes)
+    for ln in pnfLines
+        line.delete(ln)
+    array.clear(pnfLines)
+    for lb in pnfLabels
+        label.delete(lb)
+    array.clear(pnfLabels)
+
+    int total = colCnt()
+    int xCap  = math.max(1, math.floor((X_LIMIT - offsetInput) / colWidthInput))
+    int nShow = math.min(total, math.min(maxColsInput, xCap))
+
+    // trim the window to the cell budget, newest columns first
+    int cellSum  = 0
+    int firstCol = total - 1
+    for k = 0 to nShow - 1
+        int j   = total - 1 - k
+        int cnt = colCells(j)
+        if cellSum + cnt > CELL_BUDGET and k > 0
+            break
+        cellSum  += cnt
+        firstCol := j
+
+    int x0     = bar_index + offsetInput
+    int xRight = x0 + (total - firstCol) * colWidthInput
+
+    // X/O cells
+    for j = firstCol to total - 1
+        int   d   = colDir(j)
+        color cc  = d == 1 ? bullColorInput : bearColorInput
+        float b   = colBox(j)
+        float bt  = colBot(j)
+        int   cnt = colCells(j)
+        int   xL  = x0 + (j - firstCol) * colWidthInput
+        int   sg  = colSig(j)
+        float sp  = colSigPx(j)
+        int   c0  = d == 1 ? math.max(0, cnt - COL_CELL_CAP) : 0
+        int   c1  = d == 1 ? cnt - 1 : math.min(cnt - 1, COL_CELL_CAP - 1)
+        for c = c0 to c1
+            float lvl   = bt + c * b
+            bool  isSig = showSignalsInput and sg != 0 and not na(sp) and math.abs(lvl - sp) <= b * 0.25
+            box cellBox = letterMode ?
+                 box.new(xL, lvl + b / 2, xL + colWidthInput, lvl - b / 2, border_color = isSig ? cc : color(na), border_width = 1, bgcolor = isSig ? color.new(cc, 80) : color(na), text = d == 1 ? "X" : "O", text_color = cc, text_size = size.auto) :
+                 box.new(xL, lvl + b / 2, xL + colWidthInput, lvl - b / 2, border_color = color.new(cc, 45), border_width = 1, bgcolor = color.new(cc, isSig ? 35 : 72), text = "", text_color = cc, text_size = size.auto)
+            array.push(pnfBoxes, cellBox)
+
+    // 45-degree trendlines — one box per column, flipping when a column pierces the active line
+    if showTrendInput
+        segStartArray = array.new<int>()
+        segPriceArray = array.new<float>()
+        segEndArray   = array.new<int>()
+        segDirArray   = array.new<int>()
+        int   tlDir = colDir(0) == 1 ? 1 : -1
+        int   tlA   = 0
+        float tlP   = tlDir == 1 ? colBot(0) - curBox : colTop(0) + curBox
+        if total >= 2
+            for j = 1 to total - 1
+                float lv = tlP + tlDir * (j - tlA) * curBox
+                if tlDir == 1 and colDir(j) == -1 and colBot(j) <= lv + eps
+                    array.push(segStartArray, tlA)
+                    array.push(segPriceArray, tlP)
+                    array.push(segEndArray, j)
+                    array.push(segDirArray, 1)
+                    int hiIdx = tlA
+                    for q = tlA to j
+                        if colTop(q) > colTop(hiIdx)
+                            hiIdx := q
+                    tlA   := hiIdx
+                    tlP   := colTop(hiIdx) + curBox
+                    tlDir := -1
+                else if tlDir == -1 and colDir(j) == 1 and colTop(j) >= lv - eps
+                    array.push(segStartArray, tlA)
+                    array.push(segPriceArray, tlP)
+                    array.push(segEndArray, j)
+                    array.push(segDirArray, -1)
+                    int loIdx = tlA
+                    for q = tlA to j
+                        if colBot(q) < colBot(loIdx)
+                            loIdx := q
+                    tlA   := loIdx
+                    tlP   := colBot(loIdx) - curBox
+                    tlDir := 1
+        array.push(segStartArray, tlA)
+        array.push(segPriceArray, tlP)
+        array.push(segEndArray, total + 1)
+        array.push(segDirArray, tlDir)
+        int nSeg = array.size(segDirArray)
+        for s = math.max(0, nSeg - TL_SEGMENTS) to nSeg - 1
+            int   sa    = array.get(segStartArray, s)
+            float segPx = array.get(segPriceArray, s)
+            int   se    = array.get(segEndArray, s)
+            int   sd    = array.get(segDirArray, s)
+            if se >= firstCol
+                int   gs = math.max(sa, firstCol)
+                float y1 = segPx + sd * (gs - sa) * curBox
+                float y2 = segPx + sd * (se - sa) * curBox
+                int   xs = x0 + (gs - firstCol) * colWidthInput
+                int   xe = x0 + (se - firstCol) * colWidthInput
+                array.push(pnfLines, line.new(xs, y1, xe, y2, color = color.new(sd == 1 ? bullColorInput : bearColorInput, 25), width = 1))
+
+    // vertical / horizontal count objectives
+    if showVCountInput and not na(bullVTarget)
+        array.push(pnfLines, line.new(x0, bullVTarget, xRight, bullVTarget, color = bullColorInput, style = line.style_dotted))
+        array.push(pnfLabels, label.new(xRight, bullVTarget, "Vertical ▸ " + fmtPrice(bullVTarget), style = label.style_label_left, color = #00000000, textcolor = bullColorInput, size = size.small))
+    if showHCountInput and not na(bullHTarget)
+        array.push(pnfLines, line.new(x0, bullHTarget, xRight, bullHTarget, color = bullColorInput, style = line.style_dotted))
+        array.push(pnfLabels, label.new(xRight, bullHTarget, "Horizontal ▸ " + fmtPrice(bullHTarget), style = label.style_label_left, color = #00000000, textcolor = bullColorInput, size = size.small))
+    if showVCountInput and not na(bearVTarget)
+        array.push(pnfLines, line.new(x0, bearVTarget, xRight, bearVTarget, color = bearColorInput, style = line.style_dotted))
+        array.push(pnfLabels, label.new(xRight, bearVTarget, "Vertical ▸ " + fmtPrice(bearVTarget), style = label.style_label_left, color = #00000000, textcolor = bearColorInput, size = size.small))
+    if showHCountInput and not na(bearHTarget)
+        array.push(pnfLines, line.new(x0, bearHTarget, xRight, bearHTarget, color = bearColorInput, style = line.style_dotted))
+        array.push(pnfLabels, label.new(xRight, bearHTarget, "Horizontal ▸ " + fmtPrice(bearHTarget), style = label.style_label_left, color = #00000000, textcolor = bearColorInput, size = size.small))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table infoTable = showDashInput ? table.new(position.top_right, 2, 4, bgcolor = color.new(chart.bg_color, 30), frame_color = color.new(chart.fg_color, 80), frame_width = 1) : table(na)
+
+if barstate.islast and showDashInput and curDir != 0
+    string methodTxt = boxMethodInput == "ATR" ? "ATR(" + str.tostring(atrLengthInput) + ")" : boxMethodInput == "Percent" ? str.tostring(percentInput) + "%" : "Fixed"
+    table.cell(infoTable, 0, 0, "Box Size", text_color = chart.fg_color, text_size = size.small, text_halign = text.align_left)
+    table.cell(infoTable, 1, 0, str.tostring(curBox, "#.#####") + " · " + methodTxt, text_color = chart.fg_color, text_size = size.small, text_halign = text.align_right)
+    table.cell(infoTable, 0, 1, "Reversal", text_color = chart.fg_color, text_size = size.small, text_halign = text.align_left)
+    table.cell(infoTable, 1, 1, str.tostring(reversalInput) + " boxes", text_color = chart.fg_color, text_size = size.small, text_halign = text.align_right)
+    table.cell(infoTable, 0, 2, "Column", text_color = chart.fg_color, text_size = size.small, text_halign = text.align_left)
+    table.cell(infoTable, 1, 2, (curDir == 1 ? "X × " : "O × ") + str.tostring(colCells(colCnt() - 1)), text_color = curDir == 1 ? bullColorInput : bearColorInput, text_size = size.small, text_halign = text.align_right)
+    table.cell(infoTable, 0, 3, "Last Signal", text_color = chart.fg_color, text_size = size.small, text_halign = text.align_left)
+    table.cell(infoTable, 1, 3, lastSignalTxt, text_color = lastSignalColor, text_size = size.small, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Signal Markers
+//---------------------------------------------------------------------------------------------------------------------{
+plotshape(showMarkersInput and dtBuy, "Double Top Breakout", shape.triangleup, location.belowbar, bullColorInput, size = size.tiny)
+plotshape(showMarkersInput and ttBuy, "Triple Top Breakout", shape.diamond, location.belowbar, bullColorInput, size = size.tiny)
+plotshape(showMarkersInput and dbSell, "Double Bottom Breakdown", shape.triangledown, location.abovebar, bearColorInput, size = size.tiny)
+plotshape(showMarkersInput and tbSell, "Triple Bottom Breakdown", shape.diamond, location.abovebar, bearColorInput, size = size.tiny)
+plotshape(showRevMarkInput and newXCol, "New X Column", shape.circle, location.belowbar, color.new(bullColorInput, 40), size = size.tiny)
+plotshape(showRevMarkInput and newOCol, "New O Column", shape.circle, location.abovebar, color.new(bearColorInput, 40), size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(newXCol, "New X Column (Bullish Reversal)", "{{ticker}} P&F: price reversed up into a new X column ({{interval}})")
+alertcondition(newOCol, "New O Column (Bearish Reversal)", "{{ticker}} P&F: price reversed down into a new O column ({{interval}})")
+alertcondition(dtBuy, "Double Top Breakout", "{{ticker}} P&F: double top breakout — X column printed one box above the previous X column high ({{interval}})")
+alertcondition(ttBuy, "Triple Top Breakout", "{{ticker}} P&F: triple top breakout — X column printed above two matching X column highs ({{interval}})")
+alertcondition(dbSell, "Double Bottom Breakdown", "{{ticker}} P&F: double bottom breakdown — O column printed one box below the previous O column low ({{interval}})")
+alertcondition(tbSell, "Triple Bottom Breakdown", "{{ticker}} P&F: triple bottom breakdown — O column printed below two matching O column lows ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

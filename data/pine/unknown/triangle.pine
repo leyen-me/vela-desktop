@@ -1,0 +1,586 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Triangle", "Triangle", overlay = true, max_lines_count = 500, max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+int MAX_MAJOR_PIVOTS  = 60
+int MAX_MINOR_PIVOTS  = 500
+int MAX_PREFIX_BARS   = 5000
+int PROJ_RIGHT_OFFSET = 3
+int EXT_FUTURE_CAP    = 400
+
+float SLOPE_EPS = 1e-10
+
+string DETECTION_GROUP = 'Swing Detection'
+string RULES_GROUP     = 'Triangle Rules'
+string THRUST_GROUP    = 'Thrust'
+string STYLE_GROUP     = 'Style'
+
+string SUB_OFF    = 'Off'
+string SUB_LOOSE  = 'Loose'
+string SUB_STRICT = 'Strict'
+
+string CONTRACTING_TXT = 'Contracting Triangle'
+string BARRIER_TXT     = 'Barrier Triangle'
+string EXPANDING_TXT   = 'Expanding Triangle'
+string RUNNING_TXT     = 'Running Triangle'
+
+color TRANSPARENT_COLOR = #00000000
+color GRAY_COLOR        = #787b86
+
+string POSITION_TIP = 'Valid positions in the larger count: wave 4 of an impulse, wave B of a correction, or the last leg of a combination - never a standalone wave 2. The thrust out of the triangle is typically the final wave of its degree, a move to take profits into.'
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Inputs
+//---------------------------------------------------------------------------------------------------------------------{
+
+majorLengthInput = input.int(8, 'Swing Length', minval = 2, group = DETECTION_GROUP, tooltip = 'Pivot length used to detect the swing points forming legs A through E. Larger values look for triangles at a higher degree.')
+
+minorLengthInput = input.int(3, 'Sub-Wave Length', minval = 1, group = DETECTION_GROUP, tooltip = 'Smaller pivot length used to count the sub-swings inside each leg when checking that every leg is a three. Values equal to or above the swing length are clamped below it.')
+
+subwaveModeInput = input.string(SUB_LOOSE, 'Sub-Wave Validation', options = [SUB_OFF, SUB_LOOSE, SUB_STRICT], group = DETECTION_GROUP, tooltip = 'Every leg of an Elliott triangle must subdivide into three waves, and a leg that subdivides into five breaks the pattern. A three shows about 2 interior sub-swings, a five about 4: Loose only rejects clear fives, Strict requires counts consistent with threes, Off relies on the price geometry alone.')
+
+barrierFlatInput = input.float(15, 'Barrier Flatness %', minval = 1, maxval = 50, step = 1, group = RULES_GROUP, tooltip = 'A boundary line whose total slope across the pattern stays below this percentage of the triangle widest part is treated as roughly horizontal, classifying a contracting structure as a barrier triangle when the other boundary slopes toward it.')
+
+detectExpandingInput = input.bool(true, 'Detect Expanding Triangles', group = RULES_GROUP, tooltip = 'Also detect the rare expanding variant, in which each leg exceeds the previous one and the boundaries diverge. Expanding triangles resist practical trading, so their detection can be turned off.')
+
+requireVolumeInput = input.bool(false, 'Require Fading Volume & Volatility', group = RULES_GROUP, tooltip = 'Only accept contracting, barrier and running triangles whose average volume and average true range in the second half of the pattern are below the first half, matching the expectation that volume and volatility shrink as a contracting triangle matures. The volume side is ignored when volume data is unavailable.')
+
+eOvershootInput = input.float(0.25, 'Wave E Overshoot Tolerance', minval = 0, maxval = 1, step = 0.05, group = RULES_GROUP, tooltip = 'Wave E frequently undershoots or briefly overshoots the A-C boundary before the thrust. A close beyond the A-C line by more than this fraction of the widest part voids the triangle instead.')
+
+thrustProjectionInput = input.float(1, 'Thrust Projection', minval = 0.1, step = 0.1, group = THRUST_GROUP, tooltip = 'Measuring convention for the thrust: the widest part of the triangle multiplied by this factor, projected from the breakout area. A tendency rather than a rule.')
+
+showTargetInput = input.bool(true, 'Project Thrust Target', group = THRUST_GROUP, tooltip = 'Once price breaks the B-D boundary after wave E, draws the measured thrust target together with the invalidation level inside the triangle body.')
+
+invalidationDepthInput = input.float(0.5, 'Invalidation Depth', minval = 0.1, maxval = 1, step = 0.05, group = THRUST_GROUP, tooltip = 'A close returning this deep into the triangle body, as a fraction of the body height at the breakout, is treated as evidence the count was wrong.')
+
+patternColorInput = input.color(#ff9800, 'Triangles', group = STYLE_GROUP)
+
+bullColorInput = input.color(#089981, 'Bullish Thrusts', group = STYLE_GROUP, inline = 'thrusts')
+bearColorInput = input.color(#f23645, 'Bearish Thrusts', group = STYLE_GROUP, inline = 'thrusts')
+
+showWaveLabelsInput = input.bool(true, 'Wave Labels', group = STYLE_GROUP)
+
+showSwingsInput = input.bool(true, 'Show Swings', group = STYLE_GROUP, inline = 'swings')
+swingColorInput = input.color(color.new(#787b86, 50), '', group = STYLE_GROUP, inline = 'swings')
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+// registers a confirmed pivot into a zigzag, returns 0 = no change, 1 = new swing point, 2 = last swing point extended
+f_addPivot(array<float> priceArray, array<int> barArray, array<int> dirArray, float pivotPrice, int pivotBar, int pivotDir, int maxSize) =>
+    int changeType = 0
+    int n = array.size(priceArray)
+    if n == 0
+        array.push(priceArray, pivotPrice)
+        array.push(barArray, pivotBar)
+        array.push(dirArray, pivotDir)
+        changeType := 1
+    else
+        if pivotDir == array.get(dirArray, n - 1)
+            float lastPrice = array.get(priceArray, n - 1)
+            if (pivotDir == 1 and pivotPrice >= lastPrice) or (pivotDir == -1 and pivotPrice <= lastPrice)
+                array.set(priceArray, n - 1, pivotPrice)
+                array.set(barArray, n - 1, pivotBar)
+                changeType := 2
+        else
+            array.push(priceArray, pivotPrice)
+            array.push(barArray, pivotBar)
+            array.push(dirArray, pivotDir)
+            changeType := 1
+            if array.size(priceArray) > maxSize
+                array.shift(priceArray)
+                array.shift(barArray)
+                array.shift(dirArray)
+    changeType
+
+// counts the sub-wave pivots strictly inside a leg, a proxy for its sub-wave structure
+f_interiorCount(array<int> barArray, int startBar, int endBar) =>
+    int interiorCount = 0
+    int n = array.size(barArray)
+    if n > 0
+        for i = 0 to n - 1
+            int subBar = array.get(barArray, i)
+            if subBar >= endBar
+                break
+            if subBar > startBar
+                interiorCount += 1
+    interiorCount
+
+// sub-wave check for a corrective three, per the selected validation mode
+f_isThree(int interiorCount, bool requireVisible) =>
+    bool result = true
+    if subwaveModeInput == SUB_LOOSE
+        result := interiorCount <= 3
+    else if subwaveModeInput == SUB_STRICT
+        result := interiorCount <= 3 and (not requireVisible or interiorCount >= 1)
+    result
+
+// draws or extends the faint zigzag segment joining the two most recent swing points
+f_swingSegment(array<float> priceArray, array<int> barArray, int changeType, line previousSegment) =>
+    line segment = previousSegment
+    if showSwingsInput
+        int n = array.size(priceArray)
+        if changeType == 1 and n >= 2
+            segment := line.new(array.get(barArray, n - 2), array.get(priceArray, n - 2), array.get(barArray, n - 1), array.get(priceArray, n - 1), color = swingColorInput, style = line.style_dotted)
+        else if changeType == 2 and not na(previousSegment)
+            line.set_xy2(previousSegment, array.get(barArray, n - 1), array.get(priceArray, n - 1))
+    segment
+
+// value of the straight line through (anchorBar, anchorPrice) with the given slope, evaluated at targetBar
+f_lineAt(float anchorPrice, int anchorBar, float slope, int targetBar) =>
+    anchorPrice + slope * (targetBar - anchorBar)
+
+// per-bar average of a prefix-summed series over the inclusive bar span, na when the rolling sums no longer cover it
+f_prefixAvg(array<float> prefixArray, int baseBar, int fromBar, int toBar) =>
+    float result = na
+    int prefixSize = array.size(prefixArray)
+    int fromIndex = fromBar - 1 - baseBar
+    int toIndex = toBar - baseBar
+    if fromIndex >= 0 and toIndex < prefixSize and toBar >= fromBar
+        float sumTo = array.get(prefixArray, toIndex)
+        float sumFrom = array.get(prefixArray, fromIndex)
+        result := (sumTo - sumFrom) / (toBar - fromBar + 1)
+    result
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Swing & Volume Tracking
+//---------------------------------------------------------------------------------------------------------------------{
+
+int minorLengthEff = math.max(1, math.min(minorLengthInput, majorLengthInput - 1))
+
+var array<float> majorPriceArray = array.new<float>()
+var array<int>   majorBarArray   = array.new<int>()
+var array<int>   majorDirArray   = array.new<int>()
+
+var array<float> minorPriceArray = array.new<float>()
+var array<int>   minorBarArray   = array.new<int>()
+var array<int>   minorDirArray   = array.new<int>()
+
+var line lastSwingSegment = na
+
+float majorPivotHigh = ta.pivothigh(majorLengthInput, majorLengthInput)
+float majorPivotLow  = ta.pivotlow(majorLengthInput, majorLengthInput)
+float minorPivotHigh = ta.pivothigh(minorLengthEff, minorLengthEff)
+float minorPivotLow  = ta.pivotlow(minorLengthEff, minorLengthEff)
+
+if not na(minorPivotHigh)
+    f_addPivot(minorPriceArray, minorBarArray, minorDirArray, minorPivotHigh, bar_index - minorLengthEff, 1, MAX_MINOR_PIVOTS)
+if not na(minorPivotLow)
+    f_addPivot(minorPriceArray, minorBarArray, minorDirArray, minorPivotLow, bar_index - minorLengthEff, -1, MAX_MINOR_PIVOTS)
+
+int majorChange = 0
+if not na(majorPivotHigh)
+    int changeType = f_addPivot(majorPriceArray, majorBarArray, majorDirArray, majorPivotHigh, bar_index - majorLengthInput, 1, MAX_MAJOR_PIVOTS)
+    if changeType != 0
+        majorChange := changeType
+        lastSwingSegment := f_swingSegment(majorPriceArray, majorBarArray, changeType, lastSwingSegment)
+if not na(majorPivotLow)
+    int changeType = f_addPivot(majorPriceArray, majorBarArray, majorDirArray, majorPivotLow, bar_index - majorLengthInput, -1, MAX_MAJOR_PIVOTS)
+    if changeType != 0
+        majorChange := changeType
+        lastSwingSegment := f_swingSegment(majorPriceArray, majorBarArray, changeType, lastSwingSegment)
+
+// rolling prefix sums of volume and true range, used to compare activity between the two halves of a pattern
+var array<float> volPrefixArray   = array.new<float>()
+var array<float> rangePrefixArray = array.new<float>()
+var int   volBaseBar = 0
+var float cumVolume  = 0.0
+var float cumRange   = 0.0
+
+float trueRange = ta.tr(true)
+
+cumVolume += nz(volume)
+cumRange  += nz(trueRange, high - low)
+array.push(volPrefixArray, cumVolume)
+array.push(rangePrefixArray, cumRange)
+if array.size(volPrefixArray) > MAX_PREFIX_BARS
+    array.shift(volPrefixArray)
+    array.shift(rangePrefixArray)
+    volBaseBar += 1
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Triangle Detection
+//---------------------------------------------------------------------------------------------------------------------{
+
+var int currentPatternKey  = -1
+var int currentVariant     = 0
+var int lastSetupKey       = -1
+var int lastTriangleEndBar = -1
+
+var array<line>  patternLineArray  = array.new<line>()
+var array<label> patternLabelArray = array.new<label>()
+
+var int   actState      = 0
+var int   actTrendDir   = 0
+var float actAcPrice    = na
+var int   actAcBar      = 0
+var float actAcSlope    = na
+var float actBdPrice    = na
+var int   actBdBar      = 0
+var float actBdSlope    = na
+var float actWidest     = na
+var int   actSpanBars   = 0
+var int   actTimeoutBar = 0
+var line  actAcExtLine  = na
+var line  actBdExtLine  = na
+
+var float actTarget           = na
+var float actInvalidLevel     = na
+var int   actThrustTimeoutBar = 0
+var line  actTargetLine       = na
+var line  actInvalidLine      = na
+var label actTargetLabel      = na
+
+var bool  devActive  = false
+var line  devAcLine  = na
+var line  devBdLine  = na
+var label devLabel   = na
+var float devAcPrice = na
+var int   devAcBar   = 0
+var float devAcSlope = na
+var float devBdPrice = na
+var int   devBdBar   = 0
+var float devBdSlope = na
+
+bool formingAlert     = false
+bool completedAlert   = false
+bool contractingAlert = false
+bool barrierAlert     = false
+bool expandingAlert   = false
+bool runningAlert     = false
+
+if majorChange != 0
+    int n = array.size(majorPriceArray)
+    bool completedValid = false
+
+    // the developing preview is cleared on every swing update and rebuilt below when still valid
+    if devActive
+        line.delete(devAcLine)
+        line.delete(devBdLine)
+        label.delete(devLabel)
+        devActive := false
+
+    // completed triangle, evaluated on the last six swing points as the A-B-C-D-E sequence
+    if n >= 6
+        float p0 = array.get(majorPriceArray, n - 6)
+        float p1 = array.get(majorPriceArray, n - 5)
+        float p2 = array.get(majorPriceArray, n - 4)
+        float p3 = array.get(majorPriceArray, n - 3)
+        float p4 = array.get(majorPriceArray, n - 2)
+        float p5 = array.get(majorPriceArray, n - 1)
+        int   b0 = array.get(majorBarArray, n - 6)
+        int   b1 = array.get(majorBarArray, n - 5)
+        int   b2 = array.get(majorBarArray, n - 4)
+        int   b3 = array.get(majorBarArray, n - 3)
+        int   b4 = array.get(majorBarArray, n - 2)
+        int   b5 = array.get(majorBarArray, n - 1)
+
+        int dirLegA = p1 > p0 ? 1 : -1
+        int dirLegB = p2 > p1 ? 1 : -1
+        int dirLegC = p3 > p2 ? 1 : -1
+        int dirLegD = p4 > p3 ? 1 : -1
+        int dirLegE = p5 > p4 ? 1 : -1
+
+        float lenA = math.abs(p1 - p0)
+        float lenB = math.abs(p2 - p1)
+        float lenC = math.abs(p3 - p2)
+        float lenD = math.abs(p4 - p3)
+        float lenE = math.abs(p5 - p4)
+
+        bool alternating = lenA > 0 and lenB > 0 and lenC > 0 and lenD > 0 and lenE > 0 and dirLegB == -dirLegA and dirLegC == dirLegA and dirLegD == -dirLegA and dirLegE == dirLegA
+        bool orderedBars = b0 < b1 and b1 < b2 and b2 < b3 and b3 < b4 and b4 < b5
+        bool freshWindow = b4 == currentPatternKey or b0 >= lastTriangleEndBar
+
+        if alternating and orderedBars and freshWindow
+            int trendDir = -dirLegA
+
+            float acSlope = (p3 - p1) / (b3 - b1)
+            float bdSlope = (p4 - p2) / (b4 - b2)
+
+            float sepStart = trendDir * (f_lineAt(p2, b2, bdSlope, b1) - p1)
+            float sepEnd   = trendDir * (f_lineAt(p2, b2, bdSlope, b5) - f_lineAt(p1, b1, acSlope, b5))
+
+            bool boundariesValid = sepStart > 0 and sepEnd > 0
+            bool converging      = sepEnd < sepStart
+            bool diverging       = sepEnd > sepStart
+
+            float widest = math.max(sepStart, sepEnd)
+
+            bool acFlat = math.abs(acSlope) * (b5 - b1) <= barrierFlatInput / 100 * widest
+            bool bdFlat = math.abs(bdSlope) * (b5 - b2) <= barrierFlatInput / 100 * widest
+
+            bool threeA = f_isThree(f_interiorCount(minorBarArray, b0, b1), true)
+            bool threeB = f_isThree(f_interiorCount(minorBarArray, b1, b2), false)
+            bool threeC = f_isThree(f_interiorCount(minorBarArray, b2, b3), false)
+            bool threeD = f_isThree(f_interiorCount(minorBarArray, b3, b4), false)
+            bool threeE = f_isThree(f_interiorCount(minorBarArray, b4, b5), false)
+            bool allThrees = threeA and threeB and threeC and threeD and threeE
+
+            // the barrier variant lets the legs along its flat boundary stall at the same level, so the
+            // leg-contraction checks carry a slack of the flatness tolerance next to the strict reading
+            float flatSlack    = barrierFlatInput / 100 * widest
+            bool runningB      = trendDir == 1 ? p2 > p0 : p2 < p0
+            bool shrinkStrict  = lenC < lenB and lenD < lenC and lenE < lenD
+            bool shrinkFlat    = lenC < lenB + flatSlack and lenD < lenC + flatSlack and lenE < lenD + flatSlack
+            bool expandingLegs = lenB > lenA and lenC > lenB and lenD > lenC and lenE > lenD
+
+            int variant = 0
+            if boundariesValid and allThrees
+                if detectExpandingInput and expandingLegs and diverging
+                    variant := 3
+                else if runningB and shrinkFlat and converging
+                    variant := 4
+                else if lenB < lenA and converging
+                    variant := acFlat != bdFlat and shrinkFlat ? 2 : shrinkStrict ? 1 : 0
+
+            // volume and volatility behavior across the two halves of the pattern
+            float volDeltaPct   = na
+            float rangeDeltaPct = na
+            int   volMidBar     = math.round(math.avg(b0, b5))
+            float volFirstAvg    = f_prefixAvg(volPrefixArray, volBaseBar, b0, volMidBar)
+            float volSecondAvg   = f_prefixAvg(volPrefixArray, volBaseBar, volMidBar + 1, b5)
+            float rangeFirstAvg  = f_prefixAvg(rangePrefixArray, volBaseBar, b0, volMidBar)
+            float rangeSecondAvg = f_prefixAvg(rangePrefixArray, volBaseBar, volMidBar + 1, b5)
+            if not na(volFirstAvg) and not na(volSecondAvg) and volFirstAvg > 0
+                volDeltaPct := (volSecondAvg / volFirstAvg - 1) * 100
+            if not na(rangeFirstAvg) and not na(rangeSecondAvg) and rangeFirstAvg > 0
+                rangeDeltaPct := (rangeSecondAvg / rangeFirstAvg - 1) * 100
+            bool fadingOk = (na(volDeltaPct) or volDeltaPct < 0) and (na(rangeDeltaPct) or rangeDeltaPct < 0)
+            if variant != 0 and variant != 3 and requireVolumeInput and not fadingOk
+                variant := 0
+
+            if variant != 0
+                completedValid := true
+                int patternKey = b4
+                bool newPattern = patternKey != currentPatternKey
+                if not newPattern
+                    int lineCount = array.size(patternLineArray)
+                    if lineCount > 0
+                        for i = 0 to lineCount - 1
+                            line.delete(array.get(patternLineArray, i))
+                    int labelCount = array.size(patternLabelArray)
+                    if labelCount > 0
+                        for i = 0 to labelCount - 1
+                            label.delete(array.get(patternLabelArray, i))
+                    if not na(actAcExtLine)
+                        line.delete(actAcExtLine)
+                    if not na(actBdExtLine)
+                        line.delete(actBdExtLine)
+                array.clear(patternLineArray)
+                array.clear(patternLabelArray)
+
+                array.push(patternLineArray, line.new(b0, p0, b1, p1, color = patternColorInput, width = 2))
+                array.push(patternLineArray, line.new(b1, p1, b2, p2, color = patternColorInput, width = 2))
+                array.push(patternLineArray, line.new(b2, p2, b3, p3, color = patternColorInput, width = 2))
+                array.push(patternLineArray, line.new(b3, p3, b4, p4, color = patternColorInput, width = 2))
+                array.push(patternLineArray, line.new(b4, p4, b5, p5, color = patternColorInput, width = 2))
+
+                float acEndPrice = f_lineAt(p1, b1, acSlope, b5)
+                float bdEndPrice = f_lineAt(p2, b2, bdSlope, b5)
+                array.push(patternLineArray, line.new(b1, p1, b5, acEndPrice, color = color.new(patternColorInput, 25)))
+                array.push(patternLineArray, line.new(b2, p2, b5, bdEndPrice, color = color.new(patternColorInput, 25)))
+
+                int   spanBars = b5 - b0
+                float slopeGap = acSlope - bdSlope
+                float apexBarF = math.abs(slopeGap) > SLOPE_EPS ? b1 + (f_lineAt(p2, b2, bdSlope, b1) - p1) / slopeGap : b5 + 2 * spanBars
+                int extEndBar = variant == 3 ? b5 + spanBars : math.round(math.min(apexBarF, b5 + 2 * spanBars))
+                extEndBar := math.max(extEndBar, b5 + 1)
+                extEndBar := math.min(extEndBar, bar_index + EXT_FUTURE_CAP)
+                actAcExtLine := line.new(b5, acEndPrice, extEndBar, f_lineAt(p1, b1, acSlope, extEndBar), color = color.new(patternColorInput, 50), style = line.style_dotted)
+                actBdExtLine := line.new(b5, bdEndPrice, extEndBar, f_lineAt(p2, b2, bdSlope, extEndBar), color = color.new(patternColorInput, 50), style = line.style_dotted)
+
+                string acStyle = dirLegA == 1 ? label.style_label_down : label.style_label_up
+                string bdStyle = dirLegA == 1 ? label.style_label_up : label.style_label_down
+                if showWaveLabelsInput
+                    array.push(patternLabelArray, label.new(b1, p1, 'A', color = TRANSPARENT_COLOR, textcolor = patternColorInput, style = acStyle, size = size.small))
+                    array.push(patternLabelArray, label.new(b2, p2, 'B', color = TRANSPARENT_COLOR, textcolor = patternColorInput, style = bdStyle, size = size.small))
+                    array.push(patternLabelArray, label.new(b3, p3, 'C', color = TRANSPARENT_COLOR, textcolor = patternColorInput, style = acStyle, size = size.small))
+                    array.push(patternLabelArray, label.new(b4, p4, 'D', color = TRANSPARENT_COLOR, textcolor = patternColorInput, style = bdStyle, size = size.small))
+                    array.push(patternLabelArray, label.new(b5, p5, 'E', color = TRANSPARENT_COLOR, textcolor = patternColorInput, style = acStyle, size = size.small))
+
+                string variantText = variant == 1 ? CONTRACTING_TXT : variant == 2 ? BARRIER_TXT : variant == 3 ? EXPANDING_TXT : RUNNING_TXT
+                string volText   = na(volDeltaPct) ? '' : ', Vol ' + (volDeltaPct >= 0 ? '+' : '') + str.tostring(volDeltaPct, '#') + '%'
+                string rangeText = na(rangeDeltaPct) ? '' : ', Range ' + (rangeDeltaPct >= 0 ? '+' : '') + str.tostring(rangeDeltaPct, '#') + '%'
+                string titleText = variantText + '\nE ≈ ' + str.tostring(lenE / lenA, '#.##') + ' × A' + volText + rangeText
+                float topY    = math.max(math.max(math.max(p0, p1), math.max(p2, p3)), math.max(p4, p5))
+                float bottomY = math.min(math.min(math.min(p0, p1), math.min(p2, p3)), math.min(p4, p5))
+                int   titleBar = math.round(math.avg(b0, b5))
+                float titleY = trendDir == 1 ? bottomY : topY
+                string titleStyle = trendDir == 1 ? label.style_label_up : label.style_label_down
+                array.push(patternLabelArray, label.new(titleBar, titleY, titleText, color = TRANSPARENT_COLOR, textcolor = patternColorInput, style = titleStyle, size = size.small, tooltip = POSITION_TIP))
+
+                actState := 1
+                actTrendDir := trendDir
+                actAcPrice := p1
+                actAcBar := b1
+                actAcSlope := acSlope
+                actBdPrice := p2
+                actBdBar := b2
+                actBdSlope := bdSlope
+                actWidest := widest
+                actSpanBars := spanBars
+                actTimeoutBar := extEndBar
+                lastTriangleEndBar := b5
+
+                if newPattern
+                    currentPatternKey := patternKey
+                    completedAlert := true
+                    contractingAlert := variant == 1
+                    barrierAlert := variant == 2
+                    expandingAlert := variant == 3
+                    runningAlert := variant == 4
+                else if variant != currentVariant
+                    contractingAlert := variant == 1
+                    barrierAlert := variant == 2
+                    expandingAlert := variant == 3
+                    runningAlert := variant == 4
+                currentVariant := variant
+
+    // developing triangle, legs A through D in place while wave E is still forming
+    if n >= 5 and not completedValid
+        float q0 = array.get(majorPriceArray, n - 5)
+        float q1 = array.get(majorPriceArray, n - 4)
+        float q2 = array.get(majorPriceArray, n - 3)
+        float q3 = array.get(majorPriceArray, n - 2)
+        float q4 = array.get(majorPriceArray, n - 1)
+        int   c0 = array.get(majorBarArray, n - 5)
+        int   c1 = array.get(majorBarArray, n - 4)
+        int   c2 = array.get(majorBarArray, n - 3)
+        int   c3 = array.get(majorBarArray, n - 2)
+        int   c4 = array.get(majorBarArray, n - 1)
+
+        int dirSetupA = q1 > q0 ? 1 : -1
+        int dirSetupB = q2 > q1 ? 1 : -1
+        int dirSetupC = q3 > q2 ? 1 : -1
+        int dirSetupD = q4 > q3 ? 1 : -1
+
+        float setupLenA = math.abs(q1 - q0)
+        float setupLenB = math.abs(q2 - q1)
+        float setupLenC = math.abs(q3 - q2)
+        float setupLenD = math.abs(q4 - q3)
+
+        bool setupAlternating = setupLenA > 0 and setupLenB > 0 and setupLenC > 0 and setupLenD > 0 and dirSetupB == -dirSetupA and dirSetupC == dirSetupA and dirSetupD == -dirSetupA
+        bool setupOrdered = c0 < c1 and c1 < c2 and c2 < c3 and c3 < c4
+
+        if setupAlternating and setupOrdered and c0 >= lastTriangleEndBar
+            int setupTrendDir = -dirSetupA
+
+            float setupAcSlope = (q3 - q1) / (c3 - c1)
+            float setupBdSlope = (q4 - q2) / (c4 - c2)
+
+            float setupSepStart = setupTrendDir * (f_lineAt(q2, c2, setupBdSlope, c1) - q1)
+            float setupSepEnd   = setupTrendDir * (f_lineAt(q2, c2, setupBdSlope, c4) - f_lineAt(q1, c1, setupAcSlope, c4))
+
+            bool setupBoundaries = setupSepStart > 0 and setupSepEnd > 0
+            bool setupConverging = setupSepEnd < setupSepStart
+            bool setupRunningB   = setupTrendDir == 1 ? q2 > q0 : q2 < q0
+            float setupSlack     = barrierFlatInput / 100 * math.max(setupSepStart, setupSepEnd)
+            bool setupShrinkTail = setupLenC < setupLenB + setupSlack and setupLenD < setupLenC + setupSlack
+
+            bool setupContracting = (setupLenB < setupLenA or setupRunningB) and setupShrinkTail and setupConverging
+            bool setupExpanding   = detectExpandingInput and setupLenB > setupLenA and setupLenC > setupLenB and setupLenD > setupLenC and setupSepEnd > setupSepStart
+
+            bool setupThrees = f_isThree(f_interiorCount(minorBarArray, c0, c1), true) and f_isThree(f_interiorCount(minorBarArray, c1, c2), false) and f_isThree(f_interiorCount(minorBarArray, c2, c3), false) and f_isThree(f_interiorCount(minorBarArray, c3, c4), false)
+
+            if setupBoundaries and setupThrees and (setupContracting or setupExpanding)
+                if c3 != lastSetupKey
+                    lastSetupKey := c3
+                    formingAlert := true
+                devAcPrice := q1
+                devAcBar := c1
+                devAcSlope := setupAcSlope
+                devBdPrice := q2
+                devBdBar := c2
+                devBdSlope := setupBdSlope
+                int rightBar = bar_index + PROJ_RIGHT_OFFSET
+                devAcLine := line.new(c1, q1, rightBar, f_lineAt(q1, c1, setupAcSlope, rightBar), color = color.new(patternColorInput, 40), style = line.style_dotted)
+                devBdLine := line.new(c2, q2, rightBar, f_lineAt(q2, c2, setupBdSlope, rightBar), color = color.new(patternColorInput, 40), style = line.style_dotted)
+                devLabel := label.new(rightBar, f_lineAt(q2, c2, setupBdSlope, rightBar), 'triangle forming', color = TRANSPARENT_COLOR, textcolor = color.new(patternColorInput, 20), style = label.style_label_left, size = size.tiny)
+                devActive := true
+
+// keep the developing preview anchored to the latest bar
+if devActive
+    int rightBar = bar_index + PROJ_RIGHT_OFFSET
+    float devAcY = f_lineAt(devAcPrice, devAcBar, devAcSlope, rightBar)
+    float devBdY = f_lineAt(devBdPrice, devBdBar, devBdSlope, rightBar)
+    line.set_xy2(devAcLine, rightBar, devAcY)
+    line.set_xy2(devBdLine, rightBar, devBdY)
+    label.delete(devLabel)
+    devLabel := label.new(rightBar, devBdY, 'triangle forming', color = TRANSPARENT_COLOR, textcolor = color.new(patternColorInput, 20), style = label.style_label_left, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Thrust Monitoring
+//---------------------------------------------------------------------------------------------------------------------{
+
+bool bullThrustAlert  = false
+bool bearThrustAlert  = false
+bool targetAlert      = false
+bool violatedAlert    = false
+bool invalidatedAlert = false
+
+if actState == 1
+    float acNow = f_lineAt(actAcPrice, actAcBar, actAcSlope, bar_index)
+    float bdNow = f_lineAt(actBdPrice, actBdBar, actBdSlope, bar_index)
+    if bar_index > actTimeoutBar
+        actState := 0
+    else if (actTrendDir == 1 and close > bdNow) or (actTrendDir == -1 and close < bdNow)
+        actState := 2
+        actTarget := bdNow + actTrendDir * thrustProjectionInput * actWidest
+        float bodyHeight = actTrendDir * (bdNow - acNow)
+        actInvalidLevel := bdNow - actTrendDir * invalidationDepthInput * bodyHeight
+        actThrustTimeoutBar := bar_index + 2 * actSpanBars
+        color thrustColor = actTrendDir == 1 ? bullColorInput : bearColorInput
+        label.new(bar_index, bdNow, 'Thrust', color = TRANSPARENT_COLOR, textcolor = thrustColor, style = actTrendDir == 1 ? label.style_label_up : label.style_label_down, size = size.small)
+        if showTargetInput
+            actTargetLine := line.new(bar_index, actTarget, bar_index + PROJ_RIGHT_OFFSET, actTarget, color = color.new(thrustColor, 30), style = line.style_dotted)
+            actTargetLabel := label.new(bar_index + PROJ_RIGHT_OFFSET, actTarget, str.tostring(thrustProjectionInput, '#.###') + ' × widest', color = TRANSPARENT_COLOR, textcolor = color.new(thrustColor, 20), style = label.style_label_left, size = size.tiny)
+            actInvalidLine := line.new(bar_index, actInvalidLevel, bar_index + PROJ_RIGHT_OFFSET, actInvalidLevel, color = color.new(GRAY_COLOR, 50), style = line.style_dashed)
+        bullThrustAlert := actTrendDir == 1
+        bearThrustAlert := actTrendDir == -1
+    else if (actTrendDir == 1 and close < acNow - eOvershootInput * actWidest) or (actTrendDir == -1 and close > acNow + eOvershootInput * actWidest)
+        actState := 0
+        violatedAlert := true
+        label.new(bar_index, close, 'Violated', color = TRANSPARENT_COLOR, textcolor = GRAY_COLOR, style = actTrendDir == 1 ? label.style_label_up : label.style_label_down, size = size.tiny)
+
+if actState == 2
+    if showTargetInput and not na(actTargetLine)
+        line.set_x2(actTargetLine, bar_index + PROJ_RIGHT_OFFSET)
+        label.set_x(actTargetLabel, bar_index + PROJ_RIGHT_OFFSET)
+        line.set_x2(actInvalidLine, bar_index + PROJ_RIGHT_OFFSET)
+    bool targetHit    = actTrendDir == 1 ? high >= actTarget : low <= actTarget
+    bool returnedDeep = actTrendDir == 1 ? close < actInvalidLevel : close > actInvalidLevel
+    if targetHit
+        actState := 0
+        targetAlert := true
+        label.new(bar_index, actTarget, 'Target hit', color = TRANSPARENT_COLOR, textcolor = actTrendDir == 1 ? bullColorInput : bearColorInput, style = actTrendDir == 1 ? label.style_label_down : label.style_label_up, size = size.tiny)
+    else if returnedDeep
+        actState := 0
+        invalidatedAlert := true
+        label.new(bar_index, actInvalidLevel, 'Count invalidated', color = TRANSPARENT_COLOR, textcolor = GRAY_COLOR, style = actTrendDir == 1 ? label.style_label_up : label.style_label_down, size = size.tiny)
+    else if bar_index > actThrustTimeoutBar
+        actState := 0
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(formingAlert, 'Triangle Forming', 'Legs A-D of a possible Elliott triangle are in place — sideways overlap may continue while wave E completes, discouraging premature breakout entries')
+alertcondition(completedAlert, 'Triangle Completed', 'A five-legged A-B-C-D-E triangle has completed — watch for the thrust out of the pattern')
+alertcondition(contractingAlert, 'Contracting Triangle', 'Contracting triangle completed: each leg shorter than the last with converging A-C and B-D boundaries')
+alertcondition(barrierAlert, 'Barrier Triangle', 'Barrier triangle completed: one boundary roughly horizontal while the other slopes toward it')
+alertcondition(expandingAlert, 'Expanding Triangle', 'Expanding triangle completed: each leg exceeds the previous one and the boundaries diverge — rare and difficult to trade')
+alertcondition(runningAlert, 'Running Triangle', 'Running triangle completed: wave B exceeded the start of wave A, often read as a sign of strength in the larger trend')
+alertcondition(bullThrustAlert, 'Bullish Thrust', 'Upward thrust out of the triangle — typically the final wave of its sequence, often treated as a move to take profits into')
+alertcondition(bearThrustAlert, 'Bearish Thrust', 'Downward thrust out of the triangle — typically the final wave of its sequence, often treated as a move to take profits into')
+alertcondition(targetAlert, 'Thrust Target Reached', 'The thrust reached the target projected from the widest part of the triangle')
+alertcondition(violatedAlert, 'Triangle Violated', 'Price closed beyond the A-C boundary past the wave E tolerance before any thrust — the triangle count is suspect')
+alertcondition(invalidatedAlert, 'Thrust Invalidated', 'Price returned deep into the triangle body after the thrust — evidence the count was wrong')
+
+//---------------------------------------------------------------------------------------------------------------------}

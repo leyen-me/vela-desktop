@@ -1,0 +1,430 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Elliott Hard Rules", shorttitle = "Elliott Hard Rules", overlay = true, max_lines_count = 50, max_labels_count = 50)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+WARN_COLOR    = #ff9800   // the one accent - overlap tolerated under the diagonal exception
+STRUCT_COLOR  = #787b86   // candidate structure is structure - grey
+NEUTRAL_COLOR = #787b86
+HIDDEN_COLOR  = #00000000
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+MAX_PIVOTS = 30
+
+SWING_GROUP = 'Swing Detection'
+RULES_GROUP = 'Rule Engine'
+DISP_GROUP  = 'Display'
+DASH_GROUP  = 'Dashboard'
+STYLE_GROUP = 'Style'
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+pivotLengthInput = input.int(10, 'Pivot Length', minval = 2, maxval = 100, group = SWING_GROUP, tooltip = 'Bars to the left and right that must be lower (higher) for a swing high (low) to confirm. The six most recent swing points anchor the candidate five-wave count — raise it to validate counts on major structure, lower it for minor counts.')
+
+directionInput = input.string('Auto', 'Count Selection', options = ['Auto', 'Bullish', 'Bearish'], group = RULES_GROUP, tooltip = 'Candidate count fed to the rule engine. Auto validates the six most recent swing points as waves 0-5, so the tracked count re-anchors on every new swing. Bullish or Bearish locks onto the most recent candidate ending on a swing high or a swing low respectively, keeping the tracked count stable while the next leg develops.')
+
+diagonalInput = input.bool(false, 'Diagonal Count (tolerate W1-W4 overlap)', group = RULES_GROUP, tooltip = 'Leading and ending diagonals are the recognized exception to the overlap rule. When enabled, a wave 4 entering wave-1 price territory is reported as tolerated overlap instead of invalidating the count. Rules 1 and 2 still apply in full.')
+
+showLevelsInput = input.bool(true, 'Invalidation Levels', group = DISP_GROUP, tooltip = 'Draw the exact prices where each hard rule breaks: the wave-1 origin (Rule 1), the wave-5 cap active while wave 3 is shorter than wave 1 (Rule 2), and the wave-1 extreme that wave 4 must not re-enter (Rule 3). A level turns solid once broken.')
+
+showZigzagInput = input.bool(true, 'Candidate Wave Structure', group = DISP_GROUP, tooltip = 'Connect the six swing points of the tracked candidate count. The last segment is dotted while its end point is still developing and can extend with price.')
+
+showWaveLabelsInput = input.bool(true, 'Wave Numbers', group = DISP_GROUP, tooltip = 'Label the candidate swing points 0 to 5, with 0 marking the origin of wave 1.')
+
+showDashInput = input.bool(true, 'Show Dashboard', group = DASH_GROUP, tooltip = 'Per-rule pass/fail status, the exact price where each rule would break, and the overall verdict for the tracked count.')
+
+dashPosInput = input.string('Top Right', 'Position', options = ['Top Right', 'Top Left', 'Bottom Right', 'Bottom Left'], group = DASH_GROUP, tooltip = 'Chart corner where the dashboard is anchored.')
+
+dashSizeInput = input.string('Small', 'Size', options = ['Tiny', 'Small', 'Normal'], group = DASH_GROUP, tooltip = 'Dashboard text size.')
+
+passColorInput = input.color(BULL_COLOR, 'Pass', group = STYLE_GROUP, inline = 'pf', tooltip = 'Color for rules the tracked count satisfies and for bullish candidates.')
+failColorInput = input.color(BEAR_COLOR, 'Fail', group = STYLE_GROUP, inline = 'pf', tooltip = 'Color for broken rules, invalidation levels, and bearish candidates.')
+
+warnColorInput = input.color(WARN_COLOR, 'Tolerated Overlap', group = STYLE_GROUP, tooltip = 'Color used when wave-4 overlap is tolerated under the diagonal exception.')
+
+structureColorInput = input.color(STRUCT_COLOR, 'Candidate Structure', group = STYLE_GROUP, tooltip = 'Color of the candidate wave structure and wave numbers.')
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Swing Structure
+//---------------------------------------------------------------------------------------------------------------------{
+// Alternating swing points, most recent last — each entry is the confirmed extreme of one leg
+var array<float> pivotPriceArray = array.new<float>()
+var array<int>   pivotBarArray   = array.new<int>()
+var array<bool>  pivotHighArray  = array.new<bool>()
+
+addPivot(float price, int barIdx, bool isHigh) =>
+    array.push(pivotPriceArray, price)
+    array.push(pivotBarArray, barIdx)
+    array.push(pivotHighArray, isHigh)
+    if array.size(pivotPriceArray) > MAX_PIVOTS
+        array.shift(pivotPriceArray)
+        array.shift(pivotBarArray)
+        array.shift(pivotHighArray)
+
+// Append when the swing alternates, extend the last swing when a more extreme same-side pivot prints
+processPivot(float price, int barIdx, bool isHigh) =>
+    bool changed = false
+    int n = array.size(pivotPriceArray)
+    if n == 0
+        addPivot(price, barIdx, isHigh)
+        changed := true
+    else
+        bool  lastIsHigh = array.get(pivotHighArray, n - 1)
+        float lastPrice  = array.get(pivotPriceArray, n - 1)
+        if lastIsHigh == isHigh
+            if (isHigh and price > lastPrice) or (not isHigh and price < lastPrice)
+                array.set(pivotPriceArray, n - 1, price)
+                array.set(pivotBarArray, n - 1, barIdx)
+                changed := true
+        else
+            addPivot(price, barIdx, isHigh)
+            changed := true
+    changed
+
+pivotHigh = ta.pivothigh(pivotLengthInput, pivotLengthInput)
+pivotLow  = ta.pivotlow(pivotLengthInput, pivotLengthInput)
+
+confirmBar = bar_index - pivotLengthInput
+
+bool pivotEvent = false
+
+if not na(pivotHigh)
+    if processPivot(pivotHigh, confirmBar, true)
+        pivotEvent := true
+if not na(pivotLow)
+    if processPivot(pivotLow, confirmBar, false)
+        pivotEvent := true
+
+// Developing-leg extremes — the running end point of the leg after the last confirmed swing,
+// also used to catch intrabar breaches of the rule levels before the next pivot confirms
+var float devHigh    = high
+var float devLow     = low
+var int   devHighBar = 0
+var int   devLowBar  = 0
+
+if pivotEvent
+    float legHigh    = high
+    float legLow     = low
+    int   legHighBar = bar_index
+    int   legLowBar  = bar_index
+    for i = 1 to pivotLengthInput - 1
+        if high[i] > legHigh
+            legHigh    := high[i]
+            legHighBar := bar_index - i
+        if low[i] < legLow
+            legLow    := low[i]
+            legLowBar := bar_index - i
+    devHigh    := legHigh
+    devHighBar := legHighBar
+    devLow     := legLow
+    devLowBar  := legLowBar
+else
+    if high > devHigh
+        devHigh    := high
+        devHighBar := bar_index
+    if low < devLow
+        devLow    := low
+        devLowBar := bar_index
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Candidate Count
+//---------------------------------------------------------------------------------------------------------------------{
+int pivotCount = array.size(pivotPriceArray)
+
+bool lastPivotIsHigh = false
+if pivotCount > 0
+    lastPivotIsHigh := array.get(pivotHighArray, pivotCount - 1)
+
+bool  provIsHigh = not lastPivotIsHigh
+float provPrice  = provIsHigh ? devHigh : devLow
+int   provBar    = provIsHigh ? devHighBar : devLowBar
+
+// Auto ends the count on the developing swing, Bullish/Bearish lock the end onto a high/low point
+bool endAtProv    = directionInput == 'Auto' ? true : directionInput == 'Bullish' ? provIsHigh : not provIsHigh
+bool haveCandidate = endAtProv ? pivotCount >= 5 : pivotCount >= 6
+
+array<float> candPriceArray = array.new<float>()
+array<int>   candBarArray   = array.new<int>()
+
+float c0 = na
+float c1 = na
+float c2 = na
+float c3 = na
+float c4 = na
+float c5 = na
+
+int b0 = -1
+int b1 = -1
+int b2 = -1
+int b3 = -1
+int b4 = -1
+int b5 = -1
+
+bool c5Live  = haveCandidate and endAtProv
+bool candBull = false
+
+if haveCandidate
+    int startIdx = endAtProv ? pivotCount - 5 : pivotCount - 6
+    for i = startIdx to pivotCount - 1
+        array.push(candPriceArray, array.get(pivotPriceArray, i))
+        array.push(candBarArray, array.get(pivotBarArray, i))
+    if endAtProv
+        array.push(candPriceArray, provPrice)
+        array.push(candBarArray, provBar)
+    c0 := array.get(candPriceArray, 0)
+    c1 := array.get(candPriceArray, 1)
+    c2 := array.get(candPriceArray, 2)
+    c3 := array.get(candPriceArray, 3)
+    c4 := array.get(candPriceArray, 4)
+    c5 := array.get(candPriceArray, 5)
+    b0 := array.get(candBarArray, 0)
+    b1 := array.get(candBarArray, 1)
+    b2 := array.get(candBarArray, 2)
+    b3 := array.get(candBarArray, 3)
+    b4 := array.get(candBarArray, 4)
+    b5 := array.get(candBarArray, 5)
+    candBull := endAtProv ? provIsHigh : lastPivotIsHigh
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Rule Engine
+//---------------------------------------------------------------------------------------------------------------------{
+float w1 = na
+float w3 = na
+float w5 = na
+
+bool  r1FailRaw    = false
+bool  r2FailRaw    = false
+bool  r3OverlapRaw = false
+float capPrice     = na
+
+if haveCandidate
+    if candBull
+        w1 := c1 - c0
+        w3 := c3 - c2
+        w5 := math.max(c5, devHigh) - c4
+        // Rule 1 — wave 2 never retraces beyond the wave-1 origin, a print below it even briefly breaks the count
+        r1FailRaw := c2 < c0 or devLow < c0
+        // Rule 3 — wave 4 never enters wave-1 price territory (below the wave-1 extreme)
+        r3OverlapRaw := c4 < c1 or (c5Live and devLow < c1)
+    else
+        w1 := c0 - c1
+        w3 := c2 - c3
+        w5 := c4 - math.min(c5, devLow)
+        r1FailRaw := c2 > c0 or devHigh > c0
+        r3OverlapRaw := c4 > c1 or (c5Live and devHigh > c1)
+    // Rule 2 — wave 3 is never the shortest of waves 1, 3 and 5. While wave 3 is shorter than
+    // wave 1, wave 5 carries a hard cap at the wave-3 length beyond which the count dies
+    r2FailRaw := w3 < w1 and w3 < w5
+    if w3 < w1
+        capPrice := candBull ? c4 + w3 : c4 - w3
+
+// Candidate identity — rule breaks latch per candidate, a re-anchored count re-arms the engine
+int candDirKey = candBull ? 1 : 0
+bool sameCandidate = haveCandidate and b0 == nz(b0[1], -9) and b4 == nz(b4[1], -9) and candDirKey == nz(candDirKey[1], -9)
+
+var bool r1Latch = false
+var bool r2Latch = false
+var bool r3Latch = false
+
+bool r1Prev = r1Latch
+bool r2Prev = r2Latch
+bool r3Prev = r3Latch
+
+if not sameCandidate
+    r1Latch := false
+    r2Latch := false
+    r3Latch := false
+
+r1Latch := r1Latch or r1FailRaw
+r2Latch := r2Latch or r2FailRaw
+r3Latch := r3Latch or r3OverlapRaw
+
+bool overlapTolerated = r3Latch and diagonalInput
+bool anyFail          = r1Latch or r2Latch or (r3Latch and not diagonalInput)
+bool countValid       = haveCandidate and not anyFail
+
+bool rule1Break   = sameCandidate and r1Latch and not r1Prev
+bool rule2Break   = sameCandidate and r2Latch and not r2Prev
+bool rule3Break   = sameCandidate and not diagonalInput and r3Latch and not r3Prev
+bool anyRuleBreak = rule1Break or rule2Break or rule3Break
+
+var bool countValidPrev = false
+bool countValidated = countValid and not (sameCandidate and countValidPrev)
+countValidPrev := countValid
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Candidate Structure
+//---------------------------------------------------------------------------------------------------------------------{
+var array<line>  zzLineArray    = array.new<line>()
+var array<label> waveLabelArray = array.new<label>()
+
+if showZigzagInput and haveCandidate
+    if array.size(zzLineArray) == 0
+        for i = 0 to 4
+            array.push(zzLineArray, line.new(bar_index, close, bar_index, close, color = structureColorInput, width = 1))
+    for i = 0 to 4
+        line segLine = array.get(zzLineArray, i)
+        line.set_xy1(segLine, array.get(candBarArray, i), array.get(candPriceArray, i))
+        line.set_xy2(segLine, array.get(candBarArray, i + 1), array.get(candPriceArray, i + 1))
+        line.set_style(segLine, i == 4 and c5Live ? line.style_dotted : line.style_solid)
+        line.set_color(segLine, structureColorInput)
+
+if showWaveLabelsInput and haveCandidate
+    if array.size(waveLabelArray) == 0
+        for i = 0 to 5
+            array.push(waveLabelArray, label.new(bar_index, close, '', color = HIDDEN_COLOR, textcolor = structureColorInput, size = size.small))
+    for i = 0 to 5
+        bool pointIsHigh = candBull ? i % 2 == 1 : i % 2 == 0
+        label waveLabel = array.get(waveLabelArray, i)
+        label.set_xy(waveLabel, array.get(candBarArray, i), array.get(candPriceArray, i))
+        label.set_text(waveLabel, str.tostring(i))
+        label.set_style(waveLabel, pointIsHigh ? label.style_label_down : label.style_label_up)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Invalidation Levels
+//---------------------------------------------------------------------------------------------------------------------{
+var line  r1LineId  = na
+var label r1LabelId = na
+var line  r3LineId  = na
+var label r3LabelId = na
+var line  r2LineId  = na
+var label r2LabelId = na
+
+if showLevelsInput and haveCandidate
+    if na(r1LineId)
+        r1LineId  := line.new(b0, c0, bar_index, c0, color = failColorInput, style = line.style_dashed)
+        r1LabelId := label.new(bar_index, c0, '', color = HIDDEN_COLOR, style = label.style_label_left, textcolor = failColorInput, size = size.tiny)
+        r3LineId  := line.new(b1, c1, bar_index, c1, color = failColorInput, style = line.style_dashed)
+        r3LabelId := label.new(bar_index, c1, '', color = HIDDEN_COLOR, style = label.style_label_left, textcolor = failColorInput, size = size.tiny)
+    // Rule 1 level — the wave-1 origin, the structural stop for wave-2 and wave-3 positions
+    line.set_xy1(r1LineId, b0, c0)
+    line.set_xy2(r1LineId, bar_index, c0)
+    line.set_style(r1LineId, r1Latch ? line.style_solid : line.style_dashed)
+    line.set_width(r1LineId, r1Latch ? 2 : 1)
+    label.set_xy(r1LabelId, bar_index, c0)
+    label.set_text(r1LabelId, 'R1 · ' + str.tostring(c0, format.mintick))
+    // Rule 3 level — the wave-1 extreme, the structural stop for wave-4 positions
+    color r3Color = overlapTolerated ? warnColorInput : failColorInput
+    line.set_xy1(r3LineId, b1, c1)
+    line.set_xy2(r3LineId, bar_index, c1)
+    line.set_style(r3LineId, r3Latch ? line.style_solid : line.style_dashed)
+    line.set_width(r3LineId, r3Latch ? 2 : 1)
+    line.set_color(r3LineId, r3Color)
+    label.set_xy(r3LabelId, bar_index, c1)
+    label.set_text(r3LabelId, 'R3 · ' + str.tostring(c1, format.mintick))
+    label.set_textcolor(r3LabelId, r3Color)
+
+// Rule 2 level — wave-5 cap, only lives while wave 3 is shorter than wave 1
+bool capActive = showLevelsInput and haveCandidate and not na(capPrice)
+
+if capActive
+    if na(r2LineId)
+        r2LineId  := line.new(b4, capPrice, bar_index, capPrice, color = failColorInput, style = line.style_dashed)
+        r2LabelId := label.new(bar_index, capPrice, '', color = HIDDEN_COLOR, style = label.style_label_left, textcolor = failColorInput, size = size.tiny)
+    line.set_xy1(r2LineId, b4, capPrice)
+    line.set_xy2(r2LineId, bar_index, capPrice)
+    line.set_style(r2LineId, r2Latch ? line.style_solid : line.style_dashed)
+    line.set_width(r2LineId, r2Latch ? 2 : 1)
+    label.set_xy(r2LabelId, bar_index, capPrice)
+    label.set_text(r2LabelId, 'R2 cap · ' + str.tostring(capPrice, format.mintick))
+else if not na(r2LineId)
+    line.delete(r2LineId)
+    label.delete(r2LabelId)
+    r2LineId  := na
+    r2LabelId := na
+
+plot(haveCandidate ? c0 : na, 'Rule 1 Invalidation (W1 Origin)', failColorInput, 1, display = display.data_window, editable = false)
+plot(capPrice, 'Rule 2 Invalidation (W5 Cap)', failColorInput, 1, display = display.data_window, editable = false)
+plot(haveCandidate ? c1 : na, 'Rule 3 Invalidation (W1 Extreme)', failColorInput, 1, display = display.data_window, editable = false)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+dashPos = switch dashPosInput
+    'Top Right'    => position.top_right
+    'Top Left'     => position.top_left
+    'Bottom Right' => position.bottom_right
+    => position.bottom_left
+
+dashTxtSize = switch dashSizeInput
+    'Tiny'  => size.tiny
+    'Small' => size.small
+    => size.normal
+
+var table dashTable = na
+
+if showDashInput and barstate.islast
+    if na(dashTable)
+        dashTable := table.new(dashPos, 3, 6, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+        table.merge_cells(dashTable, 1, 0, 2, 0)
+        table.merge_cells(dashTable, 1, 5, 2, 5)
+
+    labelColor = DASH_HEADER
+    fadedColor = NEUTRAL_COLOR
+    valueColor = DASH_TEXT
+
+    dirTxt   = not haveCandidate ? 'Collecting swings' : (candBull ? 'Bullish 0-5' : 'Bearish 0-5') + (c5Live ? ' · W5 developing' : ' · W5 confirmed')
+    dirColor = not haveCandidate ? fadedColor : candBull ? passColorInput : failColorInput
+
+    r1Status = not haveCandidate ? '—' : r1Latch ? 'FAIL' : 'PASS'
+    r2Status = not haveCandidate ? '—' : r2Latch ? 'FAIL' : 'PASS'
+    r3Status = not haveCandidate ? '—' : r3Latch ? (diagonalInput ? 'OVERLAP OK' : 'FAIL') : 'PASS'
+
+    r1StatusColor = not haveCandidate ? fadedColor : r1Latch ? failColorInput : passColorInput
+    r2StatusColor = not haveCandidate ? fadedColor : r2Latch ? failColorInput : passColorInput
+    r3StatusColor = not haveCandidate ? fadedColor : r3Latch ? (diagonalInput ? warnColorInput : failColorInput) : passColorInput
+
+    r1PriceTxt = haveCandidate ? str.tostring(c0, format.mintick) : '—'
+    r2PriceTxt = haveCandidate and not na(capPrice) ? str.tostring(capPrice, format.mintick) : '—'
+    r3PriceTxt = haveCandidate ? str.tostring(c1, format.mintick) : '—'
+
+    verdictTxt = not haveCandidate ? 'Waiting for swing points' : anyFail ? 'INVALID — RECOUNT' : overlapTolerated ? 'VALID · DIAGONAL' : 'VALID IMPULSE'
+    verdictColor = not haveCandidate ? fadedColor : anyFail ? failColorInput : overlapTolerated ? warnColorInput : passColorInput
+
+    table.cell(dashTable, 0, 0, 'Tracked Count', text_color = labelColor, text_size = dashTxtSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 0, dirTxt, text_color = dirColor, text_size = dashTxtSize, text_halign = text.align_right)
+
+    table.cell(dashTable, 0, 1, 'Hard Rule', text_color = fadedColor, text_size = dashTxtSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 1, 'Status', text_color = fadedColor, text_size = dashTxtSize)
+    table.cell(dashTable, 2, 1, 'Break @', text_color = fadedColor, text_size = dashTxtSize, text_halign = text.align_right)
+
+    table.cell(dashTable, 0, 2, 'R1 · W2 holds W1 origin', text_color = labelColor, text_size = dashTxtSize, text_halign = text.align_left, tooltip = 'Wave 2 never retraces more than 100% of wave 1. A print beyond the wave-1 origin — even briefly — invalidates the count.')
+    table.cell(dashTable, 1, 2, r1Status, text_color = r1StatusColor, text_size = dashTxtSize)
+    table.cell(dashTable, 2, 2, r1PriceTxt, text_color = r1Latch ? failColorInput : valueColor, text_size = dashTxtSize, text_halign = text.align_right)
+
+    table.cell(dashTable, 0, 3, 'R2 · W3 not the shortest', text_color = labelColor, text_size = dashTxtSize, text_halign = text.align_left, tooltip = 'Wave 3 is never the shortest of waves 1, 3 and 5. While wave 3 is shorter than wave 1, wave 5 must not exceed the wave-3 length — the cap price. When no cap shows, rule 2 can no longer break.')
+    table.cell(dashTable, 1, 3, r2Status, text_color = r2StatusColor, text_size = dashTxtSize)
+    table.cell(dashTable, 2, 3, r2PriceTxt, text_color = r2Latch ? failColorInput : valueColor, text_size = dashTxtSize, text_halign = text.align_right)
+
+    table.cell(dashTable, 0, 4, 'R3 · W4 clear of W1', text_color = labelColor, text_size = dashTxtSize, text_halign = text.align_left, tooltip = 'Wave 4 never enters wave-1 price territory. Overlap is tolerated only when the structure is counted as a diagonal.')
+    table.cell(dashTable, 1, 4, r3Status, text_color = r3StatusColor, text_size = dashTxtSize)
+    table.cell(dashTable, 2, 4, r3PriceTxt, text_color = r3Latch and not diagonalInput ? failColorInput : valueColor, text_size = dashTxtSize, text_halign = text.align_right)
+
+    table.cell(dashTable, 0, 5, 'Verdict', text_color = labelColor, text_size = dashTxtSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 5, verdictTxt, text_color = verdictColor, text_size = dashTxtSize, text_halign = text.align_right, bgcolor = color.new(verdictColor, 85), tooltip = 'Breaking any one hard rule invalidates the count outright — guidelines only weaken it. Treat a breach as the cue to recount, not to argue with the chart.')
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(rule1Break, 'Rule 1 Broken', 'Elliott Hard Rules on {{ticker}} ({{interval}}): price broke the wave-1 origin — wave 2 retraced beyond the start of wave 1. The tracked count is invalid, recount.')
+
+alertcondition(rule2Break, 'Rule 2 Broken', 'Elliott Hard Rules on {{ticker}} ({{interval}}): wave 3 became the shortest of waves 1, 3 and 5 — wave 5 exceeded its cap. The tracked count is invalid, recount.')
+
+alertcondition(rule3Break, 'Rule 3 Broken', 'Elliott Hard Rules on {{ticker}} ({{interval}}): wave 4 entered wave-1 price territory on a non-diagonal count. The tracked count is invalid, recount.')
+
+alertcondition(anyRuleBreak, 'Any Hard Rule Broken', 'Elliott Hard Rules on {{ticker}} ({{interval}}): a hard rule just broke on the tracked five-wave count — the labeling is invalid, recount.')
+
+alertcondition(countValidated, 'Candidate Passes All Rules', 'Elliott Hard Rules on {{ticker}} ({{interval}}): the tracked five-wave candidate satisfies all three hard rules.')
+
+//---------------------------------------------------------------------------------------------------------------------}

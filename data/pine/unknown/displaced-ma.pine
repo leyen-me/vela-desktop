@@ -1,0 +1,193 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Displaced MA", shorttitle = "Displaced MA", overlay = true)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+NEUTRAL_COLOR = #787b86
+BASE_COLOR    = #787b86               // comparison line is structure - grey
+DN_3X3_COLOR  = #ff9800               // the one accent - DiNapoli's short-term thrust line
+DN_7X5_COLOR  = #787b86               // the other set members are structure - grey, fading with length
+DN_25X5_COLOR = color.new(#787b86, 40)
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+MAX_DISPLACEMENT = 100 // hard bound on the plot shift, in bars, both directions
+
+// DiNapoli set — simple moving averages of the close, displaced forward (length x displacement)
+DN_3X3_LENGTH  = 3
+DN_3X3_OFFSET  = 3
+DN_7X5_LENGTH  = 7
+DN_7X5_OFFSET  = 5
+DN_25X5_LENGTH = 25
+DN_25X5_OFFSET = 5
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+maTypeInput       = input.string("SMA", "Type", options = ["SMA", "EMA", "WMA", "RMA", "HMA"], group = "Settings",
+     tooltip = "Moving average formula. Displacement never touches the calculation — it only slides the finished plot along the time axis — so any ordinary average can be displaced. DiNapoli's classic displaced lines use the SMA.")
+
+srcInput          = input.source(close, "Source", group = "Settings",
+     tooltip = "Price series the average is computed on. Close is the usual choice; running one instance on highs and another on lows builds a displaced MA channel.")
+
+lengthInput       = input.int(7, "Length", minval = 2, group = "Settings",
+     tooltip = "Look-back window of the average. The window keeps rolling exactly as it would undisplaced — only the drawing moves. The default pairs with the displacement below to form DiNapoli's 7x5, a 7-period SMA displaced 5 bars forward.")
+
+displacementInput = input.int(5, "Displacement", minval = -MAX_DISPLACEMENT, maxval = MAX_DISPLACEMENT, group = "Settings",
+     tooltip = "Number of bars the plot is shifted. Positive values slide the line rightward, so today's price is read against an average finished that many bars ago — a deliberately stale reference that extends past the last bar without forecasting anything. Negative values slide it leftward, centering the average over the data it summarizes; the newest bars then have no line value, which makes the centered view a research tool rather than a live signal. Crossing alerts and the dashboard compare price with the value plotted under the current bar and stay silent while that value does not exist.")
+
+showBaseInput     = input.bool(false, "Undisplaced Average", group = "Comparison",
+     tooltip = "Overlays the same average without displacement for a one-time sanity check: the two shapes are identical, only slid along the time axis, which makes the timing change — later touches, later crossings — obvious.")
+
+show3x3Input      = input.bool(false, "3x3 — SMA 3, Displaced 3", group = "DiNapoli Set",
+     tooltip = "DiNapoli's 3-period simple average of the close displaced 3 bars forward — the short-term thrust line of his method. The set always uses close-based SMAs, independent of the settings above.")
+
+show7x5Input      = input.bool(false, "7x5 — SMA 7, Displaced 5", group = "DiNapoli Set",
+     tooltip = "DiNapoli's 7-period simple average of the close displaced 5 bars forward — his intermediate trend and pullback reference.")
+
+show25x5Input     = input.bool(false, "25x5 — SMA 25, Displaced 5", group = "DiNapoli Set",
+     tooltip = "DiNapoli's 25-period simple average of the close displaced 5 bars forward — the broader trend context line of the set.")
+
+showDashboardInput     = input.bool(true, "Show Dashboard", group = "Dashboard",
+     tooltip = "Displays a compact panel with the active displacement and its direction, the slope of the average, and price's position against the value plotted under the current bar — including the reminder that a back-displaced line has no live value at the right edge.")
+
+dashboardLocationInput = input.string("Top Right", "Location", options = ["Top Right", "Bottom Right", "Bottom Left", "Top Left"], group = "Dashboard",
+     tooltip = "Chart corner the dashboard is anchored to.")
+
+dashboardSizeInput     = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = "Dashboard",
+     tooltip = "Text size of the dashboard.")
+
+trendColorInput   = input.bool(true, "Slope Trend Coloring", group = "Style",
+     tooltip = "Colors the displaced line by the slope of the average itself — bullish while it rises, bearish while it falls. The coloring shifts together with the plot, so each segment keeps the color of the data it was computed from; disable to draw the line in the neutral color.")
+
+bullColorInput    = input.color(BULL_COLOR, "Bullish", inline = "direction", group = "Style",
+     tooltip = "Bullish color, used while the average slopes upward.")
+
+bearColorInput    = input.color(BEAR_COLOR, "Bearish", inline = "direction", group = "Style",
+     tooltip = "Bearish color, used while the average slopes downward.")
+
+neutralColorInput = input.color(NEUTRAL_COLOR, "Neutral", group = "Style",
+     tooltip = "Line color used when slope trend coloring is disabled, or when the slope is flat.")
+
+baseColorInput    = input.color(BASE_COLOR, "Undisplaced Average", group = "Style",
+     tooltip = "Color of the undisplaced comparison line.")
+
+dn3x3ColorInput   = input.color(DN_3X3_COLOR, "3x3", inline = "dinapoli", group = "Style",
+     tooltip = "Color of the DiNapoli 3x3 line.")
+
+dn7x5ColorInput   = input.color(DN_7X5_COLOR, "7x5", inline = "dinapoli", group = "Style",
+     tooltip = "Color of the DiNapoli 7x5 line.")
+
+dn25x5ColorInput  = input.color(DN_25X5_COLOR, "25x5", inline = "dinapoli", group = "Style",
+     tooltip = "Color of the DiNapoli 25x5 line.")
+
+lineWidthInput    = input.int(2, "Line Width", minval = 1, maxval = 5, group = "Style",
+     tooltip = "Width of the displaced average line.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+// Displacement is a plotting offset: the average is computed normally and the finished plot is slid
+// sideways, so the values never change and no lag is removed. Positive settings push the line under
+// bars that had not printed when its values were computed — a stale reference, not a forecast — while
+// negative settings pull it back over the data it summarizes, the centered position of time-series
+// work. Joe DiNapoli ("Trading with DiNapoli Levels", 1998) popularized the forward form with his
+// 3x3, 7x5 and 25x5 simple averages.
+
+// Every average type is computed on every bar so the selected line's history stays consistent
+smaValue = ta.sma(srcInput, lengthInput)
+emaValue = ta.ema(srcInput, lengthInput)
+wmaValue = ta.wma(srcInput, lengthInput)
+rmaValue = ta.rma(srcInput, lengthInput)
+hmaValue = ta.hma(srcInput, lengthInput)
+
+maValue = switch maTypeInput
+    "SMA" => smaValue
+    "EMA" => emaValue
+    "WMA" => wmaValue
+    "RMA" => rmaValue
+    => hmaValue
+
+max_bars_back(maValue, MAX_DISPLACEMENT)
+
+// DiNapoli set — always simple averages of the close, displaced forward at plot time
+dn3x3Value  = ta.sma(close, DN_3X3_LENGTH)
+dn7x5Value  = ta.sma(close, DN_7X5_LENGTH)
+dn25x5Value = ta.sma(close, DN_25X5_LENGTH)
+
+// Value of the displaced line under the current bar. It exists only for forward (>= 0) displacement:
+// with a backward shift, the line under today's bar would need average values that have not been
+// computed yet, so crossings are evaluated honestly — never against values missing at the right edge.
+safeOffset     = math.max(displacementInput, 0)
+displacedValue = displacementInput >= 0 ? maValue[safeOffset] : na
+
+// Slope of the average itself — displacement changes timing, not information, so slope is unaffected
+slope = maValue - nz(maValue[1], maValue)
+
+// Closes through the displaced line: the early-warning read, and the slow regime side flip
+crossUp   = ta.crossover(close, displacedValue)
+crossDown = ta.crossunder(close, displacedValue)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+maColor = trendColorInput ? (slope > 0 ? bullColorInput : slope < 0 ? bearColorInput : neutralColorInput) : neutralColorInput
+
+plot(showBaseInput ? maValue : na, "Undisplaced Average", color = baseColorInput)
+
+plot(show3x3Input ? dn3x3Value : na, "DiNapoli 3x3", color = dn3x3ColorInput, offset = DN_3X3_OFFSET)
+plot(show7x5Input ? dn7x5Value : na, "DiNapoli 7x5", color = dn7x5ColorInput, offset = DN_7X5_OFFSET)
+plot(show25x5Input ? dn25x5Value : na, "DiNapoli 25x5", color = dn25x5ColorInput, offset = DN_25X5_OFFSET)
+
+plot(maValue, "Displaced Average", color = maColor, linewidth = lineWidthInput, offset = displacementInput)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+dashboardLocation = switch dashboardLocationInput
+    "Top Right"    => position.top_right
+    "Bottom Right" => position.bottom_right
+    "Bottom Left"  => position.bottom_left
+    => position.top_left
+
+dashboardTextSize = switch dashboardSizeInput
+    "Tiny"  => size.tiny
+    "Small" => size.small
+    => size.normal
+
+var table dashboardTable = table.new(dashboardLocation, 2, 3, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+if barstate.islast and showDashboardInput
+    dispText = displacementInput > 0 ? "Forward +" + str.tostring(displacementInput) : displacementInput < 0 ? "Backward " + str.tostring(displacementInput) : "None"
+
+    slopeNow   = nz(slope)
+    slopeText  = slopeNow > 0 ? "Rising" : slopeNow < 0 ? "Falling" : "Flat"
+    slopeColor = slopeNow > 0 ? bullColorInput : slopeNow < 0 ? bearColorInput : neutralColorInput
+
+    // A back-displaced line has no final value under the newest bars — say so instead of faking one
+    liveValue = not na(displacedValue)
+    biasText  = liveValue ? (close > displacedValue ? "Above Line" : close < displacedValue ? "Below Line" : "On Line") : displacementInput < 0 ? "No Live Value" : "—"
+    biasColor = liveValue ? (close > displacedValue ? bullColorInput : close < displacedValue ? bearColorInput : neutralColorInput) : neutralColorInput
+
+    table.cell(dashboardTable, 0, 0, "Displacement", text_color = DASH_HEADER, text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 0, dispText,       text_color = DASH_TEXT,   text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 1, "Slope",        text_color = DASH_HEADER, text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 1, slopeText,      text_color = slopeColor,  text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 2, "Price",        text_color = DASH_HEADER, text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 2, biasText,       text_color = biasColor,   text_size = dashboardTextSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(crossUp, "Bullish Price Cross", "Price crossed above the displaced average on {{ticker}} ({{interval}})")
+alertcondition(crossDown, "Bearish Price Cross", "Price crossed below the displaced average on {{ticker}} ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

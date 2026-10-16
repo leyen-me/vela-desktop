@@ -1,0 +1,434 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Parabolic Phase", shorttitle = "Parabolic Phase", overlay = true, max_lines_count = 500, max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+DEPTH_FLOOR  = 0.1 // minimum pullback ratio treated as "deeper than any seen" once phase pullbacks shrink toward zero
+MAX_PIVOTS   = 100 // retained swing points in the alternating pivot sequence
+MAX_DRAWINGS = 250 // retained lines / labels
+
+BULL_DEFAULT    = #089981
+BEAR_DEFAULT    = #f23645
+NEUTRAL_DEFAULT = #5b9cf6
+
+GRP_DETECTION = 'Parabolic Detection'
+GRP_FILTERS   = 'Confirmation Filters'
+GRP_DASH      = 'Dashboard'
+GRP_STYLE     = 'Style'
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+swingLenInput    = input.int(5, 'Swing Length', minval = 2, maxval = 50, group = GRP_DETECTION, tooltip = 'Half-length of the pivot window used to confirm swing highs and lows. Impulse legs, pullbacks and acceleration trendlines are all measured between these swings; larger values track larger structures with more confirmation lag.')
+legsInput        = input.int(3, 'Accelerating Impulses', minval = 2, maxval = 6, group = GRP_DETECTION, tooltip = 'Number of consecutive impulse legs that must each satisfy the acceleration tests (steeper slope, higher structure, shrinking pullbacks, steepening trendlines) before a parabolic phase is confirmed.')
+slopeFactorInput = input.float(1.2, 'Acceleration Factor', minval = 1.0, step = 0.05, group = GRP_DETECTION, tooltip = 'Minimum slope ratio between successive impulses: each leg must cover price at least this many times faster (price per bar) than the previous leg.')
+
+requireStretchInput  = input.bool(true, 'Require MA Stretch Extreme', group = GRP_FILTERS, tooltip = 'Only confirm a phase when the distance between price and the long-term moving average has stretched to a historical extreme for this symbol.')
+maTypeInput          = input.string('SMA', 'Long-Term MA', options = ['SMA', 'EMA'], inline = 'ma', group = GRP_FILTERS, tooltip = 'Type and length of the long-term moving average used to measure how far price has stretched away from it.')
+maLenInput           = input.int(200, '', minval = 10, inline = 'ma', group = GRP_FILTERS, tooltip = 'Length of the long-term moving average.')
+stretchPctInput      = input.float(95, 'Stretch Percentile', minval = 50, maxval = 99.9, step = 0.5, group = GRP_FILTERS, tooltip = 'Percentile of the historical price-to-average distance that must be reached to qualify as an extreme.')
+stretchLookbackInput = input.int(500, 'Stretch History', minval = 50, maxval = 2000, group = GRP_FILTERS, tooltip = 'Number of bars used to build the historical distribution of the price-to-average distance.')
+requireVolumeInput   = input.bool(false, 'Require Volume Surge', group = GRP_FILTERS, tooltip = 'Additionally require a volume surge, a supporting symptom of parabolic phases, before confirming. Leave disabled on symbols without reliable volume data.')
+volLenInput          = input.int(20, 'Volume Average', minval = 1, inline = 'vol', group = GRP_FILTERS, tooltip = 'A surge is volume exceeding its moving average by the given multiplier.')
+volMultInput         = input.float(1.5, 'Mult', minval = 1, step = 0.1, inline = 'vol', group = GRP_FILTERS, tooltip = 'Multiplier applied to the volume average when testing for a surge.')
+
+showDashInput = input.bool(true, 'Show Dashboard', inline = 'dash', group = GRP_DASH, tooltip = 'Compact summary of the phase state, impulse count, moving-average stretch, volume surge and runaway-gap symptoms.')
+dashPosInput  = input.string('Top Right', '', options = ['Top Right', 'Bottom Right', 'Bottom Left', 'Top Left'], inline = 'dash', group = GRP_DASH, tooltip = 'Dashboard position on the chart.')
+dashSizeInput = input.string('Small', '', options = ['Tiny', 'Small', 'Normal'], inline = 'dash', group = GRP_DASH, tooltip = 'Dashboard text size.')
+
+showTlInput      = input.bool(true, 'Acceleration Trendlines', group = GRP_STYLE, tooltip = 'Draw the successive, steepening trendlines under the advance (over the decline); the steepest one extends to the right until broken.')
+showRetraceInput = input.bool(true, '50% Retracement Level', group = GRP_STYLE, tooltip = 'Once a phase ends, draw the 50% retracement of the full accelerated advance or decline, a common expectation after failed parabolas.')
+showFillInput    = input.bool(true, 'Stretch Gradient Fill', group = GRP_STYLE)
+showBgInput      = input.bool(true, 'Phase Background', group = GRP_STYLE)
+showMaInput      = input.bool(true, 'Long-Term MA', inline = 'mac', group = GRP_STYLE)
+maColorInput     = input.color(NEUTRAL_DEFAULT, '', inline = 'mac', group = GRP_STYLE)
+bullColorInput   = input.color(BULL_DEFAULT, 'Bullish', inline = 'cols', group = GRP_STYLE)
+bearColorInput   = input.color(BEAR_DEFAULT, 'Bearish', inline = 'cols', group = GRP_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Variables
+//---------------------------------------------------------------------------------------------------------------------{
+
+var pivotPricesArray = array.new_float()
+var pivotBarsArray   = array.new_int()
+var pivotDirsArray   = array.new_int()
+
+var phaseLinesArray  = array.new<line>()
+var phaseLabelsArray = array.new<label>()
+
+var int   phaseDir        = 0
+var int   phaseStartBar   = na
+var float phaseExtreme    = na
+var float phaseBase       = na
+var float maxPullback     = na
+var float lastAnchorPrice = na
+var float tlSlope         = na
+var int   tlAnchorBar     = na
+var float tlAnchorPrice   = na
+var int   legsCount       = 0
+var int   gapCount        = 0
+var line  activeTl        = na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Register a confirmed pivot in the alternating swing sequence, returns true when the sequence changed
+registerPivot(float price, int pivotBar, int dir) =>
+    changed = false
+    n = array.size(pivotDirsArray)
+    if n > 0 and array.get(pivotDirsArray, n - 1) == dir
+        lastPrice = array.get(pivotPricesArray, n - 1)
+        if (dir == 1 and price > lastPrice) or (dir == -1 and price < lastPrice)
+            array.set(pivotPricesArray, n - 1, price)
+            array.set(pivotBarsArray, n - 1, pivotBar)
+            changed := true
+    else
+        array.push(pivotPricesArray, price)
+        array.push(pivotBarsArray, pivotBar)
+        array.push(pivotDirsArray, dir)
+        changed := true
+    if array.size(pivotDirsArray) > MAX_PIVOTS
+        array.shift(pivotPricesArray)
+        array.shift(pivotBarsArray)
+        array.shift(pivotDirsArray)
+    changed
+
+// Store a drawing and enforce the retention cap
+pushLine(line newLine) =>
+    array.push(phaseLinesArray, newLine)
+    if array.size(phaseLinesArray) > MAX_DRAWINGS
+        line.delete(array.shift(phaseLinesArray))
+
+pushLabel(label newLabel) =>
+    array.push(phaseLabelsArray, newLabel)
+    if array.size(phaseLabelsArray) > MAX_DRAWINGS
+        label.delete(array.shift(phaseLabelsArray))
+
+// Test the last `legsN` impulses for parabolic acceleration in direction `dirSign` (1 bullish, -1 bearish).
+// Works in transformed space (price * dirSign) so one routine covers advances and capitulation declines.
+// Returns the verdict, the deepest setup pullback ratio, and the anchor swings (newest first) for trendlines.
+checkPhase(int dirSign, int legsN) =>
+    ok = false
+    maxDepth = 0.0
+    ancBarsOut   = array.new_int()
+    ancPricesOut = array.new_float()
+    n = array.size(pivotDirsArray)
+    if n >= 2 * legsN and array.get(pivotDirsArray, n - 1) == dirSign
+        ok := true
+        termValuesArray = array.new_float()
+        termBarsArray   = array.new_int()
+        ancValuesArray  = array.new_float()
+        ancBarsArray    = array.new_int()
+        for i = 0 to legsN - 1
+            termIdx = n - 1 - 2 * i
+            ancIdx  = termIdx - 1
+            if ok
+                if array.get(pivotDirsArray, termIdx) == dirSign and array.get(pivotDirsArray, ancIdx) == -dirSign
+                    array.push(termValuesArray, array.get(pivotPricesArray, termIdx) * dirSign)
+                    array.push(termBarsArray, array.get(pivotBarsArray, termIdx))
+                    array.push(ancValuesArray, array.get(pivotPricesArray, ancIdx) * dirSign)
+                    array.push(ancBarsArray, array.get(pivotBarsArray, ancIdx))
+                    array.push(ancBarsOut, array.get(pivotBarsArray, ancIdx))
+                    array.push(ancPricesOut, array.get(pivotPricesArray, ancIdx))
+                else
+                    ok := false
+        if ok
+            // impulse slopes (price per bar, positive in transformed space)
+            slopesArray = array.new_float()
+            for i = 0 to legsN - 1
+                legBars = array.get(termBarsArray, i) - array.get(ancBarsArray, i)
+                legGain = array.get(termValuesArray, i) - array.get(ancValuesArray, i)
+                if legBars <= 0 or legGain <= 0
+                    ok := false
+                    array.push(slopesArray, 0.0)
+                else
+                    array.push(slopesArray, legGain / legBars)
+            // rising structure + each impulse steeper and faster than the prior one
+            for i = 0 to legsN - 2
+                if array.get(termValuesArray, i) <= array.get(termValuesArray, i + 1)
+                    ok := false
+                if array.get(ancValuesArray, i) <= array.get(ancValuesArray, i + 1)
+                    ok := false
+                if array.get(slopesArray, i) < array.get(slopesArray, i + 1) * slopeFactorInput
+                    ok := false
+            // pullback depth ratios (newest first), each measured against the impulse it retraces
+            depthsArray = array.new_float()
+            for i = 0 to legsN - 2
+                priorSpan = array.get(termValuesArray, i + 1) - array.get(ancValuesArray, i + 1)
+                if priorSpan <= 0
+                    ok := false
+                    array.push(depthsArray, 1.0)
+                else
+                    array.push(depthsArray, (array.get(termValuesArray, i + 1) - array.get(ancValuesArray, i)) / priorSpan)
+            if legsN >= 3
+                for i = 0 to legsN - 3
+                    // pullbacks must shrink
+                    if array.get(depthsArray, i) > array.get(depthsArray, i + 1)
+                        ok := false
+                    // successive trendlines drawn on the anchors must steepen
+                    seg0Bars  = math.max(array.get(ancBarsArray, i) - array.get(ancBarsArray, i + 1), 1)
+                    seg1Bars  = math.max(array.get(ancBarsArray, i + 1) - array.get(ancBarsArray, i + 2), 1)
+                    seg0Slope = (array.get(ancValuesArray, i) - array.get(ancValuesArray, i + 1)) / seg0Bars
+                    seg1Slope = (array.get(ancValuesArray, i + 1) - array.get(ancValuesArray, i + 2)) / seg1Bars
+                    if seg0Slope <= seg1Slope
+                        ok := false
+            if array.size(depthsArray) > 0
+                maxDepth := array.max(depthsArray)
+    [ok, maxDepth, ancBarsOut, ancPricesOut]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+
+// swing detection
+phHit = ta.pivothigh(swingLenInput, swingLenInput)
+plHit = ta.pivotlow(swingLenInput, swingLenInput)
+
+pivotChanged = false
+if not na(phHit)
+    pivotChanged := registerPivot(phHit, bar_index - swingLenInput, 1)
+if not na(plHit)
+    pivotChanged := registerPivot(plHit, bar_index - swingLenInput, -1) or pivotChanged
+
+// long-term moving average stretch
+smaValue = ta.sma(close, maLenInput)
+emaValue = ta.ema(close, maLenInput)
+maValue  = maTypeInput == 'EMA' ? emaValue : smaValue
+distPct  = na(maValue) or maValue == 0 ? 0.0 : (close - maValue) / maValue * 100
+
+upThreshold = ta.percentile_nearest_rank(distPct, stretchLookbackInput, stretchPctInput)
+dnThreshold = ta.percentile_nearest_rank(distPct, stretchLookbackInput, 100 - stretchPctInput)
+
+recentMaxDist = ta.highest(distPct, swingLenInput + 1)
+recentMinDist = ta.lowest(distPct, swingLenInput + 1)
+recentHighest = ta.highest(high, swingLenInput + 1)
+recentLowest  = ta.lowest(low, swingLenInput + 1)
+
+stretchUpOk = not requireStretchInput or (not na(upThreshold) and recentMaxDist >= upThreshold)
+stretchDnOk = not requireStretchInput or (not na(dnThreshold) and recentMinDist <= dnThreshold)
+
+// volume surge symptom
+volAverage   = ta.sma(nz(volume), volLenInput)
+recentMaxVol = ta.highest(nz(volume), swingLenInput + 1)
+volSurgeOk   = not requireVolumeInput or (volAverage > 0 and recentMaxVol > volAverage * volMultInput)
+volSurgeNow  = volAverage > 0 and nz(volume) > volAverage * volMultInput
+
+// per-bar event flags
+bool bullStartEvent = false
+bool bearStartEvent = false
+bool bullEndEvent   = false
+bool bearEndEvent   = false
+bool endPhaseNow    = false
+string endReason    = ''
+
+// phase maintenance: track the terminal extreme and runaway-gap symptom
+if phaseDir != 0
+    phaseExtreme := phaseDir == 1 ? math.max(phaseExtreme, high) : math.min(phaseExtreme, low)
+    if (phaseDir == 1 and low > high[1]) or (phaseDir == -1 and high < low[1])
+        gapCount += 1
+
+// new swings inside an active phase: extend legs, redraw steeper trendlines, watch pullback depth
+if pivotChanged and phaseDir != 0
+    n = array.size(pivotDirsArray)
+    lastPivotDir   = array.get(pivotDirsArray, n - 1)
+    lastPivotPrice = array.get(pivotPricesArray, n - 1)
+    lastPivotBar   = array.get(pivotBarsArray, n - 1)
+    if lastPivotDir == phaseDir
+        legsCount += 1
+    else
+        extremeV  = phaseExtreme * phaseDir
+        prevAncV  = lastAnchorPrice * phaseDir
+        newAncV   = lastPivotPrice * phaseDir
+        pullSpan  = extremeV - prevAncV
+        pullDepth = pullSpan > 0 ? (extremeV - newAncV) / pullSpan : 1.0
+        if pullDepth > math.max(maxPullback, DEPTH_FLOOR)
+            endPhaseNow := true
+            endReason   := 'Pullback deeper than any in phase'
+        else
+            maxPullback := math.max(maxPullback, pullDepth)
+            newSlope = (lastPivotPrice - tlAnchorPrice) / math.max(lastPivotBar - tlAnchorBar, 1)
+            if newSlope * phaseDir > tlSlope * phaseDir
+                // freeze the previous trendline and redraw a steeper one, mirroring manual redraws
+                if not na(activeTl)
+                    line.set_extend(activeTl, extend.none)
+                    line.set_xy2(activeTl, lastPivotBar, tlAnchorPrice + tlSlope * (lastPivotBar - tlAnchorBar))
+                    line.set_style(activeTl, line.style_dotted)
+                if showTlInput
+                    steeperTl = line.new(tlAnchorBar, tlAnchorPrice, lastPivotBar, lastPivotPrice, extend = extend.right, color = phaseDir == 1 ? bullColorInput : bearColorInput, width = 2)
+                    pushLine(steeperTl)
+                    activeTl := steeperTl
+                tlSlope       := newSlope
+                tlAnchorBar   := lastPivotBar
+                tlAnchorPrice := lastPivotPrice
+            lastAnchorPrice := lastPivotPrice
+
+// bar-level phase end checks: decisive break of the steepest trendline, or an unprecedented pullback
+if phaseDir != 0 and not endPhaseNow and bar_index > phaseStartBar
+    tlNow = not na(tlSlope) ? tlAnchorPrice + tlSlope * (bar_index - tlAnchorBar) : na
+    if not na(tlNow) and close * phaseDir < tlNow * phaseDir
+        endPhaseNow := true
+        endReason   := 'Steepest trendline break'
+    else
+        extremeV2  = phaseExtreme * phaseDir
+        anchorV2   = lastAnchorPrice * phaseDir
+        span2      = extremeV2 - anchorV2
+        retraceNow = span2 > 0 ? (extremeV2 - close * phaseDir) / span2 : 0.0
+        if retraceNow > math.max(maxPullback, DEPTH_FLOOR)
+            endPhaseNow := true
+            endReason   := 'Pullback deeper than any in phase'
+
+// phase end handling
+if endPhaseNow and phaseDir != 0
+    if not na(activeTl)
+        line.set_extend(activeTl, extend.none)
+        line.set_xy2(activeTl, bar_index, tlAnchorPrice + tlSlope * (bar_index - tlAnchorBar))
+    endLabel = label.new(bar_index, phaseDir == 1 ? high : low, 'Phase End\n' + endReason, style = phaseDir == 1 ? label.style_label_down : label.style_label_up, color = #00000000, textcolor = phaseDir == 1 ? bearColorInput : bullColorInput, size = size.small)
+    pushLabel(endLabel)
+    if showRetraceInput and not na(phaseBase)
+        halfLevel = (phaseExtreme + phaseBase) / 2
+        halfLine  = line.new(bar_index, halfLevel, bar_index + 1, halfLevel, extend = extend.right, style = line.style_dotted, color = phaseDir == 1 ? bearColorInput : bullColorInput)
+        pushLine(halfLine)
+        halfLabel = label.new(bar_index, halfLevel, '50% retracement', style = label.style_label_left, color = #00000000, textcolor = phaseDir == 1 ? bearColorInput : bullColorInput, size = size.tiny)
+        pushLabel(halfLabel)
+    bullEndEvent := phaseDir == 1
+    bearEndEvent := phaseDir == -1
+    phaseDir        := 0
+    phaseStartBar   := na
+    phaseExtreme    := na
+    phaseBase       := na
+    maxPullback     := na
+    lastAnchorPrice := na
+    tlSlope         := na
+    tlAnchorBar     := na
+    tlAnchorPrice   := na
+    legsCount       := 0
+    gapCount        := 0
+    activeTl        := na
+
+// phase start detection on each newly confirmed swing
+if pivotChanged and phaseDir == 0
+    n = array.size(pivotDirsArray)
+    lastPivotDir = array.get(pivotDirsArray, n - 1)
+    if lastPivotDir == 1 and stretchUpOk and volSurgeOk
+        [bullOk, bullMaxDepth, bullAncBars, bullAncPrices] = checkPhase(1, legsInput)
+        if bullOk
+            a0Bar     = array.get(bullAncBars, 0)
+            a0Price   = array.get(bullAncPrices, 0)
+            a1Bar     = array.get(bullAncBars, 1)
+            a1Price   = array.get(bullAncPrices, 1)
+            leadSlope = (a0Price - a1Price) / math.max(a0Bar - a1Bar, 1)
+            tlAtNow   = a0Price + leadSlope * (bar_index - a0Bar)
+            if close > tlAtNow
+                phaseDir        := 1
+                phaseStartBar   := bar_index
+                phaseExtreme    := recentHighest
+                phaseBase       := array.get(bullAncPrices, legsInput - 1)
+                maxPullback     := bullMaxDepth
+                lastAnchorPrice := a0Price
+                tlSlope         := leadSlope
+                tlAnchorBar     := a0Bar
+                tlAnchorPrice   := a0Price
+                legsCount       := legsInput
+                gapCount        := 0
+                if showTlInput
+                    for i = 0 to legsInput - 2
+                        segTl = line.new(array.get(bullAncBars, i + 1), array.get(bullAncPrices, i + 1), array.get(bullAncBars, i), array.get(bullAncPrices, i), extend = i == 0 ? extend.right : extend.none, style = i == 0 ? line.style_solid : line.style_dotted, color = bullColorInput, width = i == 0 ? 2 : 1)
+                        pushLine(segTl)
+                        if i == 0
+                            activeTl := segTl
+                startLabel = label.new(bar_index, low, 'Parabolic Phase', style = label.style_label_up, color = #00000000, textcolor = bullColorInput, size = size.small)
+                pushLabel(startLabel)
+                bullStartEvent := true
+    else if lastPivotDir == -1 and stretchDnOk and volSurgeOk
+        [bearOk, bearMaxDepth, bearAncBars, bearAncPrices] = checkPhase(-1, legsInput)
+        if bearOk
+            b0Bar       = array.get(bearAncBars, 0)
+            b0Price     = array.get(bearAncPrices, 0)
+            b1Bar       = array.get(bearAncBars, 1)
+            b1Price     = array.get(bearAncPrices, 1)
+            leadSlopeDn = (b0Price - b1Price) / math.max(b0Bar - b1Bar, 1)
+            tlAtNowDn   = b0Price + leadSlopeDn * (bar_index - b0Bar)
+            if close < tlAtNowDn
+                phaseDir        := -1
+                phaseStartBar   := bar_index
+                phaseExtreme    := recentLowest
+                phaseBase       := array.get(bearAncPrices, legsInput - 1)
+                maxPullback     := bearMaxDepth
+                lastAnchorPrice := b0Price
+                tlSlope         := leadSlopeDn
+                tlAnchorBar     := b0Bar
+                tlAnchorPrice   := b0Price
+                legsCount       := legsInput
+                gapCount        := 0
+                if showTlInput
+                    for i = 0 to legsInput - 2
+                        segDn = line.new(array.get(bearAncBars, i + 1), array.get(bearAncPrices, i + 1), array.get(bearAncBars, i), array.get(bearAncPrices, i), extend = i == 0 ? extend.right : extend.none, style = i == 0 ? line.style_solid : line.style_dotted, color = bearColorInput, width = i == 0 ? 2 : 1)
+                        pushLine(segDn)
+                        if i == 0
+                            activeTl := segDn
+                startLabelDn = label.new(bar_index, high, 'Parabolic Phase', style = label.style_label_down, color = #00000000, textcolor = bearColorInput, size = size.small)
+                pushLabel(startLabelDn)
+                bearStartEvent := true
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+
+maPlotId    = plot(maValue, 'Long-Term MA', showMaInput ? maColorInput : color(na), 1)
+pricePlotId = plot(close, 'Price Anchor', color(na), editable = false, display = display.none)
+
+fillTopValue = math.max(close, maValue)
+fillBotValue = math.min(close, maValue)
+fillTopColor = showFillInput and phaseDir == 1 ? color.new(bullColorInput, 55) : showFillInput and phaseDir == -1 ? color.new(bearColorInput, 100) : color(na)
+fillBotColor = showFillInput and phaseDir == 1 ? color.new(bullColorInput, 100) : showFillInput and phaseDir == -1 ? color.new(bearColorInput, 55) : color(na)
+fill(pricePlotId, maPlotId, fillTopValue, fillBotValue, fillTopColor, fillBotColor, title = 'Stretch Gradient')
+
+bgcolor(showBgInput and phaseDir == 1 ? color.new(bullColorInput, 92) : showBgInput and phaseDir == -1 ? color.new(bearColorInput, 92) : color(na), title = 'Phase Background')
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+
+dashPosition = dashPosInput == 'Top Right' ? position.top_right : dashPosInput == 'Bottom Right' ? position.bottom_right : dashPosInput == 'Bottom Left' ? position.bottom_left : position.top_left
+dashTextSize = dashSizeInput == 'Tiny' ? size.tiny : dashSizeInput == 'Small' ? size.small : size.normal
+
+var table dashTable = na
+
+if showDashInput and barstate.isfirst
+    dashTable := table.new(dashPosition, 2, 6, bgcolor = color.new(chart.bg_color, 20), frame_color = color.new(chart.fg_color, 80), frame_width = 1, border_color = color.new(chart.fg_color, 90), border_width = 1)
+
+if showDashInput and barstate.islast
+    phaseText   = phaseDir == 1 ? 'Parabolic Advance' : phaseDir == -1 ? 'Parabolic Decline' : 'None'
+    phaseColor  = phaseDir == 1 ? bullColorInput : phaseDir == -1 ? bearColorInput : chart.fg_color
+    stretchText = not na(upThreshold) and distPct >= upThreshold ? 'Above extreme' : not na(dnThreshold) and distPct <= dnThreshold ? 'Below extreme' : 'No'
+    volumeText  = na(volume) ? 'n/a' : volSurgeNow ? 'Yes' : 'No'
+    table.cell(dashTable, 0, 0, 'Phase', text_color = chart.fg_color, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 0, phaseText, text_color = phaseColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 0, 1, 'Impulses', text_color = chart.fg_color, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 1, phaseDir != 0 ? str.tostring(legsCount) : '-', text_color = chart.fg_color, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 0, 2, 'MA Stretch', text_color = chart.fg_color, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 2, str.tostring(distPct, '#.##') + '%', text_color = chart.fg_color, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 0, 3, 'Stretch Extreme', text_color = chart.fg_color, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 3, stretchText, text_color = chart.fg_color, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 0, 4, 'Volume Surge', text_color = chart.fg_color, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 4, volumeText, text_color = chart.fg_color, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 0, 5, 'Gaps In Phase', text_color = chart.fg_color, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 5, phaseDir != 0 ? str.tostring(gapCount) : '-', text_color = chart.fg_color, text_size = dashTextSize, text_halign = text.align_left)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(bullStartEvent, 'Bullish Parabolic Phase Start', 'Parabolic phase confirmed: accelerating upside impulses with shrinking pullbacks')
+alertcondition(bearStartEvent, 'Bearish Parabolic Phase Start', 'Parabolic decline confirmed: accelerating downside impulses with shrinking bounces')
+alertcondition(bullEndEvent, 'Bullish Parabolic Phase End', 'Bullish parabolic phase ended: steepest trendline broken or pullback deeper than any during the phase')
+alertcondition(bearEndEvent, 'Bearish Parabolic Phase End', 'Bearish parabolic phase ended: steepest trendline reclaimed or bounce deeper than any during the phase')
+
+//---------------------------------------------------------------------------------------------------------------------}

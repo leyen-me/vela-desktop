@@ -1,0 +1,315 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Reclaimed Order Block", "Reclaimed Order Block", overlay = true, max_boxes_count = 250, max_labels_count = 250)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+int OB_SCAN_LIMIT = 20
+
+int STATE_FRESH = 0
+int STATE_CANDIDATE = 1
+int STATE_RETIRED = 2
+
+string DEF_RESPECTED = 'Respected reuse'
+string DEF_VIOLATED = 'Violated recovery'
+string DEF_BOTH = 'Both'
+
+string CONF_CLOSE = 'Close beyond zone'
+string CONF_WICK = 'Rejection wick'
+string CONF_DISP = 'Displacement away'
+string CONF_WICK_DISP = 'Wick or displacement'
+
+string SRC_FULL = 'Full Range'
+string SRC_BODY = 'Body'
+
+string GRP_OB = 'Order Block Detection'
+string GRP_RC = 'Reclaim Logic'
+string GRP_CX = 'Context Filter'
+string GRP_ST = 'Style'
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+atrLenInput = input.int(14, 'ATR Length', minval = 1, group = GRP_OB, tooltip = 'Average True Range length used to scale displacement moves.')
+dispMultInput = input.float(1.5, 'Displacement Multiple', minval = 0.1, step = 0.1, group = GRP_OB, tooltip = 'A candle body must exceed this multiple of the ATR to qualify as displacement, both for order block formation and for the "Displacement away" reclaim confirmation.')
+zoneSourceInput = input.string(SRC_FULL, 'Zone Boundaries', options = [SRC_FULL, SRC_BODY], group = GRP_OB, tooltip = 'Price range used to draw the block from its originating candle: the full high/low range, or the candle body only.')
+maxBlocksInput = input.int(5, 'Max Blocks Per Side', minval = 1, maxval = 15, group = GRP_OB, tooltip = 'Maximum number of bullish and bearish blocks tracked at once. Oldest blocks are dropped first.')
+
+defInput = input.string(DEF_BOTH, 'Reclaim Definition', options = [DEF_RESPECTED, DEF_VIOLATED, DEF_BOTH], group = GRP_RC, tooltip = 'Respected reuse: a zone that was already respected at least once is defended again in its original direction. Violated recovery: price closed through the zone (without full acceptance) and then reclaimed it. Both definitions circulate in ICT/SMC material, so pick the one your framework intends.')
+confirmInput = input.string(CONF_WICK_DISP, 'Reclaim Confirmation', options = [CONF_CLOSE, CONF_WICK, CONF_DISP, CONF_WICK_DISP], group = GRP_RC, tooltip = 'Reaction demanded on the return visit before a reclaim is confirmed. This is what separates a reclaim from a pause on the way through.')
+confirmBarsInput = input.int(10, 'Reaction Window (Bars)', minval = 1, maxval = 100, group = GRP_RC, tooltip = 'The defending reaction must complete within this many bars of price re-entering the zone. Slower resolutions still count as a use of the zone but are not flagged as reclaims.')
+wickRatioInput = input.float(0.5, 'Rejection Wick Ratio', minval = 0.1, maxval = 0.9, step = 0.05, group = GRP_RC, tooltip = 'Minimum wick-to-range ratio for a candle probing the zone to count as a rejection wick.')
+sepBarsInput = input.int(3, 'Min Bars Between Tests', minval = 1, maxval = 100, group = GRP_RC, tooltip = 'Bars price must spend away from the zone before a new visit counts as a distinct test. A reclaim requires the market to have moved away and returned.')
+acceptBarsInput = input.int(2, 'Acceptance Closes To Retire', minval = 1, maxval = 10, group = GRP_RC, tooltip = 'Consecutive closes beyond the far side of the zone that mark decisive acceptance and retire the block as spent. Wicks through the zone never retire it. Set to 1 for the strict policy where any close through kills the zone (this also disables violated recoveries).')
+maxTestsInput = input.int(3, 'Max Uses Before Retirement', minval = 2, maxval = 10, group = GRP_RC, tooltip = 'Each successful defense consumes resting interest, so the zone is retired after this many uses. Repeated reclaims of the same zone deserve increasing skepticism.')
+
+useStructInput = input.bool(true, 'Structure Bias Filter', group = GRP_CX, tooltip = 'Only confirm reclaims that do not fight a fresh opposing trend: the swing-structure bias must not be bearish for bullish reclaims, nor bullish for bearish ones.')
+structLenInput = input.int(10, 'Swing Length', minval = 2, maxval = 50, group = GRP_CX, tooltip = 'Pivot length used to build the swing-structure bias. A close beyond the latest swing high/low sets the bias.')
+
+bullColorInput = input.color(#089981, 'Bullish', group = GRP_ST, inline = 'colors')
+bearColorInput = input.color(#f23645, 'Bearish', group = GRP_ST, inline = 'colors')
+showLabelsInput = input.bool(true, 'Reclaim Labels', group = GRP_ST, tooltip = 'Mark confirmed reclaims on the chart. xN is the number of times the zone has been used, (v) flags a violated recovery.')
+showFreshInput = input.bool(false, 'Show Unproven Blocks', group = GRP_ST, tooltip = 'Also display blocks that have not been respected once yet. Off by default: only zones with a history are reclaim material.')
+showRetiredInput = input.bool(false, 'Keep Retired Zones', group = GRP_ST, tooltip = 'Keep spent zones on the chart, greyed out, instead of removing them.')
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types
+//---------------------------------------------------------------------------------------------------------------------{
+type obZone
+    float top
+    float bottom
+    int dir
+    int originBar
+    int state
+    int tests
+    int violCount
+    bool violated
+    bool inTest
+    int startBar
+    int exitBar
+    bool wickSeen
+    box zoneBox
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Offset of the last opposing candle within the scan limit, -1 when none is found
+findOpposing(int dir) =>
+    int offset = -1
+    for i = 1 to OB_SCAN_LIMIT
+        if dir == 1 ? close[i] < open[i] : close[i] > open[i]
+            offset := i
+            break
+    offset
+
+// Zone boundaries taken from the candle at the given offset
+zoneBounds(int offsetIdx) =>
+    float zoneTop = high[offsetIdx]
+    float zoneBottom = low[offsetIdx]
+    if zoneSourceInput == SRC_BODY
+        float bodyTop = math.max(open[offsetIdx], close[offsetIdx])
+        float bodyBottom = math.min(open[offsetIdx], close[offsetIdx])
+        if not na(bodyTop) and bodyTop > bodyBottom
+            zoneTop := bodyTop
+            zoneBottom := bodyBottom
+    [zoneTop, zoneBottom]
+
+// True when a tracked block already originates from the given bar
+hasDuplicate(array<obZone> blocksArray, int originBarIdx) =>
+    bool found = false
+    for blk in blocksArray
+        if blk.originBar == originBarIdx
+            found := true
+            break
+    found
+
+// Retire a block: freeze it, then grey it out or remove it
+retireBlock(obZone blk) =>
+    blk.state := STATE_RETIRED
+    if not na(blk.zoneBox)
+        blk.zoneBox.set_right(bar_index)
+        if not showRetiredInput
+            blk.zoneBox.delete()
+            blk.zoneBox := box(na)
+
+// Refresh a block's visual state, freshness fades with each additional use
+styleBlock(obZone blk) =>
+    if not na(blk.zoneBox)
+        color baseColor = blk.dir == 1 ? bullColorInput : bearColorInput
+        if blk.state == STATE_RETIRED
+            blk.zoneBox.set_bgcolor(color.new(color.gray, 94))
+            blk.zoneBox.set_border_color(color.new(color.gray, 70))
+            blk.zoneBox.set_border_style(line.style_dotted)
+            blk.zoneBox.set_text('spent')
+            blk.zoneBox.set_text_color(color.new(color.gray, 55))
+        else if blk.tests == 0
+            blk.zoneBox.set_bgcolor(color.new(baseColor, showFreshInput ? 93 : 100))
+            blk.zoneBox.set_border_color(color.new(baseColor, showFreshInput ? 70 : 100))
+            blk.zoneBox.set_border_style(line.style_dotted)
+        else
+            blk.zoneBox.set_bgcolor(color.new(baseColor, math.min(78 + (blk.tests - 1) * 6, 92)))
+            blk.zoneBox.set_border_color(color.new(baseColor, 40))
+            blk.zoneBox.set_border_style(line.style_dashed)
+            blk.zoneBox.set_text(str.tostring(blk.tests) + 'x')
+            blk.zoneBox.set_text_color(color.new(baseColor, 35))
+
+// Advance one block through the test/violation/reclaim state machine, returns event flags
+updateBlock(obZone blk, float atrVal, int biasVal) =>
+    bool reclaimEvt = false
+    bool candidateEvt = false
+    bool retireEvt = false
+    bool violRecovery = false
+    bool isBull = blk.dir == 1
+    if blk.state != STATE_RETIRED
+        // decisive acceptance beyond the far side retires the zone as spent
+        bool acceptClose = isBull ? close < blk.bottom : close > blk.top
+        if acceptClose
+            blk.violCount += 1
+            blk.violated := true
+            if blk.violCount >= acceptBarsInput
+                retireBlock(blk)
+                retireEvt := true
+        else
+            blk.violCount := 0
+        if blk.state != STATE_RETIRED
+            // a new visit only counts after price has spent time away from the zone
+            bool touching = isBull ? low <= blk.top : high >= blk.bottom
+            if not blk.inTest and touching and bar_index - blk.exitBar >= sepBarsInput
+                blk.inTest := true
+                blk.startBar := bar_index
+                blk.wickSeen := false
+                blk.violated := acceptClose
+            if blk.inTest
+                float barRange = high - low
+                bool bullWick = barRange > 0 and low <= blk.top and math.min(open, close) - low >= wickRatioInput * barRange
+                bool bearWick = barRange > 0 and high >= blk.bottom and high - math.max(open, close) >= wickRatioInput * barRange
+                if isBull ? bullWick : bearWick
+                    blk.wickSeen := true
+                // defense: price closes back beyond the zone in the block's direction
+                bool defended = isBull ? close > blk.top : close < blk.bottom
+                if defended
+                    bool withinWindow = bar_index - blk.startBar <= confirmBarsInput
+                    bool dispAway = not na(atrVal) and (isBull ? close > open and close - open >= dispMultInput * atrVal : close < open and open - close >= dispMultInput * atrVal)
+                    bool reactOk = switch confirmInput
+                        CONF_CLOSE => true
+                        CONF_WICK => blk.wickSeen
+                        CONF_DISP => dispAway
+                        => blk.wickSeen or dispAway
+                    bool firstUse = blk.tests == 0
+                    bool visitViolated = blk.violated
+                    bool biasOk = not useStructInput or (isBull ? biasVal >= 0 : biasVal <= 0)
+                    bool defAllowed = visitViolated ? defInput != DEF_RESPECTED : not firstUse and defInput != DEF_VIOLATED
+                    blk.tests += 1
+                    blk.inTest := false
+                    blk.exitBar := bar_index
+                    blk.violated := false
+                    blk.state := STATE_CANDIDATE
+                    if withinWindow and reactOk and biasOk and defAllowed
+                        reclaimEvt := true
+                        violRecovery := visitViolated
+                    else if firstUse
+                        candidateEvt := true
+                    if blk.tests >= maxTestsInput
+                        retireBlock(blk)
+                        retireEvt := true
+    [reclaimEvt, candidateEvt, retireEvt, violRecovery]
+
+// Process every block on one side: state updates, drawing upkeep, reclaim labels, capacity
+processSide(array<obZone> blocksArray, float atrVal, int biasVal) =>
+    bool reclaimAny = false
+    bool candidateAny = false
+    bool retireAny = false
+    int i = 0
+    while i < blocksArray.size()
+        obZone blk = blocksArray.get(i)
+        [reclaimEvt, candidateEvt, retireEvt, violRecovery] = updateBlock(blk, atrVal, biasVal)
+        reclaimAny := reclaimAny or reclaimEvt
+        candidateAny := candidateAny or candidateEvt
+        retireAny := retireAny or retireEvt
+        if blk.state != STATE_RETIRED and not na(blk.zoneBox)
+            blk.zoneBox.set_right(bar_index)
+        styleBlock(blk)
+        if reclaimEvt and showLabelsInput
+            bool isBull = blk.dir == 1
+            string labelText = 'Reclaim' + (blk.tests >= 2 ? ' x' + str.tostring(blk.tests) : '') + (violRecovery ? ' (v)' : '')
+            label.new(bar_index, isBull ? low : high, labelText, style = isBull ? label.style_label_up : label.style_label_down, color = #00000000, textcolor = isBull ? bullColorInput : bearColorInput, size = size.small)
+        if blk.state == STATE_RETIRED and na(blk.zoneBox)
+            blocksArray.remove(i)
+        else
+            i += 1
+    while blocksArray.size() > maxBlocksInput
+        obZone oldest = blocksArray.shift()
+        if not na(oldest.zoneBox)
+            oldest.zoneBox.delete()
+    [reclaimAny, candidateAny, retireAny]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+var array<obZone> bullBlocksArray = array.new<obZone>()
+var array<obZone> bearBlocksArray = array.new<obZone>()
+
+var float lastSwingHigh = na
+var float lastSwingLow = na
+var int structBias = 0
+
+float atrValue = ta.atr(atrLenInput)
+float pivotHighPrice = ta.pivothigh(structLenInput, structLenInput)
+float pivotLowPrice = ta.pivotlow(structLenInput, structLenInput)
+
+int bullOff = findOpposing(1)
+int bearOff = findOpposing(-1)
+int bullIdx = math.max(bullOff, 1)
+int bearIdx = math.max(bearOff, 1)
+[bullZoneTop, bullZoneBottom] = zoneBounds(bullIdx)
+[bearZoneTop, bearZoneBottom] = zoneBounds(bearIdx)
+float bullBreakLevel = high[bullIdx]
+float bearBreakLevel = low[bearIdx]
+
+bool bullDispBar = not na(atrValue) and close > open and close - open >= dispMultInput * atrValue
+bool bearDispBar = not na(atrValue) and close < open and open - close >= dispMultInput * atrValue
+bool bullFormation = bullDispBar and bullOff > 0 and close > bullBreakLevel
+bool bearFormation = bearDispBar and bearOff > 0 and close < bearBreakLevel
+
+bool bullReclaim = false
+bool bearReclaim = false
+bool bullCandidate = false
+bool bearCandidate = false
+bool bullRetired = false
+bool bearRetired = false
+
+if barstate.isconfirmed
+    // swing-structure bias: a close beyond the latest confirmed swing sets the direction
+    if not na(pivotHighPrice)
+        lastSwingHigh := pivotHighPrice
+    if not na(pivotLowPrice)
+        lastSwingLow := pivotLowPrice
+    if not na(lastSwingHigh) and close > lastSwingHigh
+        structBias := 1
+    if not na(lastSwingLow) and close < lastSwingLow
+        structBias := -1
+
+    // new order blocks: the last opposing candle before a displacement move that clears its extreme
+    if bullFormation and not hasDuplicate(bullBlocksArray, bar_index - bullOff)
+        box bullBox = box.new(bar_index - bullOff, bullZoneTop, bar_index, bullZoneBottom, border_color = color.new(bullColorInput, 100), bgcolor = color.new(bullColorInput, 100), border_width = 1, border_style = line.style_dotted, text = '', text_size = size.tiny, text_color = color.new(bullColorInput, 100), text_halign = text.align_right)
+        bullBlocksArray.push(obZone.new(bullZoneTop, bullZoneBottom, 1, bar_index - bullOff, STATE_FRESH, 0, 0, false, false, 0, bar_index, false, bullBox))
+    if bearFormation and not hasDuplicate(bearBlocksArray, bar_index - bearOff)
+        box bearBox = box.new(bar_index - bearOff, bearZoneTop, bar_index, bearZoneBottom, border_color = color.new(bearColorInput, 100), bgcolor = color.new(bearColorInput, 100), border_width = 1, border_style = line.style_dotted, text = '', text_size = size.tiny, text_color = color.new(bearColorInput, 100), text_halign = text.align_right)
+        bearBlocksArray.push(obZone.new(bearZoneTop, bearZoneBottom, -1, bar_index - bearOff, STATE_FRESH, 0, 0, false, false, 0, bar_index, false, bearBox))
+
+    // advance every tracked block through the reclaim state machine
+    [bullReclaimEvt, bullCandidateEvt, bullRetiredEvt] = processSide(bullBlocksArray, atrValue, structBias)
+    [bearReclaimEvt, bearCandidateEvt, bearRetiredEvt] = processSide(bearBlocksArray, atrValue, structBias)
+    bullReclaim := bullReclaimEvt
+    bullCandidate := bullCandidateEvt
+    bullRetired := bullRetiredEvt
+    bearReclaim := bearReclaimEvt
+    bearCandidate := bearCandidateEvt
+    bearRetired := bearRetiredEvt
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+// keep active zones extended to the live bar between confirmations
+if barstate.islast
+    for blk in bullBlocksArray
+        if blk.state != STATE_RETIRED and not na(blk.zoneBox)
+            blk.zoneBox.set_right(bar_index)
+    for blk in bearBlocksArray
+        if blk.state != STATE_RETIRED and not na(blk.zoneBox)
+            blk.zoneBox.set_right(bar_index)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(bullReclaim, 'Bullish Reclaim', 'Bullish reclaimed order block - the zone was defended again in its original direction.')
+alertcondition(bearReclaim, 'Bearish Reclaim', 'Bearish reclaimed order block - the zone was defended again in its original direction.')
+alertcondition(bullCandidate, 'Bullish Reclaim Candidate', 'Bullish order block respected for the first time - now tracked as a reclaim candidate.')
+alertcondition(bearCandidate, 'Bearish Reclaim Candidate', 'Bearish order block respected for the first time - now tracked as a reclaim candidate.')
+alertcondition(bullRetired, 'Bullish Zone Retired', 'Bullish order block retired - acceptance through the zone or its use limit was reached.')
+alertcondition(bearRetired, 'Bearish Zone Retired', 'Bearish order block retired - acceptance through the zone or its use limit was reached.')
+
+//---------------------------------------------------------------------------------------------------------------------}

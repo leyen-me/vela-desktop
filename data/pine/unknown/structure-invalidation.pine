@@ -1,0 +1,234 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Structure Invalidation", "Structure Invalidation", overlay = true, max_lines_count = 500, max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+int BULL = 1
+int BEAR = -1
+int NEUTRAL = 0
+
+string RULE_WICK = "Wick beyond level"
+string RULE_CLOSE = "Close beyond level"
+string RULE_HTF = "Higher timeframe close"
+
+string GRP_STRUCTURE = "Structure"
+string GRP_CHARACTER = "Break Character"
+string GRP_STYLE = "Style"
+
+int FILL_PRICE_TRANSP = 60
+int FILL_LEVEL_TRANSP = 100
+
+color BULL_COLOR    = #089981
+color BEAR_COLOR    = #f23645
+color NEUTRAL_COLOR = #787b86 // undefined thesis
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+swingLengthInput = input.int(10, "Swing Length", minval = 2, group = GRP_STRUCTURE, tooltip = "Bars on each side needed to confirm a swing high or swing low. The most recent confirmed swing in the thesis direction is the protected swing whose decisive break invalidates the structure. Larger values track external structure, smaller values internal structure.")
+
+ruleInput = input.string(RULE_CLOSE, "Invalidation Rule", options = [RULE_WICK, RULE_CLOSE, RULE_HTF], group = GRP_STRUCTURE, tooltip = "What counts as a decisive break of the protected swing. 'Wick beyond level' reacts fastest but is most exposed to liquidity sweeps. 'Close beyond level' waits for a chart close through the level. 'Higher timeframe close' waits for a close on the selected higher timeframe. The rule is chosen in advance and applied mechanically.")
+
+htfInput = input.timeframe("240", "Higher Timeframe", group = GRP_STRUCTURE, tooltip = "Timeframe used by the 'Higher timeframe close' rule. Must be higher than the chart timeframe, otherwise the rule falls back to a chart close.")
+
+atrLengthInput = input.int(14, "ATR Length", minval = 1, group = GRP_CHARACTER, tooltip = "ATR length used as the reference when judging displacement of a breaking close through the invalidation level.")
+
+displacementInput = input.float(1.0, "Displacement Multiple", minval = 0, step = 0.1, group = GRP_CHARACTER, tooltip = "A break whose close penetrates the level by at least this many ATRs is tagged as displaced, which argues genuine invalidation rather than a sweep.")
+
+acceptanceInput = input.int(3, "Acceptance Window", minval = 1, group = GRP_CHARACTER, tooltip = "Bars after a break used to judge acceptance beyond the level. A close back through the broken level within this window tags the event as reclaimed (sweep-like). The structure stays invalid either way, the stated rule is not renegotiated.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish Structure", group = GRP_STYLE)
+bearColorInput = input.color(BEAR_COLOR, "Bearish Structure", group = GRP_STYLE)
+
+showFillInput = input.bool(true, "Distance To Invalidation Fill", group = GRP_STYLE, tooltip = "Gradient between price and the active invalidation level, showing the room left before the thesis is proven wrong.")
+
+showPanelInput = input.bool(true, "Show Thesis Panel", group = GRP_STYLE, tooltip = "Compact panel showing the current thesis, its invalidation level, and the active rule.")
+
+labelSizeInput = input.string("Small", "Label Size", options = ["Tiny", "Small", "Normal"], group = GRP_STYLE, tooltip = "Size of the invalidation event labels.")
+
+labelSize = labelSizeInput == "Tiny" ? size.tiny : labelSizeInput == "Small" ? size.small : size.normal
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// line marking the currently protected swing level
+newProtectedLine(int x1, float level, color lineColor) =>
+    line.new(x1, level, bar_index, level, color = lineColor, width = 2)
+
+// freeze a broken level line at the invalidation bar and fade it into history
+freezeLine(line lineId, color fadedColor) =>
+    if not na(lineId)
+        line.set_x2(lineId, bar_index)
+        line.set_width(lineId, 1)
+        line.set_color(lineId, fadedColor)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+// swing detection and references
+pivotHigh = ta.pivothigh(swingLengthInput, swingLengthInput)
+pivotLow = ta.pivotlow(swingLengthInput, swingLengthInput)
+atrValue = ta.atr(atrLengthInput)
+
+// last confirmed higher timeframe close (non-repainting idiom: previous HTF close with lookahead)
+htfClose = request.security(syminfo.tickerid, htfInput, close[1], lookahead = barmerge.lookahead_on)
+htfBarClosed = timeframe.change(htfInput)
+htfIsHigher = timeframe.in_seconds(htfInput) > timeframe.in_seconds(timeframe.period)
+activeRule = ruleInput == RULE_HTF and not htfIsHigher ? RULE_CLOSE : ruleInput
+
+// structural state
+var int bias = NEUTRAL
+var float protectedLevel = na
+var line protectedLineId = na
+
+var float lastSwingHigh = na
+var int lastSwingHighBar = na
+var float lastSwingLow = na
+var int lastSwingLowBar = na
+
+// pending break character assessment
+var label invalidationLabelId = na
+var float invalidationLevel = na
+var int invalidationDir = NEUTRAL
+var int invalidationBar = na
+var string invalidationTooltip = na
+var bool assessmentOpen = false
+
+bool bullInvalidation = false
+bool bearInvalidation = false
+bool reclaimEvent = false
+
+// update confirmed swings, the newest confirmed swing in the thesis direction becomes the protected swing
+if not na(pivotHigh)
+    lastSwingHigh := pivotHigh
+    lastSwingHighBar := bar_index - swingLengthInput
+    if bias == BEAR
+        protectedLevel := pivotHigh
+        line.delete(protectedLineId)
+        protectedLineId := newProtectedLine(lastSwingHighBar, protectedLevel, bearColorInput)
+
+if not na(pivotLow)
+    lastSwingLow := pivotLow
+    lastSwingLowBar := bar_index - swingLengthInput
+    if bias == BULL
+        protectedLevel := pivotLow
+        line.delete(protectedLineId)
+        protectedLineId := newProtectedLine(lastSwingLowBar, protectedLevel, bullColorInput)
+
+// bootstrap the initial thesis from the first close beyond a confirmed swing
+if bias == NEUTRAL and barstate.isconfirmed and not na(lastSwingHigh) and not na(lastSwingLow)
+    if close > lastSwingHigh
+        bias := BULL
+        if lastSwingLow < close
+            protectedLevel := lastSwingLow
+            protectedLineId := newProtectedLine(lastSwingLowBar, protectedLevel, bullColorInput)
+    else if close < lastSwingLow
+        bias := BEAR
+        if lastSwingHigh > close
+            protectedLevel := lastSwingHigh
+            protectedLineId := newProtectedLine(lastSwingHighBar, protectedLevel, bearColorInput)
+
+// invalidation triggers per the stated rule
+breakBelow = bias == BULL and not na(protectedLevel) and (activeRule == RULE_WICK ? low < protectedLevel : activeRule == RULE_CLOSE ? close < protectedLevel and barstate.isconfirmed : htfBarClosed and htfClose < protectedLevel)
+breakAbove = bias == BEAR and not na(protectedLevel) and (activeRule == RULE_WICK ? high > protectedLevel : activeRule == RULE_CLOSE ? close > protectedLevel and barstate.isconfirmed : htfBarClosed and htfClose > protectedLevel)
+
+if breakBelow
+    bullInvalidation := true
+    assessmentOpen := false
+    freezeLine(protectedLineId, color.new(bullColorInput, 50))
+    float breakClose = activeRule == RULE_HTF ? htfClose : close
+    bool displaced = protectedLevel - breakClose >= displacementInput * atrValue
+    invalidationDir := BULL
+    invalidationLevel := protectedLevel
+    invalidationBar := bar_index
+    invalidationTooltip := "Bullish structure invalidated - rule: " + activeRule + "\nProtected swing low: " + str.tostring(invalidationLevel, format.mintick) + "\nDisplaced close (>= " + str.tostring(displacementInput, "#.##") + " ATR): " + (displaced ? "yes" : "no")
+    invalidationLabelId := label.new(bar_index, invalidationLevel, "Invalidation", style = label.style_label_up, color = #00000000, textcolor = bearColorInput, size = labelSize, tooltip = invalidationTooltip)
+    assessmentOpen := true
+    // the same break is the first evidence of a bearish structure
+    bias := BEAR
+    protectedLevel := na
+    protectedLineId := na
+    if not na(lastSwingHigh) and lastSwingHigh > close
+        protectedLevel := lastSwingHigh
+        protectedLineId := newProtectedLine(lastSwingHighBar, protectedLevel, bearColorInput)
+
+if breakAbove
+    bearInvalidation := true
+    assessmentOpen := false
+    freezeLine(protectedLineId, color.new(bearColorInput, 50))
+    float breakClose = activeRule == RULE_HTF ? htfClose : close
+    bool displaced = breakClose - protectedLevel >= displacementInput * atrValue
+    invalidationDir := BEAR
+    invalidationLevel := protectedLevel
+    invalidationBar := bar_index
+    invalidationTooltip := "Bearish structure invalidated - rule: " + activeRule + "\nProtected swing high: " + str.tostring(invalidationLevel, format.mintick) + "\nDisplaced close (>= " + str.tostring(displacementInput, "#.##") + " ATR): " + (displaced ? "yes" : "no")
+    invalidationLabelId := label.new(bar_index, invalidationLevel, "Invalidation", style = label.style_label_down, color = #00000000, textcolor = bullColorInput, size = labelSize, tooltip = invalidationTooltip)
+    assessmentOpen := true
+    // the same break is the first evidence of a bullish structure
+    bias := BULL
+    protectedLevel := na
+    protectedLineId := na
+    if not na(lastSwingLow) and lastSwingLow < close
+        protectedLevel := lastSwingLow
+        protectedLineId := newProtectedLine(lastSwingLowBar, protectedLevel, bullColorInput)
+
+// break character, acceptance beyond the level versus an instant reclaim (sweep-like)
+if assessmentOpen and not na(invalidationLabelId) and barstate.isconfirmed
+    bool reclaimedNow = invalidationDir == BULL ? close > invalidationLevel : close < invalidationLevel
+    if reclaimedNow
+        assessmentOpen := false
+        reclaimEvent := true
+        label.set_text(invalidationLabelId, "Invalidation\n(reclaimed)")
+        label.set_tooltip(invalidationLabelId, invalidationTooltip + "\nCharacter: level reclaimed after " + str.tostring(bar_index - invalidationBar) + " bar(s), sweep-like")
+    else if bar_index - invalidationBar >= acceptanceInput
+        assessmentOpen := false
+        label.set_tooltip(invalidationLabelId, invalidationTooltip + "\nCharacter: accepted beyond the level for " + str.tostring(acceptanceInput) + " bar(s), genuine invalidation")
+
+// extend the active protected level to the current bar
+if not na(protectedLineId)
+    line.set_x2(protectedLineId, bar_index)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visuals
+//---------------------------------------------------------------------------------------------------------------------{
+bool fillActive = showFillInput and bias != NEUTRAL and not na(protectedLevel) and bias == bias[1] and protectedLevel == protectedLevel[1]
+float fillPrice = fillActive ? close : na
+float fillLevel = fillActive ? protectedLevel : na
+color nearColor = fillActive ? color.new(bias == BULL ? bullColorInput : bearColorInput, FILL_PRICE_TRANSP) : na
+color farColor = fillActive ? color.new(bias == BULL ? bullColorInput : bearColorInput, FILL_LEVEL_TRANSP) : na
+color topColor = bias == BULL ? nearColor : farColor
+color bottomColor = bias == BULL ? farColor : nearColor
+
+pricePlotId = plot(fillPrice, "Price", color = na, editable = false, display = display.none)
+levelPlotId = plot(fillLevel, "Invalidation Level", color = na, editable = false, display = display.none)
+fill(pricePlotId, levelPlotId, math.max(fillPrice, fillLevel), math.min(fillPrice, fillLevel), topColor, bottomColor)
+
+var table thesisTable = table.new(position.top_right, 2, 3, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+if showPanelInput and barstate.islast
+    color thesisColor = bias == BULL ? bullColorInput : bias == BEAR ? bearColorInput : NEUTRAL_COLOR
+    table.cell(thesisTable, 0, 0, "Thesis", text_color = DASH_HEADER, text_size = size.small, text_halign = text.align_left)
+    table.cell(thesisTable, 1, 0, bias == BULL ? "Bullish" : bias == BEAR ? "Bearish" : "Undefined", text_color = thesisColor, text_size = size.small, text_halign = text.align_right)
+    table.cell(thesisTable, 0, 1, "Invalidation", text_color = DASH_HEADER, text_size = size.small, text_halign = text.align_left)
+    table.cell(thesisTable, 1, 1, na(protectedLevel) ? "-" : str.tostring(protectedLevel, format.mintick), text_color = thesisColor, text_size = size.small, text_halign = text.align_right)
+    table.cell(thesisTable, 0, 2, "Rule", text_color = DASH_HEADER, text_size = size.small, text_halign = text.align_left)
+    table.cell(thesisTable, 1, 2, activeRule + (ruleInput == RULE_HTF ? (htfIsHigher ? " (" + htfInput + ")" : " (fallback)") : ""), text_color = DASH_TEXT, text_size = size.small, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(bullInvalidation, "Bullish Structure Invalidated", "Bullish structure invalidated on {{ticker}} {{interval}}: the protected swing low was decisively broken per the stated rule.")
+alertcondition(bearInvalidation, "Bearish Structure Invalidated", "Bearish structure invalidated on {{ticker}} {{interval}}: the protected swing high was decisively broken per the stated rule.")
+alertcondition(bullInvalidation or bearInvalidation, "Any Structure Invalidation", "Structure invalidated on {{ticker}} {{interval}}: the protected swing was decisively broken per the stated rule.")
+alertcondition(reclaimEvent, "Broken Level Reclaimed", "Price closed back through the broken invalidation level on {{ticker}} {{interval}}: sweep-like break, any re-entry is a new trade with its own invalidation.")
+
+//---------------------------------------------------------------------------------------------------------------------}

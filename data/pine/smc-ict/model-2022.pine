@@ -1,0 +1,586 @@
+// This work is licensed under Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("ICT Model 2022", "Model 2022", overlay = true, max_boxes_count = 300, max_lines_count = 400, max_labels_count = 400)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+color GREEN = #089981
+color RED   = #f23645
+color GRAY  = #787b86
+color BLUE  = #2157f3
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+int BULL = 1
+int BEAR = -1
+
+int KIND_SWING   = 0
+int KIND_EQ      = 1
+int KIND_SESSION = 2
+int KIND_DAY     = 3
+
+//setup states
+int S_IDLE  = 0
+int S_RAID  = 1   //pool raided, waiting for the market structure shift
+int S_GAP   = 2   //shift printed, waiting (two bars at most) for the displacement gap
+int S_ENTRY = 3   //gap marked, waiting for the retracement into it
+int S_TRADE = 4   //entry filled
+
+string ENTRY_EDGE = "Gap edge"
+string ENTRY_CE   = "Gap CE (50%)"
+
+string SIZE_TINY   = "Tiny"
+string SIZE_SMALL  = "Small"
+string SIZE_NORMAL = "Normal"
+
+string POS_TR = "Top Right"
+string POS_TL = "Top Left"
+string POS_BR = "Bottom Right"
+string POS_BL = "Bottom Left"
+
+string GRP_POOL  = "Liquidity Pools"
+string GRP_TIME  = "Killzones"
+string GRP_SEQ   = "Sequence"
+string GRP_TRADE = "Trade"
+string GRP_DASH  = "Dashboard"
+string GRP_STYLE = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+showPdInput = input.bool(true, "Prior Day High/Low"
+  , group   = GRP_POOL
+  , tooltip = "Prior day high and low (PDH/PDL) as resting liquidity: the classic pools Model 2022 waits to see raided.")
+
+showSessInput = input.bool(true, "Asia & London Highs/Lows"
+  , group   = GRP_POOL
+  , tooltip = "Completed Asian range and London session extremes as pools (24-hour markets only; regular-hours stock charts print no bars in these windows). Windows below, on the timezone clock.")
+
+asiaSessInput   = input.session("2000-0000", "Asian Range", group = GRP_POOL)
+londonSessInput = input.session("0200-0500", "London",      group = GRP_POOL)
+
+showSwInput = input.bool(true, "Old Highs/Lows"
+  , inline  = "sw"
+  , group   = GRP_POOL
+  , tooltip = "Untaken swing highs and lows of the length set here (SwH/SwL): the old highs and lows where stops rest. They also stand in for the session pools on regular-hours charts.")
+swLenInput = input.int(12, ""
+  , minval  = 3
+  , maxval  = 50
+  , inline  = "sw"
+  , group   = GRP_POOL)
+
+showEqInput = input.bool(true, "Equal Highs/Lows"
+  , group   = GRP_POOL
+  , tooltip = "Two swing points printing within the tolerance below form an equal highs or equal lows pool (EQH/EQL), engineered liquidity resting just beyond them.")
+
+eqLenInput = input.int(5, "Equal Level Swing Length"
+  , minval  = 2
+  , maxval  = 30
+  , group   = GRP_POOL)
+
+eqTolInput = input.float(0.1, "Equal Level Tolerance (ATR)"
+  , minval  = 0
+  , step    = 0.05
+  , group   = GRP_POOL)
+
+eqAgeInput = input.int(160, "Swing Pool Max Age (bars)"
+  , minval  = 10
+  , group   = GRP_POOL
+  , tooltip = "Old highs/lows and equal highs/lows still untaken after this many bars are dropped from the pool map.")
+
+tzInput = input.string("America/New_York", "Timezone"
+  , group   = GRP_TIME
+  , tooltip = "Clock for the Asian range, London and the killzones. New York time keeps the defaults daylight-saving aware whatever the chart's timezone.")
+
+useKzInput = input.bool(false, "Raid Must Be Inside a Killzone"
+  , group   = GRP_TIME
+  , tooltip = "Only accept raids that print inside the killzones below. Off by default: the model is event-sequenced and can form at any hour, and regular-hours stock charts barely overlap the New York AM window. Turn it on for 24-hour markets to keep the event and the clock aligned.")
+
+kzLondonInput = input.session("0200-0500", "London Killzone", group = GRP_TIME)
+kzNyInput     = input.session("0700-1000", "New York AM Killzone", group = GRP_TIME)
+
+mssLenInput = input.int(3, "Structure Swing Length"
+  , minval  = 1
+  , maxval  = 20
+  , group   = GRP_SEQ
+  , tooltip = "Pivot length of the execution-timeframe swings. The market structure shift is a close through the most recent opposing swing that formed before the raid's extreme.")
+
+mssWindowInput = input.int(30, "Shift Window (bars)"
+  , minval  = 3
+  , group   = GRP_SEQ
+  , tooltip = "The structure shift must print within this many bars of the raid, or the raid is dropped.")
+
+gapMinInput = input.float(0.1, "Minimum Gap Size (ATR)"
+  , minval  = 0
+  , step    = 0.05
+  , group   = GRP_SEQ
+  , tooltip = "Displacement is demanded as a fair value gap left by the shifting leg, at least this multiple of ATR(14). No gap, no setup.")
+
+entryInput = input.string(ENTRY_EDGE, "Entry"
+  , options = [ENTRY_EDGE, ENTRY_CE]
+  , group   = GRP_TRADE
+  , tooltip = "Where the retracement into the gap fills the entry: its near edge (first touch) or its 50% consequent encroachment.")
+
+entryWindowInput = input.int(24, "Entry Window (bars)"
+  , minval  = 1
+  , group   = GRP_TRADE
+  , tooltip = "Bars allowed for the retracement into the gap after it is marked. The setup is also dropped if price trades through the stop or reaches the target first.")
+
+stopBufInput = input.float(0.05, "Stop Buffer (ATR)"
+  , minval  = 0
+  , step    = 0.05
+  , group   = GRP_TRADE
+  , tooltip = "Stop sits beyond the raided extreme by this multiple of ATR(14).")
+
+minRrInput = input.float(1.5, "Minimum Target R"
+  , minval  = 0.5
+  , step    = 0.25
+  , group   = GRP_TRADE
+  , tooltip = "The target is the nearest opposing pool (prior day level, session extreme, equal highs/lows or the day's extreme) at least this many R from the entry.")
+
+fallbackRInput = input.float(2.0, "Fallback Target R"
+  , minval  = 0.5
+  , step    = 0.25
+  , group   = GRP_TRADE
+  , tooltip = "Target used when no opposing pool lies far enough away.")
+
+dayExitInput = input.bool(true, "Exit at Day Change"
+  , group   = GRP_TRADE
+  , tooltip = "Close an open trade at the last close of the day: Model 2022 is an intraday model.")
+
+showDashInput = input.bool(true, "Show Dashboard", group = GRP_DASH)
+dashPosInput  = input.string(POS_TR, "Position", options = [POS_TR, POS_TL, POS_BR, POS_BL], group = GRP_DASH)
+dashSizeInput = input.string(SIZE_SMALL, "Size", options = [SIZE_TINY, SIZE_SMALL, SIZE_NORMAL], group = GRP_DASH)
+
+bullColorInput = input.color(GREEN, "Bullish",  inline = "dir", group = GRP_STYLE)
+bearColorInput = input.color(RED,   "Bearish",  inline = "dir", group = GRP_STYLE)
+poolColorInput = input.color(GRAY,  "Pools",    inline = "aux", group = GRP_STYLE)
+gapColorInput  = input.color(BLUE,  "Entry Gap", inline = "aux", group = GRP_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+textSize(string s) =>
+    switch s
+        SIZE_TINY   => size.tiny
+        SIZE_NORMAL => size.normal
+        => size.small
+
+tablePos(string s) =>
+    switch s
+        POS_TL => position.top_left
+        POS_BR => position.bottom_right
+        POS_BL => position.bottom_left
+        => position.top_right
+
+inSession(string sess) => timeframe.isintraday and not na(time(timeframe.period, sess, tzInput))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Pool map
+//---------------------------------------------------------------------------------------------------------------------{
+float atr = ta.atr(14)
+
+//untaken pools held in parallel arrays: price, side (1 buy-side above / -1 sell-side below), kind, tag, birth bar, drawings
+var array<float>  pPrice = array.new<float>()
+var array<int>    pSide  = array.new<int>()
+var array<int>    pKind  = array.new<int>()
+var array<string> pTag   = array.new<string>()
+var array<int>    pBorn  = array.new<int>()
+var array<line>   pLine  = array.new<line>()
+var array<label>  pLbl   = array.new<label>()
+
+// @function    retire pool i: its line ends at the given bar, its tag is removed
+dropPool(int i, int endBar) =>
+    line ln = pLine.get(i)
+    ln.set_x2(endBar)
+    label.delete(pLbl.get(i))
+    pPrice.remove(i)
+    pSide.remove(i)
+    pKind.remove(i)
+    pTag.remove(i)
+    pBorn.remove(i)
+    pLine.remove(i)
+    pLbl.remove(i)
+
+// @function    register a pool; a level printing within tolerance of an existing pool on the same side keeps only the more significant one
+addPool(float price, int side, int kind, string tag, int startBar) =>
+    bool keep = true
+    int k = pPrice.size() - 1
+    while k >= 0
+        if pSide.get(k) == side and math.abs(pPrice.get(k) - price) <= eqTolInput * nz(atr)
+            if pKind.get(k) >= kind
+                keep := false
+            else
+                line.delete(pLine.get(k))
+                dropPool(k, bar_index)
+        k -= 1
+    if keep
+        pPrice.push(price)
+        pSide.push(side)
+        pKind.push(kind)
+        pTag.push(tag)
+        pBorn.push(bar_index)
+        pLine.push(line.new(startBar, price, bar_index, price, color = color.new(poolColorInput, kind == KIND_DAY ? 0 : 30), style = kind <= KIND_EQ ? line.style_dotted : line.style_dashed, width = 1))
+        pLbl.push(label.new(bar_index, price, tag, color = color(na), textcolor = poolColorInput, style = label.style_label_left, size = size.tiny))
+
+// prior day levels
+bool newDay = timeframe.change("D")
+var float dayHi = na
+var float dayLo = na
+var int   dayStart = na
+if newDay
+    if showPdInput and not na(dayHi) and timeframe.isintraday
+        // yesterday's untaken prior-day levels give way to the new ones
+        int k = pPrice.size() - 1
+        while k >= 0
+            if pKind.get(k) == KIND_DAY
+                line.delete(pLine.get(k))
+                dropPool(k, bar_index)
+            k -= 1
+        addPool(dayHi, BULL, KIND_DAY, "PDH", bar_index)
+        addPool(dayLo, BEAR, KIND_DAY, "PDL", bar_index)
+    dayHi    := high
+    dayLo    := low
+    dayStart := bar_index
+else
+    dayHi := math.max(nz(dayHi, high), high)
+    dayLo := math.min(nz(dayLo, low), low)
+
+// Asian range and London session extremes, pooled when the window closes
+trackSession(string sess, string name) =>
+    var float sHi = na
+    var float sLo = na
+    var int   sStart = na
+    bool inS = inSession(sess)
+    if inS and not inS[1]
+        sHi    := high
+        sLo    := low
+        sStart := bar_index
+    else if inS
+        sHi := math.max(sHi, high)
+        sLo := math.min(sLo, low)
+    if showSessInput and not inS and inS[1] and not na(sHi)
+        addPool(sHi, BULL, KIND_SESSION, name + " H", sStart)
+        addPool(sLo, BEAR, KIND_SESSION, name + " L", sStart)
+
+trackSession(asiaSessInput, "Asia")
+trackSession(londonSessInput, "London")
+
+// equal highs and lows from swing points within tolerance of each other
+float eqPh = ta.pivothigh(high, eqLenInput, eqLenInput)
+float eqPl = ta.pivotlow(low, eqLenInput, eqLenInput)
+var float lastEqPh    = na
+var int   lastEqPhBar = na
+var float lastEqPl    = na
+var int   lastEqPlBar = na
+float recentHi = ta.highest(high, eqLenInput)
+float recentLo = ta.lowest(low, eqLenInput)
+if not na(eqPh)
+    if showEqInput and not na(lastEqPh) and math.abs(eqPh - lastEqPh) <= eqTolInput * atr and recentHi <= math.max(eqPh, lastEqPh)
+        addPool(math.max(eqPh, lastEqPh), BULL, KIND_EQ, "EQH", lastEqPhBar)
+    lastEqPh    := eqPh
+    lastEqPhBar := bar_index - eqLenInput
+if not na(eqPl)
+    if showEqInput and not na(lastEqPl) and math.abs(eqPl - lastEqPl) <= eqTolInput * atr and recentLo >= math.min(eqPl, lastEqPl)
+        addPool(math.min(eqPl, lastEqPl), BEAR, KIND_EQ, "EQL", lastEqPlBar)
+    lastEqPl    := eqPl
+    lastEqPlBar := bar_index - eqLenInput
+
+// old highs and lows
+float swPh = ta.pivothigh(high, swLenInput, swLenInput)
+float swPl = ta.pivotlow(low, swLenInput, swLenInput)
+float swRecentHi = ta.highest(high, swLenInput)
+float swRecentLo = ta.lowest(low, swLenInput)
+if showSwInput and not na(swPh) and swRecentHi <= swPh
+    addPool(swPh, BULL, KIND_SWING, "SwH", bar_index - swLenInput)
+if showSwInput and not na(swPl) and swRecentLo >= swPl
+    addPool(swPl, BEAR, KIND_SWING, "SwL", bar_index - swLenInput)
+
+// raids: the most significant pool traded through on this bar, per side
+bool   kzOk      = not useKzInput or inSession(kzLondonInput) or inSession(kzNyInput)
+bool   raidUp    = false   //buy-side pool raided (bearish setup)
+bool   raidDn    = false   //sell-side pool raided (bullish setup)
+string raidUpTag = ""
+string raidDnTag = ""
+int    raidUpKind = -1
+int    raidDnKind = -1
+int j = pPrice.size() - 1
+while j >= 0
+    float lvl  = pPrice.get(j)
+    int   side = pSide.get(j)
+    bool  hit  = side == BULL ? high > lvl : low < lvl
+    bool  old  = pKind.get(j) <= KIND_EQ and bar_index - pBorn.get(j) > eqAgeInput
+    if hit and pBorn.get(j) < bar_index
+        if side == BULL and pKind.get(j) > raidUpKind
+            raidUpKind := pKind.get(j)
+            raidUpTag  := pTag.get(j)
+        if side == BEAR and pKind.get(j) > raidDnKind
+            raidDnKind := pKind.get(j)
+            raidDnTag  := pTag.get(j)
+        dropPool(j, bar_index)
+    else if old
+        line.delete(pLine.get(j))
+        dropPool(j, bar_index)
+    j -= 1
+raidUp := raidUpKind >= 0 and kzOk
+raidDn := raidDnKind >= 0 and kzOk
+
+// live pools stay extended just past the last bar
+if pPrice.size() > 0
+    for k = 0 to pPrice.size() - 1
+        pLine.get(k).set_x2(bar_index + 2)
+        pLbl.get(k).set_xy(bar_index + 2, pPrice.get(k))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Execution swings and displacement gaps
+//---------------------------------------------------------------------------------------------------------------------{
+float sh = ta.pivothigh(high, mssLenInput, mssLenInput)
+float sl = ta.pivotlow(low, mssLenInput, mssLenInput)
+var float lastSh    = na
+var int   lastShBar = na
+var float lastSl    = na
+var int   lastSlBar = na
+if not na(sh)
+    lastSh    := sh
+    lastShBar := bar_index - mssLenInput
+if not na(sl)
+    lastSl    := sl
+    lastSlBar := bar_index - mssLenInput
+
+bool bullGapNow = bar_index > 2 and low > high[2] and (low - high[2]) >= gapMinInput * nz(atr)
+bool bearGapNow = bar_index > 2 and high < low[2] and (low[2] - high) >= gapMinInput * nz(atr)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Raid, shift, gap entry
+//---------------------------------------------------------------------------------------------------------------------{
+var int    st       = S_IDLE
+var int    dir      = 0
+var string poolTag  = ""
+var int    raidBar  = na
+var float  ext      = na     //raided extreme, the invalidation
+var int    extBar   = na
+var float  mssLvl   = na
+var int    mssFrom  = na
+var int    mssBar   = na
+var float  gTop     = na
+var float  gBot     = na
+var int    gLeft    = na
+var int    gBar     = na
+var float  entry    = na
+var float  stop     = na
+var float  target   = na
+var string tgtTag   = ""
+var int    fillBar  = na
+var string lastResult = ""
+
+var label  raidLbl  = na
+var box    gapBox   = na
+var box    tpBox    = na
+var box    slBox    = na
+
+bool evRaid   = false
+bool evMss    = false
+bool evFill   = false
+bool evTarget = false
+bool evStop   = false
+bool evDayEnd = false
+
+// @function    nearest opposing pool at least the minimum R away from the entry, else the fallback multiple
+pickTarget(int d, float e, float s) =>
+    float risk = math.abs(e - s)
+    float best = na
+    string tag = ""
+    if pPrice.size() > 0
+        for k = 0 to pPrice.size() - 1
+            float lvl = pPrice.get(k)
+            if pSide.get(k) == d and (d == BULL ? lvl > e : lvl < e) and math.abs(lvl - e) >= minRrInput * risk
+                if na(best) or math.abs(lvl - e) < math.abs(best - e)
+                    best := lvl
+                    tag  := pTag.get(k)
+    float dayExt = d == BULL ? dayHi : dayLo
+    if not na(dayExt) and (d == BULL ? dayExt > e : dayExt < e) and math.abs(dayExt - e) >= minRrInput * risk
+        if na(best) or math.abs(dayExt - e) < math.abs(best - e)
+            best := dayExt
+            tag  := d == BULL ? "Day high" : "Day low"
+    if na(best)
+        best := e + d * fallbackRInput * risk
+        tag  := str.tostring(fallbackRInput) + "R"
+    [best, tag]
+
+closeTrade(string result, int endBar, float exitPrice) =>
+    tpBox.set_right(endBar)
+    slBox.set_right(endBar)
+    color css = result == "Target" ? bullColorInput : result == "Stop" ? bearColorInput : GRAY
+    label.new(endBar, exitPrice, result, color = color(na), textcolor = css, style = label.style_label_left, size = size.small)
+
+// a fresh raid replaces any setup that has not been filled
+bool takeRaid = st != S_TRADE and (raidUp or raidDn)
+if takeRaid
+    int d = raidDn ? BULL : BEAR
+    // a bar raiding both sides is ambiguous: keep the side that closed back inside
+    if raidUp and raidDn
+        d := close > open ? BULL : BEAR
+    float swing = d == BULL ? lastSh : lastSl
+    if not na(swing)
+        if st == S_ENTRY
+            gapBox.delete()
+        // a deeper raid on the same side, before any shift, supersedes the first one
+        if st == S_RAID and d == dir
+            raidLbl.delete()
+        st      := S_RAID
+        dir     := d
+        poolTag := d == BULL ? raidDnTag : raidUpTag
+        raidBar := bar_index
+        ext     := d == BULL ? low : high
+        extBar  := bar_index
+        mssLvl  := swing
+        mssFrom := d == BULL ? lastShBar : lastSlBar
+        evRaid  := true
+        raidLbl := label.new(bar_index, ext, "Raid " + poolTag, color = color(na), textcolor = d == BULL ? bullColorInput : bearColorInput, style = d == BULL ? label.style_label_up : label.style_label_down, size = size.small)
+
+else if st == S_RAID
+    // the raid may extend; the shift level follows the latest swing that formed before the extreme
+    if dir == BULL and low < ext
+        ext    := low
+        extBar := bar_index
+        raidLbl.set_xy(bar_index, low)
+    if dir == BEAR and high > ext
+        ext    := high
+        extBar := bar_index
+        raidLbl.set_xy(bar_index, high)
+    if dir == BULL and not na(sh) and lastShBar < extBar
+        mssLvl  := lastSh
+        mssFrom := lastShBar
+    if dir == BEAR and not na(sl) and lastSlBar < extBar
+        mssLvl  := lastSl
+        mssFrom := lastSlBar
+    if bar_index - raidBar > mssWindowInput
+        st := S_IDLE
+        raidLbl.set_textcolor(color.new(GRAY, 30))
+    else if dir == BULL ? close > mssLvl : close < mssLvl
+        st     := S_GAP
+        mssBar := bar_index
+        evMss  := true
+        line.new(mssFrom, mssLvl, bar_index, mssLvl, color = dir == BULL ? bullColorInput : bearColorInput, style = line.style_dashed, width = 1)
+        label.new(int(math.round(0.5 * (mssFrom + bar_index))), mssLvl, "MSS", color = color(na), textcolor = dir == BULL ? bullColorInput : bearColorInput, style = dir == BULL ? label.style_label_down : label.style_label_up, size = size.small)
+
+// displacement gap: the most recent gap of the shifting leg, formed after the extreme, at most two bars after the shift
+if st == S_GAP
+    bool gapHere = dir == BULL ? bullGapNow : bearGapNow
+    if gapHere and bar_index - 2 >= extBar
+        gTop  := dir == BULL ? low : low[2]
+        gBot  := dir == BULL ? high[2] : high
+        gLeft := bar_index - 2
+        gBar  := bar_index
+    bool gapValid = not na(gLeft) and gLeft >= extBar and gBar >= raidBar
+    if gapValid and bar_index - mssBar >= 0 and gBar <= bar_index
+        st     := S_ENTRY
+        entry  := entryInput == ENTRY_CE ? math.avg(gTop, gBot) : dir == BULL ? gTop : gBot
+        stop   := dir == BULL ? ext - stopBufInput * atr : ext + stopBufInput * atr
+        [t, tg] = pickTarget(dir, entry, stop)
+        target := t
+        tgtTag := tg
+        gapBox := box.new(gLeft, gTop, bar_index, gBot, border_color = color.new(gapColorInput, 40), bgcolor = color.new(gapColorInput, 75), text = "FVG", text_size = size.tiny, text_color = gapColorInput, text_halign = text.align_left)
+    else if bar_index - mssBar >= 2
+        st := S_IDLE
+
+// track the gap from the shift leg while the shift is pending, so a gap printed with the shift candle counts
+if st == S_RAID
+    bool gapLeg = dir == BULL ? bullGapNow : bearGapNow
+    if gapLeg and bar_index - 2 >= extBar
+        gTop  := dir == BULL ? low : low[2]
+        gBot  := dir == BULL ? high[2] : high
+        gLeft := bar_index - 2
+        gBar  := bar_index
+    else if na(extBar) or (not na(gLeft) and gLeft < extBar)
+        gLeft := na
+
+// waiting for the retracement into the gap
+if st == S_ENTRY and bar_index > gBar
+    gapBox.set_right(bar_index)
+    bool touched  = dir == BULL ? low <= entry : high >= entry
+    bool stopped  = dir == BULL ? low <= stop : high >= stop
+    bool missed   = dir == BULL ? high >= target : low <= target
+    if touched
+        st      := S_TRADE
+        fillBar := bar_index
+        evFill  := true
+        tpBox := box.new(bar_index, dir == BULL ? target : entry, bar_index, dir == BULL ? entry : target, border_color = color(na), bgcolor = color.new(bullColorInput, 82), text = "TP " + tgtTag, text_size = size.tiny, text_color = color.new(bullColorInput, 0), text_halign = text.align_left)
+        slBox := box.new(bar_index, dir == BULL ? entry : stop, bar_index, dir == BULL ? stop : entry, border_color = color(na), bgcolor = color.new(bearColorInput, 82), text = "SL", text_size = size.tiny, text_color = bearColorInput, text_halign = text.align_left)
+        label.new(bar_index, dir == BULL ? low : high, "", color = dir == BULL ? bullColorInput : bearColorInput, style = dir == BULL ? label.style_triangleup : label.style_triangledown, size = size.small, tooltip = "Entry filled at " + str.tostring(entry, format.mintick))
+        if stopped
+            st         := S_IDLE
+            evStop     := true
+            lastResult := "Stop"
+            closeTrade("Stop", bar_index, stop)
+    else if stopped or missed or bar_index - gBar > entryWindowInput
+        st := S_IDLE
+        gapBox.set_bgcolor(color.new(gapColorInput, 90))
+        gapBox.set_text(stopped ? "FVG · invalid" : missed ? "FVG · missed" : "FVG · expired")
+
+// managing the open trade
+else if st == S_TRADE and bar_index > fillBar
+    bool hitStop   = dir == BULL ? low <= stop : high >= stop
+    bool hitTarget = dir == BULL ? high >= target : low <= target
+    if dayExitInput and newDay
+        st         := S_IDLE
+        evDayEnd   := true
+        lastResult := "Day end"
+        closeTrade("Day end", bar_index - 1, close[1])
+    else if hitStop
+        st         := S_IDLE
+        evStop     := true
+        lastResult := "Stop"
+        closeTrade("Stop", bar_index, stop)
+    else if hitTarget
+        st         := S_IDLE
+        evTarget   := true
+        lastResult := "Target"
+        closeTrade("Target", bar_index, target)
+    else
+        tpBox.set_right(bar_index)
+        slBox.set_right(bar_index)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dash = table.new(tablePos(dashPosInput), 2, 5, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+if barstate.islast and showDashInput
+    string sz = textSize(dashSizeInput)
+    color dirCss = dir == BULL ? bullColorInput : bearColorInput
+    string stTxt = switch st
+        S_RAID  => (dir == BULL ? "Long" : "Short") + ": raid, wait for MSS"
+        S_GAP   => (dir == BULL ? "Long" : "Short") + ": MSS, wait for gap"
+        S_ENTRY => (dir == BULL ? "Long" : "Short") + ": wait for retrace"
+        S_TRADE => (dir == BULL ? "Long" : "Short") + ": in trade"
+        => "Scanning" + (lastResult != "" ? " (last: " + lastResult + ")" : "")
+    bool hasPlan = st == S_ENTRY or st == S_TRADE or (st == S_IDLE and lastResult != "")
+    float rr = hasPlan and math.abs(entry - stop) > 0 ? math.abs(target - entry) / math.abs(entry - stop) : na
+    table.cell(dash, 0, 0, "Model 2022", text_color = DASH_TEXT, text_halign = text.align_left, text_size = sz)
+    table.cell(dash, 1, 0, stTxt, text_color = st == S_IDLE ? DASH_TEXT : dirCss, text_halign = text.align_right, text_size = sz)
+    table.cell(dash, 0, 1, "Pool Raided", text_color = DASH_HEADER, text_halign = text.align_left, text_size = sz)
+    table.cell(dash, 1, 1, poolTag == "" ? "-" : poolTag, text_color = DASH_TEXT, text_halign = text.align_right, text_size = sz)
+    table.cell(dash, 0, 2, "Entry / Stop", text_color = DASH_HEADER, text_halign = text.align_left, text_size = sz)
+    table.cell(dash, 1, 2, hasPlan ? str.tostring(entry, format.mintick) + " / " + str.tostring(stop, format.mintick) : "-", text_color = DASH_TEXT, text_halign = text.align_right, text_size = sz)
+    table.cell(dash, 0, 3, "Target", text_color = DASH_HEADER, text_halign = text.align_left, text_size = sz)
+    table.cell(dash, 1, 3, hasPlan ? str.tostring(target, format.mintick) + " (" + tgtTag + ", " + str.tostring(rr, "#.#") + "R)" : "-", text_color = DASH_TEXT, text_halign = text.align_right, text_size = sz)
+    table.cell(dash, 0, 4, "Killzone", text_color = DASH_HEADER, text_halign = text.align_left, text_size = sz)
+    table.cell(dash, 1, 4, not useKzInput ? "Filter off" : (inSession(kzLondonInput) ? "London" : inSession(kzNyInput) ? "New York AM" : "Outside"), text_color = DASH_TEXT, text_halign = text.align_right, text_size = sz)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(evRaid and dir == BULL,   "Sell-side Raid",      "Model 2022 on {{ticker}}: sell-side pool raided, waiting for a bullish market structure shift")
+alertcondition(evRaid and dir == BEAR,   "Buy-side Raid",       "Model 2022 on {{ticker}}: buy-side pool raided, waiting for a bearish market structure shift")
+alertcondition(st == S_ENTRY and st[1] != S_ENTRY, "Entry Gap Marked", "Model 2022 on {{ticker}}: structure shifted with displacement, entry gap marked")
+alertcondition(evFill,                    "Entry Filled",        "Model 2022 on {{ticker}}: retracement into the gap filled the entry")
+alertcondition(evTarget,                  "Target Reached",      "Model 2022 on {{ticker}}: target pool reached")
+alertcondition(evStop,                    "Stop Hit",            "Model 2022 on {{ticker}}: price traded beyond the raided extreme")
+
+//---------------------------------------------------------------------------------------------------------------------}

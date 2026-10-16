@@ -1,0 +1,240 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Dow Theory", shorttitle = "Dow Theory", overlay = true, precision = 0, max_lines_count = 500, max_labels_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+color NEUTRAL_COLOR = #787b86
+color HIDDEN_COLOR  = #00000000
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+
+int GHOST_TRANSP = 40
+int BG_TRANSP    = 94
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+primaryLenInput   = input.int(20, "Primary Swing Length",   minval = 2, group = "Structure", tooltip = "Width in bars on each side used to confirm the swing points that define the primary trend. Rising swing highs and rising swing lows classify an uptrend, falling ones a downtrend. A swing confirms this many bars after it forms, so the read is deliberately late, as Dow intended.")
+secondaryLenInput = input.int(5,  "Secondary Swing Length", minval = 2, group = "Structure", tooltip = "Width in bars for the shorter swings that define the secondary trend (Dow's secondary reactions against the primary move). Fluctuations smaller than this are treated as minor noise, the third of Dow's three trends.")
+basisInput        = input.string("Close", "Price Basis", options = ["Close", "High/Low"], group = "Structure", tooltip = "Dow Theory judges the trend on closing prices rather than intraday wicks. 'Close' detects swings on closes (classic reading), 'High/Low' uses wick extremes. Reversals always require a decisive close beyond the prior swing point.")
+
+confSymInput   = input.symbol("", "Confirmation Index", group = "Confirmation", tooltip = "Index-confirmation tenet: the averages must confirm each other. Select a related index, sector or correlated market; its primary trend is computed with the same settings and compared with the chart's. Leave empty to disable.")
+volWindowInput = input.int(50, "Volume Window", minval = 5, group = "Confirmation", tooltip = "Volume-confirms-trend tenet: average volume of advancing bars is compared with that of declining bars over this window. In a healthy uptrend volume expands on advances and contracts on pullbacks; the mirror holds in downtrends.")
+
+showDashInput = input.bool(true, "Show Dashboard", group = "Dashboard", tooltip = "Summary panel showing the primary and secondary trend states with their latest swing pair, volume confirmation, the market phase, and index confirmation when a confirmation index is set.")
+dashPosInput  = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], inline = "dash", group = "Dashboard", tooltip = "Dashboard corner on the chart.")
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], inline = "dash", group = "Dashboard", tooltip = "Dashboard text size.")
+
+bullColorInput = input.color(#089981, "Bullish", inline = "colors", group = "Style", tooltip = "Color used for bullish structure: HH/HL labels, uptrend swing lines, bullish reversals, background and dashboard cells.")
+bearColorInput = input.color(#f23645, "Bearish", inline = "colors", group = "Style", tooltip = "Color used for bearish structure: LH/LL labels, downtrend swing lines, bearish reversals, background and dashboard cells.")
+
+showZigzagInput  = input.bool(true, "Swing Lines",           group = "Style", tooltip = "Connect confirmed swing points with lines colored by the trend state in force when each swing confirms. Primary structure is solid, secondary structure dotted.")
+showPrimLblInput = input.bool(true, "Primary Swing Labels",  group = "Style", tooltip = "Label each confirmed primary swing HH, HL, LH or LL relative to the previous swing of the same kind.")
+showSecInput     = input.bool(true, "Secondary Structure",   group = "Style", tooltip = "Overlay the secondary-degree structure (ghosted labels, dotted swing lines and reversal marks) inside the primary structure, separating primary legs from secondary reactions.")
+showRevInput     = input.bool(true, "Trend Change Markers",  group = "Style", tooltip = "Mark trend changes on the chart. 'Reversal' tags flag the classic failure swing (a failed swing followed by a close beyond the prior swing point) with the broken level traced back to its swing; small arrows mark trends classified from the swing sequence alone.")
+showBgInput      = input.bool(false, "Trend Background",      group = "Style", tooltip = "Tint the chart background with the primary trend state.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Dow trend state machine for one degree of structure. Trend is classified from the sequence of confirmed
+// swings (higher highs & higher lows = up, lower highs & lower lows = down) and is presumed to continue
+// until a failure swing gives a definite reversal signal: a failed swing, then a close beyond the prior swing point.
+structureState(float pivotHighVal, float pivotLowVal, int length) =>
+    var float h1    = na
+    var float h2    = na
+    var float l1    = na
+    var float l2    = na
+    var int   h1Bar = na
+    var int   l1Bar = na
+    var int   hiDir = 0
+    var int   loDir = 0
+    var int   state = 0
+
+    bool newHigh  = not na(pivotHighVal)
+    bool newLow   = not na(pivotLowVal)
+    int  pivotBar = bar_index - length
+
+    if newHigh
+        h2    := h1
+        h1    := pivotHighVal
+        h1Bar := pivotBar
+        hiDir := na(h2) ? 0 : h1 > h2 ? 1 : -1
+    if newLow
+        l2    := l1
+        l1    := pivotLowVal
+        l1Bar := pivotBar
+        loDir := na(l2) ? 0 : l1 > l2 ? 1 : -1
+
+    bool bearRev = state == 1  and hiDir == -1 and not na(l1) and close < l1
+    bool bullRev = state == -1 and loDir == 1  and not na(h1) and close > h1
+
+    int prevState = state
+    if bearRev
+        state := -1
+    else if bullRev
+        state := 1
+    else if hiDir == 1 and loDir == 1
+        state := 1
+    else if hiDir == -1 and loDir == -1
+        state := -1
+
+    bool upFlip = state == 1  and prevState != 1
+    bool dnFlip = state == -1 and prevState != -1
+
+    [state, upFlip, dnFlip, bullRev, bearRev, hiDir, loDir, h1, l1, h1Bar, l1Bar, newHigh, newLow]
+
+// Draws one degree of structure: HH/HL/LH/LL swing labels, trend-colored swing lines, and failure-swing
+// reversal marks with the broken swing level traced back to its origin.
+drawStructure(bool enabled, bool isPrimary, int state, bool bullRev, bool bearRev, int hiDir, int loDir, float h1, float l1, int h1Bar, int l1Bar, bool newHigh, bool newLow) =>
+    var int   zzBar = na
+    var float zzVal = na
+
+    int    ghost    = isPrimary ? 0 : GHOST_TRANSP
+    color  stateCss = state == 1 ? bullColorInput : state == -1 ? bearColorInput : NEUTRAL_COLOR
+    string lblSize  = isPrimary ? size.small : size.tiny
+    bool   lblOn    = enabled and (isPrimary ? showPrimLblInput : true)
+    bool   lineOn   = enabled and showZigzagInput
+    bool   revOn    = enabled and showRevInput
+
+    if newHigh
+        if lblOn and hiDir != 0
+            label.new(h1Bar, h1, hiDir == 1 ? "HH" : "LH", color = HIDDEN_COLOR, textcolor = color.new(hiDir == 1 ? bullColorInput : bearColorInput, ghost), style = label.style_label_down, size = lblSize)
+        if lineOn
+            if not na(zzBar)
+                line.new(zzBar, zzVal, h1Bar, h1, color = color.new(stateCss, ghost), width = 1, style = isPrimary ? line.style_solid : line.style_dotted)
+            zzBar := h1Bar
+            zzVal := h1
+    if newLow
+        if lblOn and loDir != 0
+            label.new(l1Bar, l1, loDir == 1 ? "HL" : "LL", color = HIDDEN_COLOR, textcolor = color.new(loDir == 1 ? bullColorInput : bearColorInput, ghost), style = label.style_label_up, size = lblSize)
+        if lineOn
+            if not na(zzBar)
+                line.new(zzBar, zzVal, l1Bar, l1, color = color.new(stateCss, ghost), width = 1, style = isPrimary ? line.style_solid : line.style_dotted)
+            zzBar := l1Bar
+            zzVal := l1
+    if revOn
+        if bearRev
+            line.new(l1Bar, l1, bar_index, l1, color = color.new(bearColorInput, ghost), width = 1, style = isPrimary ? line.style_dashed : line.style_dotted)
+            label.new(bar_index, l1, "Reversal", color = HIDDEN_COLOR, textcolor = color.new(bearColorInput, ghost), style = label.style_label_down, size = lblSize, tooltip = "Failure swing — lower high, then a close below the prior swing low")
+        if bullRev
+            line.new(h1Bar, h1, bar_index, h1, color = color.new(bullColorInput, ghost), width = 1, style = isPrimary ? line.style_dashed : line.style_dotted)
+            label.new(bar_index, h1, "Reversal", color = HIDDEN_COLOR, textcolor = color.new(bullColorInput, ghost), style = label.style_label_up, size = lblSize, tooltip = "Failure swing — higher low, then a close above the prior swing high")
+
+// Dashboard helpers
+trendTxt(int state) =>
+    state == 1 ? "▲ Up" : state == -1 ? "▼ Down" : "—"
+
+trendCol(int state) =>
+    state == 1 ? bullColorInput : state == -1 ? bearColorInput : NEUTRAL_COLOR
+
+pairTxt(int hiDir, int loDir) =>
+    hiDir != 0 and loDir != 0 ? " · " + (hiDir == 1 ? "HH" : "LH") + "/" + (loDir == 1 ? "HL" : "LL") : ""
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Structure
+//---------------------------------------------------------------------------------------------------------------------{
+float hSrcSeries = basisInput == "Close" ? close : high
+float lSrcSeries = basisInput == "Close" ? close : low
+
+float primaryPh   = ta.pivothigh(hSrcSeries, primaryLenInput, primaryLenInput)
+float primaryPl   = ta.pivotlow(lSrcSeries, primaryLenInput, primaryLenInput)
+float secondaryPh = ta.pivothigh(hSrcSeries, secondaryLenInput, secondaryLenInput)
+float secondaryPl = ta.pivotlow(lSrcSeries, secondaryLenInput, secondaryLenInput)
+
+[primTrend, primUpFlip, primDnFlip, primBullRev, primBearRev, primHiDir, primLoDir, primH1, primL1, primH1Bar, primL1Bar, primNewHigh, primNewLow] = structureState(primaryPh, primaryPl, primaryLenInput)
+[secTrend, secUpFlip, secDnFlip, secBullRev, secBearRev, secHiDir, secLoDir, secH1, secL1, secH1Bar, secL1Bar, secNewHigh, secNewLow] = structureState(secondaryPh, secondaryPl, secondaryLenInput)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Volume Confirmation & Phase
+//---------------------------------------------------------------------------------------------------------------------{
+bool  upBar     = close > nz(close[1], close)
+bool  dnBar     = close < nz(close[1], close)
+float barVolume = nz(volume)
+
+float advVolSum = math.sum(upBar ? barVolume : 0, volWindowInput)
+float advBarCnt = math.sum(upBar ? 1 : 0, volWindowInput)
+float decVolSum = math.sum(dnBar ? barVolume : 0, volWindowInput)
+float decBarCnt = math.sum(dnBar ? 1 : 0, volWindowInput)
+
+float advVolAvg = advBarCnt > 0 ? advVolSum / advBarCnt : na
+float decVolAvg = decBarCnt > 0 ? decVolSum / decBarCnt : na
+
+int volState = 0
+if not na(advVolAvg) and not na(decVolAvg) and advVolSum + decVolSum > 0 and primTrend != 0
+    volState := primTrend == 1 ? (advVolAvg > decVolAvg ? 1 : -1) : decVolAvg > advVolAvg ? 1 : -1
+
+string phaseTxt = primTrend == 1 and secTrend == 1 ? "Markup" : primTrend == -1 and secTrend == -1 ? "Markdown" : primTrend == -1 and secTrend == 1 ? "Accumulation" : primTrend == 1 and secTrend == -1 ? "Distribution" : "—"
+color  phaseCss = phaseTxt == "Markup" or phaseTxt == "Accumulation" ? bullColorInput : phaseTxt == "—" ? NEUTRAL_COLOR : bearColorInput
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Index Confirmation
+//---------------------------------------------------------------------------------------------------------------------{
+bool   extEnabled = confSymInput != ""
+string extSymbol  = extEnabled ? confSymInput : syminfo.tickerid
+
+[extTrend, extUpFlip, extDnFlip, extBullRev, extBearRev, extHiDir, extLoDir, extH1, extL1, extH1Bar, extL1Bar, extNewHigh, extNewLow] = request.security(extSymbol, timeframe.period, structureState(primaryPh, primaryPl, primaryLenInput))
+
+bool indexConfirms = extEnabled and primTrend != 0 and extTrend != 0 and extTrend == primTrend
+bool indexDiverges = extEnabled and primTrend != 0 and extTrend != 0 and extTrend != primTrend
+bool divergeStart  = indexDiverges and not indexDiverges[1]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visuals
+//---------------------------------------------------------------------------------------------------------------------{
+drawStructure(true, true, primTrend, primBullRev, primBearRev, primHiDir, primLoDir, primH1, primL1, primH1Bar, primL1Bar, primNewHigh, primNewLow)
+drawStructure(showSecInput, false, secTrend, secBullRev, secBearRev, secHiDir, secLoDir, secH1, secL1, secH1Bar, secL1Bar, secNewHigh, secNewLow)
+
+// Primary trend classified from the swing sequence alone (no failure swing involved)
+if showRevInput and primUpFlip and not primBullRev
+    label.new(bar_index, low, "▲", color = HIDDEN_COLOR, textcolor = bullColorInput, style = label.style_label_up, size = size.tiny, tooltip = "Primary uptrend — rising swing highs and rising swing lows")
+if showRevInput and primDnFlip and not primBearRev
+    label.new(bar_index, high, "▼", color = HIDDEN_COLOR, textcolor = bearColorInput, style = label.style_label_down, size = size.tiny, tooltip = "Primary downtrend — falling swing highs and falling swing lows")
+
+bgcolor(showBgInput and primTrend == 1 ? color.new(bullColorInput, BG_TRANSP) : showBgInput and primTrend == -1 ? color.new(bearColorInput, BG_TRANSP) : na, title = "Primary Trend Background")
+
+plot(primTrend, "Primary Trend",   editable = false, display = display.data_window)
+plot(secTrend,  "Secondary Trend", editable = false, display = display.data_window)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+string dashLocation = dashPosInput == "Top Right" ? position.top_right : dashPosInput == "Top Left" ? position.top_left : dashPosInput == "Bottom Right" ? position.bottom_right : position.bottom_left
+string dashTextSize = dashSizeInput == "Tiny" ? size.tiny : dashSizeInput == "Small" ? size.small : size.normal
+
+var table dash = na
+
+if showDashInput and barstate.islast
+    if na(dash)
+        dash := table.new(dashLocation, 2, extEnabled ? 5 : 4, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+    table.cell(dash, 0, 0, "Primary",   text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dash, 1, 0, trendTxt(primTrend) + pairTxt(primHiDir, primLoDir), text_color = trendCol(primTrend), text_size = dashTextSize, text_halign = text.align_right, tooltip = "Primary trend from the sequence of confirmed primary swings, presumed to continue until a definite reversal signal")
+    table.cell(dash, 0, 1, "Secondary", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dash, 1, 1, trendTxt(secTrend) + pairTxt(secHiDir, secLoDir), text_color = trendCol(secTrend), text_size = dashTextSize, text_halign = text.align_right, tooltip = "Secondary trend from the shorter swings — reactions against the primary move")
+    table.cell(dash, 0, 2, "Volume",    text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dash, 1, 2, volState == 1 ? "Confirms" : volState == -1 ? "Diverges" : "—", text_color = trendCol(volState), text_size = dashTextSize, text_halign = text.align_right, tooltip = "Volume should expand in the direction of the primary trend: average advancing-bar volume vs declining-bar volume over the volume window")
+    table.cell(dash, 0, 3, "Phase",     text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dash, 1, 3, phaseTxt, text_color = phaseCss, text_size = dashTextSize, text_halign = text.align_right, tooltip = "Accumulation, markup, distribution, markdown — read from the primary and secondary trend states together")
+    if extEnabled
+        table.cell(dash, 0, 4, "Index", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left)
+        table.cell(dash, 1, 4, (extTrend == 1 ? "▲ " : extTrend == -1 ? "▼ " : "") + (indexConfirms ? "Confirms" : indexDiverges ? "Diverges" : "—"), text_color = indexConfirms ? bullColorInput : indexDiverges ? bearColorInput : NEUTRAL_COLOR, text_size = dashTextSize, text_halign = text.align_right, tooltip = "The averages must confirm each other: primary trend of the confirmation index vs this chart's primary trend")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(primUpFlip,   "Primary Uptrend Confirmed",   "Dow Theory: primary trend turned up on {{ticker}} {{interval}} — rising swing highs and rising swing lows")
+alertcondition(primDnFlip,   "Primary Downtrend Confirmed", "Dow Theory: primary trend turned down on {{ticker}} {{interval}} — falling swing highs and falling swing lows")
+alertcondition(primBullRev,  "Primary Bullish Reversal",    "Dow Theory: primary bullish failure swing on {{ticker}} {{interval}} — higher low, then a close above the prior swing high")
+alertcondition(primBearRev,  "Primary Bearish Reversal",    "Dow Theory: primary bearish failure swing on {{ticker}} {{interval}} — lower high, then a close below the prior swing low")
+alertcondition(secUpFlip,    "Secondary Uptrend Confirmed",   "Dow Theory: secondary trend turned up on {{ticker}} {{interval}}")
+alertcondition(secDnFlip,    "Secondary Downtrend Confirmed", "Dow Theory: secondary trend turned down on {{ticker}} {{interval}}")
+alertcondition(secBullRev,   "Secondary Bullish Reversal",  "Dow Theory: secondary bullish failure swing on {{ticker}} {{interval}} — higher low, then a close above the prior swing high")
+alertcondition(secBearRev,   "Secondary Bearish Reversal",  "Dow Theory: secondary bearish failure swing on {{ticker}} {{interval}} — lower high, then a close below the prior swing low")
+alertcondition(divergeStart, "Index Non-Confirmation",      "Dow Theory: confirmation index no longer confirms the primary trend of {{ticker}} {{interval}}")
+
+//---------------------------------------------------------------------------------------------------------------------}

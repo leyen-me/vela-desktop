@@ -1,0 +1,452 @@
+// This work is licensed under Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("ACD Method", shorttitle = "ACD Method", overlay = true
+  , max_boxes_count  = 500
+  , max_lines_count  = 500
+  , max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR    = #089981 // A up and C up
+BEAR_COLOR    = #f23645 // A down and C down
+ACCENT_COLOR  = #ff9800 // the one accent: failed A, the trap the C trades against
+NEUTRAL_COLOR = #787b86 // opening range
+PIVOT_COLOR   = #5b9cf6 // pivot range
+
+color COLOR_HIDDEN = #00000000
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+string TZ_EXCHANGE = "Exchange"
+string TXT_NA      = "-"
+
+string GRP_SESSION = "Session & Opening Range"
+string GRP_LEVELS  = "A & C Levels"
+string GRP_PIVOT   = "Pivot Range"
+string GRP_LINE    = "Number Line"
+string GRP_DISPLAY = "Display"
+string GRP_DASH    = "Dashboard"
+string GRP_STYLE   = "Style"
+
+int MIN_BASELINE = 3
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+sessionInput = input.session("0930-1600", "Regular Session", group = GRP_SESSION
+  , tooltip = "The session whose open starts the opening range, 09:30-16:00 for US stocks. Bars outside it are ignored. The window must not cross midnight.")
+
+tzInput = input.string(TZ_EXCHANGE, "Timezone", options = [TZ_EXCHANGE, "America/New_York", "America/Chicago", "Europe/London", "Europe/Berlin", "Asia/Tokyo", "Asia/Hong_Kong", "Australia/Sydney", "UTC"], group = GRP_SESSION
+  , tooltip = "Timezone the Regular Session is expressed in. Exchange uses the symbol's own timezone, correct for listed stocks.")
+
+orInput = input.int(30, "Opening Range (minutes)", minval = 5, maxval = 120, step = 5, group = GRP_SESSION
+  , tooltip = "Length of the opening range. Mark Fisher set it per market; test a few lengths on your instrument, since it changes how often the A levels are reached. Use a chart timeframe of a third of this window or less.")
+
+holdInput = input.float(50, "Time Rule (% of Opening Range)", minval = 0, maxval = 200, step = 5, group = GRP_SESSION
+  , tooltip = "How long price must hold beyond an A or C level before the signal counts, as a share of the opening range length; half the window is the commonly cited rule. On bars, holding means consecutive closes beyond the level for that long. 0 accepts the first close beyond the level.")
+
+aInput = input.float(0.10, "A Value (x ADR)", minval = 0.01, maxval = 1, step = 0.01, group = GRP_LEVELS
+  , tooltip = "Distance of the A levels beyond the opening range, as a share of the average daily range. Fisher calibrated a fixed value per market; scaling to the average daily range carries the same idea across instruments and volatility regimes.")
+
+cInput = input.float(0.15, "C Value (x ADR)", minval = 0.01, maxval = 1, step = 0.01, group = GRP_LEVELS
+  , tooltip = "Distance of the C levels beyond the opening range, as a share of the average daily range, usually larger than the A value. A C only counts after a failed A on the other side: the reversal trade against traders trapped by that A.")
+
+adrInput = input.int(10, "ADR Length (Sessions)", minval = MIN_BASELINE, maxval = 50, group = GRP_LEVELS
+  , tooltip = "Completed regular sessions averaged for the average daily range the A and C values are scaled by.")
+
+pivotDaysInput = input.int(1, "Pivot Range Sessions", minval = 1, maxval = 10, group = GRP_PIVOT
+  , tooltip = "Sessions the pivot range is computed from. 1 uses the prior session's high, low and close; 3 gives Fisher's rolling three-day pivot range (highest high and lowest low of the last three sessions with the latest close) for a slower, multi-day read.")
+
+showPivotInput = input.bool(true, "Show Pivot Range", group = GRP_PIVOT
+  , tooltip = "Shade the pivot range across each session: the band between the pivot, (H + L + C) / 3, and the midpoint, (H + L) / 2, mirrored around the pivot. An A up from above it is aligned with the day's context; an A up that runs into it from below is suspect, and the reverse for A downs.")
+
+lineLenInput = input.int(30, "Number Line Sessions", minval = 5, maxval = 120, group = GRP_LINE
+  , tooltip = "Sessions summed by the number line. Each session is scored at its close: +4 or -4 for a C that held into the close beyond the opening range, +2 or -2 for an A that held the same way, 0 otherwise (failed or no signal). The rolling sum gauges the developing trend: positive sums come from more held upside signals. The scoring here is this build's mechanical reading of Fisher's idea.")
+
+keepInput = input.int(10, "Sessions Kept", minval = 1, maxval = 60, group = GRP_DISPLAY
+  , tooltip = "Most recent sessions whose levels and signals stay on the chart. The number line and dashboard keep counting every session.")
+
+showCInput = input.bool(true, "Show C Levels", group = GRP_DISPLAY
+  , tooltip = "Draw the C up and C down levels. Signals fire either way.")
+
+showScoreInput = input.bool(true, "Show Session Scores", group = GRP_DISPLAY
+  , tooltip = "Print each completed session's number line score above its high. Sessions scoring 0 are left unmarked.")
+
+showDashInput = input.bool(true, "Show Dashboard", group = GRP_DASH
+  , tooltip = "Today's levels and signal, price against the pivot range, the developing score and the number line.")
+
+dashPosInput = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], inline = "dash", group = GRP_DASH)
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], inline = "dash", group = GRP_DASH
+  , tooltip = "Dashboard position and text size.")
+
+bullColorInput   = input.color(BULL_COLOR, "Up", inline = "dir", group = GRP_STYLE)
+bearColorInput   = input.color(BEAR_COLOR, "Down", inline = "dir", group = GRP_STYLE)
+failColorInput   = input.color(ACCENT_COLOR, "Failed A", inline = "dir", group = GRP_STYLE
+  , tooltip = "Colors of upside levels and signals, downside levels and signals, and failed A marks.")
+orColorInput     = input.color(NEUTRAL_COLOR, "Opening Range", inline = "ref", group = GRP_STYLE)
+pivotColorInput  = input.color(PIVOT_COLOR, "Pivot Range", inline = "ref", group = GRP_STYLE
+  , tooltip = "Colors of the opening range and of the pivot range.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types & Variables
+//---------------------------------------------------------------------------------------------------------------------{
+//All drawings of one session, removed together once the session ages out
+type SessionDraw
+    box   orBox
+    line  orHigh
+    line  orLow
+    line  aUp
+    line  aDn
+    line  cUp
+    line  cDn
+    box   pivotBox
+    line  pivotLine
+    array<label> marks
+
+var array<SessionDraw> drawArray = array.new<SessionDraw>()
+var SessionDraw        cur       = na
+var array<label>       tagArray  = array.new<label>()
+
+//Completed sessions
+var array<float> rangeArray = array.new_float()
+var array<float> highArray  = array.new_float()
+var array<float> lowArray   = array.new_float()
+var array<int>   scoreArray = array.new_int()
+
+//Session state
+var bool  sessActive = false
+var int   sessStartTime = na
+var float sessHigh   = na
+var float sessLow    = na
+var float sessClose  = na
+var float adr        = na
+
+//Opening range and levels
+var bool  orDone = false
+var float orh    = na
+var float orl    = na
+var float aUpLvl = na
+var float aDnLvl = na
+var float cUpLvl = na
+var float cDnLvl = na
+
+//Pivot range of the session
+var float prTop = na
+var float prBot = na
+var float prPiv = na
+
+//Signal state
+var bool  aUpMade   = false
+var bool  aDnMade   = false
+var bool  cUpMade   = false
+var bool  cDnMade   = false
+var bool  failedUp  = false
+var bool  failedDn  = false
+var int   runUp     = na
+var int   runDn     = na
+var int   runCUp    = na
+var int   runCDn    = na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+dropLine(line l) =>
+    if not na(l)
+        line.delete(l)
+dropBox(box b) =>
+    if not na(b)
+        box.delete(b)
+
+dropSession(SessionDraw s) =>
+    dropBox(s.orBox)
+    dropLine(s.orHigh)
+    dropLine(s.orLow)
+    dropLine(s.aUp)
+    dropLine(s.aDn)
+    dropLine(s.cUp)
+    dropLine(s.cDn)
+    dropBox(s.pivotBox)
+    dropLine(s.pivotLine)
+    for l in s.marks
+        label.delete(l)
+
+//Score of a session as the number line counts it
+sessionScore(float c) =>
+    int sc = 0
+    if cUpMade and c >= orh
+        sc := 4
+    else if cDnMade and c <= orl
+        sc := -4
+    else if aUpMade and not failedUp and c >= orh
+        sc := 2
+    else if aDnMade and not failedDn and c <= orl
+        sc := -2
+    sc
+
+signedText(int v) =>
+    (v > 0 ? "+" : "") + str.tostring(v)
+
+//Where a level sits against the pivot range
+prSide(float lvl) =>
+    na(prTop) ? 0 : lvl > prTop ? 1 : lvl < prBot ? -1 : 0
+
+//Tags a level of the newest session at its right end
+addTag(float price, string txt, color c, bool above) =>
+    tagArray.push(label.new(bar_index, price, txt, color = COLOR_HIDDEN, style = above ? label.style_label_lower_left : label.style_label_upper_left, textcolor = c, size = size.small))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Session Tracking
+//---------------------------------------------------------------------------------------------------------------------{
+string tz         = tzInput == TZ_EXCHANGE ? syminfo.timezone : tzInput
+int    barMs      = timeframe.in_seconds() * 1000
+bool   validChart = timeframe.isintraday and timeframe.in_seconds() * 3 <= orInput * 60
+bool   inSession  = validChart and not na(time(timeframe.period, sessionInput, tz))
+bool   sessStart  = inSession and (not inSession[1] or timeframe.change("D"))
+int    holdMs     = int(math.round(orInput * 60000 * holdInput / 100))
+
+bool aUpEvent   = false
+bool aDnEvent   = false
+bool cUpEvent   = false
+bool cDnEvent   = false
+bool failUpEvent = false
+bool failDnEvent = false
+
+//Completed session: score, baselines and the pivot inputs
+if sessActive and (sessStart or not inSession)
+    if orDone and not na(adr)
+        int sc = sessionScore(sessClose)
+        scoreArray.unshift(sc)
+        if scoreArray.size() > 200
+            scoreArray.pop()
+        if showScoreInput and not na(cur) and sc != 0
+            color scColor = sc > 0 ? bullColorInput : sc < 0 ? bearColorInput : DASH_HEADER
+            cur.marks.push(label.new(bar_index - 1, sessHigh, "Score " + signedText(sc), color = COLOR_HIDDEN, style = label.style_label_lower_right, textcolor = scColor, size = size.small
+              , tooltip = "Number line score of this session"))
+    rangeArray.unshift(sessHigh - sessLow)
+    highArray.unshift(sessHigh)
+    lowArray.unshift(sessLow)
+    if rangeArray.size() > 100
+        rangeArray.pop()
+        highArray.pop()
+        lowArray.pop()
+    sessActive := false
+
+//New session: baseline, pivot range, reset
+if sessStart
+    sessActive    := true
+    sessStartTime := time
+    sessHigh      := high
+    sessLow       := low
+    adr           := rangeArray.size() >= MIN_BASELINE ? rangeArray.slice(0, math.min(adrInput, rangeArray.size())).avg() : na
+    orDone        := false
+    orh           := high
+    orl           := low
+    aUpLvl        := na
+    aDnLvl        := na
+    cUpLvl        := na
+    cDnLvl        := na
+    aUpMade       := false
+    aDnMade       := false
+    cUpMade       := false
+    cDnMade       := false
+    failedUp      := false
+    failedDn      := false
+    runUp         := na
+    runDn         := na
+    runCUp        := na
+    runCDn        := na
+
+    //pivot range from the last completed sessions
+    prTop := na
+    prBot := na
+    prPiv := na
+    if highArray.size() >= pivotDaysInput and not na(sessClose)
+        float pH = highArray.slice(0, pivotDaysInput).max()
+        float pL = lowArray.slice(0, pivotDaysInput).min()
+        float p  = (pH + pL + sessClose) / 3
+        float m  = (pH + pL) / 2
+        prPiv := p
+        prTop := math.max(m, 2 * p - m)
+        prBot := math.min(m, 2 * p - m)
+
+    for t in tagArray
+        label.delete(t)
+    tagArray.clear()
+
+    cur := SessionDraw.new()
+    cur.marks := array.new<label>()
+    cur.orBox := box.new(bar_index, high, bar_index, low, border_color = color.new(orColorInput, 40), border_width = 1, bgcolor = color.new(orColorInput, 85))
+    if showPivotInput and not na(prTop)
+        cur.pivotBox  := box.new(bar_index, prTop, bar_index, prBot, border_color = color.new(pivotColorInput, 60), border_width = 1, bgcolor = color.new(pivotColorInput, 88))
+        cur.pivotLine := line.new(bar_index, prPiv, bar_index, prPiv, color = color.new(pivotColorInput, 30), style = line.style_dotted)
+    drawArray.push(cur)
+    while drawArray.size() > keepInput
+        dropSession(drawArray.shift())
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Opening Range & Signals
+//---------------------------------------------------------------------------------------------------------------------{
+//Holds a run of closes beyond a level: returns the run start time, na when the run breaks
+holdRun(int run, bool beyond) =>
+    beyond ? (na(run) ? time : run) : na
+
+if sessActive and inSession
+    sessHigh  := math.max(sessHigh, high)
+    sessLow   := math.min(sessLow, low)
+    sessClose := close
+
+    if not orDone
+        orh := math.max(orh, high)
+        orl := math.min(orl, low)
+        box.set_right(cur.orBox, bar_index)
+        box.set_top(cur.orBox, orh)
+        box.set_bottom(cur.orBox, orl)
+        //the range is set once the bar closing the window has printed
+        if time + barMs >= sessStartTime + orInput * 60000
+            orDone := true
+            if not na(adr)
+                aUpLvl := orh + aInput * adr
+                aDnLvl := orl - aInput * adr
+                cUpLvl := orh + cInput * adr
+                cDnLvl := orl - cInput * adr
+                cur.orHigh := line.new(bar_index, orh, bar_index, orh, color = color.new(orColorInput, 30), style = line.style_dotted)
+                cur.orLow  := line.new(bar_index, orl, bar_index, orl, color = color.new(orColorInput, 30), style = line.style_dotted)
+                cur.aUp    := line.new(bar_index, aUpLvl, bar_index, aUpLvl, color = bullColorInput, width = 2)
+                cur.aDn    := line.new(bar_index, aDnLvl, bar_index, aDnLvl, color = bearColorInput, width = 2)
+                if showCInput
+                    cur.cUp := line.new(bar_index, cUpLvl, bar_index, cUpLvl, color = color.new(bullColorInput, 20), style = line.style_dashed)
+                    cur.cDn := line.new(bar_index, cDnLvl, bar_index, cDnLvl, color = color.new(bearColorInput, 20), style = line.style_dashed)
+                addTag(aUpLvl, "A↑ " + str.tostring(aUpLvl, format.mintick), bullColorInput, false)
+                addTag(aDnLvl, "A↓ " + str.tostring(aDnLvl, format.mintick), bearColorInput, true)
+                if showCInput
+                    addTag(cUpLvl, "C↑ " + str.tostring(cUpLvl, format.mintick), bullColorInput, true)
+                    addTag(cDnLvl, "C↓ " + str.tostring(cDnLvl, format.mintick), bearColorInput, false)
+    else if not na(aUpLvl)
+        int tEnd = time + barMs
+
+        //A levels: the first A that holds sets the day; once it fails only a C can signal
+        if not aUpMade and not aDnMade and not failedUp and not failedDn
+            runUp := holdRun(runUp, close >= aUpLvl)
+            runDn := holdRun(runDn, close <= aDnLvl)
+            if not na(runUp) and tEnd - runUp >= holdMs
+                aUpMade  := true
+                aUpEvent := true
+                int side = prSide(aUpLvl)
+                cur.marks.push(label.new(bar_index, low, side == -1 ? "A↑ under PR" : "A↑", color = bullColorInput, style = label.style_label_up, textcolor = color.white, size = size.small
+                  , tooltip = "A up made: closes held above " + str.tostring(aUpLvl, format.mintick) + " for the time rule." + (side == 1 ? " The level is above the pivot range: aligned with the day's context." : side == -1 ? " The level is below the pivot range, which sits overhead as resistance: treat with suspicion." : " The level is inside the pivot range.")))
+            else if not na(runDn) and tEnd - runDn >= holdMs
+                aDnMade  := true
+                aDnEvent := true
+                int side = prSide(aDnLvl)
+                cur.marks.push(label.new(bar_index, high, side == 1 ? "A↓ over PR" : "A↓", color = bearColorInput, style = label.style_label_down, textcolor = color.white, size = size.small
+                  , tooltip = "A down made: closes held below " + str.tostring(aDnLvl, format.mintick) + " for the time rule." + (side == -1 ? " The level is below the pivot range: aligned with the day's context." : side == 1 ? " The level is above the pivot range, which sits underneath as support: treat with suspicion." : " The level is inside the pivot range.")))
+
+        //Failed A: a made A closes back inside the opening range
+        if aUpMade and not failedUp and close < orh
+            failedUp    := true
+            failUpEvent := true
+            cur.marks.push(label.new(bar_index, high, "Failed A↑", color = failColorInput, style = label.style_label_down, textcolor = color.white, size = size.small
+              , tooltip = "The A up closed back inside the opening range: traders long from it are trapped. A C down below " + str.tostring(cDnLvl, format.mintick) + " now reverses the day."))
+        if aDnMade and not failedDn and close > orl
+            failedDn    := true
+            failDnEvent := true
+            cur.marks.push(label.new(bar_index, low, "Failed A↓", color = failColorInput, style = label.style_label_up, textcolor = color.white, size = size.small
+              , tooltip = "The A down closed back inside the opening range: traders short from it are trapped. A C up above " + str.tostring(cUpLvl, format.mintick) + " now reverses the day."))
+
+        //C levels: the reversal after a failed A on the other side
+        if failedUp and not cDnMade and not cUpMade
+            runCDn := holdRun(runCDn, close <= cDnLvl)
+            if not na(runCDn) and tEnd - runCDn >= holdMs
+                cDnMade  := true
+                cDnEvent := true
+                cur.marks.push(label.new(bar_index, high, "C↓", color = bearColorInput, style = label.style_label_down, textcolor = color.white, size = size.normal
+                  , tooltip = "C down made after a failed A up: closes held below " + str.tostring(cDnLvl, format.mintick) + " for the time rule."))
+        if failedDn and not cUpMade and not cDnMade
+            runCUp := holdRun(runCUp, close >= cUpLvl)
+            if not na(runCUp) and tEnd - runCUp >= holdMs
+                cUpMade  := true
+                cUpEvent := true
+                cur.marks.push(label.new(bar_index, low, "C↑", color = bullColorInput, style = label.style_label_up, textcolor = color.white, size = size.normal
+                  , tooltip = "C up made after a failed A down: closes held above " + str.tostring(cUpLvl, format.mintick) + " for the time rule."))
+
+    //extend the session's drawings
+    if not na(cur)
+        if orDone
+            for l in array.from(cur.orHigh, cur.orLow, cur.aUp, cur.aDn, cur.cUp, cur.cDn)
+                if not na(l)
+                    line.set_x2(l, bar_index)
+        if not na(cur.pivotBox)
+            box.set_right(cur.pivotBox, bar_index)
+            line.set_x2(cur.pivotLine, bar_index)
+    for t in tagArray
+        label.set_x(t, bar_index)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+dashPosition = switch dashPosInput
+    "Top Left"     => position.top_left
+    "Bottom Right" => position.bottom_right
+    "Bottom Left"  => position.bottom_left
+    => position.top_right
+
+dashTextSize = switch dashSizeInput
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    => size.small
+
+var table dashTable = na
+
+dashRow(int row, string name, string value, color valueColor, string tip) =>
+    table.cell(dashTable, 0, row, name, text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left, tooltip = tip)
+    table.cell(dashTable, 1, row, value, text_color = valueColor, text_size = dashTextSize, text_halign = text.align_right)
+
+if barstate.islast
+    if not na(dashTable)
+        table.delete(dashTable)
+        dashTable := na
+    if showDashInput and validChart
+        dashTable := table.new(dashPosition, 2, 5, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+        string todayText = not sessActive ? "Session closed" : na(adr) ? "Building ADR" : not orDone ? "Building OR" : cUpMade ? "C↑ made" : cDnMade ? "C↓ made" : failedUp and failedDn ? "Both A failed" : failedUp ? "Failed A↑" : failedDn ? "Failed A↓" : aUpMade ? "A↑ made" : aDnMade ? "A↓ made" : "No A yet"
+        color  todayColor = cUpMade or (aUpMade and not failedUp) ? bullColorInput : cDnMade or (aDnMade and not failedDn) ? bearColorInput : failedUp or failedDn ? failColorInput : DASH_TEXT
+        string prText    = na(prTop) ? TXT_NA : close > prTop ? "Price above" : close < prBot ? "Price below" : "Price inside"
+        int    nSum      = math.min(lineLenInput, scoreArray.size())
+        int    lineSum   = nSum > 0 ? int(scoreArray.slice(0, nSum).sum()) : 0
+        int    todayScore = sessActive and orDone and not na(adr) ? sessionScore(close) : 0
+        table.cell(dashTable, 0, 0, "ACD Method", text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_left)
+        table.cell(dashTable, 1, 0, "OR " + str.tostring(orInput) + "m", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_right
+          , tooltip = na(adr) ? "Average daily range still building." : "A value " + str.tostring(aInput * adr, format.mintick) + " and C value " + str.tostring(cInput * adr, format.mintick) + " in price: " + str.tostring(aInput) + " and " + str.tostring(cInput) + " x the " + str.tostring(adrInput) + "-session average daily range.")
+        int upDays = 0
+        int dnDays = 0
+        if nSum > 0
+            for i = 0 to nSum - 1
+                int v = scoreArray.get(i)
+                upDays += v > 0 ? 1 : 0
+                dnDays += v < 0 ? 1 : 0
+        dashRow(1, "Today", todayText + (sessActive and orDone and not na(adr) ? " (" + signedText(todayScore) + ")" : ""), todayColor, "The latest session's ACD state, with the score it would get if it closed now.")
+        dashRow(2, "Pivot Range", prText, DASH_TEXT, "Price against the " + (pivotDaysInput == 1 ? "prior session's" : str.tostring(pivotDaysInput) + "-session rolling") + " pivot range.")
+        dashRow(3, "Number Line", signedText(lineSum) + " (" + str.tostring(nSum) + "d)", lineSum > 0 ? bullColorInput : lineSum < 0 ? bearColorInput : DASH_TEXT, "Sum of the last " + str.tostring(lineLenInput) + " completed session scores; fewer while history builds.")
+        dashRow(4, "Held Days", str.tostring(upDays) + " up / " + str.tostring(dnDays) + " down", DASH_TEXT, "Sessions in the number line window whose A or C held into the close, by direction. The rest failed or never signaled.")
+
+var table noticeTable = na
+if barstate.islast and not validChart and na(noticeTable)
+    noticeTable := table.new(position.middle_center, 1, 1, bgcolor = DASH_BG, frame_color = DASH_FRAME, frame_width = 1, border_width = 0)
+    table.cell(noticeTable, 0, 0, "ACD Method reads intraday charts at a third of the opening range or lower (10 minutes or less for a 30 minute range)", text_color = DASH_TEXT, text_size = size.small)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(aUpEvent, "A Up Made", "ACD on {{ticker}}: A up made, price held above the A up level for the time rule")
+alertcondition(aDnEvent, "A Down Made", "ACD on {{ticker}}: A down made, price held below the A down level for the time rule")
+alertcondition(failUpEvent, "Failed A Up", "ACD on {{ticker}}: the A up failed back into the opening range, C down is now the reversal level")
+alertcondition(failDnEvent, "Failed A Down", "ACD on {{ticker}}: the A down failed back into the opening range, C up is now the reversal level")
+alertcondition(cUpEvent, "C Up Made", "ACD on {{ticker}}: C up made after a failed A down")
+alertcondition(cDnEvent, "C Down Made", "ACD on {{ticker}}: C down made after a failed A up")
+
+//---------------------------------------------------------------------------------------------------------------------}

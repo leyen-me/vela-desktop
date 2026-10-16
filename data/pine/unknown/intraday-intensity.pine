@@ -1,0 +1,153 @@
+//@version=6
+indicator("Intraday Intensity", shorttitle = "Intraday Intensity", overlay = false, format = format.price, precision = 2, max_lines_count = 500, max_labels_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR        = #089981 // directional bullish color
+BEAR_COLOR        = #f23645 // directional bearish color
+FILL_VALUE_TRANSP = 50      // gradient transparency at the oscillator value
+FILL_ZERO_TRANSP  = 100     // gradient transparency at the zero line
+
+MODE_OSCILLATOR = "Normalized Oscillator (II%)"
+MODE_CUMULATIVE = "Cumulative Line"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+modeInput = input.string(MODE_OSCILLATOR, "Display", options = [MODE_OSCILLATOR, MODE_CUMULATIVE], group = "Settings",
+     tooltip = "The two published forms of the study. Bostian's original cumulative line is open-ended and read by slope against price, coinciding bar-for-bar with the Accumulation/Distribution Line. The normalized oscillator - the form Bollinger favors - divides a rolling sum of intensity by the rolling sum of volume and oscillates around zero as a bounded percentage, comparable across symbols.")
+
+lengthInput = input.int(21, "Oscillator Length", minval = 1, group = "Settings",
+     tooltip = "Window of the rolling sums in the normalized form: the sum of intraday intensity over this many bars divided by the sum of volume, times 100. The common setting is 21 bars - roughly one trading month on daily charts. Shorter windows react faster and whipsaw more; longer windows suit position-level audits. Has no effect on the cumulative line, which takes no parameter.")
+
+divergenceInput = input.bool(false, "Mark Divergences", group = "Divergence",
+     tooltip = "Draws the pivot-to-pivot comparison when a fresh price extreme is not matched by intensity: a higher high in price against a lower intensity high (bearish) or a lower low in price against a higher intensity low (bullish), read on whichever form is displayed. Detection always runs and feeds the divergence alerts - this toggle only controls the drawings.")
+
+pivotInput = input.int(5, "Pivot Lookback", minval = 1, maxval = 50, group = "Divergence",
+     tooltip = "Bars on each side of a price swing point that must not exceed it before the swing counts as confirmed. Intensity is read at the same swing bar, so divergences confirm with this delay and drawn swings do not repaint.")
+
+maxGapInput = input.int(60, "Max Bars Between Swings", minval = 5, maxval = 500, group = "Divergence",
+     tooltip = "Maximum distance in bars between the two successive swing points being compared. Swings further apart than this are not treated as part of the same move and are not compared.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "colors", group = "Style",
+     tooltip = "Color of positive oscillator readings, the rising cumulative line, the gradient fill above zero and bullish divergences - the accumulation side.")
+
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "colors", group = "Style",
+     tooltip = "Color of negative oscillator readings, the falling cumulative line, the gradient fill below zero and bearish divergences - the distribution side.")
+
+gradientInput = input.bool(true, "Gradient Fill", group = "Style",
+     tooltip = "Fills the area between the zero line and the oscillator with a vertical gradient, fully transparent at zero and strongest at the current value. Applies to the normalized oscillator only - the open-ended cumulative line is read by slope, not by area.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+// The study needs a genuine volume feed - on symbols without one the reading would be meaningless
+float cumulativeVolume = ta.cum(nz(volume))
+if barstate.islast and cumulativeVolume == 0
+    runtime.error("No volume is provided by the data vendor. Intraday Intensity requires volume data.")
+
+// Bostian's intraday intensity - each bar's volume weighted by where the close sits in the range. The multiplier
+// (2 x close - high - low) / (high - low) is +1 for a close at the high, -1 at the low and 0 at mid-range, so close
+// location times volume approximates the footprint of institutions pushing price toward an extreme by the close.
+// Bars where high equals low leave the multiplier undefined and are zeroed; gaps never enter the arithmetic
+float barRange      = high - low
+float closeLocation = barRange > 0 ? (2 * close - high - low) / barRange : 0.0
+float intensity     = closeLocation * nz(volume)
+
+// Original cumulative form - the running sum, open-ended and read by slope against price
+var float cumulativeIntensity = 0.0
+cumulativeIntensity += intensity
+
+// Bollinger's normalized form - rolling intensity sum over rolling volume sum, as a percentage oscillating around
+// zero. Guarded against windows holding no volume at all
+float intensitySum        = math.sum(intensity, lengthInput)
+float volumeSum           = math.sum(nz(volume), lengthInput)
+float normalizedIntensity = volumeSum > 0 ? 100 * intensitySum / volumeSum : na
+
+bool  oscillatorMode    = modeInput == MODE_OSCILLATOR
+float intradayIntensity = oscillatorMode ? normalizedIntensity : cumulativeIntensity
+
+// Line coloring - the oscillator is graded against zero, the cumulative line by its slope (rising reads as
+// accumulation, falling as distribution), holding the last color through flat zero-range bars
+float intensityChange = ta.change(cumulativeIntensity)
+
+var color slopeColor = na
+slopeColor := intensityChange > 0 ? bullColorInput : intensityChange < 0 ? bearColorInput : slopeColor
+
+color intensityColor = oscillatorMode ? (intradayIntensity > 0 ? bullColorInput : bearColorInput) : slopeColor
+
+// Zero-line regime changes, always read on the normalized form - sustained positive values mean closes keep
+// finishing high in their ranges on volume, sustained negative values the reverse
+bool zeroCrossUp   = ta.crossover(normalizedIntensity, 0)
+bool zeroCrossDown = ta.crossunder(normalizedIntensity, 0)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Divergence Detection
+//---------------------------------------------------------------------------------------------------------------------{
+// Divergence audit at extremes - a fresh price high without a fresh intensity high implies rallies closing nearer
+// mid-range, with the mirrored read at successive lows. Intensity is read at the confirmed price swing bar
+float pivotHighPrice  = ta.pivothigh(high, pivotInput, pivotInput)
+float pivotLowPrice   = ta.pivotlow(low, pivotInput, pivotInput)
+float laggedIntensity = intradayIntensity[pivotInput]
+
+var float prevHighPrice     = na
+var float prevHighIntensity = na
+var int   prevHighBar       = na
+var float prevLowPrice      = na
+var float prevLowIntensity  = na
+var int   prevLowBar        = na
+
+bool bearishDivergence = false
+bool bullishDivergence = false
+
+// Swing highs - bearish: price higher high against a lower intensity high
+if not na(pivotHighPrice)
+    int  swingBar   = bar_index - pivotInput
+    bool comparable = not na(prevHighPrice) and not na(prevHighIntensity) and not na(laggedIntensity) and swingBar - prevHighBar <= maxGapInput
+    if comparable and pivotHighPrice > prevHighPrice and laggedIntensity < prevHighIntensity
+        bearishDivergence := true
+        if divergenceInput
+            line.new(prevHighBar, prevHighIntensity, swingBar, laggedIntensity, color = bearColorInput, style = line.style_dashed)
+            label.new(swingBar, laggedIntensity, "Bear", color = bearColorInput, textcolor = chart.bg_color, style = label.style_label_down, size = size.tiny)
+    prevHighPrice     := pivotHighPrice
+    prevHighIntensity := laggedIntensity
+    prevHighBar       := swingBar
+
+// Swing lows - bullish: price lower low against a higher intensity low
+if not na(pivotLowPrice)
+    int  swingBar   = bar_index - pivotInput
+    bool comparable = not na(prevLowPrice) and not na(prevLowIntensity) and not na(laggedIntensity) and swingBar - prevLowBar <= maxGapInput
+    if comparable and pivotLowPrice < prevLowPrice and laggedIntensity > prevLowIntensity
+        bullishDivergence := true
+        if divergenceInput
+            line.new(prevLowBar, prevLowIntensity, swingBar, laggedIntensity, color = bullColorInput, style = line.style_dashed)
+            label.new(swingBar, laggedIntensity, "Bull", color = bullColorInput, textcolor = chart.bg_color, style = label.style_label_up, size = size.tiny)
+    prevLowPrice     := pivotLowPrice
+    prevLowIntensity := laggedIntensity
+    prevLowBar       := swingBar
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+// The zero line anchors the oscillator; it is dropped in cumulative mode so the open-ended line is not flattened
+// against the origin by the pane's auto-scale
+zeroPlotId = plot(oscillatorMode ? 0 : na, "Zero Line", color = color.new(chart.fg_color, 90), linewidth = 1)
+
+intensityPlotId = plot(intradayIntensity, "Intraday Intensity", color = intensityColor, linewidth = 1)
+
+// Centered-oscillator gradient - fully transparent at the zero line, strongest at the oscillator value
+fillTopColor    = intradayIntensity > 0 ? color.new(bullColorInput, FILL_VALUE_TRANSP) : color.new(bearColorInput, FILL_ZERO_TRANSP)
+fillBottomColor = intradayIntensity > 0 ? color.new(bullColorInput, FILL_ZERO_TRANSP) : color.new(bearColorInput, FILL_VALUE_TRANSP)
+applyGradient   = gradientInput and oscillatorMode
+
+fill(intensityPlotId, zeroPlotId, top_value = math.max(intradayIntensity, 0), bottom_value = math.min(intradayIntensity, 0), top_color = applyGradient ? fillTopColor : na, bottom_color = applyGradient ? fillBottomColor : na, title = "Zero-line Gradient Fill")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(zeroCrossUp, "Bullish Zero Cross", "Intraday Intensity (normalized) crossed above zero on {{ticker}} ({{interval}}) - closes finishing high in their ranges on volume, the accumulation side")
+alertcondition(zeroCrossDown, "Bearish Zero Cross", "Intraday Intensity (normalized) crossed below zero on {{ticker}} ({{interval}}) - closes finishing low in their ranges on volume, the distribution side")
+alertcondition(bullishDivergence, "Bullish Divergence", "Bullish Intraday Intensity divergence confirmed on {{ticker}} ({{interval}}) - price lower low against a higher intensity low, read as evidence of quiet accumulation rather than a standalone signal")
+alertcondition(bearishDivergence, "Bearish Divergence", "Bearish Intraday Intensity divergence confirmed on {{ticker}} ({{interval}}) - price higher high against a lower intensity high, rallies closing nearer mid-range. Not a standalone signal")
+
+//---------------------------------------------------------------------------------------------------------------------}

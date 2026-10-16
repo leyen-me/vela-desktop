@@ -1,0 +1,239 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Engulfing Bar", shorttitle = "Engulfing Bar", overlay = true, format = format.price, max_labels_count = 500, max_lines_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR = #089981
+BEAR_COLOR = #f23645
+STOP_COLOR = #787b86
+LABEL_BG   = #00000000
+
+TREND_NONE = "None"
+TREND_REV  = "Reversal"
+TREND_CONT = "Continuation"
+
+TRIGGER_EXTREME = "Bar Extreme"
+TRIGGER_CLOSE   = "Bar Close"
+
+// Maximum number of prior bars scanned when counting how many bars a signal bar engulfed
+SCAN_CAP = 20
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+engulfedMinInput = input.int(1, "Minimum Bars Engulfed", minval = 1, maxval = 10, group = "Pattern Detection",
+     tooltip = "Number of consecutive prior bars the signal bar must fully engulf. 1 reproduces the classic two-bar definition: a high above the prior high, a low below the prior low, and a close beyond the prior extreme in the new direction. Higher values demand the bar swallow several bars at once - swallowing a single tiny bar is a low hurdle, while engulfing one or more full-sized bars says considerably more.")
+
+sizeFilterInput = input.bool(true, "Range Filter", inline = "size", group = "Significance Filters",
+     tooltip = "Require the signal bar's high-to-low span to exceed a multiple of the trailing average range. An engulfing bar smaller than typical bars carries little of the pattern's intended meaning, and small engulfing bars inside chop fire constantly.")
+
+sizeMultInput = input.float(1.0, "Multiple", minval = 0.1, maxval = 5, step = 0.1, inline = "size", group = "Significance Filters",
+     tooltip = "Minimum bar range as a multiple of the trailing average range. The average is taken one bar back so the signal bar does not inflate its own threshold.")
+
+sizeLenInput = input.int(14, "Length", minval = 1, maxval = 500, inline = "size", group = "Significance Filters",
+     tooltip = "Number of bars in the trailing average range. Also used to report each signal's range expansion ratio in its label tooltip.")
+
+closeFilterInput = input.bool(false, "Close Location Filter", inline = "close", group = "Significance Filters",
+     tooltip = "Require the close to finish inside the extreme zone of the bar's span - near the high for bullish signals, near the low for bearish ones - the close-location emphasis that price-action practice keeps from candlestick reading.")
+
+closeZoneInput = input.float(33, "Zone %", minval = 5, maxval = 50, step = 1, inline = "close", group = "Significance Filters",
+     tooltip = "Size of the extreme zone as a percentage of the bar's span, measured from the signal-direction extreme. 33 keeps the common top-third / bottom-third convention.")
+
+trendModeInput = input.string(TREND_NONE, "Trend Context", options = [TREND_NONE, TREND_REV, TREND_CONT], inline = "trend", group = "Significance Filters",
+     tooltip = "Optional trend context measured against a simple moving average at the engulfed bar. 'Reversal' demands the pattern print against the prevailing move - price below the average before a bullish signal, above it before a bearish one - matching its use at swing turns. 'Continuation' demands alignment with the prevailing move instead, reading the engulfed dip as the end of a pullback rather than a turn.")
+
+trendLenInput = input.int(50, "SMA Length", minval = 2, maxval = 500, inline = "trend", group = "Significance Filters",
+     tooltip = "Length of the simple moving average used by the trend context filter.")
+
+swingFilterInput = input.bool(false, "Swing Extreme Location", inline = "swing", group = "Significance Filters",
+     tooltip = "Only keep signals printed at a swing extreme: a bullish bar must set the lowest low of the location window, sweeping the prior swing low, and a bearish bar the highest high. Signals in the middle of a range usually carry no context and are filtered out.")
+
+swingLenInput = input.int(20, "Window", minval = 2, maxval = 500, inline = "swing", group = "Significance Filters",
+     tooltip = "Number of bars in the location window used by the swing extreme filter, the signal bar included.")
+
+volumeFilterInput = input.bool(false, "Volume Filter", inline = "volume", group = "Significance Filters",
+     tooltip = "Require volume above a multiple of its trailing average. Volume is not part of the definition - treat this as a participation preference, evidence that real business was done on the round trip. Automatically bypassed when the symbol reports no volume data.")
+
+volMultInput = input.float(1.0, "Multiple", minval = 0.1, maxval = 5, step = 0.1, inline = "volume", group = "Significance Filters",
+     tooltip = "Minimum volume as a multiple of the trailing volume average.")
+
+volLenInput = input.int(20, "Length", minval = 1, maxval = 500, inline = "volume", group = "Significance Filters",
+     tooltip = "Number of bars in the trailing volume average. The average is taken one bar back so the signal bar's own volume does not inflate the threshold.")
+
+showLevelsInput = input.bool(true, "Trigger & Stop Levels", group = "Trigger & Stop Levels",
+     tooltip = "Draw each signal's level map as dashed lines: the conventional entry trigger, and the protective stop beyond the bar's opposite extreme - below the low of a bullish signal, above the high of a bearish one - since a return through that level negates the two-bar story.")
+
+triggerModeInput = input.string(TRIGGER_EXTREME, "Trigger Level", options = [TRIGGER_EXTREME, TRIGGER_CLOSE], group = "Trigger & Stop Levels",
+     tooltip = "Entry convention marked by the trigger level. 'Bar Extreme' waits for a break of the engulfing bar's extreme in the signal direction; 'Bar Close' records the signal bar's closing price for immediate entries. The trigger-break alerts fire once price trades through this level after the signal bar completes.")
+
+extendInput = input.int(10, "Levels Extension", minval = 1, maxval = 250, group = "Trigger & Stop Levels",
+     tooltip = "Number of bars the trigger and stop levels extend to the right of the signal bar.")
+
+showLabelsInput = input.bool(true, "Pattern Labels", group = "Style",
+     tooltip = "Mark each signal with an Engulfing label - below the bar for bullish signals, above it for bearish ones. Hovering a label reports the bars engulfed, the range expansion ratio, the close location within the span, and the trigger and stop prices.")
+
+colorBarsInput = input.bool(true, "Color Pattern Bars", group = "Style",
+     tooltip = "Color the engulfing bar itself in the signal direction.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "colors", group = "Style",
+     tooltip = "Color of bullish signals: labels, bar coloring and trigger levels.")
+
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "colors", group = "Style",
+     tooltip = "Color of bearish signals: labels, bar coloring and trigger levels.")
+
+stopColorInput = input.color(STOP_COLOR, "Stop", inline = "colors", group = "Style",
+     tooltip = "Color of the protective stop levels.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Pattern Detection
+//---------------------------------------------------------------------------------------------------------------------{
+max_bars_back(high, SCAN_CAP)
+max_bars_back(low, SCAN_CAP)
+
+barRange = high - low
+
+// Trailing context series, computed unconditionally on every bar
+priorHigh     = ta.highest(high, engulfedMinInput)[1]
+priorLow      = ta.lowest(low, engulfedMinInput)[1]
+averageRange  = ta.sma(barRange, sizeLenInput)
+trendSma      = ta.sma(close, trendLenInput)
+swingLowest   = ta.lowest(low, swingLenInput)
+swingHighest  = ta.highest(high, swingLenInput)
+volumeAverage = ta.sma(volume, volLenInput)
+
+// Baselines taken one bar back so the signal bar does not inflate its own thresholds
+averageRangePrev  = averageRange[1]
+volumeAveragePrev = volumeAverage[1]
+trendSmaPrev      = trendSma[1]
+
+// Raw two-bar definition: the bar exceeds both prior extremes and closes beyond the one in the new direction
+rangeEngulfs = not na(priorHigh) and not na(priorLow) and high > priorHigh and low < priorLow
+bullPattern  = rangeEngulfs and close > priorHigh
+bearPattern  = rangeEngulfs and close < priorLow
+
+// Close location within the bar's low-to-high span, as a percentage
+closePosition = barRange > 0 ? (close - low) / barRange * 100 : 50.
+
+// Significance filters - size, close location, trend context, swing location and participation
+rangeOk     = not sizeFilterInput or (not na(averageRangePrev) and barRange > averageRangePrev * sizeMultInput)
+bullCloseOk = not closeFilterInput or closePosition >= 100 - closeZoneInput
+bearCloseOk = not closeFilterInput or closePosition <= closeZoneInput
+bullTrendOk = trendModeInput == TREND_NONE or (not na(trendSmaPrev) and (trendModeInput == TREND_REV ? close[1] < trendSmaPrev : close[1] > trendSmaPrev))
+bearTrendOk = trendModeInput == TREND_NONE or (not na(trendSmaPrev) and (trendModeInput == TREND_REV ? close[1] > trendSmaPrev : close[1] < trendSmaPrev))
+bullSwingOk = not swingFilterInput or (not na(swingLowest) and low <= swingLowest)
+bearSwingOk = not swingFilterInput or (not na(swingHighest) and high >= swingHighest)
+
+hasVolumeData = not na(volume) and not na(volumeAveragePrev)
+volumeOk      = not volumeFilterInput or not hasVolumeData or volume > volumeAveragePrev * volMultInput
+
+bullSignal = bullPattern and rangeOk and bullCloseOk and bullTrendOk and bullSwingOk and volumeOk
+bearSignal = bearPattern and rangeOk and bearCloseOk and bearTrendOk and bearSwingOk and volumeOk
+
+// Count how many consecutive prior bars the signal bar fully engulfed, reported in the signal label
+int engulfedCount = 0
+
+if bullSignal or bearSignal
+    for i = 1 to SCAN_CAP
+        if na(high[i]) or na(low[i])
+            break
+        if high > high[i] and low < low[i]
+            engulfedCount += 1
+        else
+            break
+
+// Range expansion ratio reported in label tooltips
+rangeRatio = not na(averageRangePrev) and averageRangePrev > 0 ? barRange / averageRangePrev : na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Trigger & Stop Tracking
+//---------------------------------------------------------------------------------------------------------------------{
+bullTriggerPrice = triggerModeInput == TRIGGER_CLOSE ? close : high
+bearTriggerPrice = triggerModeInput == TRIGGER_CLOSE ? close : low
+
+// Levels of the most recent pattern on each side, cleared once price resolves them
+var float bullTriggerLevel = na
+var float bullStopLevel    = na
+var float bearTriggerLevel = na
+var float bearStopLevel    = na
+
+bool bullTriggerBreak = false
+bool bullStopBreak    = false
+bool bearTriggerBreak = false
+bool bearStopBreak    = false
+
+if bullSignal
+    bullTriggerLevel := bullTriggerPrice
+    bullStopLevel    := low
+else
+    if not na(bullTriggerLevel) and high > bullTriggerLevel
+        bullTriggerBreak := true
+        bullTriggerLevel := na
+    if not na(bullStopLevel) and low < bullStopLevel
+        bullStopBreak    := true
+        bullStopLevel    := na
+        bullTriggerLevel := na
+
+if bearSignal
+    bearTriggerLevel := bearTriggerPrice
+    bearStopLevel    := high
+else
+    if not na(bearTriggerLevel) and low < bearTriggerLevel
+        bearTriggerBreak := true
+        bearTriggerLevel := na
+    if not na(bearStopLevel) and high > bearStopLevel
+        bearStopBreak    := true
+        bearStopLevel    := na
+        bearTriggerLevel := na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+signalColor = bullSignal ? bullColorInput : bearColorInput
+
+// The engulfing bar itself, painted in the signal direction
+barcolor(colorBarsInput and (bullSignal or bearSignal) ? signalColor : na, title = "Engulfing Bars")
+
+if bullSignal or bearSignal
+    trigPrice = bullSignal ? bullTriggerPrice : bearTriggerPrice
+    stopPrice = bullSignal ? low : high
+
+    if showLabelsInput
+        countText = engulfedCount > 1 ? " x" + str.tostring(engulfedCount) : ""
+        ratioText = na(rangeRatio) ? "" : "\nRange " + str.tostring(rangeRatio, "#.##") + "x its " + str.tostring(sizeLenInput) + "-bar average"
+        labelTip  = (bullSignal ? "Bullish engulfing bar" : "Bearish engulfing bar")
+          + "\nBars engulfed: " + str.tostring(engulfedCount)
+          + ratioText
+          + "\nClose at " + str.tostring(closePosition, "#") + "% of the span"
+          + "\nTrigger: " + str.tostring(trigPrice, format.mintick)
+          + "\nStop: " + str.tostring(stopPrice, format.mintick)
+
+        label.new(bar_index, na, "Engulfing" + countText
+          , yloc      = bullSignal ? yloc.belowbar : yloc.abovebar
+          , style     = bullSignal ? label.style_label_up : label.style_label_down
+          , color     = signalColor
+          , textcolor = chart.bg_color
+          , size      = size.small
+          , tooltip   = labelTip)
+
+    if showLevelsInput
+        line.new(bar_index, trigPrice, bar_index + extendInput, trigPrice, color = signalColor, style = line.style_dashed)
+        line.new(bar_index, stopPrice, bar_index + extendInput, stopPrice, color = stopColorInput, style = line.style_dashed)
+        label.new(bar_index + extendInput, trigPrice, "Trigger", style = label.style_label_left, color = LABEL_BG, textcolor = signalColor, size = size.tiny)
+        label.new(bar_index + extendInput, stopPrice, "Stop", style = label.style_label_left, color = LABEL_BG, textcolor = stopColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(bullSignal, "Bullish Engulfing Bar", "Bullish engulfing bar on {{ticker}} ({{interval}}) - the bar swept below the prior low and closed above the prior high, with all active filters passed")
+alertcondition(bearSignal, "Bearish Engulfing Bar", "Bearish engulfing bar on {{ticker}} ({{interval}}) - the bar swept above the prior high and closed below the prior low, with all active filters passed")
+alertcondition(bullPattern, "Bullish Engulfing Bar (Unfiltered)", "Bullish engulfing bar on {{ticker}} ({{interval}}) - raw two-bar definition, ignoring the significance filters")
+alertcondition(bearPattern, "Bearish Engulfing Bar (Unfiltered)", "Bearish engulfing bar on {{ticker}} ({{interval}}) - raw two-bar definition, ignoring the significance filters")
+alertcondition(bullTriggerBreak, "Bullish Trigger Break", "Price broke above the trigger level of a bullish engulfing bar on {{ticker}} ({{interval}})")
+alertcondition(bearTriggerBreak, "Bearish Trigger Break", "Price broke below the trigger level of a bearish engulfing bar on {{ticker}} ({{interval}})")
+alertcondition(bullStopBreak, "Bullish Pattern Invalidated", "Price returned below the low of a bullish engulfing bar on {{ticker}} ({{interval}}) - the two-bar story is negated")
+alertcondition(bearStopBreak, "Bearish Pattern Invalidated", "Price returned above the high of a bearish engulfing bar on {{ticker}} ({{interval}}) - the two-bar story is negated")
+
+//---------------------------------------------------------------------------------------------------------------------}

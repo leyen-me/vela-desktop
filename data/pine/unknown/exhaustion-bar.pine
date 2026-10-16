@@ -1,0 +1,305 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Exhaustion Bar"
+  , shorttitle       = "Exhaustion Bar"
+  , overlay          = true
+  , format           = format.price
+  , max_lines_count  = 100
+  , max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+//Default palette
+color BULL_COLOR = #089981
+color BEAR_COLOR = #f23645
+color LABEL_BG   = #00000000
+
+//Transparency applied to an extreme level once price has closed beyond it
+int DEAD_LEVEL_TRANSP = 60
+
+string NUM_FORMAT = "#.##"
+
+//Confirmation modes
+string CONF_NONE = "None"
+string CONF_MID  = "Close Beyond Midpoint"
+string CONF_EXT  = "Close Beyond Opposite Extreme"
+
+string GROUP_TREND     = "Trend Context"
+string GROUP_DETECTION = "Exhaustion Bar Detection"
+string GROUP_SIGNALS   = "Confirmation & Invalidation"
+string GROUP_STYLE     = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+trendLengthInput = input.int(20, "Trend Lookback"
+  , minval  = 2
+  , maxval  = 200
+  , group   = GROUP_TREND
+  , tooltip = "Bars used to measure the prior move and to define its extreme: an exhaustion bar must print a fresh high or low of this window after a net directional move across it. Context does most of the work - the same bar in the middle of a range means nothing.")
+
+trendMoveInput = input.float(2, "Minimum Prior Move (ATR)"
+  , minval  = 0
+  , maxval  = 10
+  , step    = 0.25
+  , group   = GROUP_TREND
+  , tooltip = "Minimum net progress of the closes across the lookback, in ATR multiples, for the prior move to count as extended. Exhaustion needs something to exhaust: raise it to demand a more stretched trend, or set 0 to require only the direction.")
+
+atrLengthInput = input.int(14, "ATR Length"
+  , minval  = 1
+  , maxval  = 200
+  , group   = GROUP_TREND
+  , tooltip = "Average True Range length used to normalize the prior move.")
+
+avgLengthInput = input.int(20, "Effort Average Length"
+  , minval  = 1
+  , maxval  = 200
+  , group   = GROUP_DETECTION
+  , tooltip = "Bars used to average the range and the volume of the candles preceding the pattern bar. These averages are the baseline the effort checks below compare against.")
+
+rangeMultInput = input.float(1.5, "Wide Range Multiplier"
+  , minval  = 1
+  , maxval  = 5
+  , step    = 0.1
+  , group   = GROUP_DETECTION
+  , tooltip = "The bar's high-low range must reach this multiple of the recent average range - the maximum-effort signature of the pattern.")
+
+volumeFilterInput = input.bool(true, "Require Volume Spike"
+  , group   = GROUP_DETECTION
+  , tooltip = "Require participation well above recent averages on the bar, the volume reading of a buying or selling climax. Pure price-action definitions accept range and close location alone, so the check can be disabled; it is skipped automatically on symbols without volume data.")
+
+volumeMultInput = input.float(1.5, "Volume Spike Multiplier"
+  , minval  = 0.5
+  , maxval  = 5
+  , step    = 0.1
+  , group   = GROUP_DETECTION
+  , tooltip = "The bar's volume must reach this multiple of its recent average when the volume filter is enabled.")
+
+closeLocationInput = input.float(25, "Close Location %"
+  , minval  = 1
+  , maxval  = 50
+  , step    = 1
+  , group   = GROUP_DETECTION
+  , tooltip = "Largest distance allowed between the close and the bar's opposite extreme, as a percentage of the bar's range: 50 accepts any close in the opposite half, 25 demands the opposite quarter. Wide range and heavy volume show maximum effort; a close that gives most of it back is the whole message.")
+
+insideInput = input.bool(true, "Close Back Inside Prior Range"
+  , group   = GROUP_DETECTION
+  , tooltip = "Require the close back inside the range of the preceding lookback bars, so the excursion beyond the old extreme is left as a wick above (or below) all nearby price action - the probe was rejected rather than accepted.")
+
+gapInput = input.bool(false, "Require Gap Open"
+  , group   = GROUP_DETECTION
+  , tooltip = "Restrict detection to bars that open beyond the previous bar's range in the trend direction, for the definitions that demand a final enthusiasm gap the bar then fails to hold.")
+
+confirmInput = input.string(CONF_NONE, "Confirmation"
+  , options = [CONF_NONE, CONF_MID, CONF_EXT]
+  , group   = GROUP_SIGNALS
+  , tooltip = "Optionally wait for the following bar to close beyond the exhaustion bar's midpoint or opposite extreme before marking the pattern, as in a two-bar reversal - it substantially cleans up the signal. Marks then appear one bar after the pattern, on the candle that printed it.")
+
+showLevelsInput = input.bool(true, "Extreme Levels"
+  , group   = GROUP_SIGNALS
+  , tooltip = "Extends each exhaustion bar's wick tip forward as a reference level: the natural stop sits beyond it, and a close accepted beyond it argues the move was continuation, not exhaustion. Levels turn dotted and dim once price closes beyond them.")
+
+maxLevelsInput = input.int(8, "Show Last Levels"
+  , minval  = 1
+  , maxval  = 50
+  , group   = GROUP_SIGNALS
+  , tooltip = "Maximum number of extreme levels kept on the chart; the oldest is dropped as newer exhaustion bars print.")
+
+showLabelsInput = input.bool(true, "Show Pattern Labels"
+  , group   = GROUP_STYLE
+  , tooltip = "Labels each exhaustion bar on the candle where it printed.")
+
+highlightInput = input.bool(false, "Highlight Pattern Candles"
+  , group   = GROUP_STYLE
+  , tooltip = "Colors the exhaustion bar candle itself.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "patternColors", group = GROUP_STYLE)
+
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "patternColors", group = GROUP_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types
+//---------------------------------------------------------------------------------------------------------------------{
+
+//A tracked reference level at an exhaustion bar's wick tip, extended forward while the rejection holds.
+//'dir' is 1 for a bullish exhaustion bar (level at its low), -1 for a bearish one (level at its high)
+type ExhaustionLevel
+    line  levelLine
+    float price
+    int   dir
+    bool  active
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+
+float barRange = high - low
+float barMid   = math.avg(high, low)
+
+//Baselines are measured on the bars preceding the pattern candle
+float atrValue   = ta.atr(atrLengthInput)
+float baseAtr    = atrValue[1]
+float rangeSma   = ta.sma(barRange, avgLengthInput)
+float volumeSma  = ta.sma(nz(volume), avgLengthInput)
+float baseRange  = rangeSma[1]
+float baseVolume = volumeSma[1]
+
+float rangeRatio  = baseRange  > 0 ? barRange   / baseRange  : na
+float volumeRatio = baseVolume > 0 ? nz(volume) / baseVolume : na
+
+//The move the bar may be exhausting: its extremes and its net progress across the lookback
+float priorHigh = ta.highest(high, trendLengthInput)[1]
+float priorLow  = ta.lowest(low, trendLengthInput)[1]
+float netMove   = close[1] - close[trendLengthInput + 1]
+
+bool dataReady = not na(priorHigh) and not na(priorLow) and not na(netMove) and not na(baseAtr) and baseAtr > 0
+
+//Context: an extended prior trend, and a bar printing a fresh extreme for that move
+bool upContext   = dataReady and netMove > 0 and netMove >= trendMoveInput * baseAtr
+bool downContext = dataReady and netMove < 0 and -netMove >= trendMoveInput * baseAtr
+bool newHigh     = dataReady and high > priorHigh
+bool newLow      = dataReady and low  < priorLow
+
+//Effort: a range noticeably wider than recent bars, optionally a participation extreme
+bool wideRange = not na(rangeRatio) and rangeRatio >= rangeMultInput
+bool volumeOk  = not volumeFilterInput or na(volumeRatio) or volumeRatio >= volumeMultInput
+
+//Result: the close near the opposite extreme of the bar's own range
+float closeFrac  = barRange > 0 ? (close - low) / barRange : 0.5
+float closeLimit = closeLocationInput / 100
+bool  bearResult = closeFrac <= closeLimit
+bool  bullResult = closeFrac >= 1 - closeLimit
+
+//Rejected probe: the close back inside the prior bars' range, the excursion left as a wick
+bool bearInsideOk = not insideInput or close < priorHigh
+bool bullInsideOk = not insideInput or close > priorLow
+
+//Optional gap in the trend direction that the bar then fails to hold
+bool bearGapOk = not gapInput or open > high[1]
+bool bullGapOk = not gapInput or open < low[1]
+
+//Bearish exhaustion bar: the advance drives to a new high on outsized effort yet the close gives it back
+bool rawBear = upContext and newHigh and wideRange and volumeOk and bearResult and bearInsideOk and bearGapOk
+
+//Bullish exhaustion bar: the decline plunges to a new low on outsized effort yet closes near its high
+bool rawBull = downContext and newLow and wideRange and volumeOk and bullResult and bullInsideOk and bullGapOk
+
+//Next-bar follow-through: a close beyond the pattern's midpoint, or beyond its opposite extreme
+bool bearFollowThrough = confirmInput == CONF_EXT ? close < low[1]  : close < barMid[1]
+bool bullFollowThrough = confirmInput == CONF_EXT ? close > high[1] : close > barMid[1]
+bool bearConfirmed     = rawBear[1] and bearFollowThrough
+bool bullConfirmed     = rawBull[1] and bullFollowThrough
+
+//Marked signal: the raw bar, or the confirmed one when follow-through is required (marked one bar later)
+bool bearSignal = confirmInput == CONF_NONE ? rawBear : bearConfirmed
+bool bullSignal = confirmInput == CONF_NONE ? rawBull : bullConfirmed
+
+int   signalOffset = confirmInput == CONF_NONE ? 0 : 1
+int   signalBar    = bar_index - signalOffset
+float signalHigh   = high[signalOffset]
+float signalLow    = low[signalOffset]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Pattern Marks & Extreme Levels
+//---------------------------------------------------------------------------------------------------------------------{
+
+var array<ExhaustionLevel> levelsArray = array.new<ExhaustionLevel>()
+
+bool bullInvalidated = false
+bool bearInvalidated = false
+
+//Extend the active wick-tip levels and retire any that price closes beyond - acceptance beyond the wick
+//that was supposedly rejected means the exhaustion thesis is wrong by definition
+if array.size(levelsArray) > 0
+    for i = 0 to array.size(levelsArray) - 1
+        ExhaustionLevel refLevel = array.get(levelsArray, i)
+        if refLevel.active
+            if not na(refLevel.levelLine)
+                line.set_x2(refLevel.levelLine, bar_index)
+            bool accepted = barstate.isconfirmed and (refLevel.dir > 0 ? close < refLevel.price : close > refLevel.price)
+            if accepted
+                refLevel.active := false
+                if refLevel.dir > 0
+                    bullInvalidated := true
+                else
+                    bearInvalidated := true
+                if not na(refLevel.levelLine)
+                    line.set_style(refLevel.levelLine, line.style_dotted)
+                    line.set_color(refLevel.levelLine, color.new(refLevel.dir > 0 ? bullColorInput : bearColorInput, DEAD_LEVEL_TRANSP))
+
+//Mark a new bearish exhaustion bar on the candle that printed it and log its high as the reference extreme
+if bearSignal
+    string bearDetails = "Bearish exhaustion bar: the advance drove to a new " + str.tostring(trendLengthInput) + "-bar high with outsized effort, yet closed near its low - maximum effort, minimal result."
+    bearDetails += "\nRange: " + (na(rangeRatio[signalOffset]) ? "n/a" : str.tostring(rangeRatio[signalOffset], NUM_FORMAT) + "x recent average")
+    bearDetails += "\nVolume: " + (na(volumeRatio[signalOffset]) ? "no data" : str.tostring(volumeRatio[signalOffset], NUM_FORMAT) + "x recent average")
+    bearDetails += "\nClose at " + str.tostring(closeFrac[signalOffset] * 100, "#") + "% of the bar's range"
+    bearDetails += "\nPrior advance: " + str.tostring(netMove[signalOffset] / baseAtr[signalOffset], NUM_FORMAT) + " ATR over " + str.tostring(trendLengthInput) + " bars"
+    bearDetails += confirmInput == CONF_NONE ? "" : "\nConfirmed by the next close beyond its " + (confirmInput == CONF_EXT ? "low" : "midpoint")
+    bearDetails += "\nStop / invalidation beyond " + str.tostring(signalHigh, format.mintick)
+    if showLabelsInput
+        label.new(signalBar, signalHigh, "Exhaustion"
+          , style     = label.style_label_down
+          , color     = LABEL_BG
+          , textcolor = bearColorInput
+          , size      = size.small
+          , tooltip   = bearDetails)
+    line bearLevelLine = na
+    if showLevelsInput
+        bearLevelLine := line.new(signalBar, signalHigh, bar_index, signalHigh, color = bearColorInput, style = line.style_dashed, width = 1)
+    array.push(levelsArray, ExhaustionLevel.new(bearLevelLine, signalHigh, -1, true))
+
+//Bullish mirror: the wick low is the reference extreme
+if bullSignal
+    string bullDetails = "Bullish exhaustion bar: the decline plunged to a new " + str.tostring(trendLengthInput) + "-bar low with outsized effort, yet closed near its high - maximum effort, minimal result."
+    bullDetails += "\nRange: " + (na(rangeRatio[signalOffset]) ? "n/a" : str.tostring(rangeRatio[signalOffset], NUM_FORMAT) + "x recent average")
+    bullDetails += "\nVolume: " + (na(volumeRatio[signalOffset]) ? "no data" : str.tostring(volumeRatio[signalOffset], NUM_FORMAT) + "x recent average")
+    bullDetails += "\nClose at " + str.tostring(closeFrac[signalOffset] * 100, "#") + "% of the bar's range"
+    bullDetails += "\nPrior decline: " + str.tostring(-netMove[signalOffset] / baseAtr[signalOffset], NUM_FORMAT) + " ATR over " + str.tostring(trendLengthInput) + " bars"
+    bullDetails += confirmInput == CONF_NONE ? "" : "\nConfirmed by the next close beyond its " + (confirmInput == CONF_EXT ? "high" : "midpoint")
+    bullDetails += "\nStop / invalidation beyond " + str.tostring(signalLow, format.mintick)
+    if showLabelsInput
+        label.new(signalBar, signalLow, "Exhaustion"
+          , style     = label.style_label_up
+          , color     = LABEL_BG
+          , textcolor = bullColorInput
+          , size      = size.small
+          , tooltip   = bullDetails)
+    line bullLevelLine = na
+    if showLevelsInput
+        bullLevelLine := line.new(signalBar, signalLow, bar_index, signalLow, color = bullColorInput, style = line.style_dashed, width = 1)
+    array.push(levelsArray, ExhaustionLevel.new(bullLevelLine, signalLow, 1, true))
+
+//Oldest levels beyond the cap are dropped
+while array.size(levelsArray) > maxLevelsInput
+    ExhaustionLevel oldLevel = array.shift(levelsArray)
+    if not na(oldLevel.levelLine)
+        line.delete(oldLevel.levelLine)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+
+barcolor(highlightInput and rawBear ? bearColorInput : highlightInput and rawBull ? bullColorInput : color(na), title = "Exhaustion Bar Candles")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(rawBear, "Bearish Exhaustion Bar", "Bearish exhaustion bar on {{ticker}} ({{interval}}) - the advance drove to a new high on outsized range/volume but closed weak. The move may have spent its fuel; the bar's high is the reference extreme")
+
+alertcondition(rawBull, "Bullish Exhaustion Bar", "Bullish exhaustion bar on {{ticker}} ({{interval}}) - the decline plunged to a new low on outsized range/volume but closed strong. The move may have spent its fuel; the bar's low is the reference extreme")
+
+alertcondition(bearConfirmed, "Bearish Exhaustion Confirmed", "The bar following a bearish exhaustion bar on {{ticker}} ({{interval}}) closed beyond it against the uptrend - the two-bar follow-through that substantially cleans up the signal")
+
+alertcondition(bullConfirmed, "Bullish Exhaustion Confirmed", "The bar following a bullish exhaustion bar on {{ticker}} ({{interval}}) closed beyond it against the downtrend - the two-bar follow-through that substantially cleans up the signal")
+
+alertcondition(bearInvalidated, "Bearish Exhaustion Invalidated", "Price on {{ticker}} ({{interval}}) closed above a bearish exhaustion bar's high - acceptance beyond the rejected wick argues the move was continuation, not exhaustion")
+
+alertcondition(bullInvalidated, "Bullish Exhaustion Invalidated", "Price on {{ticker}} ({{interval}}) closed below a bullish exhaustion bar's low - acceptance beyond the rejected wick argues the move was continuation, not exhaustion")
+
+//---------------------------------------------------------------------------------------------------------------------}

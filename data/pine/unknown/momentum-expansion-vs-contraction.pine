@@ -1,0 +1,335 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Momentum Expansion vs Contraction", shorttitle = "Momentum Expansion vs Contraction", overlay = false, format = format.price, precision = 2, max_lines_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+OSC_MACD  = "MACD Histogram"
+OSC_MOM   = "Momentum"
+OSC_ROC   = "Rate of Change"
+OSC_RSI   = "RSI"
+OSC_STOCH = "Stochastic %K"
+OSC_CCI   = "CCI"
+
+BAR_TO_BAR      = "Bar-to-bar"
+CONFIRMED_PHASE = "Confirmed Phase"
+
+TOP_RIGHT    = "Top Right"
+TOP_LEFT     = "Top Left"
+BOTTOM_RIGHT = "Bottom Right"
+BOTTOM_LEFT  = "Bottom Left"
+
+TINY_SIZE   = "Tiny"
+SMALL_SIZE  = "Small"
+NORMAL_SIZE = "Normal"
+
+PHASE_EXPANSION   = 1       // confirmed expansion phase - readings growing away from the zero line
+PHASE_CONTRACTION = -1      // confirmed contraction phase - readings shrinking back toward the zero line
+PHASE_NONE        = 0       // unresolved - fresh side of the zero line or chart start
+
+// Composite lifecycle states (phase x side of the zero line)
+STATE_NONE     = 0
+STATE_BULL_EXP = 1
+STATE_BULL_CON = 2
+STATE_BEAR_EXP = 3
+STATE_BEAR_CON = 4
+
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+WARNING_COLOR = #ff9800
+NEUTRAL_COLOR = #787b86
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+CONTRACTION_TRANSP = 55     // fade applied to the side color on shrinking readings - the classic light histogram tone
+CENTER_0_100       = 50.0   // balance point of the 0-100 oscillators, so every option plots zero-centered
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+oscillatorInput = input.string(OSC_MACD, "Oscillator", options = [OSC_MACD, OSC_MOM, OSC_ROC, OSC_RSI, OSC_STOCH, OSC_CCI]
+  , group   = "Oscillator"
+  , tooltip = "Momentum tool the expansion/contraction grammar is read on. The MACD histogram is the standard choice because it makes the read bar-to-bar visual; RSI and Stochastic %K are read as their distance from 50, so every option plots as a zero-centered histogram. The read transfers across tools because it depends on shape, not on the specific oscillator.")
+
+srcInput = input.source(close, "Source"
+  , group   = "Oscillator"
+  , tooltip = "Price series feeding the MACD histogram, Momentum, Rate of Change and RSI. Stochastic %K always uses close/high/low and CCI its typical price (HLC3), per their standard definitions.")
+
+macdFastInput = input.int(12, "MACD Fast", minval = 1, inline = "macd"
+  , group   = "Oscillator"
+  , tooltip = "Fast EMA length of the MACD line.")
+
+macdSlowInput = input.int(26, "Slow", minval = 1, inline = "macd"
+  , group   = "Oscillator"
+  , tooltip = "Slow EMA length of the MACD line.")
+
+macdSignalInput = input.int(9, "Signal", minval = 1, inline = "macd"
+  , group   = "Oscillator"
+  , tooltip = "Signal EMA length. The histogram measures the gap between the MACD line and this signal line - shrinking bars mean that gap is closing, deceleration, well before the lines actually cross.")
+
+oscLengthInput = input.int(14, "Oscillator Length", minval = 1
+  , group   = "Oscillator"
+  , tooltip = "Lookback used by Momentum, Rate of Change, RSI, Stochastic %K and CCI. Faster settings flag deceleration earlier with more false alarms, slower settings later with fewer.")
+
+confirmBarsInput = input.int(3, "Confirmation Bars", minval = 1
+  , group   = "Expansion & Contraction"
+  , tooltip = "Consecutive bars the reading must keep growing (or shrinking) before the phase is called. One shorter bar is noise; several consecutive shrinking bars is the real deceleration signal. The count resets whenever momentum changes sides of the zero line.")
+
+swingLengthInput = input.int(5, "Swing Detection Length", minval = 1
+  , group   = "Expansion & Contraction"
+  , tooltip = "Pivot strength of the swing-to-swing read: a momentum peak or trough is confirmed once this many bars print on each side of it. Successive peaks reaching further in the trend's direction signal expansion; peaks falling short signal contraction.")
+
+showSwingsInput = input.bool(true, "Swing Connectors"
+  , group   = "Expansion & Contraction"
+  , tooltip = "Connects successive same-side momentum extremes in the pane: solid trend-colored lines when the latest extreme reaches further (expansion), dashed warning-colored lines when it falls short (contraction). Repeated shortfalls while price keeps trending are the raw material of divergence.")
+
+showMarkersInput = input.bool(false, "Phase Markers"
+  , group   = "Expansion & Contraction"
+  , tooltip = "Small marker on the bar a phase is confirmed: triangles for expansion starts, diamonds for contraction warnings. Off by default to keep the pane clean - the alerts fire regardless.")
+
+showDashboardInput = input.bool(true, "Show Dashboard"
+  , group   = "Dashboard"
+  , tooltip = "Lifecycle panel: the confirmed phase, the live bar-to-bar read with its streak, the swing-to-swing verdict on momentum peaks and troughs, and the current reading.")
+
+dashboardPositionInput = input.string(TOP_RIGHT, "Position", options = [TOP_RIGHT, TOP_LEFT, BOTTOM_RIGHT, BOTTOM_LEFT], inline = "dash"
+  , group   = "Dashboard"
+  , tooltip = "Corner of the pane the dashboard is anchored to.")
+
+dashboardSizeInput = input.string(SMALL_SIZE, "Size", options = [TINY_SIZE, SMALL_SIZE, NORMAL_SIZE], inline = "dash"
+  , group   = "Dashboard"
+  , tooltip = "Dashboard text size.")
+
+barColorModeInput = input.string(BAR_TO_BAR, "Bar Coloring", options = [BAR_TO_BAR, CONFIRMED_PHASE]
+  , group   = "Style"
+  , tooltip = "Bar-to-bar paints every column by its own read - full color when the reading grows away from the zero line, faded when it shrinks back toward it, the classic four-color histogram. Confirmed Phase waits for the confirmation window and paints the whole phase one color, trading immediacy for stability.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "direction"
+  , group   = "Style"
+  , tooltip = "Color of bull-side momentum (readings above the zero line) and of expanding peak connectors.")
+
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "direction"
+  , group   = "Style"
+  , tooltip = "Color of bear-side momentum (readings below the zero line) and of expanding trough connectors.")
+
+warningColorInput = input.color(WARNING_COLOR, "Warning", inline = "direction"
+  , group   = "Style"
+  , tooltip = "Color of contraction evidence: falling-short swing connectors, contraction markers and dashboard warnings. Contraction is a warning, not a signal - deceleration precedes both reversals and ordinary consolidations.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Dashboard anchor from the position option
+tableLocation(string positionText) =>
+    switch
+        positionText == TOP_RIGHT    => position.top_right
+        positionText == TOP_LEFT     => position.top_left
+        positionText == BOTTOM_RIGHT => position.bottom_right
+        => position.bottom_left
+
+// Dashboard text size from the size option
+tableTextSize(string sizeText) =>
+    switch
+        sizeText == TINY_SIZE  => size.tiny
+        sizeText == SMALL_SIZE => size.small
+        => size.normal
+
+// Readings formatted for the dashboard - MACD histogram and Momentum live in price units, the rest on their own scale
+formatOsc(float value) =>
+    na(value) ? "n/a" : oscillatorInput == OSC_MACD or oscillatorInput == OSC_MOM ? str.tostring(value, format.mintick) : str.tostring(value, "#.##")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Oscillator Engine
+//---------------------------------------------------------------------------------------------------------------------{
+// Every selectable oscillator is computed on every bar so the selection only picks a value,
+// never changes what executes
+[macdLine, macdSignalLine, macdHistogram] = ta.macd(srcInput, macdFastInput, macdSlowInput, macdSignalInput)
+
+momValue   = ta.mom(srcInput, oscLengthInput)
+rocValue   = ta.roc(srcInput, oscLengthInput)
+rsiValue   = ta.rsi(srcInput, oscLengthInput)
+stochValue = ta.stoch(close, high, low, oscLengthInput)
+cciValue   = ta.cci(hlc3, oscLengthInput)
+
+// 0-100 designs are re-centered on 50 so the whole pane reads as distance from the zero line
+osc = switch oscillatorInput
+    OSC_MACD  => macdHistogram
+    OSC_MOM   => momValue
+    OSC_ROC   => rocValue
+    OSC_RSI   => rsiValue - CENTER_0_100
+    OSC_STOCH => stochValue - CENTER_0_100
+    => cciValue
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Bar-to-bar Lifecycle Engine
+//---------------------------------------------------------------------------------------------------------------------{
+// The histogram grammar: a bar printing further from the zero line on its own side is expansion,
+// a bar shrinking back toward it is contraction
+oscValid     = not na(osc) and not na(osc[1])
+growingBar   = oscValid and (osc > 0 ? osc > osc[1] : osc < 0 ? osc < osc[1] : false)
+shrinkingBar = oscValid and (osc > 0 ? osc < osc[1] : osc < 0 ? osc > osc[1] : false)
+sideFlip     = oscValid and math.sign(osc) != math.sign(osc[1])
+
+// Judge swing to swing, not tick to tick: streaks of same-direction change feed the confirmation window,
+// and a change of side always starts the count over
+var int growStreak   = 0
+var int shrinkStreak = 0
+
+if sideFlip
+    growStreak   := growingBar ? 1 : 0
+    shrinkStreak := shrinkingBar ? 1 : 0
+else if growingBar
+    growStreak   := growStreak + 1
+    shrinkStreak := 0
+else if shrinkingBar
+    shrinkStreak := shrinkStreak + 1
+    growStreak   := 0
+
+// The confirmed phase is sticky: once called it holds through single-bar noise until the opposite
+// behavior sustains for the full window or momentum changes sides
+var int phase = PHASE_NONE
+
+if sideFlip
+    phase := PHASE_NONE
+if growStreak >= confirmBarsInput
+    phase := PHASE_EXPANSION
+if shrinkStreak >= confirmBarsInput
+    phase := PHASE_CONTRACTION
+
+// Composite lifecycle state and its transitions - expansion starts and contraction warnings
+stateCode = phase == PHASE_NONE or na(osc) or osc == 0 ? STATE_NONE :
+     osc > 0 ? (phase == PHASE_EXPANSION ? STATE_BULL_EXP : STATE_BULL_CON) :
+     phase == PHASE_EXPANSION ? STATE_BEAR_EXP : STATE_BEAR_CON
+
+prevStateCode = nz(stateCode[1])
+
+bullishExpansionStart   = stateCode == STATE_BULL_EXP and prevStateCode != STATE_BULL_EXP
+bullishContractionStart = stateCode == STATE_BULL_CON and prevStateCode != STATE_BULL_CON
+bearishExpansionStart   = stateCode == STATE_BEAR_EXP and prevStateCode != STATE_BEAR_EXP
+bearishContractionStart = stateCode == STATE_BEAR_CON and prevStateCode != STATE_BEAR_CON
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Swing-to-swing Comparison
+//---------------------------------------------------------------------------------------------------------------------{
+// Line-oscillator grammar: successive same-side extremes are compared - peaks above zero for the up move,
+// troughs below zero for the down move. Reaching further is expansion, falling short is contraction.
+pivotHighValue = ta.pivothigh(osc, swingLengthInput, swingLengthInput)
+pivotLowValue  = ta.pivotlow(osc, swingLengthInput, swingLengthInput)
+
+var float lastPeakValue   = na
+var int   lastPeakBar     = na
+var float lastTroughValue = na
+var int   lastTroughBar   = na
+var int   peakSwingRead   = 0   // 1 expanding, -1 contracting, 0 no comparison yet
+var int   troughSwingRead = 0
+
+bool higherMomentumPeak      = false
+bool lowerMomentumPeak       = false
+bool deeperMomentumTrough    = false
+bool shallowerMomentumTrough = false
+
+if not na(pivotHighValue) and pivotHighValue > 0
+    int pivotBar = bar_index - swingLengthInput
+    if not na(lastPeakValue)
+        higherMomentumPeak := pivotHighValue > lastPeakValue
+        lowerMomentumPeak  := pivotHighValue < lastPeakValue
+        peakSwingRead      := higherMomentumPeak ? 1 : lowerMomentumPeak ? -1 : peakSwingRead
+        if showSwingsInput
+            line.new(lastPeakBar, lastPeakValue, pivotBar, pivotHighValue
+              , color = higherMomentumPeak ? bullColorInput : warningColorInput
+              , style = higherMomentumPeak ? line.style_solid : line.style_dashed
+              , width = 1)
+    lastPeakValue := pivotHighValue
+    lastPeakBar   := pivotBar
+
+if not na(pivotLowValue) and pivotLowValue < 0
+    int pivotBar = bar_index - swingLengthInput
+    if not na(lastTroughValue)
+        deeperMomentumTrough    := pivotLowValue < lastTroughValue
+        shallowerMomentumTrough := pivotLowValue > lastTroughValue
+        troughSwingRead         := deeperMomentumTrough ? 1 : shallowerMomentumTrough ? -1 : troughSwingRead
+        if showSwingsInput
+            line.new(lastTroughBar, lastTroughValue, pivotBar, pivotLowValue
+              , color = deeperMomentumTrough ? bearColorInput : warningColorInput
+              , style = deeperMomentumTrough ? line.style_solid : line.style_dashed
+              , width = 1)
+    lastTroughValue := pivotLowValue
+    lastTroughBar   := pivotBar
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+sideColor     = osc >= 0 ? bullColorInput : bearColorInput
+fadedSide     = color.new(sideColor, CONTRACTION_TRANSP)
+unresolvedTone = color.new(NEUTRAL_COLOR, 40)
+
+barToBarColor  = growingBar ? sideColor : fadedSide
+phaseBarColor  = phase == PHASE_EXPANSION ? sideColor : phase == PHASE_CONTRACTION ? fadedSide : unresolvedTone
+histogramColor = barColorModeInput == BAR_TO_BAR ? barToBarColor : phaseBarColor
+
+plot(osc, "Momentum Reading", histogramColor, 1, plot.style_columns)
+
+hline(0, "Zero Line", color = color.new(NEUTRAL_COLOR, 50), linestyle = hline.style_dashed)
+
+plotshape(showMarkersInput and bullishExpansionStart ? osc : na, "Bullish Expansion Marker", shape.triangleup, location.absolute, bullColorInput, size = size.tiny)
+plotshape(showMarkersInput and bearishExpansionStart ? osc : na, "Bearish Expansion Marker", shape.triangledown, location.absolute, bearColorInput, size = size.tiny)
+plotshape(showMarkersInput and bullishContractionStart ? osc : na, "Bullish Contraction Marker", shape.diamond, location.absolute, warningColorInput, size = size.tiny)
+plotshape(showMarkersInput and bearishContractionStart ? osc : na, "Bearish Contraction Marker", shape.diamond, location.absolute, warningColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dashboardTable = na
+
+if barstate.islast and showDashboardInput
+    if na(dashboardTable)
+        dashboardTable := table.new(tableLocation(dashboardPositionInput), 2, 6, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+    string textSize  = tableTextSize(dashboardSizeInput)
+    color labelColor = DASH_HEADER
+    color valueColor = DASH_TEXT
+
+    string sideText  = na(osc) ? "n/a" : osc > 0 ? "Bullish" : osc < 0 ? "Bearish" : "Flat"
+    string phaseText = phase == PHASE_EXPANSION ? sideText + " Expansion" : phase == PHASE_CONTRACTION ? sideText + " Contraction" : "Forming"
+    color phaseTextColor = phase == PHASE_EXPANSION ? (osc >= 0 ? bullColorInput : bearColorInput) : phase == PHASE_CONTRACTION ? warningColorInput : NEUTRAL_COLOR
+
+    string barReadText = growingBar ? "Growing (" + str.tostring(growStreak) + (growStreak == 1 ? " bar)" : " bars)") :
+         shrinkingBar ? "Shrinking (" + str.tostring(shrinkStreak) + (shrinkStreak == 1 ? " bar)" : " bars)") : "Flat"
+    color barReadColor = growingBar ? sideColor : shrinkingBar ? warningColorInput : NEUTRAL_COLOR
+
+    string peakText   = peakSwingRead == 1 ? "Expanding" : peakSwingRead == -1 ? "Contracting" : "n/a"
+    color peakColor   = peakSwingRead == 1 ? bullColorInput : peakSwingRead == -1 ? warningColorInput : NEUTRAL_COLOR
+    string troughText = troughSwingRead == 1 ? "Expanding" : troughSwingRead == -1 ? "Contracting" : "n/a"
+    color troughColor = troughSwingRead == 1 ? bearColorInput : troughSwingRead == -1 ? warningColorInput : NEUTRAL_COLOR
+
+    table.cell(dashboardTable, 0, 0, "Oscillator", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 0, oscillatorInput, text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 1, "Phase", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 1, phaseText, text_color = phaseTextColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 2, "Bar Read", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 2, barReadText, text_color = barReadColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 3, "Peak Swings", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 3, peakText, text_color = peakColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 4, "Trough Swings", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 4, troughText, text_color = troughColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 5, "Reading", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 5, formatOsc(osc), text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(bullishExpansionStart, "Bullish Expansion Confirmed", "Momentum Expansion vs Contraction: bullish expansion confirmed on {{ticker}} - readings grew away from the zero line for the full confirmation window, the up move is accelerating ({{interval}})")
+alertcondition(bullishContractionStart, "Bullish Contraction Warning", "Momentum Expansion vs Contraction: contraction warning on {{ticker}} - bull-side readings shrank back toward the zero line for the full confirmation window, the up move is decelerating; an early warning, not a reversal signal ({{interval}})")
+alertcondition(bearishExpansionStart, "Bearish Expansion Confirmed", "Momentum Expansion vs Contraction: bearish expansion confirmed on {{ticker}} - readings pushed deeper below the zero line for the full confirmation window, the down move is accelerating ({{interval}})")
+alertcondition(bearishContractionStart, "Bearish Contraction Warning", "Momentum Expansion vs Contraction: contraction warning on {{ticker}} - bear-side readings shrank back toward the zero line for the full confirmation window, the down move is decelerating; an early warning, not a reversal signal ({{interval}})")
+alertcondition(higherMomentumPeak, "Higher Momentum Peak (Swing Expansion)", "Momentum Expansion vs Contraction: the latest momentum peak on {{ticker}} printed above the prior one - swing-level expansion, the up move keeps accelerating ({{interval}})")
+alertcondition(lowerMomentumPeak, "Lower Momentum Peak (Swing Contraction)", "Momentum Expansion vs Contraction: the latest momentum peak on {{ticker}} fell short of the prior one - swing-level contraction of the up move; if price is still printing new highs this is the raw material of divergence ({{interval}})")
+alertcondition(deeperMomentumTrough, "Deeper Momentum Trough (Swing Expansion)", "Momentum Expansion vs Contraction: the latest momentum trough on {{ticker}} printed below the prior one - swing-level expansion, the down move keeps accelerating ({{interval}})")
+alertcondition(shallowerMomentumTrough, "Shallower Momentum Trough (Swing Contraction)", "Momentum Expansion vs Contraction: the latest momentum trough on {{ticker}} fell short of the prior one - swing-level contraction of the down move; if price is still printing new lows this is the raw material of divergence ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

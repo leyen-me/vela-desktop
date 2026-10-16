@@ -1,0 +1,529 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Re-distribution"
+  , shorttitle       = "Re-distribution"
+  , overlay          = true
+  , format           = format.price
+  , max_boxes_count  = 250
+  , max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+//Tracker stages: no candidate, stall low found and awaiting the first bounce high, active range, breakdown under test
+int STAGE_IDLE       = 0
+int STAGE_AWAIT_HIGH = 1
+int STAGE_RANGE      = 2
+int STAGE_BREAKDOWN  = 3
+
+//Storage cap for the per-advance volume series feeding the weak-rally contraction read
+int MAX_UP_VOLUMES = 2000
+
+color BULL_COLOR    = #089981
+color BEAR_COLOR    = #f23645
+color NEUTRAL_COLOR = #787b86 // the developing range - structure until it resolves
+color TRANSP_COLOR  = #00000000
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+int MARKER_TRANSP    = 30
+
+string GROUP_TREND = "Downtrend Context"
+string GROUP_RANGE = "Range Detection"
+string GROUP_EVID  = "Weak-Rally Evidence"
+string GROUP_DASH  = "Dashboard"
+string GROUP_STYLE = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+trendLookbackInput = input.int(50, "Downtrend Lookback (Bars)"
+  , minval  = 10
+  , group   = GROUP_TREND
+  , tooltip = "Bars used to qualify the prior decline. The stall low must be the lowest low of this window, with price down by at least the minimum decline across it - without a markdown already underway there is nothing to re-distribute, and a range forming after a long advance is candidate distribution instead.")
+
+trendMultInput = input.float(2.0, "Minimum Decline (xATR)"
+  , minval  = 0.25
+  , step    = 0.25
+  , group   = GROUP_TREND
+  , tooltip = "Net decline into the range start, in ATR multiples measured over the downtrend lookback, required before a pause qualifies as candidate re-distribution. Raise it to demand a stronger markdown leg into the range.")
+
+atrLengthInput = input.int(14, "ATR Length"
+  , minval  = 1
+  , group   = GROUP_TREND
+  , tooltip = "Average True Range length used to normalize the prior decline.")
+
+pivotLengthInput = input.int(5, "Swing Length"
+  , minval  = 2
+  , group   = GROUP_RANGE
+  , tooltip = "Swing strength of the pivots that mark the reaction low and the first bounce high - the range boundaries. A pivot must be the extreme of this many bars on each side, so boundaries confirm this many bars after they print.")
+
+minRangeBarsInput = input.int(15, "Minimum Range Duration (Bars)"
+  , minval  = 5
+  , group   = GROUP_RANGE
+  , tooltip = "Bars the pause must last, counted from the reaction low, before it is treated as a trading range. Resolutions before that are discarded as simple pauses - a short, tight upward drift in a downtrend is bear-flag territory rather than a trading range.")
+
+upthrustBarsInput = input.int(5, "Upthrust Recovery Window (Bars)"
+  , minval  = 1
+  , group   = GROUP_RANGE
+  , tooltip = "Maximum bars price may close above range resistance and still snap back as an upthrust - the brief poke above the range that fails quickly. Holding above resistance any longer is sustained acceptance, which argues the range is accumulation and invalidates the re-distribution hypothesis.")
+
+confirmBarsInput = input.int(3, "Breakdown Hold (Bars)"
+  , minval  = 1
+  , group   = GROUP_RANGE
+  , tooltip = "Consecutive closes below the range low required for the breakdown to count as held. The diagnosis is treated as confirmed only when price breaks and holds below range support - until then the bullish alternative of a developing base remains possible.")
+
+volLengthInput = input.int(20, "Volume Average Length"
+  , minval  = 1
+  , group   = GROUP_RANGE
+  , tooltip = "Simple moving average length of volume used as the participation baseline reported with the confirmed breakdown - declines that expand in volume strengthen the read. On symbols without volume data the note is skipped.")
+
+resistanceZoneInput = input.float(25, "Resistance Zone (% of Range Height)"
+  , minval  = 5
+  , maxval  = 50
+  , step    = 5
+  , group   = GROUP_EVID
+  , tooltip = "Depth of the resistance zone below the range high, as a share of the range height. Rallies into this zone that fail quickly count as weak-rally evidence - strength being sold near range resistance, where continuation shorts look to sell.")
+
+rallyFailBarsInput = input.int(5, "Rally Rejection Window (Bars)"
+  , minval  = 1
+  , group   = GROUP_EVID
+  , tooltip = "Maximum bars a rally may linger inside the resistance zone and still count as a quickly rejected advance.")
+
+showDashboardInput = input.bool(true, "Show Dashboard"
+  , group   = GROUP_DASH
+  , tooltip = "Shows the evidence dashboard - the diagnostic checklist of weak-rally behavior traders weigh for or against the label before the range resolves.")
+
+dashboardPositionInput = input.string("Top Right", "Position"
+  , options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"]
+  , group   = GROUP_DASH
+  , tooltip = "Chart corner the dashboard is anchored to.")
+
+dashboardSizeInput = input.string("Small", "Size"
+  , options = ["Tiny", "Small", "Normal"]
+  , group   = GROUP_DASH
+  , tooltip = "Dashboard text size.")
+
+showBoxInput = input.bool(true, "Show Range Box"
+  , group   = GROUP_STYLE
+  , tooltip = "Draws the trading range between the first bounce high and the reaction low. Dashed while the hypothesis is live, solid once the range resolves.")
+
+showLowerHighsInput = input.bool(true, "Lower-High Markers"
+  , group   = GROUP_STYLE
+  , tooltip = "Marks swing highs stepping down inside the range - supply capping each advance at a progressively lower level.")
+
+showEventLabelsInput = input.bool(true, "Event Labels"
+  , group   = GROUP_STYLE
+  , tooltip = "Labels upthrusts, the confirmed resolution and the acceptance above the range on the chart.")
+
+fillTransparencyInput = input.int(90, "Range Fill Transparency"
+  , minval  = 50
+  , maxval  = 100
+  , group   = GROUP_STYLE)
+
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "colors", group = GROUP_STYLE)
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "colors", group = GROUP_STYLE)
+
+neutralColorInput = input.color(NEUTRAL_COLOR, "Developing", inline = "colors", group = GROUP_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+//Compares average up-move volume between the first and second half of the range - advances on
+//contracting volume are the weak-rally signature the re-distribution label leans on
+getUpVolumeTrend(volumesArray) =>
+    int elementCount = array.size(volumesArray)
+    bool isValid = elementCount >= 4
+    bool isContracting = false
+    if isValid
+        int halfCount = math.floor(elementCount / 2)
+        float firstSum  = 0.0
+        float secondSum = 0.0
+        for i = 0 to elementCount - 1
+            if i < halfCount
+                firstSum += array.get(volumesArray, i)
+            else
+                secondSum += array.get(volumesArray, i)
+        isContracting := secondSum / (elementCount - halfCount) < firstSum / halfCount
+    [isValid, isContracting]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Downtrend Context & Swings
+//---------------------------------------------------------------------------------------------------------------------{
+
+float atrValue       = ta.atr(atrLengthInput)
+float volumeSma      = ta.sma(nz(volume), volLengthInput)
+float lowestLow      = ta.lowest(low, trendLookbackInput)
+float pivotHighPrice = ta.pivothigh(high, pivotLengthInput, pivotLengthInput)
+float pivotLowPrice  = ta.pivotlow(low, pivotLengthInput, pivotLengthInput)
+
+//Trend qualification evaluated at the pivot bar: the stall low must be the lookback-window low and
+//price must have declined by the minimum ATR-normalized amount into it - the markdown-leg requirement
+float lowAtPivot        = low[pivotLengthInput]
+float lowestAtPivot     = lowestLow[pivotLengthInput]
+float atrAtPivot        = atrValue[pivotLengthInput]
+float priorCloseAtPivot = close[pivotLengthInput + trendLookbackInput]
+
+float declineAtPivot = not na(priorCloseAtPivot) and not na(atrAtPivot) and atrAtPivot > 0 ? (priorCloseAtPivot - lowAtPivot) / atrAtPivot : na
+bool  downtrendOk    = not na(pivotLowPrice) and not na(declineAtPivot) and declineAtPivot >= trendMultInput and not na(lowestAtPivot) and lowAtPivot <= lowestAtPivot
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Range State Machine
+//---------------------------------------------------------------------------------------------------------------------{
+
+var int   stage       = STAGE_IDLE
+var float rangeTop    = na
+var float rangeBottom = na
+var int   topBar      = na
+var int   bottomBar   = na
+var bool  established = false
+var box   rangeBox    = na
+
+//Weak-rally evidence, reset when a new range forms and kept after resolution for the dashboard
+var int   lowerHighCount   = 0
+var int   stallCount       = 0
+var int   upthrustCount    = 0
+var float lastInternalHigh = na
+var float closePosSum      = 0.0
+var int   rangeBarCount    = 0
+var float upVolumeSum      = 0.0
+var int   upVolumeCount    = 0
+var float downVolumeSum    = 0.0
+var int   downVolumeCount  = 0
+var array<float> upVolumeArray = array.new_float()
+
+//Resistance penetration, resistance-zone rally and breakdown trackers
+var int   aboveResistanceBar = na
+var float penetrationHigh    = na
+var int   penetrationHighBar = na
+var int   rallyStartBar      = na
+var int   lastUpthrustBar    = na
+var int   breakdownBar       = na
+var int   holdCount          = 0
+var float maxBreakdownVol    = na
+var float preBreakdownSma    = na
+
+var string rangeStatus = "None"
+
+//Per-bar event flags for labels and alerts
+bool rangeDetectedEvent  = false
+bool resistanceTestEvent = false
+bool upthrustEvent       = false
+bool breakdownEvent      = false
+bool confirmedEvent      = false
+bool invalidatedEvent    = false
+bool doReset  = false
+bool doCancel = false
+
+//A confirmed stall low inside an established downtrend opens a candidate: the reaction low where
+//the markdown leg halted
+if stage == STAGE_IDLE and downtrendOk
+    stage       := STAGE_AWAIT_HIGH
+    rangeBottom := pivotLowPrice
+    bottomBar   := bar_index - pivotLengthInput
+
+//Waiting for the first bounce high that completes the range boundaries. A newer, lower stall low
+//supersedes the candidate - the markdown simply continued before pausing
+if stage == STAGE_AWAIT_HIGH
+    if not na(pivotLowPrice) and pivotLowPrice <= rangeBottom
+        rangeBottom := pivotLowPrice
+        bottomBar   := bar_index - pivotLengthInput
+    if not na(pivotHighPrice) and bar_index - pivotLengthInput > bottomBar and pivotHighPrice > rangeBottom
+        stage            := STAGE_RANGE
+        rangeTop         := pivotHighPrice
+        topBar           := bar_index - pivotLengthInput
+        lastInternalHigh := pivotHighPrice
+        established      := false
+        lowerHighCount   := 0
+        stallCount       := 0
+        upthrustCount    := 0
+        closePosSum      := 0.0
+        rangeBarCount    := 0
+        upVolumeSum      := 0.0
+        upVolumeCount    := 0
+        downVolumeSum    := 0.0
+        downVolumeCount  := 0
+        array.clear(upVolumeArray)
+        aboveResistanceBar := na
+        penetrationHigh    := na
+        penetrationHighBar := na
+        rallyStartBar      := na
+        lastUpthrustBar    := na
+        breakdownBar       := na
+        holdCount          := 0
+        maxBreakdownVol    := na
+        preBreakdownSma    := na
+        rangeStatus        := "Forming"
+        //Backfill the tallies from the bounce-high bar so the evidence covers the whole range
+        float newRangeHeight = rangeTop - rangeBottom
+        for i = 0 to pivotLengthInput - 1
+            int offset = pivotLengthInput - i
+            float barClose  = close[offset]
+            float prevClose = close[offset + 1]
+            float barVolume = nz(volume[offset])
+            rangeBarCount += 1
+            closePosSum   += math.min(math.max((barClose - rangeBottom) / newRangeHeight, 0.0), 1.0)
+            if not na(prevClose)
+                if barClose > prevClose
+                    upVolumeSum   += barVolume
+                    upVolumeCount += 1
+                    if array.size(upVolumeArray) >= MAX_UP_VOLUMES
+                        array.shift(upVolumeArray)
+                    array.push(upVolumeArray, barVolume)
+                else if barClose < prevClose
+                    downVolumeSum   += barVolume
+                    downVolumeCount += 1
+
+//Active range: tally the evidence, judge behavior at the edges, and resolve on a held breakdown or
+//sustained acceptance above the range - until then the bullish alternative of a base remains live
+if stage == STAGE_RANGE
+    float rangeHeight = rangeTop - rangeBottom
+    rangeBarCount += 1
+    closePosSum   += math.min(math.max((close - rangeBottom) / rangeHeight, 0.0), 1.0)
+    if close > close[1]
+        upVolumeSum   += nz(volume)
+        upVolumeCount += 1
+        if array.size(upVolumeArray) >= MAX_UP_VOLUMES
+            array.shift(upVolumeArray)
+        array.push(upVolumeArray, nz(volume))
+    else if close < close[1]
+        downVolumeSum   += nz(volume)
+        downVolumeCount += 1
+
+    //The pause has lasted long enough to count as a trading range - the hypothesis goes live
+    if not established and bar_index - bottomBar >= minRangeBarsInput
+        established        := true
+        rangeDetectedEvent := true
+        rangeStatus        := "Developing"
+        if showBoxInput
+            rangeBox := box.new(bottomBar, rangeTop, bar_index, rangeBottom, border_color = neutralColorInput, border_width = 1, border_style = line.style_dashed, bgcolor = color.new(neutralColorInput, fillTransparencyInput))
+
+    if established and not na(rangeBox)
+        box.set_right(rangeBox, bar_index)
+
+    if established
+        //Lower highs forming inside the range - supply capping every advance lower
+        if not na(pivotHighPrice) and bar_index - pivotLengthInput > topBar
+            if pivotHighPrice < rangeTop and pivotHighPrice < lastInternalHigh
+                lowerHighCount += 1
+                if showLowerHighsInput
+                    label.new(bar_index - pivotLengthInput, pivotHighPrice, "", style = label.style_circle, color = color.new(bearColorInput, MARKER_TRANSP), size = size.tiny, tooltip = "Lower high inside the range - supply capping the advance at a progressively lower level")
+            lastInternalHigh := pivotHighPrice
+
+        //Rallies into the resistance zone that fail quickly - strength being sold at the upper edge
+        float resistanceZoneBottom = rangeTop - rangeHeight * resistanceZoneInput / 100
+        if na(rallyStartBar) and high >= resistanceZoneBottom and close <= rangeTop
+            rallyStartBar       := bar_index
+            resistanceTestEvent := true
+        if not na(rallyStartBar) and close < resistanceZoneBottom
+            if bar_index - rallyStartBar <= rallyFailBarsInput
+                stallCount += 1
+            rallyStartBar := na
+
+    //Upthrust versus sustained acceptance: a brief poke above range resistance that fails quickly is
+    //the bearish mirror of a spring; holding above the range high argues accumulation instead
+    if na(aboveResistanceBar)
+        if close > rangeTop
+            aboveResistanceBar := bar_index
+            penetrationHigh    := high
+            penetrationHighBar := bar_index
+        else if established and high > rangeTop and (na(lastUpthrustBar) or bar_index - lastUpthrustBar > upthrustBarsInput)
+            upthrustCount   += 1
+            upthrustEvent   := true
+            lastUpthrustBar := bar_index
+            if showEventLabelsInput
+                label.new(bar_index, high, "Upthrust", style = label.style_label_down, color = TRANSP_COLOR, textcolor = bearColorInput, size = size.small, tooltip = "Upthrust: the poke above range resistance (" + str.tostring(rangeTop, format.mintick) + ") failed within the bar - the bearish mirror of a spring and a heavily weighted re-distribution clue")
+    else
+        if high > penetrationHigh
+            penetrationHigh    := high
+            penetrationHighBar := bar_index
+        if close <= rangeTop
+            if established and bar_index - aboveResistanceBar <= upthrustBarsInput
+                upthrustCount   += 1
+                upthrustEvent   := true
+                lastUpthrustBar := bar_index
+                if showEventLabelsInput
+                    label.new(penetrationHighBar, penetrationHigh, "Upthrust", style = label.style_label_down, color = TRANSP_COLOR, textcolor = bearColorInput, size = size.small, tooltip = "Upthrust: the break above range resistance (" + str.tostring(rangeTop, format.mintick) + ") failed and snapped back within " + str.tostring(bar_index - aboveResistanceBar) + " bar(s) - heavily weighted evidence for re-distribution")
+            aboveResistanceBar := na
+            penetrationHigh    := na
+            penetrationHighBar := na
+        else if bar_index - aboveResistanceBar >= upthrustBarsInput
+            if established
+                invalidatedEvent := true
+                rangeStatus      := "Invalidated"
+                if not na(rangeBox)
+                    box.delete(rangeBox)
+                    rangeBox := box.new(bottomBar, rangeTop, bar_index, rangeBottom, border_color = bullColorInput, border_width = 1, border_style = line.style_solid, bgcolor = color.new(bullColorInput, fillTransparencyInput))
+                if showEventLabelsInput
+                    label.new(bar_index, low, "Acceptance above", style = label.style_label_up, color = TRANSP_COLOR, textcolor = bullColorInput, size = size.small, tooltip = "Sustained acceptance above the range high (" + str.tostring(rangeTop, format.mintick) + ") - price held above resistance beyond the upthrust window, arguing the range is accumulation rather than re-distribution; the thesis dies here")
+                doReset := true
+            else
+                doCancel := true
+
+    //Breakdown below the range - the diagnosis is only confirmed once the break holds
+    if close < rangeBottom and not doReset and not doCancel
+        if established
+            stage           := STAGE_BREAKDOWN
+            breakdownBar    := bar_index
+            preBreakdownSma := volumeSma[1]
+            rangeStatus     := "Breakdown"
+            breakdownEvent  := true
+        else
+            doCancel := true
+
+//Breakdown under test: confirm once the close has held below the range for the required bars; snap
+//back inside and the range read simply resumes with the bullish alternative still open
+if stage == STAGE_BREAKDOWN
+    if not na(rangeBox)
+        box.set_right(rangeBox, bar_index)
+    if close < rangeBottom
+        if bar_index == breakdownBar
+            holdCount       := 1
+            maxBreakdownVol := nz(volume)
+        else
+            holdCount       += 1
+            maxBreakdownVol := math.max(maxBreakdownVol, nz(volume))
+        if holdCount >= confirmBarsInput
+            confirmedEvent := true
+            rangeStatus    := "Confirmed"
+            if not na(rangeBox)
+                box.delete(rangeBox)
+                rangeBox := box.new(bottomBar, rangeTop, bar_index, rangeBottom, border_color = bearColorInput, border_width = 1, border_style = line.style_solid, bgcolor = color.new(bearColorInput, fillTransparencyInput))
+            if showEventLabelsInput
+                string confirmTip = "Re-distribution confirmed: the breakdown held " + str.tostring(holdCount) + " close(s) below the range low (" + str.tostring(rangeBottom, format.mintick) + ") - the pause resolved lower and the markdown has resumed"
+                if not na(preBreakdownSma) and preBreakdownSma > 0 and not na(maxBreakdownVol)
+                    confirmTip := confirmTip + ", with peak breakdown volume " + str.tostring(maxBreakdownVol / preBreakdownSma, "#.##") + "x the pre-breakdown average"
+                label.new(bar_index, high, "Re-distribution", style = label.style_label_down, color = TRANSP_COLOR, textcolor = bearColorInput, size = size.small, tooltip = confirmTip)
+            doReset := true
+    else
+        stage           := STAGE_RANGE
+        rangeStatus     := "Developing"
+        breakdownBar    := na
+        holdCount       := 0
+        maxBreakdownVol := na
+        preBreakdownSma := na
+        if close > rangeTop
+            aboveResistanceBar := bar_index
+            penetrationHigh    := high
+            penetrationHighBar := bar_index
+
+//Apply the resolution or the quiet discard of a pause that never became a range
+if doCancel
+    rangeStatus := "None"
+if doCancel or doReset
+    stage              := STAGE_IDLE
+    rangeTop           := na
+    rangeBottom        := na
+    topBar             := na
+    bottomBar          := na
+    established        := false
+    rangeBox           := na
+    lastInternalHigh   := na
+    aboveResistanceBar := na
+    penetrationHigh    := na
+    penetrationHighBar := na
+    rallyStartBar      := na
+    lastUpthrustBar    := na
+    breakdownBar       := na
+    holdCount          := 0
+    maxBreakdownVol    := na
+    preBreakdownSma    := na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+
+string tablePosition = switch dashboardPositionInput
+    "Top Right"    => position.top_right
+    "Top Left"     => position.top_left
+    "Bottom Right" => position.bottom_right
+    => position.bottom_left
+
+string tableTextSize = switch dashboardSizeInput
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    => size.small
+
+if showDashboardInput and barstate.islast
+    var table dashboardTable = table.new(tablePosition, 2, 10, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+    //Diagnostic metrics: volume on rallies versus declines, the up-move volume trend, and where within
+    //the range closes concentrate - the evidence file built before committing capital
+    bool  hasRange         = rangeBarCount > 0
+    bool  hasVolumeData    = upVolumeCount + downVolumeCount > 0 and upVolumeSum + downVolumeSum > 0
+    float rallyAvgVolume   = upVolumeCount > 0 ? upVolumeSum / upVolumeCount : na
+    float declineAvgVolume = downVolumeCount > 0 ? downVolumeSum / downVolumeCount : na
+    float volumeRatio      = hasVolumeData and not na(rallyAvgVolume) and not na(declineAvgVolume) and declineAvgVolume > 0 ? rallyAvgVolume / declineAvgVolume : na
+    float avgClosePosition = hasRange ? closePosSum / rangeBarCount : na
+    [upTrendValid, upTrendContracting] = getUpVolumeTrend(upVolumeArray)
+
+    int evidenceTotal = hasVolumeData ? 6 : 4
+    int evidenceScore = 0
+    evidenceScore += lowerHighCount > 0 ? 1 : 0
+    evidenceScore += stallCount > 0 ? 1 : 0
+    evidenceScore += upthrustCount > 0 ? 1 : 0
+    evidenceScore += not na(avgClosePosition) and avgClosePosition < 0.5 ? 1 : 0
+    if hasVolumeData
+        evidenceScore += not na(volumeRatio) and volumeRatio < 1 ? 1 : 0
+        evidenceScore += upTrendValid and upTrendContracting ? 1 : 0
+
+    color dimColor    = DASH_HEADER
+    color statusColor = rangeStatus == "Confirmed" ? bearColorInput : rangeStatus == "Invalidated" ? bullColorInput : rangeStatus == "None" ? DASH_HEADER : neutralColorInput
+
+    string durationText  = hasRange ? str.tostring(rangeBarCount) + " bars" : "-"
+    string ratioText     = not na(volumeRatio) ? str.tostring(volumeRatio, "#.##") + "x" : "-"
+    color  ratioColor    = na(volumeRatio) ? dimColor : volumeRatio < 1 ? bearColorInput : bullColorInput
+    string upVolText     = hasVolumeData and upTrendValid ? (upTrendContracting ? "Contracting" : "Expanding") : "-"
+    color  upVolColor    = hasVolumeData and upTrendValid ? (upTrendContracting ? bearColorInput : bullColorInput) : dimColor
+    string closePosText  = not na(avgClosePosition) ? str.tostring(math.round(avgClosePosition * 100)) + "%" : "-"
+    color  closePosColor = na(avgClosePosition) ? dimColor : avgClosePosition < 0.5 ? bearColorInput : bullColorInput
+    string evidenceText  = hasRange ? str.tostring(evidenceScore) + "/" + str.tostring(evidenceTotal) : "-"
+    color  evidenceColor = hasRange ? color.from_gradient(evidenceScore, 0, evidenceTotal, bullColorInput, bearColorInput) : dimColor
+
+    table.cell(dashboardTable, 0, 0, "Re-distribution", text_color = DASH_TEXT, text_size = tableTextSize, text_halign = text.align_center)
+    table.merge_cells(dashboardTable, 0, 0, 1, 0)
+    table.cell(dashboardTable, 0, 1, "Status", text_color = dimColor, text_size = tableTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 1, rangeStatus, text_color = statusColor, text_size = tableTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 2, "Duration", text_color = dimColor, text_size = tableTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 2, durationText, text_color = DASH_TEXT, text_size = tableTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 3, "Lower highs", text_color = dimColor, text_size = tableTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 3, hasRange ? str.tostring(lowerHighCount) : "-", text_color = lowerHighCount > 0 ? bearColorInput : dimColor, text_size = tableTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 4, "Rallies stalled", text_color = dimColor, text_size = tableTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 4, hasRange ? str.tostring(stallCount) : "-", text_color = stallCount > 0 ? bearColorInput : dimColor, text_size = tableTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 5, "Upthrusts", text_color = dimColor, text_size = tableTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 5, hasRange ? str.tostring(upthrustCount) : "-", text_color = upthrustCount > 0 ? bearColorInput : dimColor, text_size = tableTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 6, "Rally/decline vol", text_color = dimColor, text_size = tableTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 6, ratioText, text_color = ratioColor, text_size = tableTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 7, "Up-move volume", text_color = dimColor, text_size = tableTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 7, upVolText, text_color = upVolColor, text_size = tableTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 8, "Close position", text_color = dimColor, text_size = tableTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 8, closePosText, text_color = closePosColor, text_size = tableTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 9, "Evidence", text_color = dimColor, text_size = tableTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 9, evidenceText, text_color = evidenceColor, text_size = tableTextSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(rangeDetectedEvent, "Re-distribution Range Detected", "Trading range established inside a downtrend on {{ticker}} ({{interval}}) - candidate re-distribution; weigh rally quality and behavior at the range edges while the bullish alternative of a developing base stays live")
+
+alertcondition(resistanceTestEvent, "Resistance Zone Test", "Price rallied into the resistance zone of a candidate re-distribution range on {{ticker}} ({{interval}}) - a quick stall adds weak-rally evidence and is where continuation shorts sell strength; acceptance above the range high argues accumulation")
+
+alertcondition(upthrustEvent, "Upthrust Detected", "Upthrust on {{ticker}} ({{interval}}) - the poke above range resistance failed quickly, the bearish mirror of a spring and supporting evidence that the range is re-distribution")
+
+alertcondition(breakdownEvent, "Breakdown Below Range", "Close below the range low on {{ticker}} ({{interval}}) - the re-distribution diagnosis confirms only if price holds below range support")
+
+alertcondition(confirmedEvent, "Re-distribution Confirmed", "Re-distribution confirmed on {{ticker}} ({{interval}}) - price broke and held below range support and the markdown has resumed")
+
+alertcondition(invalidatedEvent, "Range Invalidated", "Sustained acceptance above the range high on {{ticker}} ({{interval}}) - the re-distribution hypothesis is invalidated; the range argues accumulation instead")
+
+//---------------------------------------------------------------------------------------------------------------------}

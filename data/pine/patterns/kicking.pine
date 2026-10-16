@@ -1,0 +1,395 @@
+// This work is licensed under Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Kicking Pattern"
+  , shorttitle       = "Kicking Pattern"
+  , overlay          = true
+  , format           = format.price
+  , max_lines_count  = 500
+  , max_labels_count = 500
+  , max_boxes_count  = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+color BULL_COLOR    = #089981
+color BEAR_COLOR    = #f23645
+color NEUTRAL_COLOR = #787b86
+color LABEL_BG      = #00000000
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+int GAP_BG_TRANSP      = 70
+int GAP_BORDER_TRANSP  = 30
+int REWARD_BG_TRANSP   = 88
+int DEAD_GAP_TRANSP    = 88
+int CANDLE_BOX_TRANSP  = 90
+
+string GAP_RANGE = "Range Gap (Strict)"
+string GAP_BODY  = "Body Gap (Relaxed)"
+
+string ENTRY_CLOSE  = "Kick Close"
+string ENTRY_RETEST = "Gap Retest"
+
+string GROUP_PATTERN = "Pattern Rules"
+string GROUP_CONTEXT = "Context Grades"
+string GROUP_TRADE   = "Trade Plan"
+string GROUP_DASH    = "Dashboard"
+string GROUP_STYLE   = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+shadowTolInput = input.float(15, "Shadow Tolerance %", minval = 0, maxval = 40, step = 1, group = GROUP_PATTERN
+  , tooltip = "Largest shadow allowed at each end of both candles, as a percentage of the candle's range, for it to count as a marubozu. The strict Japanese form wants no shadows at all, which almost never prints; every point of tolerance moves the pattern toward an ordinary gap-and-go bar.")
+
+bodyLengthInput = input.int(14, "Body Average Length", minval = 2, maxval = 200, group = GROUP_PATTERN
+  , tooltip = "Bars, ending right before the pattern, used to average the real body. Both candles must be long against this average.")
+
+bodyMultInput = input.float(0.8, "Long Body Multiplier", minval = 0.1, maxval = 5, step = 0.1, group = GROUP_PATTERN
+  , tooltip = "Minimum real body of both marubozu as a multiple of the average body: a shaved but tiny candle carries no conviction.")
+
+gapRuleInput = input.string(GAP_RANGE, "Gap Rule", options = [GAP_RANGE, GAP_BODY], group = GROUP_PATTERN
+  , tooltip = "Range Gap (Strict): the second candle's whole range stays beyond the first candle, so price never trades back into the gap. Body Gap (Relaxed): the second candle only has to open beyond the first candle's open so the bodies do not overlap; an intraday probe into the gap is tolerated and the label says so.")
+
+trendInput = input.bool(false, "Require Prior Trend", group = GROUP_CONTEXT
+  , tooltip = "Traditionally the kicker ignores the prior trend: its meaning comes from the violence of the repricing itself. Enable to keep only kickers that reverse a move, the first candle closing beyond the trend average in its own direction.")
+
+trendLengthInput = input.int(20, "Trend EMA Length", minval = 2, maxval = 200, group = GROUP_CONTEXT
+  , tooltip = "Exponential moving average used by the prior-trend test and by the reversal grade shown in each label's tooltip.")
+
+volumeLengthInput = input.int(20, "Volume Average Length", minval = 2, maxval = 200, group = GROUP_CONTEXT
+  , tooltip = "Kickers usually print on news. Each label reports the kick candle's volume against this average, a check that the repricing came with participation. Ignored when the symbol has no volume.")
+
+entryModeInput = input.string(ENTRY_CLOSE, "Entry", options = [ENTRY_CLOSE, ENTRY_RETEST], group = GROUP_TRADE
+  , tooltip = "'Kick Close' enters with the repricing on the second candle's close. 'Gap Retest' waits for price to pull back to the gap's near edge within the window below, trading missed runaway moves for a closer stop.")
+
+retestWindowInput = input.int(10, "Retest Window", minval = 1, maxval = 100, group = GROUP_TRADE
+  , tooltip = "Bars after the kick during which a pullback to the gap is accepted. Ignored with the 'Kick Close' entry.")
+
+targetRInput = input.float(2, "Target (R)", minval = 0.5, maxval = 10, step = 0.25, group = GROUP_TRADE
+  , tooltip = "Target as a multiple of the planned risk, measured from the entry to the gap's far edge. The enlarged range of a kicker makes that risk wide: size positions to it.")
+
+maxHoldInput = input.int(40, "Maximum Hold (Bars)", minval = 1, maxval = 500, group = GROUP_TRADE
+  , tooltip = "A position that reaches neither its target nor its invalidation within this many bars is closed at the bar's close and recorded as Timed Out.")
+
+showDashInput = input.bool(true, "Show Dashboard", group = GROUP_DASH
+  , tooltip = "Kicker count by direction and how each traded kick resolved: target, a close back through the gap, or the time stop.")
+
+dashPosInput = input.string("Top Right", "Position", options = ["Top Right", "Bottom Right", "Bottom Left", "Top Left"], group = GROUP_DASH)
+
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = GROUP_DASH)
+
+showLabelsInput = input.bool(true, "Pattern Labels", group = GROUP_STYLE
+  , tooltip = "Label each kicker; hover for shadow sizes, gap size, volume and the trade levels.")
+
+showGapInput = input.bool(true, "Gap Zone", group = GROUP_STYLE
+  , tooltip = "Shade the gap between the two bodies and extend it until price closes back through it. The gap is the line in the sand: the repricing thesis depends on it holding.")
+
+showTradeInput = input.bool(true, "Trade Levels", group = GROUP_STYLE
+  , tooltip = "Draw entry, invalidation and target of each kicker, the reward zone while the position is open, and the result where it resolves.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "colors", group = GROUP_STYLE)
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "colors", group = GROUP_STYLE)
+neutralColorInput = input.color(NEUTRAL_COLOR, "Neutral", inline = "colors", group = GROUP_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types
+//---------------------------------------------------------------------------------------------------------------------{
+// One traded kicker. state: 0 waiting for the gap retest, 1 open position
+type Setup
+    int   dir
+    int   signalBar
+    int   fillBar
+    int   state
+    float entry
+    float stop
+    float target
+    box   gapBox
+    line  entryLine
+    line  stopLine
+    line  targetLine
+    label entryTag
+    label stopTag
+    label targetTag
+    box   rewardBox
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Marubozu test: long body, both shadows inside the tolerance
+isMarubozu(float o, float h, float l, float c, float refBody) =>
+    float rng  = h - l
+    float body = math.abs(c - o)
+    float tol  = rng * shadowTolInput / 100
+    rng > 0 and refBody > 0 and body >= bodyMultInput * refBody and h - math.max(o, c) <= tol and math.min(o, c) - l <= tol
+
+// Move a level line and its tag to the given bar
+moveLevel(line ln, label tag, int x) =>
+    line.set_x2(ln, x)
+    if not na(tag)
+        label.set_x(tag, x)
+
+// Extend a setup's drawings to the given bar
+extendSetup(Setup s, int x) =>
+    moveLevel(s.entryLine, s.entryTag, x)
+    moveLevel(s.stopLine, s.stopTag, x)
+    moveLevel(s.targetLine, s.targetTag, x)
+    if not na(s.rewardBox)
+        box.set_right(s.rewardBox, x)
+    if not na(s.gapBox)
+        box.set_right(s.gapBox, x)
+
+// Open the position: the entry and target tags give way to a labeled reward zone
+openPosition(Setup s) =>
+    color dirColor = s.dir == 1 ? bullColorInput : bearColorInput
+    label.delete(s.entryTag)
+    label.delete(s.targetTag)
+    s.entryTag  := label(na)
+    s.targetTag := label(na)
+    s.rewardBox := box.new(bar_index, s.target, bar_index, s.entry, border_color = LABEL_BG, bgcolor = color.new(bullColorInput, REWARD_BG_TRANSP)
+      , text = "Target " + str.tostring(targetRInput, "#.##") + "R", text_color = bullColorInput, text_size = size.small, text_halign = text.align_right, text_valign = s.dir == 1 ? text.align_top : text.align_bottom)
+
+// Retire a retest setup that never pulled back: fade its levels and keep a single note
+fadeSetup(Setup s, int x) =>
+    extendSetup(s, x)
+    line.set_color(s.entryLine, color.new(neutralColorInput, 70))
+    line.set_color(s.targetLine, color.new(neutralColorInput, 70))
+    line.set_color(s.stopLine, color.new(neutralColorInput, 70))
+    label.delete(s.targetTag)
+    label.delete(s.stopTag)
+    if not na(s.entryTag)
+        label.set_textcolor(s.entryTag, neutralColorInput)
+        label.set_text(s.entryTag, "No Retest")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Detection
+//---------------------------------------------------------------------------------------------------------------------{
+float bodySize  = math.abs(close - open)
+float bodyAvg   = ta.sma(bodySize, bodyLengthInput)
+float trendEma  = ta.ema(close, trendLengthInput)
+float volumeAvg = ta.sma(volume, volumeLengthInput)
+
+float refBody = bodyAvg[2]
+
+bool maru1 = isMarubozu(open[1], high[1], low[1], close[1], refBody)
+bool maru2 = isMarubozu(open, high, low, close, refBody)
+
+bool rangeGap = gapRuleInput == GAP_RANGE
+
+// Bullish kicker: black marubozu, then a white marubozu opening above the first open
+bool bullBodyGap  = close[1] < open[1] and close > open and open > open[1]
+bool bullRangeGap = low > high[1]
+// Bearish kicker: white marubozu, then a black marubozu opening below the first open
+bool bearBodyGap  = close[1] > open[1] and close < open and open < open[1]
+bool bearRangeGap = high < low[1]
+
+bool bullTrendOk = not trendInput or (not na(trendEma[1]) and close[1] < trendEma[1])
+bool bearTrendOk = not trendInput or (not na(trendEma[1]) and close[1] > trendEma[1])
+
+bool bullSignal = barstate.isconfirmed and maru1 and maru2 and bullBodyGap and (not rangeGap or bullRangeGap) and bullTrendOk
+bool bearSignal = barstate.isconfirmed and maru1 and maru2 and bearBodyGap and (not rangeGap or bearRangeGap) and bearTrendOk
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Trade Tracking
+//---------------------------------------------------------------------------------------------------------------------{
+var array<Setup> setups = array.new<Setup>()
+
+var int countBull    = 0
+var int countBear    = 0
+var int countEntries = 0
+var int countTarget  = 0
+var int countFilled  = 0
+var int countTimed   = 0
+var float sumR       = 0.0
+
+bool entryEvent   = false
+bool targetEvent  = false
+bool gapFillEvent = false
+
+if barstate.isconfirmed and array.size(setups) > 0
+    for i = array.size(setups) - 1 to 0
+        Setup s = array.get(setups, i)
+        bool remove = false
+        // A close back through the gap's far edge fills it: the repricing thesis is void
+        bool gapFilled = bar_index > s.signalBar and (s.dir == 1 ? close < s.stop : close > s.stop)
+        if s.state == 0
+            bool touched = s.dir == 1 ? low <= s.entry : high >= s.entry
+            if gapFilled
+                if showTradeInput
+                    fadeSetup(s, bar_index)
+                    label.set_text(s.entryTag, "Gap Filled")
+                if not na(s.gapBox)
+                    box.set_bgcolor(s.gapBox, color.new(neutralColorInput, DEAD_GAP_TRANSP))
+                    box.set_border_color(s.gapBox, color.new(neutralColorInput, 60))
+                remove := true
+            else if touched
+                s.state   := 1
+                s.fillBar := bar_index
+                countEntries += 1
+                entryEvent := true
+                if showTradeInput
+                    openPosition(s)
+            else if bar_index - s.signalBar >= retestWindowInput
+                if showTradeInput
+                    fadeSetup(s, bar_index)
+                remove := true
+        if s.state == 1 and not remove
+            float risk     = math.abs(s.entry - s.stop)
+            bool hitTarget = not gapFilled and bar_index > s.fillBar and (s.dir == 1 ? high >= s.target : low <= s.target)
+            bool timedOut  = not gapFilled and not hitTarget and bar_index - s.fillBar >= maxHoldInput
+            if gapFilled or hitTarget or timedOut
+                float r = hitTarget ? targetRInput : (close - s.entry) * s.dir / risk
+                sumR += r
+                string rText = (r >= 0 ? "+" : "") + str.tostring(r, "#.#") + "R"
+                if gapFilled
+                    countFilled += 1
+                    gapFillEvent := true
+                else if hitTarget
+                    countTarget += 1
+                    targetEvent := true
+                else
+                    countTimed += 1
+                if showTradeInput
+                    extendSetup(s, bar_index)
+                    bool above = (s.dir == 1) == (r >= 0)
+                    color resultColor = hitTarget ? (s.dir == 1 ? bullColorInput : bearColorInput) : gapFilled ? (s.dir == 1 ? bearColorInput : bullColorInput) : neutralColorInput
+                    label.new(bar_index, na, rText
+                      , yloc      = above ? yloc.abovebar : yloc.belowbar
+                      , style     = above ? label.style_label_down : label.style_label_up
+                      , color     = resultColor
+                      , textcolor = color.white
+                      , size      = size.small
+                      , tooltip   = gapFilled ? "Invalidated: a close back through the gap" : hitTarget ? "Target reached" : "Closed at the maximum hold")
+                if gapFilled and not na(s.gapBox)
+                    box.set_bgcolor(s.gapBox, color.new(neutralColorInput, DEAD_GAP_TRANSP))
+                    box.set_border_color(s.gapBox, color.new(neutralColorInput, 60))
+                remove := true
+        if showTradeInput and not remove
+            extendSetup(s, bar_index)
+        else if not showTradeInput and not remove and not na(s.gapBox)
+            box.set_right(s.gapBox, bar_index)
+        if remove
+            array.remove(setups, i)
+
+if bullSignal or bearSignal
+    int   dir        = bullSignal ? 1 : -1
+    color dirColor   = dir == 1 ? bullColorInput : bearColorInput
+    color oppColor   = dir == 1 ? bearColorInput : bullColorInput
+    // Gap between the bodies: from the first candle's open to the second candle's open
+    float gapNear    = open
+    float gapFar     = open[1]
+    float entryLevel = entryModeInput == ENTRY_CLOSE ? close : gapNear
+    float stopLevel  = gapFar
+    float riskSize   = math.abs(entryLevel - stopLevel)
+    float targetLevel = entryLevel + dir * riskSize * targetRInput
+    bool  filledNow  = entryModeInput == ENTRY_CLOSE
+    bool  probed     = dir == 1 ? low < high[1] : high > low[1]
+
+    if dir == 1
+        countBull += 1
+    else
+        countBear += 1
+
+    box.new(bar_index - 1, math.max(high, high[1]), bar_index, math.min(low, low[1]), border_color = color.new(dirColor, 60), bgcolor = color.new(dirColor, CANDLE_BOX_TRANSP))
+
+    box gapBx = na
+    if showGapInput
+        gapBx := box.new(bar_index - 1, math.max(gapNear, gapFar), bar_index, math.min(gapNear, gapFar)
+          , border_color = color.new(dirColor, GAP_BORDER_TRANSP)
+          , border_style = line.style_dotted
+          , bgcolor      = color.new(dirColor, GAP_BG_TRANSP)
+          , text         = "Kick Gap"
+          , text_color   = dirColor
+          , text_size    = size.small
+          , text_halign  = text.align_right
+          , text_valign  = text.align_center)
+
+    line entryLn  = na
+    line stopLn   = na
+    line targetLn = na
+    label entryLb  = na
+    label stopLb   = na
+    label targetLb = na
+
+    if showTradeInput and riskSize > 0
+        entryLn  := line.new(bar_index, entryLevel, bar_index + 1, entryLevel, color = dirColor, width = 2)
+        stopLn   := line.new(bar_index - 1, stopLevel, bar_index + 1, stopLevel, color = bearColorInput, style = line.style_dashed)
+        targetLn := line.new(bar_index, targetLevel, bar_index + 1, targetLevel, color = bullColorInput, style = line.style_dashed)
+        entryLb  := label.new(bar_index + 1, entryLevel, "Entry", style = label.style_label_left, color = LABEL_BG, textcolor = dirColor, size = size.small)
+        stopLb   := label.new(bar_index + 1, stopLevel, "Invalidation (close)", style = label.style_label_left, color = LABEL_BG, textcolor = bearColorInput, size = size.small)
+        targetLb := label.new(bar_index + 1, targetLevel, "Target " + str.tostring(targetRInput, "#.##") + "R", style = label.style_label_left, color = LABEL_BG, textcolor = bullColorInput, size = size.small)
+
+    if riskSize > 0
+        Setup s = Setup.new(dir, bar_index, filledNow ? bar_index : na, filledNow ? 1 : 0, entryLevel, stopLevel, targetLevel, gapBx, entryLn, stopLn, targetLn, entryLb, stopLb, targetLb, box(na))
+        if filledNow
+            countEntries += 1
+            if showTradeInput
+                openPosition(s)
+        array.push(setups, s)
+
+    if showLabelsInput
+        float rng1 = high[1] - low[1]
+        float rng2 = high - low
+        float maxShadow1 = math.max(high[1] - math.max(open[1], close[1]), math.min(open[1], close[1]) - low[1]) / rng1 * 100
+        float maxShadow2 = math.max(high - math.max(open, close), math.min(open, close) - low) / rng2 * 100
+        bool  reversesMove = not na(trendEma[1]) and (dir == 1 ? close[1] < trendEma[1] : close[1] > trendEma[1])
+        float volRatio = not na(volume) and not na(volumeAvg[1]) and volumeAvg[1] > 0 ? volume / volumeAvg[1] : na
+        string tip = (dir == 1 ? "Bullish kicker: a black marubozu, then a white marubozu opening above the first open and running away from the gap." : "Bearish kicker: a white marubozu, then a black marubozu opening below the first open and running away from the gap.")
+          + "\nLargest shadows: " + str.tostring(maxShadow1, "#") + "% and " + str.tostring(maxShadow2, "#") + "% of range"
+          + "\nGap between bodies: " + str.tostring(math.abs(gapNear - gapFar) / refBody, "#.#") + "x the average body" + (probed ? " (probed intraday)" : " (never traded into)")
+          + "\nContext: " + (reversesMove ? "reverses the move into the pattern" : "no prior move against the kick")
+          + (na(volRatio) ? "" : "\nKick volume: " + str.tostring(volRatio, "#.#") + "x average")
+          + "\nEntry " + str.tostring(entryLevel, format.mintick) + ", invalidation on a close beyond " + str.tostring(stopLevel, format.mintick) + ", target " + str.tostring(targetLevel, format.mintick)
+        label.new(bar_index, dir == 1 ? math.min(low, low[1]) : math.max(high, high[1]), (dir == 1 ? "Bullish Kicker" : "Bearish Kicker") + (probed ? "*" : "")
+          , style     = dir == 1 ? label.style_label_up : label.style_label_down
+          , color     = dirColor
+          , textcolor = color.white
+          , size      = size.small
+          , tooltip   = tip)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var string dashPos = switch dashPosInput
+    "Bottom Right" => position.bottom_right
+    "Bottom Left"  => position.bottom_left
+    "Top Left"     => position.top_left
+    => position.top_right
+
+var string dashSize = switch dashSizeInput
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    => size.small
+
+var table dash = table.new(dashPos, 2, 7, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+dashRow(int row, string name, string value, color nameColor) =>
+    table.cell(dash, 0, row, name, text_color = nameColor, text_size = dashSize, text_halign = text.align_left)
+    table.cell(dash, 1, row, value, text_color = DASH_TEXT, text_size = dashSize, text_halign = text.align_right)
+
+if showDashInput and barstate.islast
+    int resolved = countTarget + countFilled + countTimed
+    table.cell(dash, 0, 0, "Kicking Pattern", text_color = DASH_HEADER, text_size = dashSize, text_halign = text.align_left)
+    table.cell(dash, 1, 0, "Count", text_color = DASH_HEADER, text_size = dashSize, text_halign = text.align_right)
+    dashRow(1, "Bullish / Bearish", str.tostring(countBull) + " / " + str.tostring(countBear), DASH_TEXT)
+    dashRow(2, "Entries", str.tostring(countEntries), DASH_TEXT)
+    dashRow(3, "Target Reached", str.tostring(countTarget), bullColorInput)
+    dashRow(4, "Gap Filled (Invalid)", str.tostring(countFilled), bearColorInput)
+    dashRow(5, "Timed Out", str.tostring(countTimed), DASH_TEXT)
+    dashRow(6, "Avg Result", resolved > 0 ? str.tostring(sumR / resolved, "#.##") + "R" : "-", DASH_TEXT)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(bullSignal, "Bullish Kicker", "Bullish kicker on {{ticker}} ({{interval}}): a black marubozu, then a white marubozu gapping above its open")
+alertcondition(bearSignal, "Bearish Kicker", "Bearish kicker on {{ticker}} ({{interval}}): a white marubozu, then a black marubozu gapping below its open")
+alertcondition(entryEvent, "Gap Retest Entry", "Price on {{ticker}} ({{interval}}) pulled back to a kicker's gap")
+alertcondition(targetEvent, "Target Reached", "A kicker position on {{ticker}} ({{interval}}) reached its target")
+alertcondition(gapFillEvent, "Kicker Invalidated", "A kicker on {{ticker}} ({{interval}}) failed: price closed back through the gap")
+
+//---------------------------------------------------------------------------------------------------------------------}

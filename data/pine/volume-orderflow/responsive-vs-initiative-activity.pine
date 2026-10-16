@@ -1,0 +1,418 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Responsive vs Initiative Activity"
+  , shorttitle      = "Responsive vs Initiative Activity"
+  , overlay         = true
+  , format          = format.price
+  , max_lines_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+INIT_BUY_COLOR  = #089981
+INIT_SELL_COLOR = #f23645
+RESP_BUY_COLOR  = #5b9cf6
+RESP_SELL_COLOR = #ff9800
+NEUTRAL_COLOR   = #787b86
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+VOLUME_MODE     = "Volume"
+TPO_MODE        = "Time (TPO)"
+CLOSE_OPEN_RULE = "Close vs Open"
+PREV_CLOSE_RULE = "Close vs Previous Close"
+
+VA_GROUP     = "Prior Value Area"
+CLASS_GROUP  = "Classification"
+ACCEPT_GROUP = "Acceptance"
+DASH_GROUP   = "Dashboard"
+STYLE_GROUP  = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+anchorTfInput = input.timeframe("D", "Anchor Period", group = VA_GROUP
+  , tooltip = "Session period used as the reference grid. Each new period computes the value area of the period just completed, and today's activity is classified against it. Must be higher than the chart timeframe.")
+
+rowsInput = input.int(25, "Profile Rows", minval = 5, maxval = 100, group = VA_GROUP
+  , tooltip = "Number of price rows used to build the prior session profile from which the value area is derived.")
+
+vaPctInput = input.float(70, "Value Area %", minval = 50, maxval = 99, step = 1, group = VA_GROUP
+  , tooltip = "Percentage of total session activity contained in the value area. 70% is the standard Market Profile convention.")
+
+weightModeInput = input.string(VOLUME_MODE, "Profile Weighting", options = [VOLUME_MODE, TPO_MODE], group = VA_GROUP
+  , tooltip = "Volume builds a volume profile; Time (TPO) counts the periods each price row was visited, mimicking a TPO profile. Volume automatically falls back to Time when the symbol reports no volume.")
+
+srcInput = input.source(hl2, "Location Source", group = CLASS_GROUP
+  , tooltip = "Price used to place a bar relative to the prior value area. HL2 reflects where the bar's activity was centered; Close emphasizes where it finished.")
+
+polarityInput = input.string(CLOSE_OPEN_RULE, "Buy/Sell Rule", options = [CLOSE_OPEN_RULE, PREV_CLOSE_RULE], group = CLASS_GROUP
+  , tooltip = "How a bar is tagged as buying or selling activity. Buying below the prior value area low is responsive, above the prior value area high initiative; selling mirrors this. Activity inside prior value is treated as rotational noise.")
+
+acceptBarsInput = input.int(5, "Time: Min Bars Beyond Value", minval = 1, group = ACCEPT_GROUP
+  , tooltip = "Minimum number of session bars trading beyond the prior value area before the initiative move counts as accepted (time component of acceptance).")
+
+acceptVolInput = input.float(20, "Volume: Min Session Share %", minval = 0, maxval = 100, step = 1, group = ACCEPT_GROUP
+  , tooltip = "Minimum share of the running session volume that must trade beyond the prior value area before the initiative move counts as accepted (volume component). Ignored when the symbol reports no volume.")
+
+showDashInput = input.bool(true, "Show Dashboard", group = DASH_GROUP
+  , tooltip = "Displays the session's responsive/initiative volume breakdown, the dominant activity, and the acceptance status beyond each value area edge.")
+
+dashLocInput = input.string("Top Right", "Location", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = DASH_GROUP
+  , tooltip = "Dashboard position on the chart.")
+
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = DASH_GROUP
+  , tooltip = "Dashboard text size.")
+
+initBuyColorInput  = input.color(INIT_BUY_COLOR, "Initiative     Buying", inline = "init", group = STYLE_GROUP)
+initSellColorInput = input.color(INIT_SELL_COLOR, "Selling", inline = "init", group = STYLE_GROUP)
+respBuyColorInput  = input.color(RESP_BUY_COLOR, "Responsive Buying", inline = "resp", group = STYLE_GROUP)
+respSellColorInput = input.color(RESP_SELL_COLOR, "Selling", inline = "resp", group = STYLE_GROUP)
+
+showLevelsInput = input.bool(true, "Prior VAH/VAL", inline = "lvl", group = STYLE_GROUP)
+levelColorInput = input.color(NEUTRAL_COLOR, "", inline = "lvl", group = STYLE_GROUP)
+showPocInput    = input.bool(true, "Prior POC", inline = "poc", group = STYLE_GROUP)
+pocColorInput   = input.color(NEUTRAL_COLOR, "", inline = "poc", group = STYLE_GROUP)
+showFillInput   = input.bool(true, "Value Area Fill", inline = "fill", group = STYLE_GROUP)
+fillColorInput  = input.color(color.new(#787b86, 92), "", inline = "fill", group = STYLE_GROUP)
+
+barColorInput = input.bool(true, "Color Bars by Classification", group = STYLE_GROUP)
+
+markersInput = input.bool(false, "Event Markers", group = STYLE_GROUP
+  , tooltip = "Plots acceptance and failed-probe markers on the chart. Alerts cover these events even when markers are hidden.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Build a fixed-row profile from one completed session and return its point of control and value area edges.
+// Volume weighting distributes each bar's volume across the rows it overlaps; time weighting adds one unit
+// to every row the bar touched (TPO count). The value area expands from the POC two rows at a time toward
+// the heavier side until the target share of total activity is contained (standard Market Profile method).
+buildValueArea(array<float> hArr, array<float> lArr, array<float> vArr, float sHi, float sLo, int nRows, float vaPercent, bool timeWeight) =>
+    float pocPrice = na
+    float vahPrice = na
+    float valPrice = na
+    int n = array.size(vArr)
+    if n > 0
+        float rng = sHi - sLo
+        if rng <= 0
+            pocPrice := sHi
+            vahPrice := sHi
+            valPrice := sHi
+        else
+            float binSz = rng / nRows
+            bins = array.new<float>(nRows, 0.0)
+            bool useTime = timeWeight or array.sum(vArr) <= 0
+            for i = 0 to n - 1
+                float hi = array.get(hArr, i)
+                float lo = array.get(lArr, i)
+                float w  = array.get(vArr, i)
+                int b0 = math.min(nRows - 1, math.max(0, int(math.floor((lo - sLo) / binSz))))
+                int b1 = math.min(nRows - 1, math.max(0, int(math.floor((hi - sLo) / binSz))))
+                if useTime
+                    for b = b0 to b1
+                        array.set(bins, b, array.get(bins, b) + 1.0)
+                else if w > 0
+                    if hi - lo <= 0
+                        array.set(bins, b0, array.get(bins, b0) + w)
+                    else
+                        for b = b0 to b1
+                            float binLo = sLo + b * binSz
+                            float binHi = binLo + binSz
+                            float overlap = math.min(hi, binHi) - math.max(lo, binLo)
+                            if overlap > 0
+                                array.set(bins, b, array.get(bins, b) + w * overlap / (hi - lo))
+            float totalW = array.sum(bins)
+            int pocBin = 0
+            float pocW = array.get(bins, 0)
+            for b = 1 to nRows - 1
+                float wB = array.get(bins, b)
+                if wB > pocW
+                    pocW  := wB
+                    pocBin := b
+            int hiBin = pocBin
+            int loBin = pocBin
+            float vaSum  = array.get(bins, pocBin)
+            float target = totalW * vaPercent / 100
+            while vaSum < target
+                bool canUp = hiBin < nRows - 1
+                bool canDn = loBin > 0
+                if not canUp and not canDn
+                    break
+                float upW = canUp ? array.get(bins, hiBin + 1) + (hiBin + 2 <= nRows - 1 ? array.get(bins, hiBin + 2) : 0.0) : 0.0
+                float dnW = canDn ? array.get(bins, loBin - 1) + (loBin - 2 >= 0 ? array.get(bins, loBin - 2) : 0.0) : 0.0
+                if canDn and (not canUp or dnW > upW)
+                    vaSum += dnW
+                    loBin := math.max(0, loBin - 2)
+                else
+                    vaSum += upW
+                    hiBin := math.min(nRows - 1, hiBin + 2)
+            pocPrice := sLo + (pocBin + 0.5) * binSz
+            vahPrice := sLo + (hiBin + 1) * binSz
+            valPrice := sLo + loBin * binSz
+    [pocPrice, vahPrice, valPrice]
+
+// Format a class share as a percentage of the session, falling back to bar counts when volume is absent
+shareString(float classVol, int classBars, float totVol, int totBars) =>
+    float pct = totVol > 0 ? classVol / totVol * 100 : totBars > 0 ? classBars * 100.0 / totBars : 0.0
+    str.tostring(pct, "#.#") + "%"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Prior Session Value Area
+//---------------------------------------------------------------------------------------------------------------------{
+// One completed session of bars is stored, then collapsed into VAH/VAL/POC when the next session opens.
+// Storage holds a single session at a time, so it stays well within array limits on any chart history.
+var hiArray  = array.new<float>()
+var loArray  = array.new<float>()
+var volArray = array.new<float>()
+var float sesHi = na
+var float sesLo = na
+
+var float priorPoc = na
+var float priorVah = na
+var float priorVal = na
+
+// current-session tallies
+var float sesVol       = 0.0
+var int   sesBars      = 0
+var float initBuyVol   = 0.0
+var float initSellVol  = 0.0
+var float respBuyVol   = 0.0
+var float respSellVol  = 0.0
+var float rotVol       = 0.0
+var int   initBuyBars  = 0
+var int   initSellBars = 0
+var int   respBuyBars  = 0
+var int   respSellBars = 0
+var int   rotBars      = 0
+var int   barsAbove    = 0
+var int   barsBelow    = 0
+var float volAbove     = 0.0
+var float volBelow     = 0.0
+var bool  acceptedAbove  = false
+var bool  acceptedBelow  = false
+var bool  probeAbove     = false
+var bool  probeBelow     = false
+var bool  failedAboveSes = false
+var bool  failedBelowSes = false
+
+bool newSession = timeframe.change(anchorTfInput)
+
+if newSession
+    [pocNew, vahNew, valNew] = buildValueArea(hiArray, loArray, volArray, sesHi, sesLo, rowsInput, vaPctInput, weightModeInput == TPO_MODE)
+    priorPoc := pocNew
+    priorVah := vahNew
+    priorVal := valNew
+    array.clear(hiArray)
+    array.clear(loArray)
+    array.clear(volArray)
+    sesHi := na
+    sesLo := na
+    sesVol       := 0.0
+    sesBars      := 0
+    initBuyVol   := 0.0
+    initSellVol  := 0.0
+    respBuyVol   := 0.0
+    respSellVol  := 0.0
+    rotVol       := 0.0
+    initBuyBars  := 0
+    initSellBars := 0
+    respBuyBars  := 0
+    respSellBars := 0
+    rotBars      := 0
+    barsAbove    := 0
+    barsBelow    := 0
+    volAbove     := 0.0
+    volBelow     := 0.0
+    acceptedAbove  := false
+    acceptedBelow  := false
+    probeAbove     := false
+    probeBelow     := false
+    failedAboveSes := false
+    failedBelowSes := false
+
+// accumulate the developing session, which becomes the reference grid of the next one
+array.push(hiArray, high)
+array.push(loArray, low)
+array.push(volArray, nz(volume))
+sesHi := na(sesHi) ? high : math.max(sesHi, high)
+sesLo := na(sesLo) ? low : math.min(sesLo, low)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Activity Classification
+//---------------------------------------------------------------------------------------------------------------------{
+bool hasRef    = not na(priorVah) and not na(priorVal)
+bool locAbove  = hasRef and srcInput > priorVah
+bool locBelow  = hasRef and srcInput < priorVal
+bool locInside = hasRef and not locAbove and not locBelow
+
+float polarityBase = polarityInput == CLOSE_OPEN_RULE ? (close != open ? close - open : close - nz(close[1], close)) : close - nz(close[1], close)
+bool buyBar  = polarityBase > 0
+bool sellBar = polarityBase < 0
+
+// quadrant classification against the prior value area
+bool isInitBuy  = locAbove and buyBar
+bool isRespSell = locAbove and sellBar
+bool isRespBuy  = locBelow and buyBar
+bool isInitSell = locBelow and sellBar
+
+// first appearance of each class within the session (evaluated before tallies update)
+bool initBuyStart  = isInitBuy and initBuyBars == 0
+bool initSellStart = isInitSell and initSellBars == 0
+bool respBuyStart  = isRespBuy and respBuyBars == 0
+bool respSellStart = isRespSell and respSellBars == 0
+
+float barVol = nz(volume)
+sesVol  += barVol
+sesBars += 1
+if locAbove
+    barsAbove += 1
+    volAbove  += barVol
+if locBelow
+    barsBelow += 1
+    volBelow  += barVol
+if isInitBuy
+    initBuyVol  += barVol
+    initBuyBars += 1
+if isRespSell
+    respSellVol  += barVol
+    respSellBars += 1
+if isRespBuy
+    respBuyVol  += barVol
+    respBuyBars += 1
+if isInitSell
+    initSellVol  += barVol
+    initSellBars += 1
+if locInside
+    rotVol  += barVol
+    rotBars += 1
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Acceptance & Probe Outcome
+//---------------------------------------------------------------------------------------------------------------------{
+// acceptance = time AND volume built beyond the old value area, latched for the rest of the session
+bool volDataOk  = sesVol > 0
+bool aboveMeets = barsAbove >= acceptBarsInput and (not volDataOk or volAbove / sesVol * 100 >= acceptVolInput)
+bool belowMeets = barsBelow >= acceptBarsInput and (not volDataOk or volBelow / sesVol * 100 >= acceptVolInput)
+
+bool acceptAboveEvent = aboveMeets and not acceptedAbove
+bool acceptBelowEvent = belowMeets and not acceptedBelow
+acceptedAbove := acceptedAbove or aboveMeets
+acceptedBelow := acceptedBelow or belowMeets
+
+// an initiative probe that returns inside prior value without acceptance failed - responsive activity prevailed
+bool failAboveEvent = false
+bool failBelowEvent = false
+if locAbove
+    probeAbove := true
+else
+    if probeAbove and not acceptedAbove
+        failAboveEvent := true
+        failedAboveSes := true
+    probeAbove := false
+if locBelow
+    probeBelow := true
+else
+    if probeBelow and not acceptedBelow
+        failBelowEvent := true
+        failedBelowSes := true
+    probeBelow := false
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Prior Value Area Levels
+//---------------------------------------------------------------------------------------------------------------------{
+var line vahLine = na
+var line valLine = na
+var line pocLine = na
+
+if newSession and not na(priorVah)
+    if showLevelsInput
+        vahLine := line.new(bar_index, priorVah, bar_index, priorVah, color = levelColorInput, style = line.style_dashed)
+        valLine := line.new(bar_index, priorVal, bar_index, priorVal, color = levelColorInput, style = line.style_dashed)
+        if showFillInput
+            linefill.new(vahLine, valLine, fillColorInput)
+    if showPocInput
+        pocLine := line.new(bar_index, priorPoc, bar_index, priorPoc, color = pocColorInput, style = line.style_dotted)
+
+if not na(vahLine)
+    line.set_x2(vahLine, bar_index)
+if not na(valLine)
+    line.set_x2(valLine, bar_index)
+if not na(pocLine)
+    line.set_x2(pocLine, bar_index)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Bar Coloring & Markers
+//---------------------------------------------------------------------------------------------------------------------{
+color barCol = barColorInput ? (isInitBuy ? initBuyColorInput : isRespSell ? respSellColorInput : isRespBuy ? respBuyColorInput : isInitSell ? initSellColorInput : na) : na
+barcolor(barCol, title = "Classification Bar Color")
+
+plotshape(markersInput and acceptAboveEvent, "Acceptance Above Value", style = shape.triangleup, location = location.belowbar, color = initBuyColorInput, size = size.tiny)
+plotshape(markersInput and acceptBelowEvent, "Acceptance Below Value", style = shape.triangledown, location = location.abovebar, color = initSellColorInput, size = size.tiny)
+plotshape(markersInput and failAboveEvent, "Failed Probe Above", style = shape.xcross, location = location.abovebar, color = respSellColorInput, size = size.tiny)
+plotshape(markersInput and failBelowEvent, "Failed Probe Below", style = shape.xcross, location = location.belowbar, color = respBuyColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+dashPos = dashLocInput == "Top Left" ? position.top_left : dashLocInput == "Bottom Right" ? position.bottom_right : dashLocInput == "Bottom Left" ? position.bottom_left : position.top_right
+dashTxtSize = dashSizeInput == "Tiny" ? size.tiny : dashSizeInput == "Normal" ? size.normal : size.small
+
+var table dashTable = showDashInput ? table.new(dashPos, 2, 9, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1) : table(na)
+
+if showDashInput and barstate.islast and not na(dashTable)
+    color txtColor = DASH_TEXT
+    table.cell(dashTable, 0, 0, "Responsive vs Initiative", text_color = txtColor, text_size = dashTxtSize)
+    table.merge_cells(dashTable, 0, 0, 1, 0)
+    table.cell(dashTable, 0, 1, "Initiative Buying", text_color = initBuyColorInput, text_size = dashTxtSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 1, shareString(initBuyVol, initBuyBars, sesVol, sesBars), text_color = txtColor, text_size = dashTxtSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 2, "Initiative Selling", text_color = initSellColorInput, text_size = dashTxtSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 2, shareString(initSellVol, initSellBars, sesVol, sesBars), text_color = txtColor, text_size = dashTxtSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 3, "Responsive Buying", text_color = respBuyColorInput, text_size = dashTxtSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 3, shareString(respBuyVol, respBuyBars, sesVol, sesBars), text_color = txtColor, text_size = dashTxtSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 4, "Responsive Selling", text_color = respSellColorInput, text_size = dashTxtSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 4, shareString(respSellVol, respSellBars, sesVol, sesBars), text_color = txtColor, text_size = dashTxtSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 5, "Rotational (Inside VA)", text_color = NEUTRAL_COLOR, text_size = dashTxtSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 5, shareString(rotVol, rotBars, sesVol, sesBars), text_color = txtColor, text_size = dashTxtSize, text_halign = text.align_right)
+    float initTot = volDataOk ? initBuyVol + initSellVol : initBuyBars + initSellBars
+    float respTot = volDataOk ? respBuyVol + respSellVol : respBuyBars + respSellBars
+    string domTxt  = "Rotational"
+    color domColor = NEUTRAL_COLOR
+    if initTot > 0 or respTot > 0
+        if initTot >= respTot
+            bool buyLed = volDataOk ? initBuyVol >= initSellVol : initBuyBars >= initSellBars
+            domTxt   := "Initiative " + (buyLed ? "▲" : "▼")
+            domColor := buyLed ? initBuyColorInput : initSellColorInput
+        else
+            bool buyLed = volDataOk ? respBuyVol >= respSellVol : respBuyBars >= respSellBars
+            domTxt   := "Responsive " + (buyLed ? "▲" : "▼")
+            domColor := buyLed ? respBuyColorInput : respSellColorInput
+    table.cell(dashTable, 0, 6, "Dominant", text_color = DASH_HEADER, text_size = dashTxtSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 6, domTxt, text_color = domColor, text_size = dashTxtSize, text_halign = text.align_right)
+    string aboveTxt  = acceptedAbove ? "Accepted" : probeAbove ? "Probing" : failedAboveSes ? "Probe failed" : "No test"
+    color aboveColor = acceptedAbove ? initBuyColorInput : probeAbove ? txtColor : failedAboveSes ? respSellColorInput : NEUTRAL_COLOR
+    string belowTxt  = acceptedBelow ? "Accepted" : probeBelow ? "Probing" : failedBelowSes ? "Probe failed" : "No test"
+    color belowColor = acceptedBelow ? initSellColorInput : probeBelow ? txtColor : failedBelowSes ? respBuyColorInput : NEUTRAL_COLOR
+    table.cell(dashTable, 0, 7, "Above Value", text_color = DASH_HEADER, text_size = dashTxtSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 7, aboveTxt, text_color = aboveColor, text_size = dashTxtSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 8, "Below Value", text_color = DASH_HEADER, text_size = dashTxtSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 8, belowTxt, text_color = belowColor, text_size = dashTxtSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(initBuyStart, "Initiative Buying", "Initiative buying detected above the prior value area - participants paying up away from the old consensus")
+alertcondition(initSellStart, "Initiative Selling", "Initiative selling detected below the prior value area - participants selling down away from the old consensus")
+alertcondition(respBuyStart, "Responsive Buying", "Responsive buying detected below the prior value area - bargain-hunting against advantageous prices")
+alertcondition(respSellStart, "Responsive Selling", "Responsive selling detected above the prior value area - fading prices seen as above fair value")
+alertcondition(acceptAboveEvent, "Acceptance Above Value", "Time and volume built above the prior value area - the initiative move gained acceptance")
+alertcondition(acceptBelowEvent, "Acceptance Below Value", "Time and volume built below the prior value area - the initiative move gained acceptance")
+alertcondition(failAboveEvent, "Failed Probe Above Value", "Probe above the prior value area returned inside without acceptance - responsive activity prevailed")
+alertcondition(failBelowEvent, "Failed Probe Below Value", "Probe below the prior value area returned inside without acceptance - responsive activity prevailed")
+
+//---------------------------------------------------------------------------------------------------------------------}

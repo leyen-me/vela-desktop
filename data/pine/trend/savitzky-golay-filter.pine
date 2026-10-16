@@ -1,0 +1,357 @@
+// This work is licensed under Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Savitzky-Golay Filter", "S-G Filter", overlay = true, format = format.price, max_bars_back = 250, max_labels_count = 500, max_lines_count = 500, max_polylines_count = 100)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+ACCENT_COLOR  = #ff9800 // the one accent - the provisional edge of the fit, still forming
+NEUTRAL_COLOR = #787b86
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+MAX_DEGREE    = 6
+MAX_HISTORY   = 1500
+MAX_SEGMENTS  = 95
+
+SIDE_BOTH = "Long & Short"
+SIDE_LONG = "Long Only"
+SIDE_OFF  = "Off"
+
+GRP_FIT   = "Savitzky-Golay Fit"
+GRP_SIG   = "Slope Turns"
+GRP_STYLE = "Style"
+GRP_DASH  = "Dashboard"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+srcInput = input.source(close, "Source", group = GRP_FIT
+  , tooltip = "Series the polynomial is fitted to.")
+
+halfWidthInput = input.int(15, "Half Width (m)", minval = 2, maxval = 100, group = GRP_FIT
+  , tooltip = "The fit window holds 2m + 1 bars. Wider windows smooth more. The centered value for a bar is final only once the m bars after it have closed.")
+
+degreeInput = input.int(2, "Polynomial Degree", minval = 1, maxval = MAX_DEGREE, group = GRP_FIT
+  , tooltip = "Degree p of the least-squares polynomial fitted inside the window. Degree 1 makes the centered filter a simple moving average; degree 2 or 3 follows curvature, which is what lets the filter keep the height and timing of peaks and troughs instead of flattening them. Higher degrees track price more closely and pass more noise.")
+
+historyInput = input.int(400, "History (bars)", minval = 50, maxval = MAX_HISTORY, group = GRP_FIT
+  , tooltip = "Number of past bars the confirmed filter is drawn over.")
+
+showEdgeInput = input.bool(true, "Show Provisional Edge", group = GRP_FIT
+  , tooltip = "The last m bars have no centered value yet. The dotted edge shows the newest window's polynomial over those bars: it is provisional and is redrawn on every bar, while everything to its left is final. Its last point is the real-time filter value the signals use.")
+
+markPeaksInput = input.bool(false, "Mark Confirmed Peaks / Troughs", group = GRP_FIT
+  , tooltip = "Marks the highs and lows of the confirmed filter at the bar where they occurred, once known m + 1 bars later.")
+
+sideInput = input.string(SIDE_LONG, "Signals", options = [SIDE_BOTH, SIDE_LONG, SIDE_OFF], group = GRP_SIG
+  , tooltip = "Trades the slope of the real-time fit: the first derivative of the newest window's polynomial at the newest bar, a Savitzky-Golay derivative filter. A long opens when the slope turns positive and closes when it turns negative, shorts the reverse. Evaluated on closed bars, so a signal never moves once printed.")
+
+minSlopeInput = input.float(0.05, "Minimum Slope (ATR per bar)", minval = 0, step = 0.01, group = GRP_SIG
+  , tooltip = "A turn only counts once the fitted slope exceeds this fraction of the 14-bar ATR per bar, which skips the flat wobble of a sideways market. 0 trades every sign change.")
+
+showTradesInput = input.bool(true, "Show Trades", group = GRP_SIG
+  , tooltip = "Draws each entry, the line held while the position is open and the exit with the close-to-close change.")
+
+lineWidthInput    = input.int(2, "Line Width", minval = 1, maxval = 4, group = GRP_STYLE)
+bullColorInput    = input.color(BULL_COLOR, "Rising", inline = "c1", group = GRP_STYLE)
+bearColorInput    = input.color(BEAR_COLOR, "Falling", inline = "c1", group = GRP_STYLE)
+accentColorInput  = input.color(ACCENT_COLOR, "Provisional Edge", inline = "c2", group = GRP_STYLE)
+neutralColorInput = input.color(NEUTRAL_COLOR, "Neutral", inline = "c2", group = GRP_STYLE)
+
+showDashInput = input.bool(true, "Show Dashboard", group = GRP_DASH
+  , tooltip = "Fit settings, slope and curvature from the polynomial's derivatives, and how much bar noise the centered and real-time fits pass compared with a simple moving average of the same window.")
+dashPosInput  = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], inline = "dash", group = GRP_DASH)
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], inline = "dash", group = GRP_DASH)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Least-squares projection for a polynomial of degree p over a window of n bars stored oldest first: the (p + 1) x n
+// matrix (A'A)^-1 A' that turns the window into the polynomial's coefficients. Time is scaled to [-1, 0] (newest
+// bar = 0) so the normal equations stay well conditioned. Stored row-major in a flat array.
+sgProjection(int n, int p) =>
+    int k = p + 1
+    // augmented matrix [A'A | I]
+    a = array.new_float(k * 2 * k, 0.0)
+    for i = 0 to n - 1
+        float t = (i - (n - 1)) / (n - 1.0)
+        for j = 0 to k - 1
+            for l = 0 to k - 1
+                array.set(a, j * 2 * k + l, array.get(a, j * 2 * k + l) + math.pow(t, j + l))
+    for j = 0 to k - 1
+        array.set(a, j * 2 * k + k + j, 1.0)
+    // Gauss-Jordan elimination with partial pivoting
+    for c = 0 to k - 1
+        int   piv  = c
+        float best = math.abs(array.get(a, c * 2 * k + c))
+        if c < k - 1
+            for r = c + 1 to k - 1
+                float v = math.abs(array.get(a, r * 2 * k + c))
+                if v > best
+                    best := v
+                    piv  := r
+        if piv != c
+            for l = 0 to 2 * k - 1
+                float tmp = array.get(a, c * 2 * k + l)
+                array.set(a, c * 2 * k + l, array.get(a, piv * 2 * k + l))
+                array.set(a, piv * 2 * k + l, tmp)
+        float d = array.get(a, c * 2 * k + c)
+        for l = 0 to 2 * k - 1
+            array.set(a, c * 2 * k + l, array.get(a, c * 2 * k + l) / d)
+        for r = 0 to k - 1
+            if r != c
+                float f = array.get(a, r * 2 * k + c)
+                if f != 0
+                    for l = 0 to 2 * k - 1
+                        array.set(a, r * 2 * k + l, array.get(a, r * 2 * k + l) - f * array.get(a, c * 2 * k + l))
+    // projection row j, column i = sum_l inverse[j][l] * t_i^l
+    out = array.new_float(k * n, 0.0)
+    for j = 0 to k - 1
+        for i = 0 to n - 1
+            float t = (i - (n - 1)) / (n - 1.0)
+            float s = 0.0
+            for l = 0 to k - 1
+                s += array.get(a, j * 2 * k + k + l) * math.pow(t, l)
+            array.set(out, j * n + i, s)
+    out
+
+// Polynomial coefficients of the least-squares fit to the last n values of a series
+fitCoeffs(float src, array<float> proj, int n, int k) =>
+    coef = array.new_float(k, 0.0)
+    for i = 0 to n - 1
+        float y = src[n - 1 - i]
+        for j = 0 to k - 1
+            array.set(coef, j, array.get(coef, j) + array.get(proj, j * n + i) * y)
+    coef
+
+// Value of the fitted polynomial at scaled time t (0 = newest bar, -1 = oldest bar of the window)
+polyAt(array<float> coef, float t) =>
+    float s = 0.0
+    for j = 0 to array.size(coef) - 1
+        s += array.get(coef, j) * math.pow(t, j)
+    s
+
+// Sum of squared convolution weights giving the fitted value at scaled time t0: the share of white-noise variance the
+// filter passes (1 / n for a simple moving average of n bars)
+noiseGain(array<float> proj, int n, int k, float t0) =>
+    float g = 0.0
+    for i = 0 to n - 1
+        float s = 0.0
+        for j = 0 to k - 1
+            s += array.get(proj, j * n + i) * math.pow(t0, j)
+        g += s * s
+    g
+
+getSize(string s) =>
+    switch s
+        "Tiny"   => size.tiny
+        "Normal" => size.normal
+        =>          size.small
+
+getPosition(string p) =>
+    switch p
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        "Bottom Left"  => position.bottom_left
+        =>                position.top_right
+
+fmtPct(float x) =>
+    na(x) ? "-" : (x >= 0 ? "+" : "") + str.tostring(x, "0.00") + "%"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Savitzky-Golay Fit
+//---------------------------------------------------------------------------------------------------------------------{
+int   winLen = 2 * halfWidthInput + 1
+int   degree = math.min(degreeInput, winLen - 2)
+int   nCoef  = degree + 1
+float scaleT = winLen - 1.0
+float tMid   = -0.5
+
+var array<float> proj        = sgProjection(winLen, degree)
+var float        noiseEnd    = noiseGain(proj, winLen, nCoef, 0.0)
+var float        noiseCenter = noiseGain(proj, winLen, nCoef, tMid)
+
+bool ready = bar_index >= winLen - 1 and not na(srcInput[winLen - 1])
+
+// One least-squares fit per bar over the last 2m + 1 bars. Evaluated at the window's middle it is the textbook
+// centered Savitzky-Golay value of the bar m bars back, final now that the m bars after it have closed. Evaluated at
+// the newest bar it is the real-time filter, with its slope and curvature, causal and final on the bar's close.
+float sgReal   = na
+float sgSlope  = na
+float sgCurve  = na
+float sgCenter = na
+array<float> coef = array.new_float(0)
+if ready
+    coef     := fitCoeffs(srcInput, proj, winLen, nCoef)
+    sgReal   := array.get(coef, 0)
+    sgSlope  := nCoef > 1 ? array.get(coef, 1) / scaleT : 0.0
+    sgCurve  := nCoef > 2 ? 2 * array.get(coef, 2) / (scaleT * scaleT) : 0.0
+    sgCenter := polyAt(coef, tMid)
+
+atr = ta.atr(14)
+// label anchors clear of the neighbouring candles
+float topAnchor = ta.highest(high, 5)
+float botAnchor = ta.lowest(low, 5)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Slope Turns
+//---------------------------------------------------------------------------------------------------------------------{
+float thr = minSlopeInput * nz(atr)
+
+var int slopeDir = 0
+int prevDir = slopeDir
+if not na(sgSlope)
+    if sgSlope > thr
+        slopeDir := 1
+    else if sgSlope < -thr
+        slopeDir := -1
+
+bool turnUp   = slopeDir == 1 and prevDir != 1
+bool turnDown = slopeDir == -1 and prevDir != -1
+
+var int   position   = 0
+var float entryPrice = na
+var line  tradeLine  = na
+
+bool  longEntry  = false
+bool  shortEntry = false
+bool  anyExit    = false
+int   exitSide   = 0
+float exitChange = na
+
+if sideInput != SIDE_OFF and barstate.isconfirmed
+    if (position == 1 and turnDown) or (position == -1 and turnUp)
+        exitChange := position * (close - entryPrice) / entryPrice * 100
+        exitSide   := position
+        anyExit    := true
+        if showTradesInput
+            line.set_x2(tradeLine, bar_index)
+            line.set_y2(tradeLine, close)
+        position := 0
+    longEntry  := position == 0 and turnUp
+    shortEntry := position == 0 and turnDown and sideInput == SIDE_BOTH
+    if longEntry or shortEntry
+        position   := longEntry ? 1 : -1
+        entryPrice := close
+    if showTradesInput
+        string exitText = anyExit ? "Exit " + fmtPct(exitChange) : ""
+        string exitTip  = anyExit ? "The real-time slope turned against the " + (exitSide == 1 ? "long" : "short") + ". Close-to-close change from entry: " + fmtPct(exitChange) + ". " : ""
+        if longEntry or shortEntry
+            color c = longEntry ? bullColorInput : bearColorInput
+            tradeLine := line.new(bar_index, close, bar_index, close, color = c, width = 2, style = line.style_dashed)
+            string entryText = longEntry ? "S-G Long" : "S-G Short"
+            string closedText = anyExit ? (exitSide == 1 ? "long " : "short ") + fmtPct(exitChange) : ""
+            label.new(bar_index, longEntry ? botAnchor : topAnchor, anyExit ? (longEntry ? entryText + "\n" + closedText : closedText + "\n" + entryText) : entryText
+              , style = longEntry ? label.style_label_up : label.style_label_down, color = c, textcolor = color.white, size = size.small
+              , tooltip = exitTip + "The slope of the newest polynomial fit turned " + (longEntry ? "up" : "down") + " to " + str.tostring(sgSlope / atr, "0.00") + " ATR per bar.")
+        else if anyExit
+            label.new(bar_index, exitSide == 1 ? topAnchor : botAnchor, exitText
+              , style = exitSide == 1 ? label.style_label_down : label.style_label_up, color = color.new(neutralColorInput, 20)
+              , textcolor = DASH_TEXT, size = size.small, tooltip = exitTip)
+
+if position != 0 and showTradesInput and not na(tradeLine)
+    line.set_x2(tradeLine, bar_index)
+    line.set_y2(tradeLine, close)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Confirmed Filter & Provisional Edge
+//---------------------------------------------------------------------------------------------------------------------{
+var array<float> centerHist = array.new_float()
+var array<int>   centerBars = array.new_int()
+
+if not na(sgCenter)
+    array.push(centerHist, sgCenter)
+    array.push(centerBars, bar_index - halfWidthInput)
+    if array.size(centerHist) > historyInput
+        array.shift(centerHist)
+        array.shift(centerBars)
+
+// Highs and lows of the confirmed filter, known once the next centered value is
+bool peak   = not na(sgCenter[2]) and sgCenter[1] > sgCenter[2] and sgCenter[1] > sgCenter
+bool trough = not na(sgCenter[2]) and sgCenter[1] < sgCenter[2] and sgCenter[1] < sgCenter
+
+if markPeaksInput and (peak or trough)
+    label.new(bar_index - halfWidthInput - 1, sgCenter[1], "●", style = label.style_none, textcolor = peak ? bearColorInput : bullColorInput, size = size.tiny
+      , tooltip = (peak ? "Confirmed peak" : "Confirmed trough") + " of the centered filter, known " + str.tostring(halfWidthInput + 1) + " bars after it occurred.")
+
+var array<polyline> segments = array.new<polyline>()
+var polyline edgeLine = na
+
+if barstate.islast
+    for pl in segments
+        polyline.delete(pl)
+    array.clear(segments)
+    polyline.delete(edgeLine)
+    int n = array.size(centerHist)
+    if n > 1
+        // the confirmed filter, one polyline per rising or falling run, drawn from the newest run back
+        int   runEnd = n - 1
+        int   dir    = array.get(centerHist, n - 1) >= array.get(centerHist, n - 2) ? 1 : -1
+        int   i      = n - 2
+        while i >= 0 and array.size(segments) < MAX_SEGMENTS
+            int d = i > 0 ? (array.get(centerHist, i) >= array.get(centerHist, i - 1) ? 1 : -1) : dir
+            if d != dir or i == 0
+                pts = array.new<chart.point>()
+                for j = i to runEnd
+                    pts.push(chart.point.from_index(array.get(centerBars, j), array.get(centerHist, j)))
+                array.push(segments, polyline.new(pts, line_color = dir == 1 ? bullColorInput : bearColorInput, line_width = lineWidthInput))
+                runEnd := i
+                dir    := d
+            i -= 1
+    // the newest window's polynomial over the bars that have no centered value yet
+    if showEdgeInput and array.size(coef) > 0
+        pts = array.new<chart.point>()
+        for k = 0 to halfWidthInput
+            int b = bar_index - halfWidthInput + k
+            pts.push(chart.point.from_index(b, polyAt(coef, (k - halfWidthInput) / scaleT)))
+        edgeLine := polyline.new(pts, line_color = accentColorInput, line_width = lineWidthInput, line_style = line.style_dotted)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Plots
+//---------------------------------------------------------------------------------------------------------------------{
+plot(sgReal, "S-G Real-time", color.new(neutralColorInput, 0), display = display.data_window)
+plot(sgSlope, "S-G Slope", color.new(neutralColorInput, 0), display = display.data_window)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dash = table.new(getPosition(dashPosInput), 2, 5, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+if barstate.islast and showDashInput
+    ts = getSize(dashSizeInput)
+    color slopeColor = slopeDir == 1 ? bullColorInput : slopeDir == -1 ? bearColorInput : neutralColorInput
+    table.cell(dash, 0, 0, "S-G Fit", text_color = DASH_HEADER, text_halign = text.align_left, text_size = ts)
+    table.cell(dash, 1, 0, str.tostring(winLen) + " bars, degree " + str.tostring(degree), text_color = DASH_TEXT, text_halign = text.align_right, text_size = ts)
+    table.cell(dash, 0, 1, "Slope", text_color = DASH_HEADER, text_halign = text.align_left, text_size = ts
+      , tooltip = "First derivative of the newest fit at the newest bar, in ATR per bar.")
+    table.cell(dash, 1, 1, (sgSlope >= 0 ? "+" : "") + str.tostring(sgSlope / atr, "0.00") + " ATR/bar", text_color = slopeColor, text_halign = text.align_right, text_size = ts)
+    table.cell(dash, 0, 2, "Curvature", text_color = DASH_HEADER, text_halign = text.align_left, text_size = ts
+      , tooltip = "Second derivative of the newest fit (degree 2 or more). Slope and curvature with the same sign mean the move is accelerating.")
+    table.cell(dash, 1, 2, degree < 2 ? "-" : sgCurve * sgSlope > 0 ? "Accelerating" : "Decelerating", text_color = DASH_TEXT, text_halign = text.align_right, text_size = ts)
+    table.cell(dash, 0, 3, "Noise Passed", text_color = DASH_HEADER, text_halign = text.align_left, text_size = ts
+      , tooltip = "Share of bar noise (standard deviation) passed by the centered fit and by the real-time fit, from their weights. A simple moving average of the same window passes " + str.tostring(math.sqrt(1.0 / winLen) * 100, "0") + "% and flattens peaks; the real-time fit passes more noise in exchange for no lag on polynomial trends.")
+    table.cell(dash, 1, 3, str.tostring(math.sqrt(noiseCenter) * 100, "0") + "% / " + str.tostring(math.sqrt(noiseEnd) * 100, "0") + "% edge", text_color = DASH_TEXT, text_halign = text.align_right, text_size = ts)
+    table.cell(dash, 0, 4, "Position", text_color = DASH_HEADER, text_halign = text.align_left, text_size = ts)
+    string posText = position == 1 ? "Long " + fmtPct((close - entryPrice) / entryPrice * 100) : position == -1 ? "Short " + fmtPct((entryPrice - close) / entryPrice * 100) : "Flat"
+    table.cell(dash, 1, 4, posText, text_color = position == 1 ? bullColorInput : position == -1 ? bearColorInput : DASH_HEADER, text_halign = text.align_right, text_size = ts)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(turnUp, "S-G Slope Turned Up", "Savitzky-Golay real-time slope turned up on {{ticker}} ({{interval}})")
+alertcondition(turnDown, "S-G Slope Turned Down", "Savitzky-Golay real-time slope turned down on {{ticker}} ({{interval}})")
+alertcondition(longEntry, "S-G Long", "Savitzky-Golay long on {{ticker}} ({{interval}}): the fitted slope turned positive")
+alertcondition(shortEntry, "S-G Short", "Savitzky-Golay short on {{ticker}} ({{interval}}): the fitted slope turned negative")
+alertcondition(anyExit, "S-G Exit", "Savitzky-Golay exit on {{ticker}} ({{interval}}): the fitted slope turned against the position")
+alertcondition(peak, "Confirmed Peak", "Savitzky-Golay filter confirmed a peak on {{ticker}} ({{interval}})")
+alertcondition(trough, "Confirmed Trough", "Savitzky-Golay filter confirmed a trough on {{ticker}} ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

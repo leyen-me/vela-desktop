@@ -1,0 +1,428 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Matrix Profile", "Matrix Profile", overlay = false, format = format.price, precision = 2, max_labels_count = 100, max_lines_count = 100, max_boxes_count = 100, max_polylines_count = 10)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+NEUTRAL_COLOR = #787b86 // the profile itself is structure - meaning sits in the motif / discord marks
+MOTIF_COLOR   = #089981
+DISCORD_COLOR = #f23645
+ACCENT_COLOR  = #ff9800 // the one accent - the newest window and its nearest match
+LABEL_BG      = #00000000
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+BIG_DISTANCE = 1.0e9
+FLAT_EPS_REL = 1.0e-6
+
+TOP_RIGHT    = "Top Right"
+TOP_LEFT     = "Top Left"
+BOTTOM_RIGHT = "Bottom Right"
+BOTTOM_LEFT  = "Bottom Left"
+
+GRP_MP    = "Matrix Profile"
+GRP_MD    = "Motifs & Discords"
+GRP_DASH  = "Dashboard"
+GRP_STYLE = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+srcInput     = input.source(close, "Source", group = GRP_MP, tooltip = "Series T the profile is computed on — price or any other series. Distances are z-normalized, so matches reflect shape rather than price level or volatility scale.")
+returnsInput = input.bool(false, "Use First Differences", group = GRP_MP, tooltip = "Compute the profile on bar-to-bar changes of the source instead of its level, so windows are matched on movement shape rather than on the level path.")
+mInput       = input.int(24, "Window Length (m)", minval = 4, maxval = 100, group = GRP_MP, tooltip = "Subsequence length in bars — the scale of the shapes the profile can find. There is no canonical choice for markets: common practice is to compare profiles at several lengths tied to horizons you care about (a session, a week, a swing).")
+nInput       = input.int(400, "Analysis Bars (n)", minval = 100, maxval = 600, group = GRP_MP, tooltip = "Most recent bars forming the series the self-join scans. Every length-m window inside this sample is compared against every other valid window, and the full profile recomputes on the latest bar.")
+ezInput      = input.float(0.5, "Exclusion Zone (x m)", minval = 0.25, maxval = 0.5, step = 0.05, group = GRP_MP, tooltip = "Half-width, as a fraction of m, of the zone around each window whose neighbors are skipped as trivial self-matches. Conventions range from about m/4 to m/2 on each side.")
+
+motifCountInput   = input.int(2, "Motif Pairs", minval = 0, maxval = 4, group = GRP_MD, tooltip = "Lowest points of the profile to extract as motifs — a window plus its nearest neighbor, a shape that recurred. Extraction skips one exclusion zone around each pick so listed motifs do not overlap each other.")
+discordCountInput = input.int(1, "Discords", minval = 0, maxval = 4, group = GRP_MD, tooltip = "Highest points of the profile to extract as discords — windows whose shape has no good match anywhere in the sample; shape-based anomalies worth manual review.")
+motifPctInput     = input.float(10.0, "Motif Percentile", minval = 1, maxval = 49, group = GRP_MD, tooltip = "Profile percentile at or below which the newest window counts as a motif match. Drawn as the lower dashed guide and used by the motif alert.")
+discordPctInput   = input.float(90.0, "Discord Percentile", minval = 51, maxval = 99, group = GRP_MD, tooltip = "Profile percentile at or above which the newest window counts as a discord. Drawn as the upper dashed guide and used by the discord alert.")
+showCurrentInput  = input.bool(true, "Current Window Match", group = GRP_MD, tooltip = "Outline the newest window on the price chart together with its nearest neighbor — where the shape now completing occurred before. A fast pre-filter for analog research: the profile finds the candidate, finer tools re-rank it.")
+showBoxesInput    = input.bool(true, "Mark Motifs & Discords On Chart", group = GRP_MD, tooltip = "Shade each extracted motif window (pair members connected by a dotted line when disjoint) and each discord window on the price chart.")
+showGuidesInput   = input.bool(true, "Percentile Guides", group = GRP_MD, tooltip = "Dashed horizontal guides at the motif and discord percentiles of the profile.")
+
+showDashInput = input.bool(true, "Show Dashboard", group = GRP_DASH, tooltip = "Summary table: window setup, best motif and top discord distances, and where the newest window sits within the profile.")
+dashPosInput  = input.string(TOP_RIGHT, "Position", options = [TOP_RIGHT, TOP_LEFT, BOTTOM_RIGHT, BOTTOM_LEFT], group = GRP_DASH, tooltip = "Chart corner the dashboard is anchored to.")
+
+profileColorInput = input.color(NEUTRAL_COLOR, "Profile", group = GRP_STYLE)
+motifColorInput   = input.color(MOTIF_COLOR, "Motifs", inline = "c1", group = GRP_STYLE)
+discordColorInput = input.color(DISCORD_COLOR, "Discords", inline = "c1", group = GRP_STYLE)
+currentColorInput = input.color(ACCENT_COLOR, "Current Window", group = GRP_STYLE, tooltip = "Color of the newest window and its nearest-match outline on the price chart.")
+widthInput        = input.int(2, "Profile Width", minval = 1, maxval = 4, group = GRP_STYLE, tooltip = "Width of the profile polyline.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Mid price of the chart bars a window spans — connector-line anchor
+windowMid(array<float> hiArr, array<float> loArr, int startIdx, int len) =>
+    float yTop = array.get(hiArr, startIdx)
+    float yBot = array.get(loArr, startIdx)
+    for q = startIdx + 1 to startIdx + len - 1
+        yTop := math.max(yTop, array.get(hiArr, q))
+        yBot := math.min(yBot, array.get(loArr, q))
+    (yTop + yBot) / 2
+
+// Shaded window on the price chart with a tag label above it
+markWindow(array<float> hiArr, array<float> loArr, array<box> boxArr, array<label> lblArr, int startIdx, int len, int sz, int lastBar, color col, string tag, string tip, bool dashed) =>
+    float yTop = array.get(hiArr, startIdx)
+    float yBot = array.get(loArr, startIdx)
+    for q = startIdx + 1 to startIdx + len - 1
+        yTop := math.max(yTop, array.get(hiArr, q))
+        yBot := math.min(yBot, array.get(loArr, q))
+    int x1 = lastBar - (sz - 1) + startIdx
+    int x2 = x1 + len - 1
+    array.push(boxArr, box.new(x1, yTop, x2, yBot, border_color = color.new(col, 35), border_width = 1, border_style = dashed ? line.style_dashed : line.style_solid, bgcolor = color.new(col, 88), force_overlay = true))
+    array.push(lblArr, label.new((x1 + x2) / 2, yTop, tag, style = label.style_label_down, textcolor = col, color = LABEL_BG, size = size.tiny, tooltip = tip, force_overlay = true))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Data Buffer
+//---------------------------------------------------------------------------------------------------------------------{
+float rawT = returnsInput ? srcInput - srcInput[1] : srcInput
+
+var array<float> tBufferArray  = array.new<float>()
+var array<float> hiBufferArray = array.new<float>()
+var array<float> loBufferArray = array.new<float>()
+var float lastGoodT  = na
+var float lastGoodHi = na
+var float lastGoodLo = na
+
+if not na(rawT)
+    lastGoodT := rawT
+if not na(high)
+    lastGoodHi := high
+if not na(low)
+    lastGoodLo := low
+
+if not na(lastGoodT) and not na(lastGoodHi) and not na(lastGoodLo)
+    array.push(tBufferArray, lastGoodT)
+    array.push(hiBufferArray, lastGoodHi)
+    array.push(loBufferArray, lastGoodLo)
+    if array.size(tBufferArray) > nInput
+        array.shift(tBufferArray)
+        array.shift(hiBufferArray)
+        array.shift(loBufferArray)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Matrix Profile Engine
+//---------------------------------------------------------------------------------------------------------------------{
+// Self-join over the last n bars: dist(i, j) = zEuclid(T[i .. i+m-1], T[j .. j+m-1]),
+// MP(i) = min over valid j of dist(i, j), MPI(i) = argmin, with valid j outside an
+// exclusion zone of round(m * fraction) positions on each side of i.
+// The z-normalized Euclidean distance comes from the windows' Pearson correlation r:
+// d = sqrt(2 * m * (1 - r)), with r built from running dot products updated along each
+// diagonal (STOMP-style: QT(i+1, j+1) = QT(i, j) - T[i]T[j] + T[i+m]T[j+m]) and per-window
+// moments from prefix sums. Flat-window convention: both windows constant -> d = 0,
+// exactly one constant -> d = sqrt(m).
+var array<float> mpLiveArray     = array.new<float>()
+var array<int>   mpiLiveArray    = array.new<int>()
+var array<int>   motifAArray     = array.new<int>()
+var array<int>   motifBArray     = array.new<int>()
+var array<float> motifDArray     = array.new<float>()
+var array<int>   discordIdxArray = array.new<int>()
+var array<float> discordDArray   = array.new<float>()
+
+var int    szLive           = 0
+var int    wLive            = 0
+var bool   readyLive        = false
+var string statusLive       = ""
+var float  pLowLive         = na
+var float  pHighLive        = na
+var float  currentDistLive  = na
+var float  currentPctLive   = na
+var int    currentNnAgeLive = 0
+var bool   curIsMotifLive   = false
+var bool   curIsDiscordLive = false
+var bool   curIsMaxLive     = false
+
+int ezWidth = math.max(1, math.round(mInput * ezInput))
+
+if barstate.islast
+    int m  = mInput
+    int ez = ezWidth
+    int sz = array.size(tBufferArray)
+    int w  = sz - m + 1
+    int neededSz = m + 2 * ez + 2
+
+    szLive    := sz
+    wLive     := w
+    readyLive := sz >= neededSz
+    statusLive := readyLive ? "" : nInput < neededSz ? "window too small — raise n or lower m" : "collecting bars — need " + str.tostring(neededSz - sz) + " more"
+
+    // center the sample so per-window moments stay numerically stable at high price levels
+    // (z-normalized distances are invariant to shifting the whole series by a constant)
+    float seriesSd = 0.0
+    array<float> cArray = array.new<float>()
+    if readyLive
+        float sumAll = 0.0
+        for e = 0 to sz - 1
+            sumAll += array.get(tBufferArray, e)
+        float meanAll = sumAll / sz
+        float sqAll = 0.0
+        for e = 0 to sz - 1
+            float cv = array.get(tBufferArray, e) - meanAll
+            array.push(cArray, cv)
+            sqAll += cv * cv
+        seriesSd := math.sqrt(sqAll / sz)
+        if seriesSd <= 0
+            readyLive  := false
+            statusLive := "source has no variation"
+
+    if readyLive
+        // per-window mean and standard deviation from prefix sums
+        array<float> csArray  = array.new<float>(sz + 1, 0.0)
+        array<float> cs2Array = array.new<float>(sz + 1, 0.0)
+        for e = 0 to sz - 1
+            float cv = array.get(cArray, e)
+            array.set(csArray, e + 1, array.get(csArray, e) + cv)
+            array.set(cs2Array, e + 1, array.get(cs2Array, e) + cv * cv)
+        array<float> muArray = array.new<float>(w, 0.0)
+        array<float> sdArray = array.new<float>(w, 0.0)
+        for a = 0 to w - 1
+            float muA  = (array.get(csArray, a + m) - array.get(csArray, a)) / m
+            float varA = (array.get(cs2Array, a + m) - array.get(cs2Array, a)) / m - muA * muA
+            array.set(muArray, a, muA)
+            array.set(sdArray, a, math.sqrt(math.max(varA, 0.0)))
+        float flatEps = seriesSd * FLAT_EPS_REL
+        float sqrtM   = math.sqrt(m)
+
+        // all-pairs nearest neighbor along diagonals, min-updating both ends of each pair
+        array<float> mpArray  = array.new<float>(w, BIG_DISTANCE)
+        array<int>   mpiArray = array.new<int>(w, -1)
+        for k = ez + 1 to w - 1
+            float qt = 0.0
+            for l = 0 to m - 1
+                qt += array.get(cArray, l) * array.get(cArray, k + l)
+            for a = 0 to w - 1 - k
+                int b = a + k
+                if a > 0
+                    qt := qt - array.get(cArray, a - 1) * array.get(cArray, b - 1) + array.get(cArray, a + m - 1) * array.get(cArray, b + m - 1)
+                float sdA = array.get(sdArray, a)
+                float sdB = array.get(sdArray, b)
+                float d = 0.0
+                if sdA <= flatEps and sdB <= flatEps
+                    d := 0.0
+                else if sdA <= flatEps or sdB <= flatEps
+                    d := sqrtM
+                else
+                    float r = (qt - m * array.get(muArray, a) * array.get(muArray, b)) / (m * sdA * sdB)
+                    r := math.min(math.max(r, -1.0), 1.0)
+                    d := math.sqrt(2.0 * m * (1.0 - r))
+                if d < array.get(mpArray, a)
+                    array.set(mpArray, a, d)
+                    array.set(mpiArray, a, b)
+                if d < array.get(mpArray, b)
+                    array.set(mpArray, b, d)
+                    array.set(mpiArray, b, a)
+
+        mpLiveArray  := mpArray
+        mpiLiveArray := mpiArray
+        pLowLive     := array.percentile_linear_interpolation(mpArray, motifPctInput)
+        pHighLive    := array.percentile_linear_interpolation(mpArray, discordPctInput)
+
+        // newest window: its profile value, percentile rank, and nearest-neighbor age
+        float curD  = array.get(mpArray, w - 1)
+        float maxMp = 0.0
+        int leCount = 0
+        for i = 0 to w - 1
+            float v = array.get(mpArray, i)
+            maxMp := math.max(maxMp, v)
+            if v <= curD
+                leCount += 1
+        currentDistLive  := curD
+        currentPctLive   := 100.0 * leCount / w
+        currentNnAgeLive := (w - 1) - array.get(mpiArray, w - 1)
+        curIsMotifLive   := curD <= pLowLive
+        curIsDiscordLive := curD >= pHighLive
+        curIsMaxLive     := curD >= maxMp
+
+        // motif pairs: repeated minima of the profile, one exclusion zone apart
+        array.clear(motifAArray)
+        array.clear(motifBArray)
+        array.clear(motifDArray)
+        array<bool> claimedArray = array.new<bool>(w, false)
+        bool searching = motifCountInput > 0
+        while searching and array.size(motifDArray) < motifCountInput
+            int bestI  = -1
+            float bestD = BIG_DISTANCE
+            for i = 0 to w - 1
+                int nb = array.get(mpiArray, i)
+                if not array.get(claimedArray, i) and nb >= 0 and not array.get(claimedArray, nb) and array.get(mpArray, i) < bestD
+                    bestD := array.get(mpArray, i)
+                    bestI := i
+            if bestI < 0
+                searching := false
+            else
+                int nbB = array.get(mpiArray, bestI)
+                array.push(motifAArray, math.min(bestI, nbB))
+                array.push(motifBArray, math.max(bestI, nbB))
+                array.push(motifDArray, bestD)
+                for zi = math.max(0, bestI - ez) to math.min(w - 1, bestI + ez)
+                    array.set(claimedArray, zi, true)
+                for zi = math.max(0, nbB - ez) to math.min(w - 1, nbB + ez)
+                    array.set(claimedArray, zi, true)
+
+        // discords: repeated maxima of the profile, one exclusion zone apart
+        array.clear(discordIdxArray)
+        array.clear(discordDArray)
+        array<bool> claimedDiscArray = array.new<bool>(w, false)
+        bool scanning = discordCountInput > 0
+        while scanning and array.size(discordDArray) < discordCountInput
+            int bestI  = -1
+            float bestD = -1.0
+            for i = 0 to w - 1
+                if not array.get(claimedDiscArray, i) and array.get(mpArray, i) > bestD
+                    bestD := array.get(mpArray, i)
+                    bestI := i
+            if bestI < 0
+                scanning := false
+            else
+                array.push(discordIdxArray, bestI)
+                array.push(discordDArray, bestD)
+                for zi = math.max(0, bestI - ez) to math.min(w - 1, bestI + ez)
+                    array.set(claimedDiscArray, zi, true)
+    else
+        mpLiveArray  := array.new<float>()
+        mpiLiveArray := array.new<int>()
+        array.clear(motifAArray)
+        array.clear(motifBArray)
+        array.clear(motifDArray)
+        array.clear(discordIdxArray)
+        array.clear(discordDArray)
+        pLowLive         := na
+        pHighLive        := na
+        currentDistLive  := na
+        currentPctLive   := na
+        currentNnAgeLive := 0
+        curIsMotifLive   := false
+        curIsDiscordLive := false
+        curIsMaxLive     := false
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visuals
+//---------------------------------------------------------------------------------------------------------------------{
+plot(0, "Zero Line — exact repeat", color.new(NEUTRAL_COLOR, 50), 1, display = display.pane, editable = false)
+
+tablePos = switch dashPosInput
+    TOP_RIGHT    => position.top_right
+    TOP_LEFT     => position.top_left
+    BOTTOM_RIGHT => position.bottom_right
+    => position.bottom_left
+
+var array<polyline> polyDrawArray  = array.new<polyline>()
+var array<label>    labelDrawArray = array.new<label>()
+var array<line>     lineDrawArray  = array.new<line>()
+var array<box>      boxDrawArray   = array.new<box>()
+var table dashTableId = na
+
+if barstate.islast
+    for p in polyDrawArray
+        polyline.delete(p)
+    array.clear(polyDrawArray)
+    for lb in labelDrawArray
+        label.delete(lb)
+    array.clear(labelDrawArray)
+    for ln in lineDrawArray
+        line.delete(ln)
+    array.clear(lineDrawArray)
+    for bx in boxDrawArray
+        box.delete(bx)
+    array.clear(boxDrawArray)
+    table.delete(dashTableId)
+
+    int m       = mInput
+    int sz      = szLive
+    int w       = wLive
+    int lastBar = bar_index
+
+    if readyLive and w > 1 and array.size(mpLiveArray) == w
+        // the profile as a companion series, each value anchored at its window's closing bar
+        array<chart.point> profilePoints = array.new<chart.point>()
+        for a = 0 to w - 1
+            array.push(profilePoints, chart.point.from_index(lastBar - (sz - 1) + a + m - 1, array.get(mpLiveArray, a)))
+        array.push(polyDrawArray, polyline.new(profilePoints, line_color = profileColorInput, line_width = widthInput))
+
+        int xLeft = lastBar - (sz - 1) + m - 1
+        if showGuidesInput
+            array.push(lineDrawArray, line.new(xLeft, pLowLive, lastBar, pLowLive, color = color.new(motifColorInput, 50), style = line.style_dashed, width = 1))
+            array.push(lineDrawArray, line.new(xLeft, pHighLive, lastBar, pHighLive, color = color.new(discordColorInput, 50), style = line.style_dashed, width = 1))
+            array.push(labelDrawArray, label.new(lastBar + 1, pLowLive, "p" + str.tostring(motifPctInput, "#.#"), style = label.style_label_left, textcolor = color.new(motifColorInput, 25), color = LABEL_BG, size = size.tiny, tooltip = "Motif percentile of the profile — windows at or below repeat a prior shape closely."))
+            array.push(labelDrawArray, label.new(lastBar + 1, pHighLive, "p" + str.tostring(discordPctInput, "#.#"), style = label.style_label_left, textcolor = color.new(discordColorInput, 25), color = LABEL_BG, size = size.tiny, tooltip = "Discord percentile of the profile — windows at or above have no good match anywhere in the sample."))
+
+        if array.size(motifDArray) > 0
+            for r = 0 to array.size(motifDArray) - 1
+                int aIdx    = array.get(motifAArray, r)
+                int bIdx    = array.get(motifBArray, r)
+                float pairD = array.get(motifDArray, r)
+                string rankText = str.tostring(r + 1)
+                string tipText  = "Motif " + rankText + " — z-normalized distance " + str.tostring(pairD, "#.###") + ": this shape recurred. Evidence of repetition, not of predictive value."
+                array.push(labelDrawArray, label.new(lastBar - (sz - 1) + aIdx + m - 1, array.get(mpLiveArray, aIdx), rankText, style = label.style_label_up, textcolor = motifColorInput, color = LABEL_BG, size = size.tiny, tooltip = tipText))
+                array.push(labelDrawArray, label.new(lastBar - (sz - 1) + bIdx + m - 1, array.get(mpLiveArray, bIdx), rankText, style = label.style_label_up, textcolor = motifColorInput, color = LABEL_BG, size = size.tiny, tooltip = tipText))
+                if showBoxesInput
+                    markWindow(hiBufferArray, loBufferArray, boxDrawArray, labelDrawArray, aIdx, m, sz, lastBar, motifColorInput, "M" + rankText, tipText, false)
+                    markWindow(hiBufferArray, loBufferArray, boxDrawArray, labelDrawArray, bIdx, m, sz, lastBar, motifColorInput, "M" + rankText, tipText, false)
+                    if bIdx >= aIdx + m
+                        float midA = windowMid(hiBufferArray, loBufferArray, aIdx, m)
+                        float midB = windowMid(hiBufferArray, loBufferArray, bIdx, m)
+                        array.push(lineDrawArray, line.new(lastBar - (sz - 1) + aIdx + m - 1, midA, lastBar - (sz - 1) + bIdx, midB, color = color.new(motifColorInput, 45), style = line.style_dotted, width = 1, force_overlay = true))
+
+        if array.size(discordDArray) > 0
+            for r = 0 to array.size(discordDArray) - 1
+                int dIdx    = array.get(discordIdxArray, r)
+                float dDist = array.get(discordDArray, r)
+                string rankText = str.tostring(r + 1)
+                string tipText  = "Discord " + rankText + " — z-normalized distance " + str.tostring(dDist, "#.###") + ": no good match anywhere in the sample. Possible regime break, data error, or unusual event reaction."
+                array.push(labelDrawArray, label.new(lastBar - (sz - 1) + dIdx + m - 1, array.get(mpLiveArray, dIdx), "D" + rankText, style = label.style_label_down, textcolor = discordColorInput, color = LABEL_BG, size = size.tiny, tooltip = tipText))
+                if showBoxesInput
+                    markWindow(hiBufferArray, loBufferArray, boxDrawArray, labelDrawArray, dIdx, m, sz, lastBar, discordColorInput, "D" + rankText, tipText, false)
+
+        if showCurrentInput
+            int nnIdx = array.get(mpiLiveArray, w - 1)
+            string curTip = "Newest window and its nearest neighbor — z-normalized distance " + str.tostring(currentDistLive, "#.###") + " (percentile " + str.tostring(math.round(currentPctLive)) + "). Candidate analog only: re-rank with finer tools and test out of sample."
+            markWindow(hiBufferArray, loBufferArray, boxDrawArray, labelDrawArray, w - 1, m, sz, lastBar, currentColorInput, "now", curTip, true)
+            if nnIdx >= 0
+                markWindow(hiBufferArray, loBufferArray, boxDrawArray, labelDrawArray, nnIdx, m, sz, lastBar, currentColorInput, "match", curTip, true)
+                if nnIdx + m <= w - 1
+                    float midCur = windowMid(hiBufferArray, loBufferArray, w - 1, m)
+                    float midNn  = windowMid(hiBufferArray, loBufferArray, nnIdx, m)
+                    array.push(lineDrawArray, line.new(lastBar - (sz - 1) + nnIdx + m - 1, midNn, lastBar - (sz - 1) + w - 1, midCur, color = color.new(currentColorInput, 45), style = line.style_dotted, width = 1, force_overlay = true))
+
+    if showDashInput
+        dashTableId := table.new(tablePos, 2, 6, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+        color headColor = DASH_HEADER
+        color cellColor = DASH_TEXT
+        if readyLive
+            table.cell(dashTableId, 0, 0, "Window m", text_color = headColor, text_size = size.tiny, text_halign = text.align_left)
+            table.cell(dashTableId, 1, 0, str.tostring(m) + " bars", text_color = cellColor, text_size = size.small, text_halign = text.align_right)
+            table.cell(dashTableId, 0, 1, "Windows", text_color = headColor, text_size = size.tiny, text_halign = text.align_left)
+            table.cell(dashTableId, 1, 1, str.tostring(w), text_color = cellColor, text_size = size.small, text_halign = text.align_right)
+            table.cell(dashTableId, 0, 2, "Motif 1", text_color = motifColorInput, text_size = size.tiny, text_halign = text.align_left)
+            table.cell(dashTableId, 1, 2, array.size(motifDArray) > 0 ? str.tostring(array.get(motifDArray, 0), "#.##") : "—", text_color = cellColor, text_size = size.small, text_halign = text.align_right)
+            table.cell(dashTableId, 0, 3, "Discord 1", text_color = discordColorInput, text_size = size.tiny, text_halign = text.align_left)
+            table.cell(dashTableId, 1, 3, array.size(discordDArray) > 0 ? str.tostring(array.get(discordDArray, 0), "#.##") : "—", text_color = cellColor, text_size = size.small, text_halign = text.align_right)
+            table.cell(dashTableId, 0, 4, "Current", text_color = headColor, text_size = size.tiny, text_halign = text.align_left)
+            table.cell(dashTableId, 1, 4, str.tostring(currentDistLive, "#.##") + " · p" + str.tostring(math.round(currentPctLive)), text_color = color.from_gradient(currentPctLive, 0, 100, motifColorInput, discordColorInput), text_size = size.small, text_halign = text.align_right)
+            table.cell(dashTableId, 0, 5, "Nearest Match", text_color = headColor, text_size = size.tiny, text_halign = text.align_left)
+            table.cell(dashTableId, 1, 5, str.tostring(currentNnAgeLive) + " bars ago", text_color = cellColor, text_size = size.small, text_halign = text.align_right)
+        else
+            table.cell(dashTableId, 0, 0, "Matrix Profile", text_color = headColor, text_size = size.tiny, text_halign = text.align_left)
+            table.cell(dashTableId, 1, 0, statusLive, text_color = cellColor, text_size = size.small, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+bool motifStartAlert   = curIsMotifLive and not curIsMotifLive[1]
+bool discordStartAlert = curIsDiscordLive and not curIsDiscordLive[1]
+bool topDiscordAlert   = curIsMaxLive and not curIsMaxLive[1]
+
+alertcondition(motifStartAlert,   "Motif Match",  "matrix profile: the newest window's shape closely repeats a prior stretch (profile at or below the motif percentile) on {{ticker}} {{interval}}")
+alertcondition(discordStartAlert, "Discord",      "matrix profile: the newest window is a shape anomaly (profile at or above the discord percentile) on {{ticker}} {{interval}}")
+alertcondition(topDiscordAlert,   "Top Discord",  "matrix profile: the newest window has the highest nearest-neighbor distance in the whole sample on {{ticker}} {{interval}}")
+
+//---------------------------------------------------------------------------------------------------------------------}

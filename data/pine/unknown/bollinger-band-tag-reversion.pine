@@ -1,0 +1,369 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Bollinger Band Tag Reversion", shorttitle = "Bollinger Band Tag Reversion", overlay = true, format = format.price, max_lines_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+TRIGGER_TOUCH = "Touch or Pierce"
+TRIGGER_CLOSE = "Close Beyond"
+
+// Outer-band episode lifecycle per side: no episode -> tagged, awaiting the close back inside -> band-walk standby
+STATE_IDLE  = 0
+STATE_WATCH = 1
+STATE_WALK  = 2
+
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+NEUTRAL_COLOR = #5b9cf6
+WARN_COLOR    = #ff9800 // hostile backdrop readouts - trending regime, bands expanding out of a tight base
+
+FILL_EDGE_TRANSP  = 80  // band gradient transparency at the outer bands
+FILL_BASIS_TRANSP = 100 // band gradient transparency at the basis
+TAG_MARKER_TRANSP = 50  // raw tag circles
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+lengthInput = input.int(20, "Length", minval = 2
+  , group   = "Bollinger Bands"
+  , tooltip = "Number of bars for the simple moving average basis and for the standard deviation. John Bollinger's default is 20; the basis doubles as the setup's conservative reversion target.")
+
+srcInput = input.source(close, "Source"
+  , group   = "Bollinger Bands"
+  , tooltip = "Price series used for the basis, the standard deviation and BandWidth. Default close.")
+
+multInput = input.float(2.0, "Multiplier", minval = 0.1, step = 0.1
+  , group   = "Bollinger Bands"
+  , tooltip = "Standard deviation multiplier for the outer bands. Bollinger's default is 2; he suggested nudging width with length - roughly 1.9 standard deviations for 10-period bands and 2.1 for 50-period bands - so the fraction of price contained stays similar. Tightening the bands prints more tags and more false ones.")
+
+tagTriggerInput = input.string(TRIGGER_TOUCH, "Tag Trigger", options = [TRIGGER_TOUCH, TRIGGER_CLOSE]
+  , group   = "Setup"
+  , tooltip = "Touch or Pierce - a tag is price trading at or beyond an outer band intrabar, the classic definition, equivalent to %B reaching 1 or above, or 0 or below. Close Beyond - a tag requires a full close outside the bands, a deeper stretch that prints fewer episodes and always defers confirmation to a later bar.")
+
+confirmWindowInput = input.int(5, "Confirmation Window", minval = 1, maxval = 50
+  , group   = "Setup"
+  , tooltip = "Maximum bars from the tag to the confirming close back inside the bands. Price that keeps closing outside for longer is walking the band - a sign of strength, not stretch - so the tag is refused and the side stands aside until price closes back inside and a fresh tag forms.")
+
+stretchTargetInput = input.bool(false, "Stretch Target (Opposite Band)"
+  , group   = "Setup"
+  , tooltip = "Targets the opposite band instead of the middle band. The middle band is the conservative reversion target; the opposite band is the stretch target, generally reserved for well-established ranges.")
+
+atrStopInput = input.float(0.5, "Stop ATR Fraction", minval = 0, step = 0.25
+  , group   = "Setup"
+  , tooltip = "Fraction of ATR added beyond the tag extreme to place the invalidation, so normal overshoot does not knock out an otherwise valid fade. Set 0 to anchor invalidation exactly at the tag extreme. The level is frozen on the confirming close.")
+
+atrLengthInput = input.int(14, "ATR Length", minval = 1
+  , group   = "Setup"
+  , tooltip = "Lookback of the Average True Range used for the invalidation cushion. 14 is Wilder's standard setting.")
+
+regimeFilterInput = input.bool(true, "Range Regime Filter"
+  , group   = "Regime Filter"
+  , tooltip = "Declines tags unless the backdrop reads as a range. In trends price can walk the band, tagging it repeatedly while the move continues - the setup's edge lives in this filter more than in the touch. Disable it to qualify tags on the confirming close alone.")
+
+regimeLookbackInput = input.int(20, "Regime Lookback", minval = 2
+  , group   = "Regime Filter"
+  , tooltip = "Bars inspected when classifying the backdrop: rotation back and forth across the middle band suggests a range, persistent one-sided closes suggest a trend.")
+
+minRotationsInput = input.int(3, "Minimum Rotations", minval = 1
+  , group   = "Regime Filter"
+  , tooltip = "Closes crossing the middle band within the lookback required to call the backdrop a range. Fewer crossings read as persistent one-sided closes - a trend - and tags are declined. Raise it to demand a busier rotation before fading, lower it to loosen the filter.")
+
+expansionVetoInput = input.bool(true, "Expansion Veto"
+  , group   = "Volatility Filter"
+  , tooltip = "Declines tags that occur as the bands expand out of a tight base. A tag printed while BandWidth turns up from the lowest reading of its reference lookback is breakout behavior - the worst environment for fading - so the setup stands aside and lets breakout traders have it.")
+
+squeezeLookbackInput = input.int(125, "Reference Lookback", minval = 2
+  , group   = "Volatility Filter"
+  , tooltip = "Window used to locate the tight-base reference, the lowest BandWidth of the lookback. Bollinger's guideline is roughly six months of daily data, about 125 bars.")
+
+baseWindowInput = input.int(10, "Tight Base Window", minval = 1
+  , group   = "Volatility Filter"
+  , tooltip = "How recently BandWidth must have printed its lookback low for rising width to count as expansion out of a tight base. Once the base is older than this, tags are judged on the regime filter alone.")
+
+showDashboardInput = input.bool(true, "Show Dashboard"
+  , group   = "Dashboard"
+  , tooltip = "Backdrop and setup panel: the regime classification with its rotation count, the volatility backdrop, the current setup state, and the invalidation and target of the running reversion - the same checks the setup sequence walks through.")
+
+dashboardLocationInput = input.string("Top Right", "Location", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"]
+  , group   = "Dashboard"
+  , tooltip = "Chart corner the dashboard is anchored to.")
+
+dashboardSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"]
+  , group   = "Dashboard"
+  , tooltip = "Text size of the dashboard.")
+
+showBandsInput = input.bool(true, "Show Bollinger Bands"
+  , group   = "Style"
+  , tooltip = "Displays the basis and the outer bands with a gradient fill. The middle band doubles as the conservative reversion target and tints with the direction of the running reversion.")
+
+bandColorInput = input.color(NEUTRAL_COLOR, "Bands"
+  , group   = "Style"
+  , tooltip = "Color of the bands, of their gradient fill, and of the basis while no reversion is running.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "direction"
+  , group   = "Style"
+  , tooltip = "Color of long setups - markers, invalidation line, target touch marks and the basis tint while a long reversion is running.")
+
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "direction"
+  , group   = "Style"
+  , tooltip = "Color of short setups - markers, invalidation line, target touch marks and the basis tint while a short reversion is running.")
+
+showSetupsInput = input.bool(true, "Setup Markers"
+  , group   = "Style"
+  , tooltip = "Marks each qualified setup at its confirming close: a triangle under the bar for longs off the lower band, above the bar for shorts off the upper band. Only tags that closed back inside with the filters passing are marked - never the tag alone.")
+
+showResolutionInput = input.bool(true, "Resolution Markers"
+  , group   = "Style"
+  , tooltip = "Marks how each reversion resolved: a circle at the target when the rotation completes, a cross when price breaks the invalidation instead.")
+
+showStopsInput = input.bool(true, "Invalidation Lines"
+  , group   = "Style"
+  , tooltip = "Draws each setup's invalidation - the level an ATR fraction beyond the tag extreme - as a dashed line from the confirming close until the reversion resolves.")
+
+showTagsInput = input.bool(false, "Raw Tag Markers"
+  , group   = "Style"
+  , tooltip = "Marks every outer-band tag with a small circle on the band, qualified or not. Off by default: a tag is not by itself a signal, and in trends price can tag the band bar after bar.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+// Bollinger Bands - simple moving average basis with bands a multiple of the standard deviation away
+basis = ta.sma(srcInput, lengthInput)
+dev   = multInput * ta.stdev(srcInput, lengthInput)
+
+upperBand = basis + dev
+lowerBand = basis - dev
+
+atrValue = ta.atr(atrLengthInput)
+
+// Regime classification - rotation back and forth across the middle band suggests a range, persistent
+// one-sided closes suggest a trend. Rotations are counted as the close changing sides of the basis
+aboveBasis    = not na(basis) and close > basis
+rotatedBasis  = not na(basis[1]) and aboveBasis != aboveBasis[1]
+rotationCount = nz(math.sum(rotatedBasis ? 1 : 0, regimeLookbackInput))
+
+rangeBackdrop = rotationCount >= minRotationsInput
+regimePass    = not regimeFilterInput or rangeBackdrop
+
+// Volatility backdrop - BandWidth turning up from the lowest reading of its reference lookback marks the
+// bands expanding out of a tight base: breakout behavior, the worst environment for fading a tag
+bandwidth    = basis != 0 ? (upperBand - lowerBand) / basis : na
+squeezeLevel = ta.lowest(bandwidth, squeezeLookbackInput)
+squeezeTouch = not na(bandwidth) and bandwidth <= squeezeLevel
+
+bandsExpanding = not na(bandwidth) and not na(bandwidth[1]) and bandwidth > bandwidth[1]
+barsSinceBase  = ta.barssince(squeezeTouch)
+
+expansionFromBase = bandsExpanding and nz(barsSinceBase, squeezeLookbackInput + baseWindowInput + 1) <= baseWindowInput
+volatilityPass    = not expansionVetoInput or not expansionFromBase
+
+// Tags and confirming closes - a tag is price touching or piercing an outer band (or fully closing beyond
+// it in the stricter mode); the confirmation the setup waits for is the close back inside the bands
+upperTagRaw = tagTriggerInput == TRIGGER_CLOSE ? not na(upperBand) and close > upperBand : not na(upperBand) and high >= upperBand
+lowerTagRaw = tagTriggerInput == TRIGGER_CLOSE ? not na(lowerBand) and close < lowerBand : not na(lowerBand) and low <= lowerBand
+
+closedInsideUpper = not na(upperBand) and close < upperBand
+closedInsideLower = not na(lowerBand) and close > lowerBand
+
+// Reversion targets - the middle band by default, the opposite band in stretch mode
+longTargetLevel  = stretchTargetInput ? upperBand : basis
+shortTargetLevel = stretchTargetInput ? lowerBand : basis
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Setup Engine
+//---------------------------------------------------------------------------------------------------------------------{
+var int   upperState   = STATE_IDLE
+var int   lowerState   = STATE_IDLE
+var float upperExtreme = na
+var float lowerExtreme = na
+var int   upperTagBar  = na
+var int   lowerTagBar  = na
+
+var bool  longActive    = false
+var bool  shortActive   = false
+var float longStop      = na
+var float shortStop     = na
+var line  longStopLine  = na
+var line  shortStopLine = na
+
+bool longSetup     = false
+bool shortSetup    = false
+bool longComplete  = false
+bool shortComplete = false
+bool longFail      = false
+bool shortFail     = false
+bool upperTagStart = false
+bool lowerTagStart = false
+
+// Resolve running reversions on the state carried into the bar, so the entry bar's own extremes never
+// resolve the trade they created. When one bar reaches both levels the invalidation is assumed to have
+// been hit first - the conservative read, since the intrabar order cannot be known
+if longActive
+    if low <= longStop
+        longFail   := true
+        longActive := false
+    else if not na(longTargetLevel) and high >= longTargetLevel
+        longComplete := true
+        longActive   := false
+    if not na(longStopLine)
+        line.set_x2(longStopLine, bar_index)
+        if not longActive
+            // the reversion resolved - the drawn line stays on the chart, the reference is released
+            longStopLine := na
+
+if shortActive
+    if high >= shortStop
+        shortFail   := true
+        shortActive := false
+    else if not na(shortTargetLevel) and low <= shortTargetLevel
+        shortComplete := true
+        shortActive   := false
+    if not na(shortStopLine)
+        line.set_x2(shortStopLine, bar_index)
+        if not shortActive
+            // the reversion resolved - the drawn line stays on the chart, the reference is released
+            shortStopLine := na
+
+// Upper side - a tag arms an episode on the side carried into the bar; while the episode is open the tag
+// extreme keeps updating, and the setup is judged exactly once, at the first close back inside the bands
+if upperState == STATE_IDLE and upperTagRaw
+    upperState    := STATE_WATCH
+    upperExtreme  := high
+    upperTagBar   := bar_index
+    upperTagStart := true
+
+if upperState == STATE_WATCH
+    upperExtreme := math.max(upperExtreme, high)
+    if closedInsideUpper
+        // the confirming close - the entry decision: range backdrop, no expansion out of a tight base,
+        // the rotation still open (the close must not have already crossed the basis) and the side free
+        if not shortActive and regimePass and volatilityPass and close > basis
+            shortActive := true
+            shortStop   := upperExtreme + atrStopInput * nz(atrValue)
+            shortSetup  := true
+            if showStopsInput
+                shortStopLine := line.new(bar_index, shortStop, bar_index, shortStop, color = bearColorInput, style = line.style_dashed)
+        upperState := STATE_IDLE
+    else if bar_index - upperTagBar >= confirmWindowInput
+        // price keeps closing outside - a band walk, strength rather than stretch; refuse the tag and
+        // stand aside until a close back inside frees the side for a fresh tag
+        upperState := STATE_WALK
+else if upperState == STATE_WALK and closedInsideUpper
+    upperState := STATE_IDLE
+
+// Lower side - the mirror image
+if lowerState == STATE_IDLE and lowerTagRaw
+    lowerState    := STATE_WATCH
+    lowerExtreme  := low
+    lowerTagBar   := bar_index
+    lowerTagStart := true
+
+if lowerState == STATE_WATCH
+    lowerExtreme := math.min(lowerExtreme, low)
+    if closedInsideLower
+        if not longActive and regimePass and volatilityPass and close < basis
+            longActive := true
+            longStop   := lowerExtreme - atrStopInput * nz(atrValue)
+            longSetup  := true
+            if showStopsInput
+                longStopLine := line.new(bar_index, longStop, bar_index, longStop, color = bullColorInput, style = line.style_dashed)
+        lowerState := STATE_IDLE
+    else if bar_index - lowerTagBar >= confirmWindowInput
+        lowerState := STATE_WALK
+else if lowerState == STATE_WALK and closedInsideLower
+    lowerState := STATE_IDLE
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+// The basis is the reversion target - it tints with the direction of the running reversion
+basisColor    = longActive ? bullColorInput : shortActive ? bearColorInput : bandColorInput
+bandLineColor = showBandsInput ? bandColorInput : na
+
+upperPlotId = plot(upperBand, "Upper Band", bandLineColor, 1)
+basisPlotId = plot(basis, "Basis (Reversion Target)", showBandsInput ? basisColor : na, 1)
+lowerPlotId = plot(lowerBand, "Lower Band", bandLineColor, 1)
+
+fill(basisPlotId, upperPlotId
+  , top_value    = upperBand
+  , bottom_value = basis
+  , top_color    = showBandsInput ? color.new(bandColorInput, FILL_EDGE_TRANSP) : na
+  , bottom_color = showBandsInput ? color.new(bandColorInput, FILL_BASIS_TRANSP) : na
+  , title        = "Upper Band Fill")
+
+fill(basisPlotId, lowerPlotId
+  , top_value    = basis
+  , bottom_value = lowerBand
+  , top_color    = showBandsInput ? color.new(bandColorInput, FILL_BASIS_TRANSP) : na
+  , bottom_color = showBandsInput ? color.new(bandColorInput, FILL_EDGE_TRANSP) : na
+  , title        = "Lower Band Fill")
+
+plotshape(showSetupsInput and longSetup, "Long Setup", shape.triangleup, location.belowbar, bullColorInput, size = size.tiny)
+plotshape(showSetupsInput and shortSetup, "Short Setup", shape.triangledown, location.abovebar, bearColorInput, size = size.tiny)
+plotshape(showResolutionInput and longFail, "Long Reversion Failed", shape.xcross, location.belowbar, bullColorInput, size = size.tiny)
+plotshape(showResolutionInput and shortFail, "Short Reversion Failed", shape.xcross, location.abovebar, bearColorInput, size = size.tiny)
+
+plot(showResolutionInput and longComplete ? longTargetLevel : na, "Long Target Touch", bullColorInput, 2, plot.style_circles)
+plot(showResolutionInput and shortComplete ? shortTargetLevel : na, "Short Target Touch", bearColorInput, 2, plot.style_circles)
+
+plot(showTagsInput and upperTagStart ? upperBand : na, "Upper Tag Marker", color.new(bearColorInput, TAG_MARKER_TRANSP), 2, plot.style_circles)
+plot(showTagsInput and lowerTagStart ? lowerBand : na, "Lower Tag Marker", color.new(bullColorInput, TAG_MARKER_TRANSP), 2, plot.style_circles)
+
+plot(rotationCount, "Basis Rotations", color = bandColorInput, display = display.data_window, precision = 0)
+plot(bandwidth * 100, "BandWidth %", color = bandColorInput, display = display.data_window, precision = 2)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+dashboardLocation = switch dashboardLocationInput
+    "Top Right"    => position.top_right
+    "Top Left"     => position.top_left
+    "Bottom Right" => position.bottom_right
+    => position.bottom_left
+
+dashboardTextSize = switch dashboardSizeInput
+    "Tiny"  => size.tiny
+    "Small" => size.small
+    => size.normal
+
+var table dashboardTable = table.new(dashboardLocation, 2, 5, bgcolor = color.new(chart.bg_color, 25), frame_color = color.new(chart.fg_color, 85), frame_width = 1)
+
+if barstate.islast and showDashboardInput
+    regimeText  = (rangeBackdrop ? "Range" : "Trend") + " (" + str.tostring(rotationCount, "#") + "/" + str.tostring(minRotationsInput) + ")"
+    regimeColor = rangeBackdrop ? bandColorInput : WARN_COLOR
+
+    volatilityText  = expansionFromBase ? "Expanding From Base" : "Clear"
+    volatilityColor = expansionFromBase ? WARN_COLOR : bandColorInput
+
+    setupText = longActive ? "Long Reversion" : shortActive ? "Short Reversion" : upperState == STATE_WATCH ? "Upper Tag Watch" : lowerState == STATE_WATCH ? "Lower Tag Watch" : upperState == STATE_WALK ? "Upper Band Walk" : lowerState == STATE_WALK ? "Lower Band Walk" : "None"
+    setupColor = longActive or lowerState == STATE_WATCH ? bullColorInput : shortActive or upperState == STATE_WATCH ? bearColorInput : upperState == STATE_WALK or lowerState == STATE_WALK ? WARN_COLOR : chart.fg_color
+
+    stopText   = longActive ? str.tostring(longStop, format.mintick) : shortActive ? str.tostring(shortStop, format.mintick) : "—"
+    targetText = longActive ? str.tostring(longTargetLevel, format.mintick) : shortActive ? str.tostring(shortTargetLevel, format.mintick) : "—"
+
+    table.cell(dashboardTable, 0, 0, "Regime",         text_color = chart.fg_color,  text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 0, regimeText,       text_color = regimeColor,     text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 1, "Volatility",     text_color = chart.fg_color,  text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 1, volatilityText,   text_color = volatilityColor, text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 2, "Setup",          text_color = chart.fg_color,  text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 2, setupText,        text_color = setupColor,      text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 3, "Invalidation",   text_color = chart.fg_color,  text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 3, stopText,         text_color = chart.fg_color,  text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 4, "Target",         text_color = chart.fg_color,  text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 4, targetText,       text_color = chart.fg_color,  text_size = dashboardTextSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(longSetup, "Long Setup (Lower Tag Reversion)", "Bollinger Band Tag Reversion long setup on {{ticker}}: a lower-band tag closed back inside the bands with the filters passing - rotation toward the target, invalidation beyond the tag extreme ({{interval}})")
+alertcondition(shortSetup, "Short Setup (Upper Tag Reversion)", "Bollinger Band Tag Reversion short setup on {{ticker}}: an upper-band tag closed back inside the bands with the filters passing - rotation toward the target, invalidation beyond the tag extreme ({{interval}})")
+alertcondition(longComplete, "Long Reversion Completed", "Bollinger Band Tag Reversion on {{ticker}}: the long reversion reached its target - price rotated back from the lower-band tag ({{interval}})")
+alertcondition(shortComplete, "Short Reversion Completed", "Bollinger Band Tag Reversion on {{ticker}}: the short reversion reached its target - price rotated back from the upper-band tag ({{interval}})")
+alertcondition(longFail, "Long Reversion Failed", "Bollinger Band Tag Reversion on {{ticker}}: the long reversion failed - price broke beyond the tag extreme instead of rotating back ({{interval}})")
+alertcondition(shortFail, "Short Reversion Failed", "Bollinger Band Tag Reversion on {{ticker}}: the short reversion failed - price broke beyond the tag extreme instead of rotating back ({{interval}})")
+alertcondition(upperTagStart, "Upper Band Tag", "Upper Bollinger Band tag on {{ticker}}: price is stretched against its recent distribution - not a signal by itself; the setup needs a close back inside with a range backdrop ({{interval}})")
+alertcondition(lowerTagStart, "Lower Band Tag", "Lower Bollinger Band tag on {{ticker}}: price is stretched against its recent distribution - not a signal by itself; the setup needs a close back inside with a range backdrop ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

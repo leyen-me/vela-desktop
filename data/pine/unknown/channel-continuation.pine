@@ -1,0 +1,388 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Channel Continuation"
+  , shorttitle       = "Channel Continuation"
+  , overlay          = true
+  , max_lines_count  = 500
+  , max_labels_count = 500
+  , max_bars_back    = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+int ST_SCAN   = 0
+int ST_ACTIVE = 1
+int ST_POST   = 2
+
+int   MAX_PIVOTS    = 8
+int   MAX_FIT       = 4
+int   VOL_SMA_LEN   = 20
+float MIN_WIDTH_ATR = 0.25
+
+string SET1 = "Channel Detection"
+string SET2 = "Prior Trend & Proportion"
+string SET3 = "Breakout & Targets"
+string SET4 = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+pivotLenInput        = input.int(5, "Pivot Length", minval = 2, maxval = 25, group = SET1, tooltip = "Bars required on each side to confirm a swing high or low. Confirmed pivots are the touch points used to construct the channel parallels.")
+minTouchesInput      = input.int(2, "Min Touches Per Side", minval = 2, maxval = 4, group = SET1, tooltip = "Minimum pivot touches required on each parallel. Two per side is the classical minimum; more touches make the structure more meaningful.")
+minSpanInput         = input.int(15, "Channel Length   Min", minval = 8, maxval = 100, inline = "len", group = SET1, tooltip = "Minimum channel duration in bars - separates a proper channel from a brief flag-like pause.")
+maxSpanInput         = input.int(80, "Max", minval = 20, maxval = 200, inline = "len", group = SET1, tooltip = "Minimum and maximum channel duration in bars. The lower bound separates a proper channel from a brief flag; the upper bound drops stale structures.")
+parallelTolInput     = input.float(25, "Parallel Tolerance %", minval = 5, maxval = 50, step = 5, group = SET1, tooltip = "Maximum divergence between the two fitted boundary lines over the channel span, as a percentage of channel width. Lower values demand cleaner parallels.")
+containTolInput      = input.float(15, "Touch Tolerance %", minval = 5, maxval = 40, step = 5, group = SET1, tooltip = "Tolerance around each parallel, as a percentage of channel width. Pivots must sit within it to count as touches, and closes must stay within it for the drift to qualify as a contained channel.")
+
+atrLenInput          = input.int(14, "ATR Length", minval = 1, maxval = 100, group = SET2, tooltip = "Average True Range length used to normalize the impulse-strength and channel-slope filters across symbols and timeframes.")
+impulseLenInput      = input.int(20, "Impulse Lookback", minval = 5, maxval = 100, group = SET2, tooltip = "Bars immediately before the channel used to measure the prior impulse whose continuation the channel is expected to interrupt. Either the channel or the trend alone is not the setup.")
+impulseStrengthInput = input.float(3, "Min Impulse Strength (ATR)", minval = 0.5, maxval = 10, step = 0.5, group = SET2, tooltip = "Minimum net price change over the impulse lookback, in ATR multiples, for the prior move to count as a clear trend.")
+requireCounterInput  = input.bool(true, "Require Countertrend Slope", group = SET2, tooltip = "Keep only channels sloping against the prior trend - the classical corrective shape. A channel sloping with the trend reads as the trend itself, not a pause within it.")
+minDriftInput        = input.float(1, "Min Channel Drift (ATR)", minval = 0, maxval = 5, step = 0.25, group = SET2, tooltip = "Minimum total drift of the channel midline over its span, in ATR multiples. Filters out flat, rectangle-like consolidations - the slope is part of the pattern's corrective character.")
+maxRetraceInput      = input.float(80, "Max Retracement %", minval = 20, maxval = 150, step = 5, group = SET2, tooltip = "Maximum share of the prior impulse the correction may retrace. A correction retracing most of the impulse weakens the continuation case.")
+durationMultInput    = input.float(2.5, "Max Duration (x Impulse)", minval = 0.5, maxval = 5, step = 0.5, group = SET2, tooltip = "Maximum channel duration as a multiple of the impulse lookback. A correction lasting far longer than the impulse weakens the continuation case.")
+
+breakBufInput        = input.float(5, "Breakout Buffer %", minval = 0, maxval = 50, step = 2.5, group = SET3, tooltip = "Extra close penetration beyond the boundary, as a percentage of channel width, required for a break to count as decisive.")
+failWindowInput      = input.int(8, "False-Break Window", minval = 1, maxval = 50, group = SET3, tooltip = "Bars after a continuation break during which a close back inside the channel is flagged as a false breakout - the failure signal calling for a fast exit.")
+volumeFilterInput    = input.bool(false, "Volume Filter", group = SET3, tooltip = "Require the conventional volume signature: contraction inside the channel versus the impulse, and expansion on the breakout bar. With the filter on, a break without expansion voids the pattern instead of signaling.")
+volExpandInput       = input.float(1.5, "Volume Expansion (x Average)", minval = 1, maxval = 5, step = 0.25, group = SET3, tooltip = "Breakout-bar volume must exceed its 20-bar average by this multiple when the volume filter is enabled.")
+showWidthTargetInput = input.bool(true, "Width Target", group = SET3, tooltip = "Project the channel's width from the breakout point - the classical channel objective.")
+showMeasuredTargetInput = input.bool(true, "Measured-Move Target", group = SET3, tooltip = "Project the prior impulse's height from the breakout point - the measured-move objective.")
+
+channelColorInput    = input.color(#787b86, "Channel", group = SET4)
+fillTranspInput      = input.int(90, "Fill Transparency", minval = 60, maxval = 100, group = SET4, tooltip = "Transparency of the fill between the channel parallels.")
+bullColorInput       = input.color(#089981, "Bullish", inline = "dir", group = SET4)
+bearColorInput       = input.color(#f23645, "Bearish", inline = "dir", group = SET4)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Least-squares line through the last `useN` stored pivots, x measured from `refBar`, returning [slope, value at refBar]
+fitLine(array<int> xsArray, array<float> ysArray, int useN, int refBar) =>
+    float sx  = 0.0
+    float sy  = 0.0
+    float sxy = 0.0
+    float sxx = 0.0
+    int   sz  = array.size(xsArray)
+    for k = sz - useN to sz - 1
+        float xv = array.get(xsArray, k) - refBar
+        float yv = array.get(ysArray, k)
+        sx  += xv
+        sy  += yv
+        sxy += xv * yv
+        sxx += xv * xv
+    float n     = useN
+    float den   = n * sxx - sx * sx
+    float slope = den != 0 ? (n * sxy - sx * sy) / den : 0.0
+    float base  = (sy - slope * sx) / n
+    [slope, base]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Series & Pattern State
+//---------------------------------------------------------------------------------------------------------------------{
+float atrVal = ta.atr(atrLenInput)
+float cumVol = ta.cum(nz(volume))
+float volSma = ta.sma(nz(volume), VOL_SMA_LEN)
+
+float phVal = ta.pivothigh(pivotLenInput, pivotLenInput)
+float plVal = ta.pivotlow(pivotLenInput, pivotLenInput)
+
+int maxDurBars = math.round(durationMultInput * impulseLenInput)
+
+var array<int>   phBarsArray   = array.new<int>()
+var array<float> phPricesArray = array.new<float>()
+var array<int>   plBarsArray   = array.new<int>()
+var array<float> plPricesArray = array.new<float>()
+
+var int patternState = ST_SCAN
+
+var int   chStartB     = na
+var float chUpS        = na
+var float chUpB        = na
+var float chLoS        = na
+var float chLoB        = na
+var int   chDir        = 0
+var float chImpMove    = na
+var float chImpH       = na
+var float chW          = na
+var float chMinC       = na
+var float chMaxC       = na
+var float chStartClose = na
+var int   breakB       = na
+
+var line     upLineId     = na
+var line     loLineId     = na
+var linefill chFillId     = na
+var line     wTgtLineId   = na
+var line     mTgtLineId   = na
+var label    wTgtLabelId  = na
+var label    mTgtLabelId  = na
+
+bool newChannelEvt   = false
+bool touchEvt        = false
+bool bullBreakEvt    = false
+bool bearBreakEvt    = false
+bool counterBreakEvt = false
+bool falseBreakEvt   = false
+bool doExpire        = false
+bool doResolve       = false
+
+// Pivot collection
+bool newPivot = false
+
+if not na(phVal)
+    array.push(phBarsArray, bar_index - pivotLenInput)
+    array.push(phPricesArray, phVal)
+    if array.size(phBarsArray) > MAX_PIVOTS
+        array.shift(phBarsArray)
+        array.shift(phPricesArray)
+    newPivot := true
+
+if not na(plVal)
+    array.push(plBarsArray, bar_index - pivotLenInput)
+    array.push(plPricesArray, plVal)
+    if array.size(plBarsArray) > MAX_PIVOTS
+        array.shift(plBarsArray)
+        array.shift(plPricesArray)
+    newPivot := true
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Active Channel Management
+//---------------------------------------------------------------------------------------------------------------------{
+if patternState == ST_ACTIVE
+    int   spanB = bar_index - chStartB
+    float upNow = chUpB + chUpS * spanB
+    float loNow = chLoB + chLoS * spanB
+    line.set_xy2(upLineId, bar_index, upNow)
+    line.set_xy2(loLineId, bar_index, loNow)
+    chMinC := math.min(chMinC, close)
+    chMaxC := math.max(chMaxC, close)
+    float retrNow = chDir == 1 ? (chStartClose - chMinC) / chImpMove : (chMaxC - chStartClose) / -chImpMove
+    bool  tooLong = spanB > maxSpanInput or spanB > maxDurBars
+    bool  tooDeep = retrNow > maxRetraceInput / 100
+    float wNow    = upNow - loNow
+    float buf     = breakBufInput / 100 * chW
+    bool  bullBrk = close > upNow + buf
+    bool  bearBrk = close < loNow - buf
+    bool  withBrk    = chDir == 1 ? bullBrk : bearBrk
+    bool  againstBrk = chDir == 1 ? bearBrk : bullBrk
+    if tooLong or tooDeep
+        doExpire := true
+    else if withBrk
+        bool volExpanded = not volumeFilterInput or cumVol == 0 or na(volSma) or nz(volume) > volSma * volExpandInput
+        if volExpanded
+            patternState := ST_POST
+            breakB       := bar_index
+            float brkBound = chDir == 1 ? upNow : loNow
+            color dirCol   = chDir == 1 ? bullColorInput : bearColorInput
+            label.new(bar_index, chDir == 1 ? low : high, chDir == 1 ? "Continuation ▲" : "Continuation ▼", style = chDir == 1 ? label.style_label_up : label.style_label_down, color = #00000000, textcolor = dirCol, size = size.small)
+            int tgtLen = math.max(10, spanB / 2)
+            wTgtLineId  := na
+            wTgtLabelId := na
+            mTgtLineId  := na
+            mTgtLabelId := na
+            if showWidthTargetInput
+                float wTgt = brkBound + chDir * wNow
+                wTgtLineId  := line.new(bar_index, wTgt, bar_index + tgtLen, wTgt, color = dirCol, style = line.style_dotted)
+                wTgtLabelId := label.new(bar_index + tgtLen, wTgt, "Width target", style = label.style_label_left, color = #00000000, textcolor = dirCol, size = size.tiny)
+            if showMeasuredTargetInput
+                float mTgt = brkBound + chDir * chImpH
+                mTgtLineId  := line.new(bar_index, mTgt, bar_index + tgtLen, mTgt, color = dirCol, style = line.style_dotted)
+                mTgtLabelId := label.new(bar_index + tgtLen, mTgt, "Measured move", style = label.style_label_left, color = #00000000, textcolor = dirCol, size = size.tiny)
+            if chDir == 1
+                bullBreakEvt := true
+            else
+                bearBreakEvt := true
+        else
+            doExpire := true
+    else if againstBrk
+        color ctCol = chDir == 1 ? bearColorInput : bullColorInput
+        label.new(bar_index, chDir == 1 ? high : low, "Trend change?", style = chDir == 1 ? label.style_label_down : label.style_label_up, color = #00000000, textcolor = ctCol, size = size.small)
+        counterBreakEvt := true
+        doResolve       := true
+    else
+        float tolBnd = containTolInput / 100 * chW
+        touchEvt := chDir == 1 ? low <= loNow + tolBnd : high >= upNow - tolBnd
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Post-Break Management
+//---------------------------------------------------------------------------------------------------------------------{
+if patternState == ST_POST
+    int   spanB = bar_index - chStartB
+    float bound = chDir == 1 ? chUpB + chUpS * spanB : chLoB + chLoS * spanB
+    bool  backInside = chDir == 1 ? close < bound : close > bound
+    if backInside
+        color fbCol = chDir == 1 ? bearColorInput : bullColorInput
+        label.new(bar_index, chDir == 1 ? high : low, "False break", style = chDir == 1 ? label.style_label_down : label.style_label_up, color = #00000000, textcolor = fbCol, size = size.small)
+        line.delete(wTgtLineId)
+        line.delete(mTgtLineId)
+        label.delete(wTgtLabelId)
+        label.delete(mTgtLabelId)
+        wTgtLineId    := na
+        mTgtLineId    := na
+        wTgtLabelId   := na
+        mTgtLabelId   := na
+        falseBreakEvt := true
+        doResolve     := true
+    else if bar_index - breakB >= failWindowInput
+        doResolve := true
+
+// Shared cleanup: expiry mutes the drawing, resolution restarts pivot collection
+if doExpire
+    linefill.delete(chFillId)
+    line.set_color(upLineId, color.new(chart.fg_color, 70))
+    line.set_color(loLineId, color.new(chart.fg_color, 70))
+    line.set_style(upLineId, line.style_dashed)
+    line.set_style(loLineId, line.style_dashed)
+    patternState := ST_SCAN
+
+if doResolve
+    array.clear(phBarsArray)
+    array.clear(phPricesArray)
+    array.clear(plBarsArray)
+    array.clear(plPricesArray)
+    patternState := ST_SCAN
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Channel Detection
+//---------------------------------------------------------------------------------------------------------------------{
+bool canAttempt = patternState == ST_SCAN and newPivot and not na(atrVal) and atrVal > 0 and array.size(phBarsArray) >= minTouchesInput and array.size(plBarsArray) >= minTouchesInput
+
+if canAttempt
+    float bestScore   = -1.0
+    float bUpS        = na
+    float bUpB        = na
+    float bLoS        = na
+    float bLoB        = na
+    int   bStart      = na
+    int   bDir        = 0
+    float bImpMove    = na
+    float bW          = na
+    float bMinC       = na
+    float bMaxC       = na
+    float bStartClose = na
+    int szH  = array.size(phBarsArray)
+    int szL  = array.size(plBarsArray)
+    int maxH = math.min(MAX_FIT, szH)
+    int maxL = math.min(MAX_FIT, szL)
+    for hN = minTouchesInput to maxH
+        for lN = minTouchesInput to maxL
+            int firstHB  = array.get(phBarsArray, szH - hN)
+            int firstLB  = array.get(plBarsArray, szL - lN)
+            int lastHB   = array.get(phBarsArray, szH - 1)
+            int lastLB   = array.get(plBarsArray, szL - 1)
+            int startBar = math.min(firstHB, firstLB)
+            int spanB    = bar_index - startBar
+            if spanB < minSpanInput or spanB > maxSpanInput or spanB > maxDurBars
+                continue
+            if math.max(firstHB, firstLB) >= math.min(lastHB, lastLB)
+                continue
+            int impOff = spanB + impulseLenInput
+            float impStartClose = close[impOff]
+            if na(impStartClose)
+                continue
+            float startClose = close[spanB]
+            float impMove    = startClose - impStartClose
+            if math.abs(impMove) < impulseStrengthInput * atrVal
+                continue
+            int tDir = impMove > 0 ? 1 : -1
+            [uS, uB] = fitLine(phBarsArray, phPricesArray, hN, startBar)
+            [lS, lB] = fitLine(plBarsArray, plPricesArray, lN, startBar)
+            float wS = uB - lB
+            float wE = uB + uS * spanB - (lB + lS * spanB)
+            if wS <= 0 or wE <= 0
+                continue
+            float avgW = (wS + wE) / 2
+            if avgW < MIN_WIDTH_ATR * atrVal
+                continue
+            if math.abs(uS - lS) * spanB > parallelTolInput / 100 * avgW
+                continue
+            float chanSlope = (uS + lS) / 2
+            if math.abs(chanSlope) * spanB < minDriftInput * atrVal
+                continue
+            if requireCounterInput and chanSlope * tDir >= 0
+                continue
+            float tol = containTolInput / 100 * avgW
+            bool touchesOk = true
+            for k = szH - hN to szH - 1
+                float py = array.get(phPricesArray, k)
+                int   pb = array.get(phBarsArray, k)
+                if math.abs(py - (uB + uS * (pb - startBar))) > tol
+                    touchesOk := false
+            for k = szL - lN to szL - 1
+                float py = array.get(plPricesArray, k)
+                int   pb = array.get(plBarsArray, k)
+                if math.abs(py - (lB + lS * (pb - startBar))) > tol
+                    touchesOk := false
+            if not touchesOk
+                continue
+            float minC = close
+            float maxC = close
+            bool containOk = true
+            for o = 0 to spanB
+                float cv  = close[o]
+                int   ob  = bar_index - o
+                float upV = uB + uS * (ob - startBar)
+                float loV = lB + lS * (ob - startBar)
+                if cv > upV + tol or cv < loV - tol
+                    containOk := false
+                    break
+                minC := math.min(minC, cv)
+                maxC := math.max(maxC, cv)
+            if not containOk
+                continue
+            float retr = tDir == 1 ? (startClose - minC) / impMove : (maxC - startClose) / -impMove
+            if retr > maxRetraceInput / 100
+                continue
+            float chanAvgVol = (cumVol - cumVol[spanB]) / spanB
+            float impAvgVol  = (cumVol[spanB] - cumVol[impOff]) / impulseLenInput
+            bool  hasVolC    = cumVol > 0 and not na(impAvgVol) and impAvgVol > 0
+            if volumeFilterInput and hasVolC and chanAvgVol >= impAvgVol
+                continue
+            float score = (hN + lN) * 10000 + spanB
+            if score > bestScore
+                bestScore   := score
+                bUpS        := uS
+                bUpB        := uB
+                bLoS        := lS
+                bLoB        := lB
+                bStart      := startBar
+                bDir        := tDir
+                bImpMove    := impMove
+                bW          := avgW
+                bMinC       := minC
+                bMaxC       := maxC
+                bStartClose := startClose
+    if bestScore > 0
+        patternState := ST_ACTIVE
+        chStartB     := bStart
+        chUpS        := bUpS
+        chUpB        := bUpB
+        chLoS        := bLoS
+        chLoB        := bLoB
+        chDir        := bDir
+        chImpMove    := bImpMove
+        chImpH       := math.abs(bImpMove)
+        chW          := bW
+        chMinC       := bMinC
+        chMaxC       := bMaxC
+        chStartClose := bStartClose
+        int spanNow = bar_index - bStart
+        upLineId := line.new(bStart, bUpB, bar_index, bUpB + bUpS * spanNow, color = channelColorInput)
+        loLineId := line.new(bStart, bLoB, bar_index, bLoB + bLoS * spanNow, color = channelColorInput)
+        chFillId := linefill.new(upLineId, loLineId, color.new(channelColorInput, fillTranspInput))
+        newChannelEvt := true
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(newChannelEvt, "Continuation Channel Detected", "Corrective parallel channel confirmed against the prior trend.")
+alertcondition(touchEvt, "Corrective Parallel Touch", "Price is testing the channel parallel opposite the expected break - anticipatory entry zone.")
+alertcondition(bullBreakEvt, "Bullish Continuation Breakout", "Decisive close above the channel's upper boundary in the direction of the prior uptrend.")
+alertcondition(bearBreakEvt, "Bearish Continuation Breakout", "Decisive close below the channel's lower boundary in the direction of the prior downtrend.")
+alertcondition(counterBreakEvt, "Countertrend Channel Break", "Channel broke against the prior trend - possible trend change rather than continuation.")
+alertcondition(falseBreakEvt, "False Breakout", "Close back inside the channel after the continuation break - failure signal.")
+
+//---------------------------------------------------------------------------------------------------------------------}

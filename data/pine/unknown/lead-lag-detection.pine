@@ -1,0 +1,373 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Lead-lag Detection"
+  , shorttitle       = "Lead-lag Detection"
+  , overlay          = false
+  , format           = format.price
+  , precision        = 2
+  , max_lines_count  = 500
+  , max_labels_count = 100)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+float UPPER_BOUND = 1.0  // Hard upper bound of the cross-correlation
+float LOWER_BOUND = -1.0 // Hard lower bound of the cross-correlation
+
+int HALF_TRANSP  = 50
+int FULL_TRANSP  = 100
+int MUTED_TRANSP = 40
+int WEAK_TRANSP  = 70
+
+string RET_LOG = "Log"
+string RET_PCT = "Percent"
+
+string GROUP_MAIN    = "Lead-Lag Detection"
+string GROUP_PROFILE = "Cross-Correlation Profile"
+string GROUP_DASH    = "Dashboard"
+string GROUP_STYLE   = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+symbolInput = input.symbol("SP:SPX", "Comparison Symbol"
+  , group   = GROUP_MAIN
+  , tooltip = "Second instrument of the pair. The chart symbol's returns are cross-correlated against this series across the whole lag sweep. A peak at a positive lag means the chart symbol leads the comparison; a peak at a negative lag means the comparison leads the chart symbol.")
+
+sourceInput = input.source(close, "Source"
+  , group   = GROUP_MAIN
+  , tooltip = "Price source the returns are computed from, applied to both instruments.")
+
+returnTypeInput = input.string(RET_LOG, "Returns"
+  , options = [RET_LOG, RET_PCT]
+  , group   = GROUP_MAIN
+  , tooltip = "Return definition used before correlating. Returns, not raw prices, avoid the spurious correlation that shared trends produce. Returns are sampled only on bars where the comparison symbol prints fresh data, so nonsynchronous sessions and stale prices do not fabricate lags.")
+
+windowInput = input.int(100, "Correlation Window"
+  , minval  = 10
+  , maxval  = 250
+  , group   = GROUP_MAIN
+  , tooltip = "Number of overlapping return observations (n) used at every lag of the sweep. Also sets the approximate significance bounds at 2/sqrt(n) - serial dependence in returns makes these bounds optimistic. Lead-lag structure is unstable, so the window rolls and the whole sweep is recomputed on every bar.")
+
+maxLagInput = input.int(20, "Max Lag"
+  , minval  = 1
+  , maxval  = 40
+  , group   = GROUP_MAIN
+  , tooltip = "The sweep covers lags from -K to +K bars. A wider sweep can find longer leads but multiplies the number of comparisons, raising the odds that a spurious peak clears the significance bounds.")
+
+showProfileInput = input.bool(true, "Show Profile"
+  , group   = GROUP_PROFILE
+  , tooltip = "Draws the current cross-correlation function to the right of the last bar: one column per lag, the zero-lag axis marked, and the peak lag flagged. Columns right of the axis are lags where the chart symbol leads; columns left of it, where the comparison leads.")
+
+profileOffsetInput = input.int(5, "Profile Offset"
+  , minval  = 1
+  , maxval  = 50
+  , group   = GROUP_PROFILE
+  , tooltip = "Distance, in bars, between the last bar and the left edge of the profile.")
+
+showDashInput = input.bool(true, "Show Dashboard"
+  , group   = GROUP_DASH
+  , tooltip = "Summary panel with the detected leader, peak lag, peak cross-correlation, the lag-0 correlation for comparison, and the significance bound.")
+
+dashLocationInput = input.string("Top Right", "Location"
+  , options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"]
+  , group   = GROUP_DASH
+  , tooltip = "Corner of the pane the dashboard is anchored to.")
+
+dashSizeInput = input.string("Small", "Size"
+  , options = ["Tiny", "Small", "Normal"]
+  , group   = GROUP_DASH
+  , tooltip = "Text size of the dashboard.")
+
+showLagZeroInput = input.bool(true, "Lag-0 Correlation"
+  , group   = GROUP_STYLE
+  , tooltip = "Plots the plain contemporaneous correlation as a reference, so the value added by shifting one series in time is visible at a glance.")
+
+showPeakLagInput = input.bool(false, "Normalized Peak Lag"
+  , group   = GROUP_STYLE
+  , tooltip = "Plots the peak lag divided by the max lag (from -1 to +1) as a step line. Useful for rolling monitoring: a relationship is only worth trusting while the peak lag and its sign persist.")
+
+showBoundsInput = input.bool(true, "Significance Bounds"
+  , group   = GROUP_STYLE
+  , tooltip = "Dashed levels at +/- 2/sqrt(n), the common approximate significance bounds for a sample cross-correlation.")
+
+posColorInput = input.color(#089981, "Positive Correlation", group = GROUP_STYLE)
+
+negColorInput = input.color(#f23645, "Negative Correlation", group = GROUP_STYLE)
+
+neutralColorInput = input.color(#5b9cf6, "Lag-0 Reference", group = GROUP_STYLE)
+
+levelsColorInput = input.color(#787b86, "Levels & Peak Lag", group = GROUP_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Return between two sampled prices, per the selected definition
+computeReturn(float currentValue, float previousValue, bool useLogReturns) =>
+    float result = na
+    if useLogReturns
+        result := currentValue > 0 and previousValue > 0 ? math.log(currentValue / previousValue) : na
+    else
+        result := previousValue != 0 ? currentValue / previousValue - 1 : na
+    result
+
+// Sample cross-correlation at one lag: the Pearson correlation of the two
+// length-n segments, i.e. SUM((x_t - mean_x) * (y_(t+k) - mean_y)) / (n * sd_x * sd_y)
+// with the means and standard deviations taken over the n overlapping observations
+pearsonAtLag(array<float> xArray, array<float> yArray, int xShift, int yShift, int n) =>
+    float sumX = 0.0
+    float sumY = 0.0
+    for j = 0 to n - 1
+        sumX += array.get(xArray, j + xShift)
+        sumY += array.get(yArray, j + yShift)
+    float meanX = sumX / n
+    float meanY = sumY / n
+    float sumXY = 0.0
+    float sumXX = 0.0
+    float sumYY = 0.0
+    for j = 0 to n - 1
+        float dx = array.get(xArray, j + xShift) - meanX
+        float dy = array.get(yArray, j + yShift) - meanY
+        sumXY += dx * dy
+        sumXX += dx * dx
+        sumYY += dy * dy
+    sumXX > 0 and sumYY > 0 ? sumXY / math.sqrt(sumXX * sumYY) : na
+
+// Strips the exchange prefix from a symbol string for display
+tickerOf(string symbolText) =>
+    str.contains(symbolText, ":") ? array.get(str.split(symbolText, ":"), 1) : symbolText
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+
+int   capacityBars = windowInput + maxLagInput
+float sigBound     = 2.0 / math.sqrt(windowInput)
+bool  useLog       = returnTypeInput == RET_LOG
+
+var string chartTicker = syminfo.ticker
+var string compTicker  = tickerOf(symbolInput)
+
+// Comparison series with its own bar time - a change in time identifies a fresh
+// comparison bar, so stale repeats from session mismatches are never sampled
+[compSrc, compTime] = request.security(symbolInput, timeframe.period, [sourceInput, time])
+
+bool compFresh = not na(compTime) and compTime != nz(compTime[1])
+
+// Both instruments are sampled only on common (fresh) observations, and each return
+// spans the interval since the previous common observation - the timestamp-alignment
+// hygiene that removes the most frequent source of spurious lags
+var float lastChartSrc = na
+var float lastCompSrc  = na
+
+float chartRet = na
+float compRet  = na
+
+if compFresh and not na(sourceInput) and not na(compSrc)
+    chartRet     := computeReturn(sourceInput, lastChartSrc, useLog)
+    compRet      := computeReturn(compSrc, lastCompSrc, useLog)
+    lastChartSrc := sourceInput
+    lastCompSrc  := compSrc
+
+// Rolling history of paired returns, newest first. n + K observations give every
+// lag of the sweep exactly n overlapping pairs
+var array<float> chartRetArray = array.new<float>()
+var array<float> compRetArray  = array.new<float>()
+
+if not na(chartRet) and not na(compRet)
+    array.unshift(chartRetArray, chartRet)
+    array.unshift(compRetArray, compRet)
+    if array.size(chartRetArray) > capacityBars
+        array.pop(chartRetArray)
+        array.pop(compRetArray)
+
+bool ready = array.size(chartRetArray) == capacityBars
+
+// The lag sweep. With x the chart symbol and y the comparison, lag k pairs x_t with
+// y_(t+k): under this convention a peak at positive k means the chart symbol leads
+// the comparison by k bars, and a peak at negative k means the comparison leads
+var array<float> ccfArray = array.new<float>(2 * maxLagInput + 1, na)
+
+if ready
+    for k = -maxLagInput to maxLagInput
+        int xShift = math.max(k, 0)
+        int yShift = math.max(-k, 0)
+        array.set(ccfArray, k + maxLagInput, pearsonAtLag(chartRetArray, compRetArray, xShift, yShift, windowInput))
+
+// Peak of the cross-correlation function by absolute value, scanned outward from
+// lag 0 so the smallest lag wins exact ties
+float peakCcf = na
+int   peakLag = na
+
+if ready
+    float bestAbs = -1.0
+    for a = 0 to maxLagInput
+        float vPos = array.get(ccfArray, maxLagInput + a)
+        if not na(vPos) and math.abs(vPos) > bestAbs
+            bestAbs := math.abs(vPos)
+            peakCcf := vPos
+            peakLag := a
+        if a > 0
+            float vNeg = array.get(ccfArray, maxLagInput - a)
+            if not na(vNeg) and math.abs(vNeg) > bestAbs
+                bestAbs := math.abs(vNeg)
+                peakCcf := vNeg
+                peakLag := -a
+
+float lagZeroCcf = ready ? array.get(ccfArray, maxLagInput) : na
+
+// A lead-lag relationship is called only while the peak sits at a nonzero lag AND
+// clears the approximate significance bounds
+bool significant = ready and not na(peakCcf) and math.abs(peakCcf) > sigBound
+int  leadState   = significant and peakLag > 0 ? 1 : significant and peakLag < 0 ? -1 : 0
+
+bool newLeadDetected = leadState != 0 and nz(leadState[1]) == 0
+bool leaderFlip      = leadState != 0 and nz(leadState[1]) == -leadState
+bool leadLost        = leadState == 0 and nz(leadState[1]) != 0
+bool peakLagShift    = ready and not na(peakLag) and not na(peakLag[1]) and peakLag != peakLag[1]
+
+float normalizedPeakLag = na(peakLag) ? na : 1.0 * peakLag / maxLagInput
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+
+color peakColor = not na(peakCcf) and peakCcf < 0 ? negColorInput : posColorInput
+
+peakPlotId = plot(peakCcf, "Peak Cross-Correlation", peakColor, 1)
+zeroPlotId = plot(0, "Zero Anchor", editable = false, display = display.none)
+
+fill(peakPlotId, zeroPlotId
+  , top_value    = math.max(nz(peakCcf), 0)
+  , bottom_value = math.min(nz(peakCcf), 0)
+  , top_color    = nz(peakCcf) > 0 ? color.new(posColorInput, HALF_TRANSP) : color.new(negColorInput, FULL_TRANSP)
+  , bottom_color = nz(peakCcf) > 0 ? color.new(posColorInput, FULL_TRANSP) : color.new(negColorInput, HALF_TRANSP)
+  , title        = "Gradient Fill")
+
+plot(showLagZeroInput ? lagZeroCcf : na, "Lag-0 Correlation", color.new(neutralColorInput, 30), 1)
+
+plot(showPeakLagInput ? normalizedPeakLag : na, "Normalized Peak Lag", color.new(levelsColorInput, 20), 1, plot.style_stepline)
+
+hline(UPPER_BOUND, "Upper Bound", color.new(levelsColorInput, HALF_TRANSP), hline.style_dotted)
+hline(0, "Zero Line", color.new(levelsColorInput, HALF_TRANSP), hline.style_dotted)
+hline(LOWER_BOUND, "Lower Bound", color.new(levelsColorInput, HALF_TRANSP), hline.style_dotted)
+
+// Approximate significance bounds at +/- 2/sqrt(n) - dashed, input-derived levels
+var line upperBoundLine = na
+var line lowerBoundLine = na
+
+if showBoundsInput and na(upperBoundLine)
+    upperBoundLine := line.new(bar_index, sigBound, bar_index + 1, sigBound, extend = extend.both, style = line.style_dashed, color = color.new(levelsColorInput, 30))
+    lowerBoundLine := line.new(bar_index, -sigBound, bar_index + 1, -sigBound, extend = extend.both, style = line.style_dashed, color = color.new(levelsColorInput, 30))
+
+// Cross-correlation profile: the whole CCF drawn to the right of the last bar,
+// one column per lag - sign sets the hue, magnitude the intensity
+var array<line>  profileLineArray  = array.new<line>()
+var array<label> profileLabelArray = array.new<label>()
+
+if barstate.islast and showProfileInput and ready
+    for eachLine in profileLineArray
+        line.delete(eachLine)
+    array.clear(profileLineArray)
+    for eachLabel in profileLabelArray
+        label.delete(eachLabel)
+    array.clear(profileLabelArray)
+
+    int   baseX   = bar_index + profileOffsetInput
+    int   axisX   = baseX + maxLagInput
+    float profMin = 0.0
+    float profMax = 0.0
+
+    for k = -maxLagInput to maxLagInput
+        float ccfVal = array.get(ccfArray, k + maxLagInput)
+        if not na(ccfVal)
+            profMin := math.min(profMin, ccfVal)
+            profMax := math.max(profMax, ccfVal)
+            color columnColor = ccfVal >= 0
+              ? color.from_gradient(ccfVal, 0, UPPER_BOUND, color.new(posColorInput, WEAK_TRANSP), posColorInput)
+              : color.from_gradient(ccfVal, LOWER_BOUND, 0, negColorInput, color.new(negColorInput, WEAK_TRANSP))
+            array.push(profileLineArray, line.new(baseX + k + maxLagInput, 0, baseX + k + maxLagInput, ccfVal, color = columnColor, width = 2))
+
+    array.push(profileLineArray, line.new(baseX - 1, 0, baseX + 2 * maxLagInput + 1, 0, color = color.new(chart.fg_color, 60), style = line.style_dotted))
+    array.push(profileLineArray, line.new(axisX, profMin, axisX, profMax, color = color.new(chart.fg_color, WEAK_TRANSP), style = line.style_dotted))
+
+    if not na(peakLag) and not na(peakCcf)
+        string peakText  = (peakLag > 0 ? "+" : "") + str.tostring(peakLag)
+        color  peakGrade = peakCcf >= 0 ? posColorInput : negColorInput
+        array.push(profileLabelArray, label.new(baseX + peakLag + maxLagInput, peakCcf, peakText
+          , style     = peakCcf >= 0 ? label.style_label_down : label.style_label_up
+          , textcolor = peakGrade
+          , color     = #00000000
+          , size      = size.small))
+
+    array.push(profileLabelArray, label.new(baseX, profMin, "-" + str.tostring(maxLagInput) + "\n" + compTicker + " leads"
+      , style = label.style_label_up, textcolor = color.new(chart.fg_color, MUTED_TRANSP), color = #00000000, size = size.tiny))
+    array.push(profileLabelArray, label.new(axisX, profMin, "0"
+      , style = label.style_label_up, textcolor = color.new(chart.fg_color, MUTED_TRANSP), color = #00000000, size = size.tiny))
+    array.push(profileLabelArray, label.new(baseX + 2 * maxLagInput, profMin, "+" + str.tostring(maxLagInput) + "\n" + chartTicker + " leads"
+      , style = label.style_label_up, textcolor = color.new(chart.fg_color, MUTED_TRANSP), color = #00000000, size = size.tiny))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+
+dashLocation = switch dashLocationInput
+    "Top Left"     => position.top_left
+    "Bottom Right" => position.bottom_right
+    "Bottom Left"  => position.bottom_left
+    => position.top_right
+
+dashTextSize = switch dashSizeInput
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    => size.small
+
+if barstate.islast and showDashInput
+    var table dashTable = table.new(dashLocation, 2, 6, bgcolor = color.new(chart.bg_color, 20), frame_color = color.new(chart.fg_color, 80), frame_width = 1, border_color = color.new(chart.fg_color, 90), border_width = 1)
+
+    string lagMagText = na(peakLag) ? "" : str.tostring(math.abs(peakLag)) + (math.abs(peakLag) == 1 ? " bar" : " bars")
+
+    string leaderText = not ready ? "Warming up " + str.tostring(array.size(chartRetArray)) + "/" + str.tostring(capacityBars)
+      : na(peakCcf) ? "Undefined (flat window)"
+      : not significant ? "No significant lead"
+      : peakLag > 0 ? chartTicker + " leads by " + lagMagText
+      : peakLag < 0 ? compTicker + " leads by " + lagMagText
+      : "Contemporaneous (lag 0)"
+
+    color leaderColor = leadState != 0 ? neutralColorInput : color.new(chart.fg_color, MUTED_TRANSP)
+
+    string peakLagText = na(peakLag) ? "—" : (peakLag > 0 ? "+" : "") + str.tostring(peakLag) + (peakLag != 0 ? (peakLag > 0 ? " (" + chartTicker + " first)" : " (" + compTicker + " first)") : "")
+
+    table.cell(dashTable, 0, 0, "Lead-Lag Detection", text_color = chart.fg_color, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 0, chartTicker + " vs " + compTicker, text_color = color.new(chart.fg_color, MUTED_TRANSP), text_halign = text.align_right, text_size = dashTextSize)
+
+    table.cell(dashTable, 0, 1, "Leader", text_color = color.new(chart.fg_color, MUTED_TRANSP), text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 1, leaderText, text_color = leaderColor, text_halign = text.align_right, text_size = dashTextSize)
+
+    table.cell(dashTable, 0, 2, "Peak Lag", text_color = color.new(chart.fg_color, MUTED_TRANSP), text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 2, peakLagText, text_color = chart.fg_color, text_halign = text.align_right, text_size = dashTextSize)
+
+    table.cell(dashTable, 0, 3, "Peak CCF", text_color = color.new(chart.fg_color, MUTED_TRANSP), text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 3, na(peakCcf) ? "—" : str.tostring(peakCcf, "#.##"), text_color = na(peakCcf) ? chart.fg_color : peakCcf >= 0 ? posColorInput : negColorInput, text_halign = text.align_right, text_size = dashTextSize)
+
+    table.cell(dashTable, 0, 4, "Lag-0 CCF", text_color = color.new(chart.fg_color, MUTED_TRANSP), text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 4, na(lagZeroCcf) ? "—" : str.tostring(lagZeroCcf, "#.##"), text_color = chart.fg_color, text_halign = text.align_right, text_size = dashTextSize)
+
+    table.cell(dashTable, 0, 5, "Signif. Bound", text_color = color.new(chart.fg_color, MUTED_TRANSP), text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 5, "±" + str.tostring(sigBound, "#.##") + " (2/√n)", text_color = color.new(chart.fg_color, MUTED_TRANSP), text_halign = text.align_right, text_size = dashTextSize)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(newLeadDetected, "New Significant Lead", "Lead-lag detection: the cross-correlation peak moved to a nonzero lag beyond the significance bounds on {{ticker}} ({{interval}})")
+alertcondition(leaderFlip, "Leader Flip", "Lead-lag detection: the leading instrument flipped sides on {{ticker}} ({{interval}})")
+alertcondition(leadLost, "Lead Relationship Lost", "Lead-lag detection: the lead-lag relationship dropped below significance or back to lag 0 on {{ticker}} ({{interval}})")
+alertcondition(peakLagShift, "Peak Lag Shift", "Lead-lag detection: the peak lag of the cross-correlation function changed on {{ticker}} ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

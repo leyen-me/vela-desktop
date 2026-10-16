@@ -1,0 +1,377 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Swing Magnitude Filters", "Swing Magnitude Filters", overlay = true, max_lines_count = 500, max_labels_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+//Threshold measurement modes
+MODE_ATR     = "ATR Multiple"
+MODE_PERCENT = "Percentage"
+MODE_POINTS  = "Points"
+
+//Structure grey and the one accent (quiet-range flag - "switch to rotation tactics")
+NEUTRAL_COLOR = #787b86
+ACCENT_COLOR  = #ff9800
+DASH_BG       = #161616
+DASH_FRAME    = #2E2E2E
+DASH_HEADER   = #808080
+DASH_TEXT     = #DBDBDB
+
+//Visual tuning
+PROVISIONAL_TRANSPARENCY = 25
+TRIGGER_TRANSPARENCY     = 40
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+thresholdTypeInput = input.string(MODE_ATR, "Threshold Type", options = [MODE_ATR, MODE_PERCENT, MODE_POINTS], group = "Magnitude Filter",
+  tooltip = "How the minimum swing size is measured. ATR Multiple scales the filter with current volatility so the swing count stays steadier across regimes, Percentage stays constant relative to price and compares cleanly across instruments, Points is an absolute distance suited to a single contract.")
+
+atrMultInput = input.float(3.0, "ATR Multiple", minval = 0.1, step = 0.25, inline = "atr", group = "Magnitude Filter",
+  tooltip = "Reversal distance in ATR multiples required before a provisional extreme is confirmed as a swing, alongside the averaging length of the ATR. A larger multiple keeps only larger structure but confirms it later.")
+
+atrLengthInput = input.int(14, "Length", minval = 1, inline = "atr", group = "Magnitude Filter",
+  tooltip = "Averaging length of the ATR used by the ATR Multiple threshold.")
+
+percentInput = input.float(5.0, "Percentage", minval = 0.05, step = 0.25, group = "Magnitude Filter",
+  tooltip = "Minimum reversal as a percentage of the provisional extreme's price. Easy to reason about and comparable across instruments, but it over-counts swings when volatility expands unless raised.")
+
+pointsInput = input.float(10.0, "Points", minval = 0.0, group = "Magnitude Filter",
+  tooltip = "Minimum reversal in absolute price points. Suits a single instrument - retune it when switching symbols or after large price drift.")
+
+sourceInput = input.string("Wicks", "Swing Source", options = ["Wicks", "Close"], group = "Magnitude Filter",
+  tooltip = "Prices feeding swing detection. Wicks uses each bar's high and low; Close ignores wicks so only closing prices can extend a leg or trigger a reversal.")
+
+showRawInput = input.bool(true, "Show Raw Swings", group = "Raw Swings",
+  tooltip = "Draw the unfiltered candidate zigzag behind the filtered one - every alternation of candidate pivots before the magnitude rule is applied. The gap between the faint raw layer and the solid filtered layer is the noise the filter removes.")
+
+candidateLengthInput = input.int(2, "Candidate Pivot Length", minval = 1, group = "Raw Swings",
+  tooltip = "Bar-count rule producing the raw candidate pivots: a candidate high needs this many bars without a higher high on each side. Keep it small - the raw layer exists to show unfiltered structure, magnitude does the actual filtering.")
+
+quietBarsInput = input.int(50, "Quiet Stretch (bars)", minval = 5, group = "Quiet Range",
+  tooltip = "Bars without a newly confirmed swing before the stretch is flagged as a possible trading range at this scale. When no leg clears the threshold for an extended stretch, the silence itself is information.")
+
+quietHighlightInput = input.bool(true, "Highlight Quiet Stretches", group = "Quiet Range",
+  tooltip = "Tint the chart background while no leg has cleared the magnitude threshold for at least the configured number of bars - a cue to switch from breakout to rotation tactics.")
+
+showDashboardInput = input.bool(true, "Show Dashboard", group = "Dashboard",
+  tooltip = "Compact readout of the filter: current threshold, raw versus filtered swing counts, average leg size and confirmation delay, the provisional leg's progress toward flipping, and bars since the last confirmed swing.")
+
+dashPositionInput = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = "Dashboard",
+  tooltip = "Corner of the chart holding the dashboard.")
+
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = "Dashboard",
+  tooltip = "Dashboard text size.")
+
+bullColorInput = input.color(#089981, "Bullish", inline = "colors", group = "Style",
+  tooltip = "Color of upward filtered legs - legs ending at a confirmed swing high - and of the provisional leg while it points up.")
+
+bearColorInput = input.color(#f23645, "Bearish", inline = "colors", group = "Style",
+  tooltip = "Color of downward filtered legs and of the provisional leg while it points down.")
+
+rawColorInput = input.color(color.new(NEUTRAL_COLOR, 50), "Raw", inline = "colors", group = "Style",
+  tooltip = "Color of the faint raw candidate zigzag.")
+
+quietColorInput = input.color(color.new(ACCENT_COLOR, 92), "Quiet Range Highlight", group = "Style",
+  tooltip = "Background tint applied to quiet-range stretches.")
+
+filteredWidthInput = input.int(2, "Filtered Line Width", minval = 1, maxval = 5, group = "Style",
+  tooltip = "Width of confirmed filtered legs. The provisional leg and the raw layer always draw thin so confirmed structure stays dominant.")
+
+showProvisionalInput = input.bool(true, "Show Provisional Leg", group = "Style",
+  tooltip = "Dotted leg from the last confirmed swing to the current provisional extreme. It is provisional by construction - until a reversal travels the full threshold this extreme can still be replaced.")
+
+showTriggerInput = input.bool(true, "Show Confirmation Trigger", group = "Style",
+  tooltip = "Dashed level marking where the pending reversal completes: once price travels the full threshold from the provisional extreme, the swing confirms and the leg flips. With an ATR threshold this level breathes with volatility.")
+
+showMagnitudeLabelsInput = input.bool(true, "Swing Magnitude Labels", group = "Style",
+  tooltip = "Label each confirmed swing with the travel of the leg that ended there, expressed in the active threshold unit, so the margin by which legs clear the filter stays visible.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+//Minimum reversal in price units for a swing measured off `referencePrice`
+thresholdFor(float referencePrice, float atrValue) =>
+    switch thresholdTypeInput
+        MODE_ATR     => atrValue * atrMultInput
+        MODE_PERCENT => referencePrice * percentInput / 100
+        => pointsInput
+
+//Leg travel expressed in the active threshold unit (ATR multiples, percent of the leg origin, or raw points)
+toUnits(float legSize, float originPrice, float atrValue) =>
+    switch thresholdTypeInput
+        MODE_ATR     => na(atrValue) or atrValue <= 0 ? na : legSize / atrValue
+        MODE_PERCENT => originPrice > 0 ? 100 * legSize / originPrice : na
+        => legSize
+
+formatUnitValue(float unitValue) =>
+    string formatted = switch thresholdTypeInput
+        MODE_ATR     => str.tostring(unitValue, "#.##") + " ATR"
+        MODE_PERCENT => str.tostring(unitValue, "#.##") + "%"
+        => str.tostring(unitValue, format.mintick) + " pts"
+    na(unitValue) ? "—" : formatted
+
+//---------------------------------------------------------------------------------------------------------------------}
+// State
+//---------------------------------------------------------------------------------------------------------------------{
+//Filtered swing machine: direction of the provisional leg, its extreme, and the counter-move measured against the threshold
+var int   legDirection = 0
+var float extremePrice = na
+var int   extremeBar   = na
+var float counterPrice = na
+var int   counterBar   = na
+
+//Last confirmed filtered swing - the anchor of the provisional leg
+var float lastSwingPrice = na
+var int   lastSwingBar   = na
+var int   lastConfirmBar = na
+
+//Raw candidate zigzag bookkeeping
+var int   rawDirection  = 0
+var float rawPointPrice = na
+var int   rawPointBar   = na
+var line  lastRawLine   = na
+
+//Filter statistics
+var int   rawSwingCount      = 0
+var int   filteredSwingCount = 0
+var float legUnitsSum        = 0.
+var float legRatioSum        = 0.
+var int   legMeasuredCount   = 0
+var float confirmDelaySum    = 0.
+
+//Provisional visuals
+var line provisionalLine = na
+var line triggerLine     = na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Swing Detection
+//---------------------------------------------------------------------------------------------------------------------{
+float atrValue        = ta.atr(atrLengthInput)
+float swingHighSource = sourceInput == "Wicks" ? high : close
+float swingLowSource  = sourceInput == "Wicks" ? low  : close
+
+//Raw candidate pivots from the bar-count rule (known candidateLength bars after the fact)
+float rawPivotHigh = ta.pivothigh(swingHighSource, candidateLengthInput, candidateLengthInput)
+float rawPivotLow  = ta.pivotlow(swingLowSource, candidateLengthInput, candidateLengthInput)
+int   rawPivotBar  = bar_index - candidateLengthInput
+
+bool confirmedHigh = false
+bool confirmedLow  = false
+
+if barstate.isconfirmed
+    //Raw layer: alternate candidate pivots with no size rule - same-direction candidates keep the more extreme point.
+    //On an outside bar both confirm at once - handle the extension side first to keep alternation clean.
+    bool highPassFirst = rawDirection == 1
+    for passIndex = 0 to 1
+        bool  isHighPass    = highPassFirst ? passIndex == 0 : passIndex == 1
+        float passPrice     = isHighPass ? rawPivotHigh : rawPivotLow
+        int   passDirection = isHighPass ? 1 : -1
+        if not na(passPrice)
+            if rawDirection == passDirection
+                if passDirection == 1 ? passPrice > rawPointPrice : passPrice < rawPointPrice
+                    rawPointPrice := passPrice
+                    rawPointBar   := rawPivotBar
+                    if not na(lastRawLine)
+                        line.set_xy2(lastRawLine, rawPointBar, rawPointPrice)
+            else
+                if rawDirection != 0
+                    rawSwingCount += 1
+                    if showRawInput
+                        lastRawLine := line.new(rawPointBar, rawPointPrice, rawPivotBar, passPrice
+                          , color = rawColorInput
+                          , style = line.style_dotted
+                          , width = 1)
+                rawDirection  := passDirection
+                rawPointPrice := passPrice
+                rawPointBar   := rawPivotBar
+
+    //Filtered layer: pure magnitude rule - a swing confirms only once price has traveled the full threshold
+    //from the provisional extreme; smaller counter-moves extend the current leg instead.
+    if legDirection == 0
+        float seedThreshold = thresholdFor(close, atrValue)
+        if not na(seedThreshold) and seedThreshold > 0
+            legDirection := close >= open ? 1 : -1
+            extremePrice := legDirection == 1 ? swingHighSource : swingLowSource
+            extremeBar   := bar_index
+            counterPrice := legDirection == 1 ? swingLowSource : swingHighSource
+            counterBar   := bar_index
+    else if legDirection == 1
+        //Extensions replace the provisional high and restart the counter-move from its bar
+        if swingHighSource > extremePrice
+            extremePrice := swingHighSource
+            extremeBar   := bar_index
+            counterPrice := swingLowSource
+            counterBar   := bar_index
+        else if swingLowSource < counterPrice
+            counterPrice := swingLowSource
+            counterBar   := bar_index
+        float thresholdNow = thresholdFor(extremePrice, atrValue)
+        if not na(thresholdNow) and thresholdNow > 0 and extremePrice - counterPrice >= thresholdNow
+            //Swing high confirmed - the downside reversal traveled the full threshold
+            confirmedHigh   := true
+            confirmDelaySum += bar_index - extremeBar
+            if not na(lastSwingPrice)
+                float legSize  = math.abs(extremePrice - lastSwingPrice)
+                float legUnits = toUnits(legSize, lastSwingPrice, atrValue)
+                line.new(lastSwingBar, lastSwingPrice, extremeBar, extremePrice, color = bullColorInput, width = filteredWidthInput)
+                if not na(legUnits) and legSize > 0
+                    legUnitsSum      += legUnits
+                    legRatioSum      += legSize / thresholdNow
+                    legMeasuredCount += 1
+                    if showMagnitudeLabelsInput
+                        label.new(extremeBar, extremePrice, formatUnitValue(legUnits)
+                          , style     = label.style_label_down
+                          , color     = #00000000
+                          , textcolor = bullColorInput
+                          , size      = size.tiny)
+            filteredSwingCount += 1
+            lastConfirmBar := bar_index
+            lastSwingPrice := extremePrice
+            lastSwingBar   := extremeBar
+            legDirection   := -1
+            extremePrice   := counterPrice
+            extremeBar     := counterBar
+            counterPrice   := swingHighSource
+            counterBar     := bar_index
+    else
+        if swingLowSource < extremePrice
+            extremePrice := swingLowSource
+            extremeBar   := bar_index
+            counterPrice := swingHighSource
+            counterBar   := bar_index
+        else if swingHighSource > counterPrice
+            counterPrice := swingHighSource
+            counterBar   := bar_index
+        float thresholdNow = thresholdFor(extremePrice, atrValue)
+        if not na(thresholdNow) and thresholdNow > 0 and counterPrice - extremePrice >= thresholdNow
+            //Swing low confirmed - the upside reversal traveled the full threshold
+            confirmedLow    := true
+            confirmDelaySum += bar_index - extremeBar
+            if not na(lastSwingPrice)
+                float legSize  = math.abs(lastSwingPrice - extremePrice)
+                float legUnits = toUnits(legSize, lastSwingPrice, atrValue)
+                line.new(lastSwingBar, lastSwingPrice, extremeBar, extremePrice, color = bearColorInput, width = filteredWidthInput)
+                if not na(legUnits) and legSize > 0
+                    legUnitsSum      += legUnits
+                    legRatioSum      += legSize / thresholdNow
+                    legMeasuredCount += 1
+                    if showMagnitudeLabelsInput
+                        label.new(extremeBar, extremePrice, formatUnitValue(legUnits)
+                          , style     = label.style_label_up
+                          , color     = #00000000
+                          , textcolor = bearColorInput
+                          , size      = size.tiny)
+            filteredSwingCount += 1
+            lastConfirmBar := bar_index
+            lastSwingPrice := extremePrice
+            lastSwingBar   := extremeBar
+            legDirection   := 1
+            extremePrice   := counterPrice
+            extremeBar     := counterBar
+            counterPrice   := swingLowSource
+            counterBar     := bar_index
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Provisional Leg & Confirmation Trigger
+//---------------------------------------------------------------------------------------------------------------------{
+float liveThreshold = legDirection != 0 ? thresholdFor(extremePrice, atrValue) : na
+float triggerPrice  = na(liveThreshold) or liveThreshold <= 0 ? na : legDirection == 1 ? extremePrice - liveThreshold : extremePrice + liveThreshold
+
+//The newest leg is provisional by construction - dotted until a reversal clears the threshold
+if showProvisionalInput and legDirection != 0 and not na(lastSwingPrice)
+    if na(provisionalLine)
+        provisionalLine := line.new(lastSwingBar, lastSwingPrice, extremeBar, extremePrice, style = line.style_dotted, width = 1)
+    line.set_xy1(provisionalLine, lastSwingBar, lastSwingPrice)
+    line.set_xy2(provisionalLine, extremeBar, extremePrice)
+    line.set_color(provisionalLine, color.new(legDirection == 1 ? bullColorInput : bearColorInput, PROVISIONAL_TRANSPARENCY))
+
+//Level the counter-move must reach for the provisional extreme to confirm and the leg to flip
+if showTriggerInput and legDirection != 0 and not na(triggerPrice)
+    if na(triggerLine)
+        triggerLine := line.new(extremeBar, triggerPrice, bar_index + 1, triggerPrice, style = line.style_dashed, width = 1)
+    line.set_xy1(triggerLine, extremeBar, triggerPrice)
+    line.set_xy2(triggerLine, bar_index + 1, triggerPrice)
+    line.set_color(triggerLine, color.new(legDirection == 1 ? bearColorInput : bullColorInput, TRIGGER_TRANSPARENCY))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Quiet Range
+//---------------------------------------------------------------------------------------------------------------------{
+bool quietNow   = not na(lastConfirmBar) and bar_index - lastConfirmBar >= quietBarsInput
+bool quietStart = not na(lastConfirmBar) and bar_index - lastConfirmBar == quietBarsInput
+
+bgcolor(quietHighlightInput and quietNow ? quietColorInput : na, title = "Quiet Range Highlight")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+string dashboardPosition = switch dashPositionInput
+    "Top Right"    => position.top_right
+    "Top Left"     => position.top_left
+    "Bottom Right" => position.bottom_right
+    => position.bottom_left
+
+string dashboardTextSize = switch dashSizeInput
+    "Tiny"  => size.tiny
+    "Small" => size.small
+    => size.normal
+
+var table dashboardTable = showDashboardInput ? table.new(dashboardPosition, 2, 10, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1) : na
+
+if showDashboardInput and barstate.islast
+    color titleColor = DASH_TEXT
+    color labelColor = DASH_HEADER
+    color valueColor = DASH_TEXT
+    color mutedColor = NEUTRAL_COLOR
+    string specText = switch thresholdTypeInput
+        MODE_ATR     => str.tostring(atrMultInput, "#.##") + " × ATR(" + str.tostring(atrLengthInput) + ")"
+        MODE_PERCENT => str.tostring(percentInput, "#.##") + "% of extreme"
+        => str.tostring(pointsInput, format.mintick) + " points"
+    float noiseRemovedPct  = rawSwingCount > 0 ? math.max(0., 100. * (rawSwingCount - filteredSwingCount) / rawSwingCount) : na
+    float averageLegUnits  = legMeasuredCount > 0 ? legUnitsSum / legMeasuredCount : na
+    float averageLegRatio  = legMeasuredCount > 0 ? legRatioSum / legMeasuredCount : na
+    float averageDelay     = filteredSwingCount > 0 ? confirmDelaySum / filteredSwingCount : na
+    float reversalProgress = na(liveThreshold) or liveThreshold <= 0 ? na : math.min(100., 100. * (legDirection == 1 ? extremePrice - counterPrice : counterPrice - extremePrice) / liveThreshold)
+    int   barsSinceSwing   = na(lastConfirmBar) ? na : bar_index - lastConfirmBar
+    color legColor         = legDirection == 1 ? bullColorInput : legDirection == -1 ? bearColorInput : mutedColor
+    table.cell(dashboardTable, 0, 0, "Magnitude Filter", text_color = titleColor, text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 0, specText, text_color = titleColor, text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 1, "Threshold now", text_color = labelColor, text_size = dashboardTextSize, text_halign = text.align_left,
+      tooltip = "Minimum reversal, in price units on the current bar, required to confirm the provisional extreme as a swing.")
+    table.cell(dashboardTable, 1, 1, na(liveThreshold) ? "—" : str.tostring(liveThreshold, format.mintick), text_color = valueColor, text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 2, "Raw swings", text_color = labelColor, text_size = dashboardTextSize, text_halign = text.align_left,
+      tooltip = "Candidate swings produced by the bar-count rule alone, before the magnitude filter.")
+    table.cell(dashboardTable, 1, 2, str.tostring(rawSwingCount), text_color = valueColor, text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 3, "Filtered swings", text_color = labelColor, text_size = dashboardTextSize, text_halign = text.align_left,
+      tooltip = "Swings whose reversal traveled the full magnitude threshold.")
+    table.cell(dashboardTable, 1, 3, str.tostring(filteredSwingCount), text_color = valueColor, text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 4, "Noise removed", text_color = labelColor, text_size = dashboardTextSize, text_halign = text.align_left,
+      tooltip = "Share of raw candidate swings the magnitude filter discarded. Raising the threshold removes more but confirms later.")
+    table.cell(dashboardTable, 1, 4, na(noiseRemovedPct) ? "—" : str.tostring(noiseRemovedPct, "#.#") + "%", text_color = valueColor, text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 5, "Avg leg size", text_color = labelColor, text_size = dashboardTextSize, text_halign = text.align_left,
+      tooltip = "Average confirmed leg travel, expressed in the active threshold unit.")
+    table.cell(dashboardTable, 1, 5, formatUnitValue(averageLegUnits), text_color = valueColor, text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 6, "Leg vs threshold", text_color = labelColor, text_size = dashboardTextSize, text_halign = text.align_left,
+      tooltip = "Average confirmed leg travel as a multiple of the threshold. Near 1× the filter sits right at the scale limit; well above 1× confirmed legs clear it comfortably.")
+    table.cell(dashboardTable, 1, 6, na(averageLegRatio) ? "—" : str.tostring(averageLegRatio, "#.##") + "×", text_color = valueColor, text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 7, "Confirm delay", text_color = labelColor, text_size = dashboardTextSize, text_halign = text.align_left,
+      tooltip = "Average bars between a swing extreme and the bar that confirmed it - the lag cost of the chosen threshold.")
+    table.cell(dashboardTable, 1, 7, na(averageDelay) ? "—" : str.tostring(averageDelay, "#.#") + " bars", text_color = valueColor, text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 8, "Current leg", text_color = labelColor, text_size = dashboardTextSize, text_halign = text.align_left,
+      tooltip = "Direction of the provisional leg and how far the counter-move has traveled toward the confirmation threshold.")
+    table.cell(dashboardTable, 1, 8, legDirection == 0 or na(reversalProgress) ? "—" : (legDirection == 1 ? "Up · " : "Down · ") + str.tostring(reversalProgress, "#") + "% to flip", text_color = legColor, text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 9, "Bars since swing", text_color = labelColor, text_size = dashboardTextSize, text_halign = text.align_left,
+      tooltip = "Bars since the last confirmed swing. An extended stretch with no threshold-clearing leg flags a possible trading range at this scale.")
+    table.cell(dashboardTable, 1, 9, na(barsSinceSwing) ? "—" : str.tostring(barsSinceSwing) + (quietNow ? " · Range?" : ""), text_color = quietNow ? ACCENT_COLOR : valueColor, text_size = dashboardTextSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(confirmedHigh, "Filtered Swing High Confirmed", "Swing high confirmed - the downside reversal traveled the full magnitude threshold")
+alertcondition(confirmedLow, "Filtered Swing Low Confirmed", "Swing low confirmed - the upside reversal traveled the full magnitude threshold")
+alertcondition(confirmedHigh or confirmedLow, "Any Filtered Swing Confirmed", "New swing confirmed through the magnitude filter")
+alertcondition(quietStart, "Quiet Range Stretch", "No swing has cleared the magnitude threshold for the configured stretch - possible trading range at this scale")
+
+//---------------------------------------------------------------------------------------------------------------------}

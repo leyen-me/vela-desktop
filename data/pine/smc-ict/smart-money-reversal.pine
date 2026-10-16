@@ -1,0 +1,577 @@
+// This work is licensed under Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Smart Money Reversal", "Smart Money Reversal", overlay = true, max_boxes_count = 300, max_lines_count = 400, max_labels_count = 400, max_bars_back = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+color GREEN = #089981
+color RED   = #f23645
+color GRAY  = #787b86
+color BLUE  = #2157f3
+color TEXT  = #d1d4dc
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+int BULL = 1
+int BEAR = -1
+
+int K_SWING = 1
+int K_EQUAL = 2
+
+int S_IDLE  = 0
+int S_SWEPT = 1   //pool swept, waiting for displacement and the change of character
+int S_ENTRY = 2   //structure broken, waiting for the retrace into the entry zone
+int S_TRADE = 3
+
+string SIZE_TINY   = "Tiny"
+string SIZE_SMALL  = "Small"
+string SIZE_NORMAL = "Normal"
+
+string POS_TR = "Top Right"
+string POS_TL = "Top Left"
+string POS_BR = "Bottom Right"
+string POS_BL = "Bottom Left"
+
+string GRP_POOL  = "1. Pools"
+string GRP_SWEEP = "2. Sweep"
+string GRP_DISP  = "3-4. Displacement & Change of Character"
+string GRP_ENTRY = "5. Retrace Entry"
+string GRP_TIME  = "Time Dial"
+string GRP_DASH  = "Dashboard"
+string GRP_STYLE = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+poolLenInput = input.int(10, "Pool Swing Length"
+  , minval  = 3
+  , maxval  = 50
+  , group   = GRP_POOL
+  , tooltip = "Old highs and lows of this swing length are mapped as pools, where stops predictably rest.")
+
+eqTolInput = input.float(0.15, "Equal Level Tolerance (ATR)"
+  , minval  = 0
+  , step    = 0.05
+  , group   = GRP_POOL
+  , tooltip = "A new swing printing within this multiple of ATR(14) of an untaken pool on the same side turns it into equal highs or lows (EQH/EQL), which grade higher on the pool dial.")
+
+poolAgeInput = input.int(300, "Pool Max Age (bars)"
+  , minval  = 20
+  , group   = GRP_POOL)
+
+poolViewInput = input.int(100, "Draw Pools Within Range Of (bars)"
+  , minval  = 10
+  , maxval  = 500
+  , group   = GRP_POOL
+  , tooltip = "Untaken pools outside the high-low range of this many recent bars (plus a 10% margin) are still mapped and can be targets, but are not drawn, so old far-away levels do not flatten the chart.")
+
+sweepBarsInput = input.int(2, "Sweep Close-Back (bars)"
+  , minval  = 1
+  , maxval  = 5
+  , group   = GRP_SWEEP
+  , tooltip = "Price must trade through a pool and close back on the inside within this many bars, the sweep bar included. A pool taken without the close back is a run, not a sweep.")
+
+intLenInput = input.int(3, "Structure Swing Length"
+  , minval  = 1
+  , maxval  = 20
+  , group   = GRP_DISP
+  , tooltip = "The change of character is a close through the most recent swing of this length that formed before the sweep's extreme: the swing that should have held.")
+
+windowInput = input.int(15, "Sequence Window (bars)"
+  , minval  = 2
+  , group   = GRP_DISP
+  , tooltip = "Displacement and the change of character must complete within this many bars of the sweep.")
+
+dispInput = input.float(1.0, "Displacement Body (ATR)"
+  , minval  = 0.1
+  , step    = 0.1
+  , group   = GRP_DISP
+  , tooltip = "A candle body of at least this multiple of ATR(14) in the reversal direction counts as displacement. A fair value gap left by the reversal leg also counts; both together grade higher. Neither means a drift back, not the pattern.")
+
+gapMinInput = input.float(0.1, "Minimum Gap Size (ATR)"
+  , minval  = 0
+  , step    = 0.05
+  , group   = GRP_DISP)
+
+stopBufInput = input.float(0.1, "Stop Buffer (ATR)"
+  , minval  = 0
+  , step    = 0.05
+  , group   = GRP_ENTRY
+  , tooltip = "The stop sits past the sweep's extreme by this multiple of ATR(14).")
+
+entryWinInput = input.int(20, "Entry Window (bars)"
+  , minval  = 1
+  , group   = GRP_ENTRY
+  , tooltip = "Bars allowed for the retrace into the entry zone: the reversal leg's fair value gap, or its order block when it left no gap.")
+
+minRrInput = input.float(1.0, "Minimum Target R"
+  , minval  = 0.5
+  , step    = 0.25
+  , group   = GRP_ENTRY
+  , tooltip = "The target is the nearest untaken pool on the other side at least this many R away; without one, the fallback multiple below.")
+
+fallbackRInput = input.float(2.0, "Fallback Target R"
+  , minval  = 0.5
+  , step    = 0.25
+  , group   = GRP_ENTRY)
+
+useTimeInput = input.bool(false, "Grade Time"
+  , group   = GRP_TIME
+  , tooltip = "Add the clock to the grade: a sweep inside the window below scores the time dial. Off by default, since the dial only means something on intraday charts.")
+timeSessInput = input.session("0200-0500,0700-1000", "Active Window", group = GRP_TIME)
+tzInput       = input.string("America/New_York", "Timezone", group = GRP_TIME)
+
+showDashInput = input.bool(true, "Show Dashboard", group = GRP_DASH)
+dashPosInput  = input.string(POS_TR, "Position", options = [POS_TR, POS_TL, POS_BR, POS_BL], group = GRP_DASH)
+dashSizeInput = input.string(SIZE_SMALL, "Size", options = [SIZE_TINY, SIZE_SMALL, SIZE_NORMAL], group = GRP_DASH)
+
+bullColorInput = input.color(GREEN, "Bullish",     inline = "c", group = GRP_STYLE)
+bearColorInput = input.color(RED,   "Bearish",     inline = "c", group = GRP_STYLE)
+poolColorInput = input.color(GRAY,  "Pools",       inline = "a", group = GRP_STYLE)
+zoneColorInput = input.color(BLUE,  "Entry Zone",  inline = "a", group = GRP_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+textSize(string s) =>
+    switch s
+        SIZE_TINY   => size.tiny
+        SIZE_NORMAL => size.normal
+        => size.small
+
+tablePos(string s) =>
+    switch s
+        POS_TL => position.top_left
+        POS_BR => position.bottom_right
+        POS_BL => position.bottom_left
+        => position.top_right
+
+gradeOf(int pts, int ptsMax) => pts >= ptsMax ? "A" : pts == ptsMax - 1 ? "B" : "C"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// 1. Pools
+//---------------------------------------------------------------------------------------------------------------------{
+float atr = ta.atr(14)
+float pph = ta.pivothigh(high, poolLenInput, poolLenInput)
+float ppl = ta.pivotlow(low, poolLenInput, poolLenInput)
+float viewHi   = ta.highest(high, poolViewInput)
+float viewLo   = ta.lowest(low, poolViewInput)
+float recentHi = ta.highest(high, poolLenInput)
+float recentLo = ta.lowest(low, poolLenInput)
+
+var array<float> pPrice = array.new<float>()
+var array<int>   pSide  = array.new<int>()
+var array<int>   pKind  = array.new<int>()
+var array<int>   pBorn  = array.new<int>()
+var array<line>  pLine  = array.new<line>()
+var array<label> pLbl   = array.new<label>()
+
+dropPool(int i) =>
+    label.delete(pLbl.get(i))
+    pPrice.remove(i)
+    pSide.remove(i)
+    pKind.remove(i)
+    pBorn.remove(i)
+    pLine.remove(i)
+    pLbl.remove(i)
+
+// @function    map a swing as a pool, or upgrade a nearby untaken pool on the same side to equal highs/lows
+addPool(float price, int side, int pivotBar) =>
+    int match = -1
+    if pPrice.size() > 0
+        for k = 0 to pPrice.size() - 1
+            if pSide.get(k) == side and math.abs(pPrice.get(k) - price) <= eqTolInput * nz(atr)
+                match := k
+    if match >= 0
+        float lvl = side == BULL ? math.max(price, pPrice.get(match)) : math.min(price, pPrice.get(match))
+        pPrice.set(match, lvl)
+        pKind.set(match, K_EQUAL)
+        line ln = pLine.get(match)
+        ln.set_y1(lvl)
+        ln.set_y2(lvl)
+        ln.set_style(line.style_dashed)
+        label lb = pLbl.get(match)
+        lb.set_text(side == BULL ? "EQH" : "EQL")
+        lb.set_y(lvl)
+    else
+        pPrice.push(price)
+        pSide.push(side)
+        pKind.push(K_SWING)
+        pBorn.push(pivotBar)
+        pLine.push(line.new(pivotBar, price, bar_index, price, color = color.new(poolColorInput, 25), style = line.style_dotted))
+        pLbl.push(label.new(bar_index, price, side == BULL ? "Swing H" : "Swing L", color = color(na), textcolor = poolColorInput, style = label.style_label_left, size = size.tiny))
+
+if not na(pph) and recentHi <= pph
+    addPool(pph, BULL, bar_index - poolLenInput)
+if not na(ppl) and recentLo >= ppl
+    addPool(ppl, BEAR, bar_index - poolLenInput)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// 2. Sweep
+//---------------------------------------------------------------------------------------------------------------------{
+// one pending sweep per side: pool level, kind, bars since it was traded through, extreme
+var float pendHiLvl  = na
+var int   pendHiKind = na
+var int   pendHiBars = 0
+var int   pendHiBorn = na
+var float pendLoLvl  = na
+var int   pendLoKind = na
+var int   pendLoBars = 0
+var int   pendLoBorn = na
+
+bool  sweepHi     = false
+bool  sweepLo     = false
+int   sweepHiKind = na
+int   sweepLoKind = na
+float sweepHiLvl  = na
+float sweepLoLvl  = na
+int   sweepHiBorn = na
+int   sweepLoBorn = na
+
+int j = pPrice.size() - 1
+while j >= 0
+    float lvl  = pPrice.get(j)
+    int   side = pSide.get(j)
+    bool  hit  = side == BULL ? high > lvl : low < lvl
+    if hit and pBorn.get(j) < bar_index - poolLenInput
+        // the most significant pool traded through on this bar becomes the pending sweep of its side
+        if side == BULL and (pendHiBars == 0 or pKind.get(j) > pendHiKind)
+            pendHiLvl  := lvl
+            pendHiKind := pKind.get(j)
+            pendHiBars := 0
+            pendHiBorn := pBorn.get(j)
+        if side == BEAR and (pendLoBars == 0 or pKind.get(j) > pendLoKind)
+            pendLoLvl  := lvl
+            pendLoKind := pKind.get(j)
+            pendLoBars := 0
+            pendLoBorn := pBorn.get(j)
+        line ln = pLine.get(j)
+        ln.set_x2(bar_index)
+        dropPool(j)
+    else if bar_index - pBorn.get(j) > poolAgeInput
+        line.delete(pLine.get(j))
+        dropPool(j)
+    j -= 1
+
+if not na(pendHiLvl)
+    pendHiBars += 1
+    if close < pendHiLvl
+        sweepHi     := true
+        sweepHiKind := pendHiKind
+        sweepHiLvl  := pendHiLvl
+        sweepHiBorn := pendHiBorn
+        pendHiLvl   := na
+        pendHiBars  := 0
+    else if pendHiBars >= sweepBarsInput
+        pendHiLvl  := na
+        pendHiBars := 0
+if not na(pendLoLvl)
+    pendLoBars += 1
+    if close > pendLoLvl
+        sweepLo     := true
+        sweepLoKind := pendLoKind
+        sweepLoLvl  := pendLoLvl
+        sweepLoBorn := pendLoBorn
+        pendLoLvl   := na
+        pendLoBars  := 0
+    else if pendLoBars >= sweepBarsInput
+        pendLoLvl  := na
+        pendLoBars := 0
+
+// live pools stay pinned just past the last bar; on the last bar, pools far from price keep their role as targets but are not drawn
+if pPrice.size() > 0
+    for k = 0 to pPrice.size() - 1
+        pLine.get(k).set_x2(bar_index + 2)
+        pLbl.get(k).set_xy(bar_index + 2, pPrice.get(k))
+        if barstate.islast and (pPrice.get(k) > viewHi + 0.1 * (viewHi - viewLo) or pPrice.get(k) < viewLo - 0.1 * (viewHi - viewLo))
+            line.delete(pLine.get(k))
+            label.delete(pLbl.get(k))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// 3-4. Displacement and change of character
+//---------------------------------------------------------------------------------------------------------------------{
+float ish = ta.pivothigh(high, intLenInput, intLenInput)
+float isl = ta.pivotlow(low, intLenInput, intLenInput)
+var float lastIsh    = na
+var int   lastIshBar = na
+var float lastIsl    = na
+var int   lastIslBar = na
+if not na(ish)
+    lastIsh    := ish
+    lastIshBar := bar_index - intLenInput
+if not na(isl)
+    lastIsl    := isl
+    lastIslBar := bar_index - intLenInput
+
+bool  bullGap = bar_index > 2 and low > high[2] and (low - high[2]) >= gapMinInput * nz(atr)
+bool  bearGap = bar_index > 2 and high < low[2] and (low[2] - high) >= gapMinInput * nz(atr)
+float bodyAtr = math.abs(close - open) / nz(atr, math.abs(close - open) + 1)
+bool  inTime  = timeframe.isintraday and not na(time(timeframe.period, timeSessInput, tzInput))
+
+var int    st        = S_IDLE
+var int    dir       = 0      //direction of the reversal: 1 long after a sell-side sweep, -1 short after a buy-side sweep
+var float  ext       = na
+var int    extBar    = na
+var int    swBar     = na
+var int    poolKind  = na
+var bool   swInTime  = false
+var float  chLvl     = na
+var int    chFrom    = na
+var float  maxBody   = 0.0
+var bool   legGap    = false
+var float  gTop      = na
+var float  gBot      = na
+var int    gLeft     = na
+var float  zTop      = na
+var float  zBot      = na
+var string zKind     = ""
+var int    zBar      = na
+var int    setupBar  = na
+var float  entry     = na
+var float  stop      = na
+var float  target    = na
+var string tgtTag    = ""
+var int    fillBar   = na
+var int    score     = 0
+var int    maxScore  = 4
+var string grade     = ""
+var string dialTxt   = ""
+var string dialShort = ""
+var string lastRes   = ""
+var label  swLbl     = na
+var box    zBox      = na
+var box    tpBox     = na
+var box    slBox     = na
+
+bool evSweep  = false
+bool evChoch  = false
+bool evFill   = false
+bool evTarget = false
+bool evStop   = false
+
+// @function    nearest untaken pool on the target side at least the minimum R away, else the fallback multiple
+pickTarget(int d, float e, float s) =>
+    float risk = math.abs(e - s)
+    float best = na
+    string tag = ""
+    if pPrice.size() > 0
+        for k = 0 to pPrice.size() - 1
+            float lvl = pPrice.get(k)
+            if pSide.get(k) == d and (d == BULL ? lvl > e : lvl < e) and math.abs(lvl - e) >= minRrInput * risk
+                if na(best) or math.abs(lvl - e) < math.abs(best - e)
+                    best := lvl
+                    tag  := pKind.get(k) == K_EQUAL ? (d == BULL ? "EQH" : "EQL") : (d == BULL ? "Swing H" : "Swing L")
+    if na(best)
+        best := e + d * fallbackRInput * risk
+        tag  := str.tostring(fallbackRInput) + "R"
+    [best, tag]
+
+// a new sweep replaces any setup that has not been filled; a bar sweeping both sides keeps the side it closed away from
+bool newSweep = st != S_TRADE and (sweepHi or sweepLo)
+if newSweep
+    int d = sweepLo ? BULL : BEAR
+    if sweepHi and sweepLo
+        d := close > open ? BULL : BEAR
+    float prot = d == BULL ? lastIsh : lastIsl
+    if not na(prot)
+        if st == S_ENTRY
+            zBox.delete()
+        if st == S_SWEPT and not na(swLbl)
+            swLbl.delete()
+        st       := S_SWEPT
+        dir      := d
+        ext      := d == BULL ? low : high
+        extBar   := bar_index
+        // the sweep's extreme is the deepest point since the pool was first traded
+        for i = 0 to sweepBarsInput - 1
+            if d == BULL and low[i] < ext
+                ext    := low[i]
+                extBar := bar_index - i
+            if d == BEAR and high[i] > ext
+                ext    := high[i]
+                extBar := bar_index - i
+        swBar    := bar_index
+        poolKind := d == BULL ? sweepLoKind : sweepHiKind
+        swInTime := inTime
+        chLvl    := prot
+        chFrom   := d == BULL ? lastIshBar : lastIslBar
+        maxBody  := 0.0
+        legGap   := false
+        gLeft    := na
+        evSweep  := true
+        swLbl    := label.new(extBar, ext, "Sweep", color = color(na), textcolor = d == BULL ? bullColorInput : bearColorInput, style = d == BULL ? label.style_label_up : label.style_label_down, size = size.small)
+
+else if st == S_SWEPT
+    if dir == BULL and low < ext
+        ext    := low
+        extBar := bar_index
+        swLbl.set_xy(bar_index, low)
+    if dir == BEAR and high > ext
+        ext    := high
+        extBar := bar_index
+        swLbl.set_xy(bar_index, high)
+    if dir == BULL and not na(ish) and lastIshBar < extBar
+        chLvl  := lastIsh
+        chFrom := lastIshBar
+    if dir == BEAR and not na(isl) and lastIslBar < extBar
+        chLvl  := lastIsl
+        chFrom := lastIslBar
+
+// displacement evidence of the reversal leg, gathered from the extreme onward
+if st == S_SWEPT
+    bool withDir = dir == BULL ? close > open : close < open
+    if withDir and bar_index >= extBar
+        maxBody := math.max(maxBody, bodyAtr)
+    bool gapNow = dir == BULL ? bullGap : bearGap
+    if gapNow and bar_index - 2 >= extBar
+        legGap := true
+        gTop   := dir == BULL ? low : low[2]
+        gBot   := dir == BULL ? high[2] : high
+        gLeft  := bar_index - 2
+
+    if bar_index - swBar > windowInput
+        st := S_IDLE
+        swLbl.set_textcolor(color.new(GRAY, 20))
+        swLbl.set_tooltip("Sweep without a change of character inside the window: read as a raid within continuation")
+    else if dir == BULL ? close > chLvl : close < chLvl
+        bool dispBody = maxBody >= dispInput
+        if not dispBody and not legGap
+            // a drift back through the swing is not the pattern
+            st := S_IDLE
+            swLbl.set_textcolor(color.new(GRAY, 20))
+            swLbl.set_tooltip("Structure broke without displacement: not graded")
+        else
+            evChoch := true
+            line.new(chFrom, chLvl, bar_index, chLvl, color = dir == BULL ? bullColorInput : bearColorInput, style = line.style_dashed)
+            label.new(int(math.round(0.5 * (chFrom + bar_index))), chLvl, "CHoCH", color = color(na), textcolor = dir == BULL ? bullColorInput : bearColorInput, style = dir == BULL ? label.style_label_down : label.style_label_up, size = size.small)
+            // grade the three dials
+            int pScore = poolKind == K_EQUAL ? 2 : 1
+            int dScore = dispBody and legGap ? 2 : 1
+            int tScore = useTimeInput and swInTime ? 1 : 0
+            maxScore := useTimeInput ? 5 : 4
+            score    := pScore + dScore + tScore
+            grade    := gradeOf(score, maxScore)
+            dialTxt  := "Pool: " + (pScore == 2 ? (dir == BULL ? "equal lows" : "equal highs") : "single swing") + "\nDisplacement: " + str.tostring(maxBody, "#.#") + " ATR body" + (legGap ? " + gap" : ", no gap") + (useTimeInput ? "\nTime: " + (swInTime ? "inside the window" : "outside the window") : "")
+            dialShort := (pScore == 2 ? (dir == BULL ? "EQL" : "EQH") : "Swing") + " · " + str.tostring(maxBody, "#.#") + " ATR" + (legGap ? " + FVG" : "") + (useTimeInput ? (swInTime ? " · in window" : " · off window") : "")
+            swLbl.set_text("SMR " + grade)
+            swLbl.set_tooltip(dialTxt)
+            // 5. entry zone: the leg's gap, else the order block that launched it
+            if legGap
+                zTop  := gTop
+                zBot  := gBot
+                zKind := "FVG"
+                zBar  := gLeft
+            else
+                int obOff = -1
+                for i = bar_index - extBar to math.min(bar_index - extBar + 10, 400)
+                    if dir == BULL ? close[i] < open[i] : close[i] > open[i]
+                        obOff := i
+                        break
+                if obOff >= 0
+                    zTop  := high[obOff]
+                    zBot  := low[obOff]
+                    zKind := "OB"
+                    zBar  := bar_index - obOff
+                else
+                    zTop  := na
+            if na(zTop)
+                st := S_IDLE
+            else
+                st       := S_ENTRY
+                setupBar := bar_index
+                entry    := dir == BULL ? zTop : zBot
+                stop   := dir == BULL ? ext - stopBufInput * atr : ext + stopBufInput * atr
+                [t, tg] = pickTarget(dir, entry, stop)
+                target := t
+                tgtTag := tg
+                zBox   := box.new(zBar, zTop, bar_index, zBot, border_color = color.new(zoneColorInput, 40), bgcolor = color.new(zoneColorInput, 78), text = zKind, text_size = size.tiny, text_color = TEXT, text_halign = text.align_left)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// 5. Retrace entry and trade
+//---------------------------------------------------------------------------------------------------------------------{
+closeTrade(string result, float px) =>
+    tpBox.set_right(bar_index)
+    slBox.set_right(bar_index)
+    label.new(bar_index, px, result, color = color(na), textcolor = result == "Target" ? GREEN : RED, style = label.style_label_left, size = size.small)
+
+if st == S_ENTRY and not evChoch
+    zBox.set_right(bar_index)
+    bool touched = dir == BULL ? low <= entry : high >= entry
+    bool stopped = dir == BULL ? low <= stop : high >= stop
+    bool missed  = dir == BULL ? high >= target : low <= target
+    if touched
+        st      := S_TRADE
+        fillBar := bar_index
+        evFill  := true
+        tpBox := box.new(bar_index, math.max(entry, target), bar_index, math.min(entry, target), border_color = color(na), bgcolor = color.new(GREEN, 84), text = "TP " + tgtTag, text_size = size.tiny, text_color = GREEN, text_halign = text.align_left)
+        slBox := box.new(bar_index, math.max(entry, stop), bar_index, math.min(entry, stop), border_color = color(na), bgcolor = color.new(RED, 84), text = "SL", text_size = size.tiny, text_color = RED, text_halign = text.align_left)
+        label.new(bar_index, dir == BULL ? low : high, "", color = dir == BULL ? bullColorInput : bearColorInput, style = dir == BULL ? label.style_triangleup : label.style_triangledown, size = size.small, tooltip = "Retrace entry at " + str.tostring(entry, format.mintick))
+        if stopped
+            st      := S_IDLE
+            evStop  := true
+            lastRes := "Stop"
+            closeTrade("Stop", stop)
+    else if stopped or missed or bar_index - setupBar > entryWinInput
+        st := S_IDLE
+        zBox.set_bgcolor(color.new(zoneColorInput, 90))
+        zBox.set_text(zKind + (stopped ? " · invalid" : missed ? " · missed" : " · expired"))
+else if st == S_TRADE and bar_index > fillBar
+    bool hitStop   = dir == BULL ? low <= stop : high >= stop
+    bool hitTarget = dir == BULL ? high >= target : low <= target
+    if hitStop
+        st      := S_IDLE
+        evStop  := true
+        lastRes := "Stop"
+        closeTrade("Stop", stop)
+    else if hitTarget
+        st       := S_IDLE
+        evTarget := true
+        lastRes  := "Target"
+        closeTrade("Target", target)
+    else
+        tpBox.set_right(bar_index)
+        slBox.set_right(bar_index)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dash = table.new(tablePos(dashPosInput), 2, 5, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+if barstate.islast and showDashInput
+    string sz = textSize(dashSizeInput)
+    color dCss = dir == BULL ? bullColorInput : bearColorInput
+    string side = dir == BULL ? "Long" : dir == BEAR ? "Short" : ""
+    string stTxt = switch st
+        S_SWEPT => side + ": swept, wait for CHoCH"
+        S_ENTRY => side + ": wait for retrace"
+        S_TRADE => side + ": in trade"
+        => "Scanning" + (lastRes != "" ? " (last: " + lastRes + ")" : "")
+    bool hasPlan = grade != "" and (st == S_ENTRY or st == S_TRADE or st == S_IDLE)
+    table.cell(dash, 0, 0, "Smart Money Reversal", text_color = DASH_TEXT, text_halign = text.align_left, text_size = sz)
+    table.cell(dash, 1, 0, stTxt, text_color = st == S_IDLE ? DASH_TEXT : dCss, text_halign = text.align_right, text_size = sz)
+    table.cell(dash, 0, 1, "Last Grade", text_color = DASH_HEADER, text_halign = text.align_left, text_size = sz)
+    table.cell(dash, 1, 1, grade == "" ? "-" : grade + " (" + str.tostring(score) + "/" + str.tostring(maxScore) + ")", text_color = DASH_TEXT, text_halign = text.align_right, text_size = sz)
+    table.cell(dash, 0, 2, "Dials", text_color = DASH_HEADER, text_halign = text.align_left, text_size = sz)
+    table.cell(dash, 1, 2, grade == "" ? "-" : dialShort, text_color = DASH_TEXT, text_halign = text.align_right, text_size = sz)
+    table.cell(dash, 0, 3, "Entry / Stop", text_color = DASH_HEADER, text_halign = text.align_left, text_size = sz)
+    table.cell(dash, 1, 3, hasPlan ? str.tostring(entry, format.mintick) + " / " + str.tostring(stop, format.mintick) : "-", text_color = DASH_TEXT, text_halign = text.align_right, text_size = sz)
+    table.cell(dash, 0, 4, "Target", text_color = DASH_HEADER, text_halign = text.align_left, text_size = sz)
+    table.cell(dash, 1, 4, hasPlan ? str.tostring(target, format.mintick) + " (" + tgtTag + ")" : "-", text_color = DASH_TEXT, text_halign = text.align_right, text_size = sz)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(evSweep and dir == BULL, "Sell-side Sweep",          "Smart Money Reversal on {{ticker}}: sell-side pool swept, waiting for displacement and a change of character")
+alertcondition(evSweep and dir == BEAR, "Buy-side Sweep",           "Smart Money Reversal on {{ticker}}: buy-side pool swept, waiting for displacement and a change of character")
+alertcondition(evChoch and dir == BULL, "Bullish Reversal Confirmed", "Smart Money Reversal on {{ticker}}: displacement and change of character after a sell-side sweep, entry zone marked")
+alertcondition(evChoch and dir == BEAR, "Bearish Reversal Confirmed", "Smart Money Reversal on {{ticker}}: displacement and change of character after a buy-side sweep, entry zone marked")
+alertcondition(evFill,                  "Retrace Entry",            "Smart Money Reversal on {{ticker}}: retrace into the entry zone")
+alertcondition(evTarget,                "Target Reached",           "Smart Money Reversal on {{ticker}}: opposing pool reached")
+alertcondition(evStop,                  "Stop Hit",                 "Smart Money Reversal on {{ticker}}: price traded past the sweep's extreme")
+
+//---------------------------------------------------------------------------------------------------------------------}

@@ -1,0 +1,203 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("On-neck / In-neck / Thrusting", shorttitle = "On-neck / In-neck / Thrusting", overlay = true, max_labels_count = 500, max_lines_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+ON_NECK_COLOR   = #f23645
+IN_NECK_COLOR   = #ff5d00
+THRUSTING_COLOR = #ff9800
+NEUTRAL_COLOR   = #787b86
+HIDDEN_COLOR    = #00000000
+
+ON_NECK_NAME   = "On-Neck"
+IN_NECK_NAME   = "In-Neck"
+THRUSTING_NAME = "Thrusting"
+MERGED_NAME    = "Weak Line"
+
+OPT_RELAXED = "Below prior close (relaxed)"
+OPT_STRICT  = "Below prior low (strict)"
+
+INVALID_LINE_TRANSP = 30
+FAILED_LINE_TRANSP  = 50
+TREND_TRANSP        = 40
+
+G_TREND      = "Trend & First Candle"
+G_PATTERN    = "Pattern Boundaries"
+G_RESOLUTION = "Resolution Tracking"
+G_STYLE      = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+trendLenInput = input.int(50, "Downtrend SMA Length", minval = 2, group = G_TREND, tooltip = "Length of the simple moving average used as the downtrend filter. The first candle must close below this average: without a decline in place, the formations are just adjacent candles.")
+
+bodyLookbackInput = input.int(20, "Body Average Length", minval = 1, group = G_TREND, tooltip = "Number of bars used to compute the average candle body size, the reference for the long dark candle filter.")
+
+bodyMultInput = input.float(1.2, "Long Body Multiplier", minval = 0, step = 0.1, group = G_TREND, tooltip = "The first candle's body must be at least this multiple of the average body size to qualify as a long dark candle. Set to 0 to disable the length filter.")
+
+openModeInput = input.string(OPT_RELAXED, "Open Requirement", options = [OPT_RELAXED, OPT_STRICT], group = G_PATTERN, tooltip = "Where the second candle must open. The strict Japanese form wants an open below the first candle's low, which is rare where trading is continuous; the relaxed form only requires an open below the first candle's close, removing part of the failed-rally logic.")
+
+tolPctInput = input.float(5, "Tolerance %", minval = 0, maxval = 25, step = 0.5, group = G_PATTERN, tooltip = "Tolerance band as a percentage of the first candle's body. On-neck accepts closes within this distance of the first candle's low; in-neck accepts closes at most this far above the first candle's close. The boundaries between the variants are only a few ticks wide in liquid markets, so results shift noticeably with this setting.")
+
+mergeInput = input.bool(false, "Merge Variants", group = G_PATTERN, tooltip = "Report every qualifying close from the neck area up to the body midpoint as a single Weak Line signal instead of classifying on-neck, in-neck and thrusting separately. Merged labels are colored along the on-neck to thrusting scale by recovery depth.")
+
+showOnNeckInput = input.bool(true, "On-Neck", inline = "variants", group = G_PATTERN, tooltip = "Variants to detect when classification is on: on-neck closes at or near the first candle's low, in-neck marginally above its close, thrusting well into the body but below the midpoint. Ignored when Merge Variants is enabled.")
+
+showInNeckInput = input.bool(true, "In-Neck", inline = "variants", group = G_PATTERN, tooltip = "Variants to detect when classification is on: on-neck closes at or near the first candle's low, in-neck marginally above its close, thrusting well into the body but below the midpoint. Ignored when Merge Variants is enabled.")
+
+showThrustingInput = input.bool(true, "Thrusting", inline = "variants", group = G_PATTERN, tooltip = "Variants to detect when classification is on: on-neck closes at or near the first candle's low, in-neck marginally above its close, thrusting well into the body but below the midpoint. Ignored when Merge Variants is enabled.")
+
+trackInput = input.bool(true, "Track Confirmation & Invalidation", group = G_RESOLUTION, tooltip = "Monitor each pattern after detection: a break below the pattern low confirms the classical bearish continuation, while a push above the second candle's high invalidates it, since a move through that high means the weak rally was actually absorbing supply.")
+
+trackMaxBarsInput = input.int(100, "Tracking Limit (bars)", minval = 1, maxval = 5000, group = G_RESOLUTION, tooltip = "Maximum number of bars a pattern is monitored and its trigger and invalidation levels are extended before tracking stops unresolved.")
+
+showLabelsInput = input.bool(true, "Show Pattern Labels", group = G_STYLE, tooltip = "Display a label above the second candle of each detected pattern, and small markers when a tracked pattern confirms or invalidates.")
+
+showDepthInput = input.bool(true, "Show Recovery Depth %", group = G_STYLE, tooltip = "Append the recovery depth to each label: the second close's penetration of the first candle's body, where 0% is the prior close and 50% its midpoint. A close above 50% would upgrade the formation to a piercing line.")
+
+showMidInput = input.bool(true, "Show Midpoint Boundary", group = G_STYLE, tooltip = "Draw the first body's midpoint at each detection, the boundary that matters most: a close above it is a piercing line, a different and bullish pattern.")
+
+showTrendInput = input.bool(false, "Show Trend SMA", group = G_STYLE, tooltip = "Plot the simple moving average used by the downtrend filter.")
+
+onNeckColorInput = input.color(ON_NECK_COLOR, "On-Neck", inline = "colors", group = G_STYLE, tooltip = "Label and trigger level colors of each variant, graded from weakest recovery (on-neck) to deepest (thrusting).")
+
+inNeckColorInput = input.color(IN_NECK_COLOR, "In-Neck", inline = "colors", group = G_STYLE, tooltip = "Label and trigger level colors of each variant, graded from weakest recovery (on-neck) to deepest (thrusting).")
+
+thrustingColorInput = input.color(THRUSTING_COLOR, "Thrusting", inline = "colors", group = G_STYLE, tooltip = "Label and trigger level colors of each variant, graded from weakest recovery (on-neck) to deepest (thrusting).")
+
+neutralColorInput = input.color(NEUTRAL_COLOR, "Neutral", group = G_STYLE, tooltip = "Color of the midpoint boundary, the invalidation level, the trend SMA, and the trigger level of invalidated patterns.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types
+//---------------------------------------------------------------------------------------------------------------------{
+type WeakLine
+    line   trigLineId
+    line   invLineId
+    float  trigger
+    float  invalid
+    int    startIndex
+    string variantName
+    color  variantColor
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Pattern Detection
+//---------------------------------------------------------------------------------------------------------------------{
+float bodySize = math.abs(close - open)
+float avgBody  = ta.sma(bodySize, bodyLookbackInput)
+float trendSma = ta.sma(close, trendLenInput)
+
+// First candle geometry: a dark candle has a positive body1, its body midpoint is the piercing-line boundary
+float body1 = open[1] - close[1]
+float mid1  = (open[1] + close[1]) / 2
+float tol   = body1 * tolPctInput / 100
+
+// Shared setup: downtrend, long dark first candle, white second candle opening lower and closing below the midpoint
+bool downtrend = not na(trendSma[1]) and close[1] < trendSma[1]
+bool longDark  = bar_index > 0 and not na(avgBody[1]) and close[1] < open[1] and body1 >= avgBody[1] * bodyMultInput
+bool whiteBody = close > open
+bool openLower = openModeInput == OPT_STRICT ? open < low[1] : open < close[1]
+
+bool setupOk = downtrend and longDark and whiteBody and openLower and close < mid1
+
+// Classification hangs entirely on the second close: at or near the first low, marginally into the body,
+// or well into the body but below its midpoint. The three bands are mutually exclusive.
+bool onNeckRaw    = setupOk and close <= close[1] and math.abs(close - low[1]) <= tol
+bool inNeckRaw    = setupOk and close > close[1] and close <= close[1] + tol
+bool thrustingRaw = setupOk and close > close[1] + tol
+
+// Recovery depth: penetration of the first body, 0% at the prior close, 50% at the midpoint
+float depthPct = setupOk ? (close - close[1]) / body1 * 100 : na
+
+bool onNeck    = not mergeInput and showOnNeckInput and onNeckRaw
+bool inNeck    = not mergeInput and showInNeckInput and inNeckRaw
+bool thrusting = not mergeInput and showThrustingInput and thrustingRaw
+bool mergedHit = mergeInput and setupOk and close >= low[1] - tol
+
+bool patternDetected = onNeck or inNeck or thrusting or mergedHit
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Resolution Tracking, Levels & Labels
+//---------------------------------------------------------------------------------------------------------------------{
+var array<WeakLine> pendingArray = array.new<WeakLine>()
+
+bool confirmEvent = false
+bool invalidEvent = false
+
+// Extend the trigger and invalidation levels of pending patterns, then resolve them:
+// a break below the pattern low confirms continuation, a push above the second candle's high invalidates
+if array.size(pendingArray) > 0
+    for i = array.size(pendingArray) - 1 to 0
+        WeakLine wl    = array.get(pendingArray, i)
+        int rightLimit = math.min(bar_index, wl.startIndex + trackMaxBarsInput)
+
+        if not na(wl.trigLineId)
+            line.set_x2(wl.trigLineId, rightLimit)
+        if not na(wl.invLineId)
+            line.set_x2(wl.invLineId, rightLimit)
+
+        if barstate.isconfirmed
+            if low < wl.trigger
+                confirmEvent := true
+                if showLabelsInput
+                    label.new(bar_index, low, "Confirmed", style = label.style_label_up, color = HIDDEN_COLOR, textcolor = wl.variantColor, size = size.tiny, tooltip = wl.variantName + " continuation confirmed: price broke below the pattern low at " + str.tostring(wl.trigger, format.mintick))
+                array.remove(pendingArray, i)
+            else if high > wl.invalid
+                invalidEvent := true
+                if not na(wl.trigLineId)
+                    line.set_color(wl.trigLineId, color.new(neutralColorInput, FAILED_LINE_TRANSP))
+                if showLabelsInput
+                    label.new(bar_index, high, "Invalidated", style = label.style_label_down, color = HIDDEN_COLOR, textcolor = neutralColorInput, size = size.tiny, tooltip = wl.variantName + " invalidated: price pushed above the second candle's high at " + str.tostring(wl.invalid, format.mintick) + ", the weak rally was actually absorbing supply")
+                array.remove(pendingArray, i)
+            else if bar_index >= wl.startIndex + trackMaxBarsInput
+                array.remove(pendingArray, i)
+
+// Register a new pattern once the second candle is confirmed
+if patternDetected and barstate.isconfirmed
+    string variantName = mergedHit ? MERGED_NAME : onNeck ? ON_NECK_NAME : inNeck ? IN_NECK_NAME : THRUSTING_NAME
+    color variantColor = mergedHit ? color.from_gradient(depthPct, 0, 50, onNeckColorInput, thrustingColorInput) : onNeck ? onNeckColorInput : inNeck ? inNeckColorInput : thrustingColorInput
+
+    float triggerLevel = math.min(low, low[1])
+    float invalidLevel = high
+
+    if showMidInput
+        line.new(bar_index - 1, mid1, bar_index + 2, mid1, color = neutralColorInput, style = line.style_dashed)
+
+    line trigLineId = na
+    line invLineId  = na
+
+    if trackInput
+        trigLineId := line.new(bar_index, triggerLevel, bar_index, triggerLevel, color = variantColor, style = line.style_solid)
+        invLineId  := line.new(bar_index, invalidLevel, bar_index, invalidLevel, color = color.new(neutralColorInput, INVALID_LINE_TRANSP), style = line.style_dotted)
+        array.push(pendingArray, WeakLine.new(trigLineId, invLineId, triggerLevel, invalidLevel, bar_index, variantName, variantColor))
+
+    if showLabelsInput
+        string depthText = str.tostring(depthPct, "#.#") + "%"
+        string labelText = showDepthInput ? variantName + "\n" + depthText : variantName
+        string tipText   = variantName + " line\nRecovery depth: " + depthText + " of the prior body (a close above 50% would be a piercing line)\nContinuation trigger: break below " + str.tostring(triggerLevel, format.mintick) + "\nInvalidation: push above " + str.tostring(invalidLevel, format.mintick)
+
+        label.new(bar_index, high, labelText, style = label.style_label_down, color = variantColor, textcolor = chart.bg_color, size = size.small, tooltip = tipText)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Trend Filter Plot
+//---------------------------------------------------------------------------------------------------------------------{
+plot(trendSma, "Trend SMA", showTrendInput ? color.new(neutralColorInput, TREND_TRANSP) : na, 1)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(onNeck and barstate.isconfirmed, "On-Neck Line", "On-neck line on {{ticker}} ({{interval}}): white candle stalled at the prior long dark candle's low")
+
+alertcondition(inNeck and barstate.isconfirmed, "In-Neck Line", "In-neck line on {{ticker}} ({{interval}}): white candle closed marginally above the prior long dark candle's close")
+
+alertcondition(thrusting and barstate.isconfirmed, "Thrusting Line", "Thrusting line on {{ticker}} ({{interval}}): white candle pushed into the prior dark body but stopped below its midpoint")
+
+alertcondition(patternDetected and barstate.isconfirmed, "Any Weak Line", "Weak line on {{ticker}} ({{interval}}): the rally into a long dark candle failed below the body midpoint, favoring downtrend continuation")
+
+alertcondition(confirmEvent, "Continuation Confirmed", "Weak line continuation confirmed on {{ticker}} ({{interval}}): price broke below the pattern low")
+
+alertcondition(invalidEvent, "Pattern Invalidated", "Weak line invalidated on {{ticker}} ({{interval}}): price pushed above the second candle's high")
+
+//---------------------------------------------------------------------------------------------------------------------}

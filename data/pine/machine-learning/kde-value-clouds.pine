@@ -1,0 +1,144 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("KDE Value Clouds", "KDE Value Clouds", overlay = true, max_boxes_count = 500, max_lines_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+// Constants
+color BULL_COLOR = #089981
+color BEAR_COLOR = #f23645
+
+// Groups
+string G_MAIN = "Main Settings"
+string G_VIS  = "Visualization"
+
+// Inputs
+int   lookbackInput   = input.int(200, "Lookback Period", minval = 50, group = G_MAIN, tooltip = "Number of bars used to calculate the price density.")
+float bandwidthMult   = input.float(1.0, "Bandwidth Multiplier", minval = 0.1, step = 0.1, group = G_MAIN, tooltip = "Adjusts the smoothness of the KDE curve. Higher values result in a smoother, broader curve.")
+int   precisionInput  = input.int(50, "Precision (Steps)", minval = 10, maxval = 100, group = G_MAIN, tooltip = "Number of price levels to evaluate for the density curve.")
+
+color bullColorInput  = input.color(BULL_COLOR, "High Density Color", group = G_VIS, inline = "colors")
+color bearColorInput  = input.color(BEAR_COLOR, "Low Density Color", group = G_VIS, inline = "colors")
+int   profileWidth    = input.int(50, "Profile Width (%)", minval = 10, maxval = 100, group = G_VIS, tooltip = "Width of the KDE profile on the right side of the chart.")
+bool  showCloudInput  = input.bool(true, "Show Value Cloud on Chart", group = G_VIS)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions / Methods
+//---------------------------------------------------------------------------------------------------------------------{
+// @function Gaussian Kernel Function
+// @param u Standardized distance from the evaluation point
+// @returns The probability density weight
+gaussian_kernel(float u) =>
+    (1 / math.sqrt(2 * math.pi)) * math.exp(-0.5 * math.pow(u, 2))
+
+// @function Silverman's Rule for Bandwidth
+// @param prices Array of price points
+// @param mult User-defined smoothing multiplier
+// @returns The optimal bandwidth (h) for the density estimation
+calc_bandwidth(float[] prices, float mult) =>
+    float n     = array.size(prices)
+    float sigma = array.stdev(prices)
+    1.06 * sigma * math.pow(n, -0.2) * mult
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+var box[]   cloudBoxes   = array.new_box()
+var line[]  profileLines = array.new_line()
+var line    pocLine      = na
+var label   pocLabel     = na
+
+if barstate.islast
+    // 1. Prepare Data
+    float[] prices = array.new_float(0)
+    float minPrice = na
+    float maxPrice = na
+    
+    for i = 0 to lookbackInput - 1
+        float val = close[i]
+        array.push(prices, val)
+        minPrice := na(minPrice) ? val : math.min(minPrice, val)
+        maxPrice := na(maxPrice) ? val : math.max(maxPrice, val)
+
+    // 2. Calculate Parameters
+    float h = calc_bandwidth(prices, bandwidthMult)
+    float priceRange = maxPrice - minPrice
+    float stepSize = priceRange / precisionInput
+    
+    // 3. Compute KDE Densities
+    float[] densities = array.new_float(precisionInput + 1, 0.0)
+    float maxDensity  = 0.0
+    float pocPrice    = 0.0
+    
+    for i = 0 to precisionInput
+        float evalPrice = minPrice + (i * stepSize)
+        float sumKernel = 0.0
+        
+        for j = 0 to array.size(prices) - 1
+            float u = (evalPrice - array.get(prices, j)) / h
+            sumKernel += gaussian_kernel(u)
+        
+        float density = sumKernel / (array.size(prices) * h)
+        array.set(densities, i, density)
+        
+        if density > maxDensity
+            maxDensity := density
+            pocPrice := evalPrice
+
+    //---------------------------------------------------------------------------------------------------------------------}
+    // Visuals
+    //---------------------------------------------------------------------------------------------------------------------{
+    // Clean up previous drawings
+    if array.size(cloudBoxes) > 0
+        for b in cloudBoxes
+            box.delete(b)
+        array.clear(cloudBoxes)
+    
+    if array.size(profileLines) > 0
+        for l in profileLines
+            line.delete(l)
+        array.clear(profileLines)
+
+    // Draw Profile and Cloud
+    for i = 0 to precisionInput
+        float currentPrice = minPrice + (i * stepSize)
+        float density      = array.get(densities, i)
+        float normDensity  = density / maxDensity // Scale 0 to 1
+        
+        // --- Draw Horizontal Profile ---
+        int profileLength = int(normDensity * profileWidth)
+        color profileCol  = color.from_gradient(normDensity, 0, 1, bearColorInput, bullColorInput)
+        
+        line l = line.new(
+             bar_index, currentPrice, 
+             bar_index + profileLength, currentPrice, 
+             color = color.new(profileCol, 30), 
+             width = 2
+             )
+        array.push(profileLines, l)
+        
+        // --- Draw Value Cloud (Boxes on Chart) ---
+        if showCloudInput and i < precisionInput
+            float nextPrice = minPrice + ((i + 1) * stepSize)
+            // We only show "High Value" areas (Top 50% density)
+            if normDensity > 0.5
+                float transparency = (1 - normDensity) * 100
+                box b = box.new(
+                     bar_index - lookbackInput + 1, nextPrice, 
+                     bar_index, currentPrice, 
+                     bgcolor = color.new(profileCol, math.max(85, transparency)), 
+                     border_color = na
+                     )
+                array.push(cloudBoxes, b)
+
+    // Mark the Point of Control (Highest Density)
+    line.delete(pocLine)
+    label.delete(pocLabel)
+    
+    pocLine := line.new(bar_index, pocPrice, bar_index + profileWidth, pocPrice, color = chart.fg_color, width = 1, style = line.style_dashed)
+    pocLabel := label.new(bar_index + profileWidth, pocPrice, "KDE POC", color = #00000000, textcolor = chart.fg_color, style = label.style_label_left, size = size.small)
+
+//---------------------------------------------------------------------------------------------------------------------}

@@ -1,0 +1,335 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Autocorrelation", shorttitle = "Autocorrelation", overlay = false, format = format.price, precision = 3, max_boxes_count = 100, max_lines_count = 25, max_labels_count = 50)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR    = #089981 // significantly positive - momentum-friendly follow-through
+BEAR_COLOR    = #f23645 // significantly negative - mean-reversion-friendly snap-back
+NEUTRAL_COLOR = #787b86 // inside the significance bands - noise
+BAND_COLOR    = #787b86
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+ZONE_TRANSP = 85        // transparency of the noise-band shading
+
+FILL_VALUE_TRANSP = 50  // gradient transparency at the autocorrelation value
+FILL_ZERO_TRANSP  = 100 // gradient transparency at the zero line
+
+CORR_OFFSET = 4         // bars between the last bar and the first correlogram column
+CORR_STRIDE = 3         // bars from one correlogram column to the next
+CORR_WIDTH  = 2         // width of each correlogram column, in bars
+
+RETURNS_SERIES  = "Returns"
+SQUARED_SERIES  = "Squared Returns"
+ABSOLUTE_SERIES = "Absolute Returns"
+DETREND_SERIES  = "Detrended Price"
+
+ACF_MODE  = "ACF"
+PACF_MODE = "PACF"
+
+TOP_RIGHT    = "Top Right"
+TOP_LEFT     = "Top Left"
+BOTTOM_RIGHT = "Bottom Right"
+BOTTOM_LEFT  = "Bottom Left"
+
+TINY_SIZE   = "Tiny"
+SMALL_SIZE  = "Small"
+NORMAL_SIZE = "Normal"
+
+EPSILON = 1e-12
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+srcInput      = input.source(close, "Source", group = "Autocorrelation",
+     tooltip = "Price series the analyzed series is built from.")
+
+seriesInput   = input.string(RETURNS_SERIES, "Series", options = [RETURNS_SERIES, SQUARED_SERIES, ABSOLUTE_SERIES, DETREND_SERIES], group = "Autocorrelation",
+     tooltip = "Series whose autocorrelation is measured - the choice decides the question asked. Raw (log) returns read direction persistence, squared or absolute returns read volatility persistence, and detrended price (price minus its own moving average) is for cycle hunting.")
+
+detrendInput  = input.int(20, "Detrend Length", minval = 2, maxval = 500, group = "Autocorrelation",
+     tooltip = "Moving average length subtracted from price when 'Detrended Price' is the selected series. Ignored by the return-based series.")
+
+windowInput   = input.int(200, "Sample Window", minval = 20, maxval = 1000, group = "Autocorrelation",
+     tooltip = "Rolling sample size n. Longer windows tighten the +/-2/sqrt(n) significance bands but track regime changes more slowly - windows under a hundred observations produce bands so wide that only large effects register.")
+
+lagInput      = input.int(1, "Primary Lag", minval = 1, maxval = 50, group = "Autocorrelation",
+     tooltip = "Lag whose rolling autocorrelation is plotted as the pane series and monitored by the alerts. Lag 1 reads bar-to-bar persistence. Keep it well below the sample window.")
+
+showCorrInput = input.bool(true, "Show Correlogram", group = "Correlogram",
+     tooltip = "Draws the correlogram to the right of the last bar - one column per lag with dashed significance bands. Columns outside the bands are the readings worth attention; columns inside them are silence, not signal.")
+
+corrLagsInput = input.int(20, "Lags", minval = 2, maxval = 50, group = "Correlogram",
+     tooltip = "Number of lags displayed in the correlogram.")
+
+corrModeInput = input.string(ACF_MODE, "Mode", options = [ACF_MODE, PACF_MODE], group = "Correlogram",
+     tooltip = "ACF plots the plain correlation of the series with each lagged copy of itself. PACF (Durbin-Levinson recursion) strips out the influence of shorter lags to isolate each lag's direct effect - the classic pair for choosing autoregressive and moving-average orders.")
+
+showDashInput = input.bool(true, "Show Dashboard", group = "Dashboard",
+     tooltip = "Displays a summary panel with the analyzed series, the sample size, the primary-lag reading, the significance band and the regime classification.")
+
+dashLocInput  = input.string(TOP_RIGHT, "Location", options = [TOP_RIGHT, TOP_LEFT, BOTTOM_RIGHT, BOTTOM_LEFT], inline = "dash", group = "Dashboard",
+     tooltip = "Position and text size of the dashboard.")
+
+dashSizeInput = input.string(SMALL_SIZE, "Size", options = [TINY_SIZE, SMALL_SIZE, NORMAL_SIZE], inline = "dash", group = "Dashboard",
+     tooltip = "Text size of the dashboard.")
+
+acfColorInput  = input.color(NEUTRAL_COLOR, "Autocorrelation", group = "Style",
+     tooltip = "Color of the rolling autocorrelation plot, of its gradient fill and of the correlogram columns while the reading sits inside the significance bands - noise.")
+
+momentumColorInput  = input.color(BULL_COLOR, "Momentum", inline = "regime", group = "Style",
+     tooltip = "Color of the plot, fill and correlogram columns while the reading is significantly positive - moves tend to follow through.")
+
+reversionColorInput = input.color(BEAR_COLOR, "Mean Reversion", inline = "regime", group = "Style",
+     tooltip = "Color of the plot, fill and correlogram columns while the reading is significantly negative - moves tend to snap back.")
+
+gradientInput  = input.bool(true, "Gradient Fill", group = "Style",
+     tooltip = "Fills the area between zero and the rolling autocorrelation with a vertical gradient, fully transparent at zero and strongest at the current value.")
+
+bandColorInput = input.color(BAND_COLOR, "Significance Bands", group = "Style",
+     tooltip = "Color of the +/-2/sqrt(n) significance bands on the pane and on the correlogram.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Table corner from the dashboard position option
+tableLocation(string positionText) =>
+    switch
+        positionText == TOP_RIGHT    => position.top_right
+        positionText == TOP_LEFT     => position.top_left
+        positionText == BOTTOM_RIGHT => position.bottom_right
+        => position.bottom_left
+
+// Table text size from the dashboard size option
+tableTextSize(string sizeText) =>
+    switch
+        sizeText == TINY_SIZE  => size.tiny
+        sizeText == SMALL_SIZE => size.small
+        => size.normal
+
+// Sample autocorrelation of the stored sample at one lag: products of deviations from the
+// single sample mean, divided by the sample's sum of squared deviations (its variance term)
+acfLag(array<float> sample, int lag) =>
+    int sampleSize = sample.size()
+    float rLag = na
+    if sampleSize >= lag + 2
+        float sampleMean = sample.avg()
+        float sumSquares = 0.0
+        for i = 0 to sampleSize - 1
+            float deviation = sample.get(i) - sampleMean
+            sumSquares += deviation * deviation
+        float sumProducts = 0.0
+        for i = 0 to sampleSize - lag - 1
+            sumProducts += (sample.get(i) - sampleMean) * (sample.get(i + lag) - sampleMean)
+        rLag := sumSquares > EPSILON ? sumProducts / sumSquares : na
+    rLag
+
+// Autocorrelation function - one sample autocorrelation per lag, from 1 to maxLag
+acfProfile(array<float> sample, int maxLag) =>
+    array<float> acfValues = array.new<float>()
+    for k = 1 to maxLag
+        acfValues.push(acfLag(sample, k))
+    acfValues
+
+// Partial autocorrelation function from the ACF, via the Durbin-Levinson recursion -
+// each lag's direct effect once the influence of the shorter lags is stripped out
+pacfProfile(array<float> acfValues) =>
+    int lagCount = acfValues.size()
+    array<float> pacfValues = array.new<float>()
+    array<float> phiPrev    = array.new<float>()
+    for k = 1 to lagCount
+        float rK    = acfValues.get(k - 1)
+        float phiKK = na
+        if k == 1
+            phiKK := rK
+        else
+            float numerator   = rK
+            float denominator = 1.0
+            bool valid = not na(rK)
+            if valid
+                for j = 1 to k - 1
+                    float phiJ = phiPrev.get(j - 1)
+                    float rKmJ = acfValues.get(k - j - 1)
+                    float rJ   = acfValues.get(j - 1)
+                    if na(phiJ) or na(rKmJ) or na(rJ)
+                        valid := false
+                    else
+                        numerator   -= phiJ * rKmJ
+                        denominator -= phiJ * rJ
+            phiKK := valid and math.abs(denominator) > EPSILON ? numerator / denominator : na
+        array<float> phiNext = array.new<float>()
+        if k > 1
+            for j = 1 to k - 1
+                float phiJ   = phiPrev.get(j - 1)
+                float phiKmJ = phiPrev.get(k - j - 1)
+                phiNext.push(na(phiKK) or na(phiJ) or na(phiKmJ) ? float(na) : phiJ - phiKK * phiKmJ)
+        phiNext.push(phiKK)
+        phiPrev := phiNext
+        pacfValues.push(phiKK)
+    pacfValues
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+// Analyzed series - log returns for direction persistence, their square/absolute value for
+// volatility persistence, or price minus its moving average for cycle hunting.
+// Returns are in percent: autocorrelation is scale-invariant and percent units keep the sums well-conditioned
+float logReturn = 100 * math.log(srcInput / srcInput[1])
+float detrended = srcInput - ta.sma(srcInput, detrendInput)
+
+float sampleValue = switch
+    seriesInput == RETURNS_SERIES  => logReturn
+    seriesInput == SQUARED_SERIES  => logReturn * logReturn
+    seriesInput == ABSOLUTE_SERIES => math.abs(logReturn)
+    => detrended
+
+// Rolling sample - the most recent valid observations, capped at the window size
+var array<float> sampleArray = array.new<float>()
+
+if not na(sampleValue)
+    sampleArray.push(sampleValue)
+    if sampleArray.size() > windowInput
+        sampleArray.shift()
+
+int sampleCount = sampleArray.size()
+
+// Noise band - for a series of length n with no true autocorrelation, sample values
+// mostly fall within roughly +/-2/sqrt(n); readings inside it are silence, not signal
+float bandValue = sampleCount > 0 ? 2 / math.sqrt(sampleCount) : na
+
+// Rolling sample autocorrelation at the primary lag
+float acfValue = acfLag(sampleArray, lagInput)
+
+// Regime state: +1 significantly positive (momentum-friendly follow-through),
+// -1 significantly negative (mean-reversion-friendly snap-back), 0 inside the bands
+int sigState = na(acfValue) or na(bandValue) ? 0 : acfValue > bandValue ? 1 : acfValue < -bandValue ? -1 : 0
+
+bool momentumShift  = sigState == 1  and nz(sigState[1]) != 1
+bool reversionShift = sigState == -1 and nz(sigState[1]) != -1
+bool fadeToNoise    = sigState == 0  and nz(sigState[1]) != 0
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+bool acfPositive = nz(acfValue) >= 0
+
+// State coloring - momentum beyond the upper band, mean reversion beyond the lower band, noise inside
+color acfStateColor = sigState == 1 ? momentumColorInput : sigState == -1 ? reversionColorInput : acfColorInput
+
+color valueFillColor = gradientInput ? color.new(acfStateColor, FILL_VALUE_TRANSP) : na
+color zeroFillColor  = gradientInput ? color.new(acfStateColor, FILL_ZERO_TRANSP) : na
+
+acfPlotId  = plot(acfValue, "Autocorrelation", color = acfStateColor, linewidth = 1)
+zeroPlotId = plot(0, "Zero Line", color = color.new(NEUTRAL_COLOR, 60), linewidth = 1)
+
+plot(na(acfValue) ? na : bandValue, "Upper Significance Band", color = bandColorInput, linewidth = 1, style = plot.style_circles)
+plot(na(acfValue) ? na : -bandValue, "Lower Significance Band", color = bandColorInput, linewidth = 1, style = plot.style_circles)
+
+upperBandAnchorId = plot(na(acfValue) ? na : bandValue, "Upper Band Anchor", color = color(na), editable = false, display = display.none)
+lowerBandAnchorId = plot(na(acfValue) ? na : -bandValue, "Lower Band Anchor", color = color(na), editable = false, display = display.none)
+
+fill(acfPlotId, zeroPlotId, top_value = math.max(acfValue, 0), bottom_value = math.min(acfValue, 0), top_color = acfPositive ? valueFillColor : zeroFillColor, bottom_color = acfPositive ? zeroFillColor : valueFillColor, title = "Autocorrelation Gradient Fill")
+
+// Soft shading of the noise band - readings inside it are silence, not signal
+fill(upperBandAnchorId, lowerBandAnchorId, color = color.new(bandColorInput, ZONE_TRANSP), title = "Noise Band")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Correlogram
+//---------------------------------------------------------------------------------------------------------------------{
+var array<box> corrBoxArray     = array.new<box>()
+var array<line> corrLineArray   = array.new<line>()
+var array<label> corrLabelArray = array.new<label>()
+var int sigLagCount = 0
+
+if barstate.islast
+    for eachBox in corrBoxArray
+        box.delete(eachBox)
+    corrBoxArray.clear()
+
+    for eachLine in corrLineArray
+        line.delete(eachLine)
+    corrLineArray.clear()
+
+    for eachLabel in corrLabelArray
+        label.delete(eachLabel)
+    corrLabelArray.clear()
+
+    // One value per lag - plain autocorrelations, or their direct effects in PACF mode
+    array<float> acfValues     = acfProfile(sampleArray, corrLagsInput)
+    array<float> displayValues = corrModeInput == PACF_MODE ? pacfProfile(acfValues) : acfValues
+
+    sigLagCount := 0
+    for lagIdx = 1 to corrLagsInput
+        float lagValue = displayValues.get(lagIdx - 1)
+        if not na(lagValue) and not na(bandValue) and math.abs(lagValue) > bandValue
+            sigLagCount += 1
+
+    if showCorrInput
+        int startX = bar_index + CORR_OFFSET
+        int endX   = startX + (corrLagsInput - 1) * CORR_STRIDE + CORR_WIDTH
+
+        for lagIdx = 1 to corrLagsInput
+            float lagValue = displayValues.get(lagIdx - 1)
+            if not na(lagValue)
+                int leftX = startX + (lagIdx - 1) * CORR_STRIDE
+
+                // Columns shaded by magnitude relative to the band - significant lags stand out
+                color columnBase  = not na(bandValue) and lagValue > bandValue ? momentumColorInput : not na(bandValue) and lagValue < -bandValue ? reversionColorInput : acfColorInput
+                color columnColor = color.from_gradient(math.abs(lagValue), 0, nz(bandValue, 0.25) * 2, color.new(columnBase, 80), color.new(columnBase, 10))
+
+                corrBoxArray.push(box.new(leftX, math.max(lagValue, 0), leftX + CORR_WIDTH - 1, math.min(lagValue, 0), border_color = lagIdx == lagInput ? DASH_TEXT : na, border_width = 1, bgcolor = columnColor))
+
+                if lagIdx == 1 or lagIdx % 5 == 0
+                    corrLabelArray.push(label.new(leftX, math.min(lagValue, 0), str.tostring(lagIdx), color = #00000000, textcolor = DASH_HEADER, style = label.style_label_up, size = size.tiny))
+
+        if not na(bandValue)
+            corrLineArray.push(line.new(startX - 2, bandValue, endX + 1, bandValue, color = bandColorInput, style = line.style_dashed, width = 1))
+            corrLineArray.push(line.new(startX - 2, -bandValue, endX + 1, -bandValue, color = bandColorInput, style = line.style_dashed, width = 1))
+
+        corrLineArray.push(line.new(startX - 2, 0, endX + 1, 0, color = color.new(NEUTRAL_COLOR, 60), style = line.style_dotted, width = 1))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dashboardTable = na
+
+if barstate.islast and showDashInput
+    if na(dashboardTable)
+        dashboardTable := table.new(tableLocation(dashLocInput), 2, 6, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+    string textSize  = tableTextSize(dashSizeInput)
+    color labelColor = DASH_HEADER
+    color valueColor = DASH_TEXT
+
+    string readingText = na(acfValue) ? "n/a" : str.tostring(acfValue, "#.###")
+    string bandText    = na(bandValue) ? "n/a" : "±" + str.tostring(bandValue, "#.###")
+    string regimeText  = na(acfValue) or na(bandValue) ? "n/a" : sigState == 1 ? "Momentum" : sigState == -1 ? "Mean Reversion" : "Noise"
+    color regimeColor  = na(acfValue) or na(bandValue) ? labelColor : acfStateColor
+
+    table.cell(dashboardTable, 0, 0, "Series", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 0, seriesInput, text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 1, "Sample (n)", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 1, str.tostring(sampleCount), text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 2, "r(" + str.tostring(lagInput) + ")", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 2, readingText, text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 3, "Band", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 3, bandText, text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 4, "Regime", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 4, regimeText, text_color = regimeColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 5, corrModeInput + " Sig. Lags", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 5, str.tostring(sigLagCount) + " / " + str.tostring(corrLagsInput), text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(momentumShift, "Significant Positive Autocorrelation", "Autocorrelation on {{ticker}}: the primary-lag reading crossed above its +2/sqrt(n) significance band - moves tend to follow through, momentum-friendly regime ({{interval}})")
+alertcondition(reversionShift, "Significant Negative Autocorrelation", "Autocorrelation on {{ticker}}: the primary-lag reading crossed below its -2/sqrt(n) significance band - moves tend to snap back, mean-reversion-friendly regime ({{interval}})")
+alertcondition(fadeToNoise, "Autocorrelation Back Inside Bands", "Autocorrelation on {{ticker}}: the primary-lag reading returned inside its significance bands - persistence indistinguishable from noise ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

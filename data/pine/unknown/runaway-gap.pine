@@ -1,0 +1,273 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Runaway Gap"
+  , shorttitle       = "Runaway Gap"
+  , overlay          = true
+  , max_boxes_count  = 500
+  , max_labels_count = 500
+  , max_lines_count  = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+BULL_CSS   = #089981
+BEAR_CSS   = #f23645
+FILLED_CSS = #787b86
+
+PCT_MODE = '% of Price'
+ATR_MODE = 'ATR'
+
+MAX_ACTIVE_GAPS = 80
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+minGapSizeInput = input.float(0.1, 'Minimum Gap Size', minval = 0, step = 0.05, inline = 'gap', group = 'Gap Detection', tooltip = 'Smallest open gap that is considered, expressed in the unit selected next to it. Set to 0 to accept every gap.')
+gapUnitInput    = input.string(PCT_MODE, '', options = [PCT_MODE, ATR_MODE], inline = 'gap', group = 'Gap Detection', tooltip = 'Smallest open gap that is considered, expressed in the selected unit. A gap prints when a bar opens and stays entirely beyond the prior bar\'s range, leaving untraded prices between the two bars.')
+atrLengthInput  = input.int(14, 'ATR Length', minval = 1, group = 'Gap Detection', tooltip = 'Average True Range length used when the minimum gap size is expressed in ATR units.')
+
+trendTypeInput    = input.string('SMA', 'Trend Basis', options = ['SMA', 'EMA'], inline = 'trend', group = 'Trend Context', tooltip = 'Moving average type used as the trend basis.')
+trendLengthInput  = input.int(50, '', minval = 2, inline = 'trend', group = 'Trend Context', tooltip = 'Moving average defining the prevailing trend: price above it is an uptrend, below it a downtrend. A runaway gap must print in the direction of this trend.')
+minTrendBarsInput = input.int(10, 'Established Trend (bars)', minval = 1, group = 'Trend Context', tooltip = 'Consecutive bars price must already hold the trend side of the basis before a with-trend gap can qualify as runaway. This filters gaps at the launch point of a move, which belong to breakaway territory rather than continuation.')
+
+useVolumeInput = input.bool(true, 'Apply Volume Filter', group = 'Volume Filter', tooltip = 'Requires solid but not climactic participation on the gap bar: the market should look confident, not panicking. The filter is bypassed on symbols without volume data.')
+volLengthInput = input.int(20, 'Volume Average Length', minval = 1, group = 'Volume Filter', tooltip = 'Length of the simple moving average of volume used as the participation reference.')
+volMinInput    = input.float(1, 'Minimum Volume (x Average)', minval = 0, step = 0.1, group = 'Volume Filter', tooltip = 'Gap-bar volume must be at least this multiple of its average, evidencing solid conviction behind the continuation.')
+volMaxInput    = input.float(3, 'Maximum Volume (x Average)', minval = 0.1, step = 0.1, group = 'Volume Filter', tooltip = 'Gap-bar volume must stay below this multiple of its average, excluding the extreme frenzy that conventionally accompanies exhaustion gaps.')
+
+showTargetInput = input.bool(true, 'Measured Target Projection', group = 'Measuring Guideline', tooltip = 'Projects the distance from the trend origin to the gap midpoint beyond the gap, per the classical measuring-gap guideline that this gap tends to appear near the midpoint of the overall move. Treat the projection as a rough estimate rather than a rule; it turns ambiguous when a trend prints several continuation gaps.')
+
+showLabelsInput  = input.bool(true, 'Pattern Labels', group = 'Style')
+showBasisInput   = input.bool(true, 'Show Trend Basis', group = 'Style')
+bullColorInput   = input.color(BULL_CSS, 'Bullish', inline = 'css', group = 'Style')
+bearColorInput   = input.color(BEAR_CSS, 'Bearish', inline = 'css', group = 'Style')
+filledColorInput = input.color(FILLED_CSS, 'Filled', inline = 'css', group = 'Style')
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types
+//---------------------------------------------------------------------------------------------------------------------{
+
+type GapZone
+    int   direction
+    float topEdge
+    float bottomEdge
+    float targetPrice
+    bool  targetHit
+    bool  inRetest
+    box   zoneBox
+    line  targetLine
+    label targetLabel
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Trend Context
+//---------------------------------------------------------------------------------------------------------------------{
+
+smaValue = ta.sma(close, trendLengthInput)
+emaValue = ta.ema(close, trendLengthInput)
+maValue  = trendTypeInput == 'SMA' ? smaValue : emaValue
+
+lowestSeed  = ta.lowest(low, minTrendBarsInput)
+highestSeed = ta.highest(high, minTrendBarsInput)
+
+var int   trendDir      = 0
+var int   trendAge      = 0
+var float trendOrigin   = na
+var int   trendGapCount = 0
+
+int prevTrendDir = trendDir
+int prevTrendAge = trendAge
+
+int dirNow = na(maValue) ? trendDir : close > maValue ? 1 : close < maValue ? -1 : trendDir
+
+if dirNow != trendDir
+    trendDir      := dirNow
+    trendAge      := 1
+    trendOrigin   := dirNow == 1 ? nz(lowestSeed, low) : nz(highestSeed, high)
+    trendGapCount := 0
+else if trendDir != 0
+    trendAge    += 1
+    trendOrigin := trendDir == 1 ? math.min(nz(trendOrigin, low), low) : math.max(nz(trendOrigin, high), high)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Gap Filters
+//---------------------------------------------------------------------------------------------------------------------{
+
+atrValue = ta.atr(atrLengthInput)
+volAvg   = ta.sma(volume, volLengthInput)
+
+bool volumeOk = true
+if useVolumeInput and not na(volume) and not na(volAvg) and volAvg > 0
+    volumeOk := volume >= volMinInput * volAvg and volume <= volMaxInput * volAvg
+
+float minGapSize = gapUnitInput == ATR_MODE ? minGapSizeInput * nz(atrValue) : nz(close[1]) * minGapSizeInput / 100
+
+bool bullGapRaw = not na(high[1]) and low > high[1]
+bool bearGapRaw = not na(low[1])  and high < low[1]
+
+float gapWidth = bullGapRaw ? low - high[1] : bearGapRaw ? low[1] - high : na
+bool  sizeOk   = not na(gapWidth) and gapWidth >= minGapSize
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Active Gap Management
+//---------------------------------------------------------------------------------------------------------------------{
+
+var array<GapZone> activeGapsArray = array.new<GapZone>()
+
+bool retestEvent    = false
+bool gapFilledEvent = false
+bool targetHitEvent = false
+
+if array.size(activeGapsArray) > 0
+    array<GapZone> keepArray = array.new<GapZone>()
+
+    for i = 0 to array.size(activeGapsArray) - 1
+        GapZone gapZone  = array.get(activeGapsArray, i)
+        bool isBull      = gapZone.direction == 1
+        bool stillActive = true
+
+        box.set_right(gapZone.zoneBox, bar_index)
+
+        if not na(gapZone.targetLine) and not gapZone.targetHit
+            line.set_x2(gapZone.targetLine, bar_index + 1)
+
+            if not na(gapZone.targetLabel)
+                label.set_x(gapZone.targetLabel, bar_index + 1)
+
+        if barstate.isconfirmed
+            bool filledNow = isBull ? close < gapZone.bottomEdge : close > gapZone.topEdge
+
+            if filledNow
+                stillActive    := false
+                gapFilledEvent := true
+
+                box.set_bgcolor(gapZone.zoneBox, color.new(filledColorInput, 90))
+                box.set_border_color(gapZone.zoneBox, color.new(filledColorInput, 60))
+
+                if not na(gapZone.targetLine)
+                    line.delete(gapZone.targetLine)
+
+                if not na(gapZone.targetLabel)
+                    label.delete(gapZone.targetLabel)
+
+                if showLabelsInput
+                    label.new(bar_index, isBull ? high : low, 'Gap Filled'
+                      , style     = isBull ? label.style_label_down : label.style_label_up
+                      , color     = #00000000
+                      , textcolor = filledColorInput
+                      , size      = size.small
+                      , tooltip   = 'Decisive close back through the runaway gap. The continuation thesis is undermined: the trend is weaker than it looked, or the gap was really exhaustion in disguise.')
+            else
+                bool inZoneNow = isBull ? low <= gapZone.topEdge : high >= gapZone.bottomEdge
+
+                if inZoneNow and not gapZone.inRetest
+                    gapZone.inRetest := true
+                    retestEvent      := true
+                else if not inZoneNow
+                    gapZone.inRetest := false
+
+                if not gapZone.targetHit and not na(gapZone.targetPrice)
+                    bool hitNow = isBull ? high >= gapZone.targetPrice : low <= gapZone.targetPrice
+
+                    if hitNow
+                        gapZone.targetHit := true
+                        targetHitEvent    := true
+
+                        if not na(gapZone.targetLine)
+                            line.set_x2(gapZone.targetLine, bar_index)
+
+                        if not na(gapZone.targetLabel)
+                            label.set_text(gapZone.targetLabel, 'Target Hit')
+                            label.set_x(gapZone.targetLabel, bar_index)
+
+        if stillActive
+            array.push(keepArray, gapZone)
+
+    activeGapsArray := keepArray
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Runaway Gap Detection
+//---------------------------------------------------------------------------------------------------------------------{
+
+bool establishedUp = prevTrendDir == 1  and prevTrendAge >= minTrendBarsInput and trendDir == 1
+bool establishedDn = prevTrendDir == -1 and prevTrendAge >= minTrendBarsInput and trendDir == -1
+
+bool newBullGap = barstate.isconfirmed and bullGapRaw and sizeOk and volumeOk and establishedUp
+bool newBearGap = barstate.isconfirmed and bearGapRaw and sizeOk and volumeOk and establishedDn
+
+if newBullGap or newBearGap
+    trendGapCount += 1
+
+    int   gapDir      = newBullGap ? 1 : -1
+    float zoneTop     = newBullGap ? low : low[1]
+    float zoneBottom  = newBullGap ? high[1] : high
+    float zoneMid     = math.avg(zoneTop, zoneBottom)
+    float targetPrice = showTargetInput ? 2 * zoneMid - trendOrigin : na
+    color gapColor    = newBullGap ? bullColorInput : bearColorInput
+
+    box zoneBox = box.new(bar_index - 1, zoneTop, bar_index, zoneBottom
+      , border_color = color.new(gapColor, 40)
+      , border_style = line.style_dashed
+      , border_width = 1
+      , bgcolor      = color.new(gapColor, 85))
+
+    line  targetLine  = na
+    label targetLabel = na
+
+    if not na(targetPrice)
+        targetLine := line.new(bar_index, targetPrice, bar_index + 1, targetPrice
+          , color = color.new(gapColor, 30)
+          , style = line.style_dotted)
+
+        targetLabel := label.new(bar_index + 1, targetPrice, 'Target'
+          , style     = label.style_label_left
+          , color     = #00000000
+          , textcolor = color.new(gapColor, 30)
+          , size      = size.tiny
+          , tooltip   = 'Measuring-gap projection: the distance from the trend origin (' + str.tostring(trendOrigin, format.mintick) + ') to the gap midpoint, projected beyond the gap. A rough objective for the remainder of the move - an estimate, not a rule.')
+
+    if showLabelsInput
+        string ordinalText = trendGapCount > 1 ? ' #' + str.tostring(trendGapCount) : ''
+        string volumeText  = na(volume) or na(volAvg) or volAvg <= 0 ? 'n/a' : str.tostring(volume / volAvg, '#.##') + 'x average'
+        string gapTooltip  = (newBullGap ? 'Bullish' : 'Bearish') + ' runaway (measuring) gap - continuation gap #' + str.tostring(trendGapCount) + ' of this trend'
+          + '\nGap zone: ' + str.tostring(zoneBottom, format.mintick) + ' - ' + str.tostring(zoneTop, format.mintick)
+          + '\nVolume: ' + volumeText
+          + (not na(targetPrice) ? '\nMeasured target: ' + str.tostring(targetPrice, format.mintick) : '')
+          + '\nInvalidation: a decisive close ' + (newBullGap ? 'below ' + str.tostring(zoneBottom, format.mintick) : 'above ' + str.tostring(zoneTop, format.mintick)) + ' fills the gap; stops are often parked beyond that far edge'
+          + (trendGapCount > 1 ? '\nMultiple continuation gaps make the projection ambiguous and raise the odds the latest gap is exhaustion' : '')
+
+        label.new(bar_index, newBullGap ? zoneBottom : zoneTop, 'Runaway Gap' + ordinalText
+          , style     = newBullGap ? label.style_label_up : label.style_label_down
+          , color     = #00000000
+          , textcolor = gapColor
+          , size      = size.small
+          , tooltip   = gapTooltip)
+
+    if array.size(activeGapsArray) >= MAX_ACTIVE_GAPS
+        GapZone oldestGap = array.shift(activeGapsArray)
+        box.set_right(oldestGap.zoneBox, bar_index)
+
+    array.push(activeGapsArray, GapZone.new(gapDir, zoneTop, zoneBottom, targetPrice, false, false, zoneBox, targetLine, targetLabel))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Trend Basis Plot
+//---------------------------------------------------------------------------------------------------------------------{
+
+color basisColor = trendDir == 1 ? bullColorInput : trendDir == -1 ? bearColorInput : filledColorInput
+
+plot(maValue, 'Trend Basis', showBasisInput ? color.new(basisColor, 30) : na, 1)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(newBullGap, 'Bullish Runaway Gap', 'Bullish runaway gap on {{ticker}} {{interval}} - a mid-trend continuation gap printed with the established uptrend')
+alertcondition(newBearGap, 'Bearish Runaway Gap', 'Bearish runaway gap on {{ticker}} {{interval}} - a mid-trend continuation gap printed with the established downtrend')
+alertcondition(retestEvent, 'Gap Zone Retest', 'Price is retesting an open runaway gap zone on {{ticker}} {{interval}} - the gap acting as support/resistance on the pullback')
+alertcondition(gapFilledEvent, 'Runaway Gap Filled', 'Runaway gap filled on {{ticker}} {{interval}} - a decisive close back through the gap undermines the continuation thesis')
+alertcondition(targetHitEvent, 'Measured Target Reached', 'Measuring-gap target reached on {{ticker}} {{interval}}')
+
+//---------------------------------------------------------------------------------------------------------------------}

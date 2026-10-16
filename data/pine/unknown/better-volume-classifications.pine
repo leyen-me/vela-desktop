@@ -1,0 +1,257 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Better Volume Classifications"
+  , shorttitle = "Better Volume Classifications"
+  , overlay    = false
+  , format     = format.volume)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+int S_NEUTRAL      = 0
+int S_CLIMAX_UP    = 1
+int S_CLIMAX_DOWN  = 2
+int S_CHURN        = 3
+int S_CLIMAX_CHURN = 4
+int S_LOW_VOLUME   = 5
+
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+NEUTRAL_COLOR = #787b86
+ACCENT_COLOR  = #ff9800
+DASH_BG       = #161616
+DASH_FRAME    = #2E2E2E
+DASH_HEADER   = #808080
+DASH_TEXT     = #DBDBDB
+
+color CLIMAX_UP_COLOR    = BULL_COLOR                    // extreme volume × range on an up bar
+color CLIMAX_DOWN_COLOR  = BEAR_COLOR                    // extreme volume × range on a down bar
+color CHURN_COLOR        = ACCENT_COLOR                  // extreme volume ÷ range - effort trapped in a narrow spread, the accent
+color CLIMAX_CHURN_COLOR = #e65100                       // climax and churn at once - the deeper shade of the churn accent
+color LOW_VOLUME_COLOR   = DASH_TEXT                     // lowest raw volume of the window - the quiet test bar, light structure grey
+color NEUTRAL_BAR_COLOR  = color.new(NEUTRAL_COLOR, 50)  // unclassified bars recede so the prints stand out
+
+//Extra transparency applied to weak prints - extremes of the shorter window only
+int WEAK_TRANSPARENCY = 55
+
+string TXT_NA = "-"
+
+string TIP_CLIMAX_UP    = "Up bar whose volume × range set a high of the lookback window - the last aggressive buyers committing at once. After an extended advance it is an exhaustion alert; at a range boundary it is the participation a breakout needs. Standard practice waits for failed follow-through or a low-volume test rather than fading the bar itself."
+string TIP_CLIMAX_DOWN  = "Down bar whose volume × range set a high of the lookback window - the last aggressive sellers committing at once. After an extended decline it flags potential selling exhaustion; the read is confirmed by failed follow-through or a low-volume test that holds."
+string TIP_CHURN        = "Volume ÷ range set a high of the lookback window - heavy trade that bought almost no movement. Near highs it often means sellers quietly absorbing buying, near lows the reverse; mid-range it can be two-sided noise. The winner is judged by what price does over the next few bars."
+string TIP_CLIMAX_CHURN = "The bar qualified as climax and churn at once - extreme effort on a wide print together with extreme effort per unit of progress, the scheme's strongest absorption warning. Repeated prints into the same zone warn that a move is being capped."
+string TIP_LOW_VOLUME   = "Lowest raw volume of the lookback window - the classic quiet test bar, kin to VSA no-demand and no-supply. On a pullback it supports continuation; after a climax, a low-volume test that holds strengthens the exhaustion read."
+string TIP_NEUTRAL      = "No classification - the bar set no extreme of raw volume, volume × range, or volume ÷ range over the lookback window."
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+lookbackInput = input.int(20, "Lookback", minval = 2, maxval = 500, group = "Classification",
+     tooltip = "Window of bars each print is benchmarked against. A bar is classified by comparing its raw volume, volume × range and volume ÷ range with the rolling extremes of this window, so every label is relative to the instrument's own recent behavior. Longer windows reserve labels for rarer events, shorter ones print more labels and more noise.")
+
+useWeakInput = input.bool(true, "Grade Weak Prints", group = "Classification",
+     tooltip = "Runs a second, shorter window so strong and weak extremes are graded separately: bars that set an extreme over the full lookback print as strong (solid color), bars that only set an extreme over the shorter window print as weak (lighter shade). Weak prints also trigger the classification alerts; disable to restrict prints and alerts to the full lookback.")
+
+weakLookbackInput = input.int(10, "Weak Print Lookback", minval = 2, maxval = 500, group = "Classification",
+     tooltip = "Length of the shorter grading window. Values above the main lookback are clamped to it.")
+
+showDashInput = input.bool(true, "Show Dashboard", group = "Dashboard",
+     tooltip = "Legend of the classifications with their rule, how many bars have passed since each last printed, and the current bar's classification and grade.")
+
+dashPosInput = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = "Dashboard",
+     tooltip = "Dashboard position on the pane.")
+
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = "Dashboard",
+     tooltip = "Dashboard text size.")
+
+climaxUpColorInput = input.color(CLIMAX_UP_COLOR, "Climax Up", group = "Style",
+     tooltip = "Up bars whose volume × range set a high of the lookback window - potential buying climax.")
+
+climaxDownColorInput = input.color(CLIMAX_DOWN_COLOR, "Climax Down", group = "Style",
+     tooltip = "Down bars whose volume × range set a high of the lookback window - potential selling climax.")
+
+churnColorInput = input.color(CHURN_COLOR, "Churn", group = "Style",
+     tooltip = "Bars whose volume ÷ range set a high of the lookback window - heavy effort with little progress.")
+
+climaxChurnColorInput = input.color(CLIMAX_CHURN_COLOR, "Climax Churn", group = "Style",
+     tooltip = "Bars qualifying as climax and churn at once.")
+
+lowVolumeColorInput = input.color(LOW_VOLUME_COLOR, "Low Volume", group = "Style",
+     tooltip = "Bars printing the lowest raw volume of the lookback window - the classic quiet test bar.")
+
+neutralColorInput = input.color(NEUTRAL_BAR_COLOR, "Neutral", group = "Style",
+     tooltip = "Unclassified bars - no extreme of volume, volume × range, or volume ÷ range was set.")
+
+colorBarsInput = input.bool(false, "Color Price Bars By Classification", group = "Style",
+     tooltip = "Additionally paints the price bars that print a classification, so the labels can be read by their location on the chart.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+//Joint volume/range classification - climax and churn together outrank either alone, low volume is the quiet remainder
+classify(bool climaxHit, bool churnHit, bool lowHit, bool isUpBar) =>
+    int stateId = S_NEUTRAL
+    if climaxHit and churnHit
+        stateId := S_CLIMAX_CHURN
+    else if climaxHit
+        stateId := isUpBar ? S_CLIMAX_UP : S_CLIMAX_DOWN
+    else if churnHit
+        stateId := S_CHURN
+    else if lowHit
+        stateId := S_LOW_VOLUME
+    stateId
+
+//Color associated with a classification, weak prints in a lighter shade
+stateColor(int stateId, bool weakPrint) =>
+    color base = switch stateId
+        S_CLIMAX_UP    => climaxUpColorInput
+        S_CLIMAX_DOWN  => climaxDownColorInput
+        S_CHURN        => churnColorInput
+        S_CLIMAX_CHURN => climaxChurnColorInput
+        S_LOW_VOLUME   => lowVolumeColorInput
+        =>                neutralColorInput
+    weakPrint ? color.new(base, WEAK_TRANSPARENCY) : base
+
+//Display name of a classification
+stateName(int stateId) =>
+    switch stateId
+        S_CLIMAX_UP    => "Climax Up"
+        S_CLIMAX_DOWN  => "Climax Down"
+        S_CHURN        => "Churn"
+        S_CLIMAX_CHURN => "Climax Churn"
+        S_LOW_VOLUME   => "Low Volume"
+        =>                "Neutral"
+
+//Reading attached to a classification, used as dashboard tooltip
+stateTip(int stateId) =>
+    switch stateId
+        S_CLIMAX_UP    => TIP_CLIMAX_UP
+        S_CLIMAX_DOWN  => TIP_CLIMAX_DOWN
+        S_CHURN        => TIP_CHURN
+        S_CLIMAX_CHURN => TIP_CLIMAX_CHURN
+        S_LOW_VOLUME   => TIP_LOW_VOLUME
+        =>                TIP_NEUTRAL
+
+//Bars elapsed since a classification's most recent print
+barsSinceTxt(int lastBar) =>
+    na(lastBar) ? TXT_NA : bar_index == lastBar ? "now" : str.tostring(bar_index - lastBar) + (bar_index - lastBar == 1 ? " bar" : " bars")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Classification
+//---------------------------------------------------------------------------------------------------------------------{
+float cumulativeVolume = ta.cum(nz(volume))
+
+if barstate.islast and cumulativeVolume == 0
+    runtime.error("No volume is available for this symbol. Better Volume classifications require volume data.")
+
+//Shorter grading window never exceeds the main lookback
+int weakLength = math.min(weakLookbackInput, lookbackInput)
+
+//The three classified series: raw volume, effort times result, and effort per unit of result
+bool  hasVolume        = not na(volume) and volume > 0
+float barRange         = high - low
+float volumeTimesRange = volume * barRange
+float volumePerRange   = barRange > 0 ? volume / barRange : na
+
+//Rolling extremes the current print is measured against, windows including the bar itself
+float timesRangeHigh     = ta.highest(volumeTimesRange, lookbackInput)
+float perRangeHigh       = ta.highest(volumePerRange, lookbackInput)
+float volumeLowest       = ta.lowest(volume, lookbackInput)
+float timesRangeHighWeak = ta.highest(volumeTimesRange, weakLength)
+float perRangeHighWeak   = ta.highest(volumePerRange, weakLength)
+
+//Up/down assignment of the bar; a doji falls back to its position against the prior close
+bool upBar = close > open or (close == open and close >= nz(close[1], close))
+
+//Strong prints set an extreme over the full lookback, weak prints only over the shorter window
+bool climaxStrong = hasVolume and volumeTimesRange >= timesRangeHigh
+bool churnStrong  = hasVolume and not na(volumePerRange) and volumePerRange >= perRangeHigh
+bool climaxAny    = useWeakInput ? hasVolume and volumeTimesRange >= timesRangeHighWeak : climaxStrong
+bool churnAny     = useWeakInput ? hasVolume and not na(volumePerRange) and volumePerRange >= perRangeHighWeak : churnStrong
+bool lowVolumeHit = hasVolume and volume <= volumeLowest
+
+int  state       = classify(climaxAny, churnAny, lowVolumeHit, upBar)
+int  strongState = classify(climaxStrong, churnStrong, lowVolumeHit, upBar)
+bool weakPrint   = state != S_NEUTRAL and state != strongState
+
+//Bar index of each classification's most recent print, feeding the dashboard
+var array<int> lastSeenArray = array.new<int>(5, na)
+
+if state != S_NEUTRAL
+    array.set(lastSeenArray, state - 1, bar_index)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+color stateColorValue = stateColor(state, weakPrint)
+
+plot(volume, "Volume", color = stateColorValue, style = plot.style_columns)
+
+barcolor(colorBarsInput and state != S_NEUTRAL ? stateColorValue : na, title = "Classification Bar Coloring")
+
+//Raw measures and the numeric classification, reported in the data window
+plot(state, "Classification (0-5)", color = DASH_TEXT, display = display.data_window)
+plot(volumeTimesRange, "Volume × Range", color = NEUTRAL_COLOR, display = display.data_window)
+plot(volumePerRange, "Volume ÷ Range", color = NEUTRAL_COLOR, display = display.data_window)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+dashPosition = switch dashPosInput
+    "Top Left"     => position.top_left
+    "Bottom Right" => position.bottom_right
+    "Bottom Left"  => position.bottom_left
+    =>                position.top_right
+
+dashTextSize = switch dashSizeInput
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    =>          size.small
+
+var table dashTable = table.new(dashPosition, 3, 6
+  , bgcolor      = DASH_BG
+  , frame_color  = DASH_FRAME
+  , frame_width  = 1
+  , border_width = 0)
+
+if barstate.islast and showDashInput
+    color  valueColor   = DASH_TEXT
+    color  currentColor = state == S_NEUTRAL ? NEUTRAL_COLOR : stateColor(state, false)
+    color  headerBg     = DASH_BG
+    string gradeText    = state == S_NEUTRAL ? TXT_NA : weakPrint ? "Weak" : "Strong"
+
+    table.cell(dashTable, 0, 0, "Better Volume", text_color = DASH_HEADER, text_halign = text.align_left, text_size = dashTextSize, bgcolor = headerBg,
+         tooltip = "Each bar is classified against its own recent prints: raw volume, volume × range and volume ÷ range are compared with rolling extremes over the last " + str.tostring(lookbackInput) + " bars" + (useWeakInput ? ", with a " + str.tostring(weakLength) + " bar window grading weak prints" : "") + ".")
+    table.cell(dashTable, 1, 0, stateName(state), text_color = currentColor, text_halign = text.align_center, text_size = dashTextSize, bgcolor = headerBg,
+         tooltip = stateTip(state))
+    table.cell(dashTable, 2, 0, gradeText, text_color = DASH_TEXT, text_halign = text.align_center, text_size = dashTextSize, bgcolor = headerBg,
+         tooltip = "Grade of the current print - strong prints set an extreme over the full lookback, weak prints only over the shorter grading window.")
+
+    array<string> legendNames  = array.from("Climax Up", "Climax Down", "Churn", "Climax Churn", "Low Volume")
+    array<color>  legendColors = array.from(climaxUpColorInput, climaxDownColorInput, churnColorInput, climaxChurnColorInput, lowVolumeColorInput)
+    array<string> legendRules  = array.from("Vol × range high, up", "Vol × range high, down", "Vol ÷ range high", "Climax + churn", "Lowest volume")
+    array<string> legendTips   = array.from(TIP_CLIMAX_UP, TIP_CLIMAX_DOWN, TIP_CHURN, TIP_CLIMAX_CHURN, TIP_LOW_VOLUME)
+
+    for i = 0 to 4
+        bool  rowActive = state == i + 1
+        color rowColor  = array.get(legendColors, i)
+        color rowBg     = DASH_BG
+        int   lastBar   = array.get(lastSeenArray, i)
+
+        table.cell(dashTable, 0, i + 1, array.get(legendNames, i), text_color = rowColor, text_halign = text.align_left, text_size = dashTextSize, bgcolor = rowBg,
+             tooltip = array.get(legendTips, i))
+        table.cell(dashTable, 1, i + 1, array.get(legendRules, i), text_color = rowActive ? DASH_TEXT : DASH_HEADER, text_halign = text.align_left, text_size = dashTextSize, bgcolor = rowBg)
+        table.cell(dashTable, 2, i + 1, barsSinceTxt(lastBar), text_color = rowActive ? DASH_TEXT : DASH_HEADER, text_halign = text.align_right, text_size = dashTextSize, bgcolor = rowBg,
+             tooltip = "Bars since the last " + array.get(legendNames, i) + " print.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(state == S_CLIMAX_UP, "Climax Up", "Better Volume climax up on {{ticker}} - an up bar set a volume × range high of the lookback window, intense participation and an exhaustion alert after an extended advance ({{interval}})")
+alertcondition(state == S_CLIMAX_DOWN, "Climax Down", "Better Volume climax down on {{ticker}} - a down bar set a volume × range high of the lookback window, intense participation and an exhaustion alert after an extended decline ({{interval}})")
+alertcondition(state == S_CHURN, "Churn", "Better Volume churn on {{ticker}} - volume ÷ range set a high of the lookback window, heavy effort with little progress, often absorption near highs or lows ({{interval}})")
+alertcondition(state == S_CLIMAX_CHURN, "Climax Churn", "Better Volume climax churn on {{ticker}} - the bar qualified as climax and churn at once, the scheme's strongest absorption warning ({{interval}})")
+alertcondition(state == S_LOW_VOLUME, "Low Volume", "Better Volume low volume on {{ticker}} - the lowest raw volume of the lookback window, the classic quiet test bar ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

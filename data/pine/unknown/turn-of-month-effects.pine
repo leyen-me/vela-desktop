@@ -1,0 +1,393 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Turn-of-month Effects", "Turn-of-month Effects", overlay = true, max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+color BULL_COLOR    = #089981 // window days with a positive historical average return
+color BEAR_COLOR    = #f23645 // window days with a negative historical average return
+color NEUTRAL_COLOR = #787b86 // untinted window highlight - structure, not a read
+color MUTED_GRAY    = #787b86
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+// Observed trading days required before the weekday auto-detection is trusted on its own
+int WARMUP_DAYS = 10
+
+string WINDOW_GROUP = "Turn-of-Month Window"
+string DASH_GROUP   = "Dashboard"
+string STYLE_GROUP  = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+lastDaysInput = input.int(1, "Last Trading Days Of Old Month", minval = 0, maxval = 10, group = WINDOW_GROUP,
+  tooltip = "Number of trading days before the month boundary included in the turn-of-month window. The classic academic definition uses 1 (the last trading day only), other studies use up to 4. Days ahead of the boundary are anticipated from the calendar, so a month-end holiday can shift the live highlight by one session; the dashboard statistics always use the actual trading days.")
+
+firstDaysInput = input.int(3, "First Trading Days Of New Month", minval = 0, maxval = 10, group = WINDOW_GROUP,
+  tooltip = "Number of trading days after the month boundary included in the turn-of-month window. The classic academic definition uses the first 3 sessions of the new month.")
+
+showDashInput = input.bool(true, "Show Dashboard", group = DASH_GROUP,
+  tooltip = "Display the statistics dashboard summarizing this symbol's historical returns inside and outside the turn-of-month window, so the effect can be re-verified on the instrument actually traded.")
+
+showBreakdownInput = input.bool(true, "Show Day-By-Day Breakdown", group = DASH_GROUP,
+  tooltip = "Include one dashboard row per window day (-1 = last trading day of the month, +1 = first trading day of the new month, ...) with its historical average daily return, win rate, and sample size.")
+
+dashLocationInput = input.string("Top Right", "Location", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = DASH_GROUP,
+  tooltip = "Position of the dashboard on the chart.")
+
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = DASH_GROUP,
+  tooltip = "Text size of the dashboard.")
+
+tintInput = input.bool(true, "Color Window By Historical Average Return", group = STYLE_GROUP,
+  tooltip = "Shade each window day from its own historical average return, greener when that day position has been positive on average and redder when negative. Disable for a single neutral highlight color.")
+
+showLabelsInput = input.bool(false, "Show Day Position Labels", group = STYLE_GROUP,
+  tooltip = "Print each window day's position relative to the month boundary (-1, +1, +2, ...) below its bars.")
+
+bullColorInput    = input.color(BULL_COLOR, "Bullish", inline = "tint", group = STYLE_GROUP)
+bearColorInput    = input.color(BEAR_COLOR, "Bearish", inline = "tint", group = STYLE_GROUP)
+neutralColorInput = input.color(NEUTRAL_COLOR, "Neutral", inline = "tint", group = STYLE_GROUP)
+
+transparencyInput = input.int(85, "Window Transparency", minval = 50, maxval = 98, group = STYLE_GROUP,
+  tooltip = "Transparency of the turn-of-month window background highlight.")
+
+labelColorInput = input.color(MUTED_GRAY, "Label Color", group = STYLE_GROUP)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Calendar days in a given month, leap years handled
+daysInMonth(int yr, int mo) =>
+    mo == 2 ? (yr % 4 == 0 and (yr % 100 != 0 or yr % 400 == 0) ? 29 : 28) : mo == 4 or mo == 6 or mo == 9 or mo == 11 ? 30 : 31
+
+// Format an already percent-scaled value
+fmtPct(float valuePct, string fmt) =>
+    na(valuePct) ? "—" : str.tostring(valuePct, fmt) + "%"
+
+// Signed day position, e.g. "-1" / "+2"
+fmtPos(int p) =>
+    (p > 0 ? "+" : "") + str.tostring(p)
+
+tableLocation(string s) =>
+    switch s
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        => position.bottom_left
+
+tableTextSize(string s) =>
+    switch s
+        "Tiny"   => size.tiny
+        "Normal" => size.normal
+        => size.small
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calendar Bookkeeping & Statistics
+//---------------------------------------------------------------------------------------------------------------------{
+
+// The concept is defined on daily sessions: compute on 1D or intraday charts only
+bool tfOk = timeframe.isintraday or (timeframe.isdaily and timeframe.multiplier == 1)
+
+// First bar of a new calendar trading day (true on every bar of a daily chart)
+bool newDay = dayofmonth != nz(dayofmonth[1]) or month != nz(month[1]) or year != nz(year[1])
+
+int totalSlots = lastDaysInput + firstDaysInput
+
+// Live state
+var int  liveMonthKey   = na
+var int  dayPos         = 0
+var bool liveMonthClean = false
+var int  obsDays        = 0
+
+// Completed-day chain
+var float lastDayClose   = na
+var int   curMonthKey    = na
+var bool  monthStartSeen = false
+
+// Per-position statistics: index 0..lastDays-1 = positions -N..-1, index lastDays..end = positions +1..+M
+var array<float> posSumArray = array.new<float>(math.max(totalSlots, 1), 0.0)
+var array<float> posCntArray = array.new<float>(math.max(totalSlots, 1), 0.0)
+var array<float> posWinArray = array.new<float>(math.max(totalSlots, 1), 0.0)
+
+// Daily returns of the month currently being accumulated
+var array<float> monthRetArray = array.new<float>()
+
+// Weekdays on which this market has been observed trading (index 1 = Sunday ... 7 = Saturday)
+var array<bool> dowSeenArray = array.new<bool>(8, false)
+
+// Aggregates over completed months
+var float windowSum     = 0.0
+var float windowCnt     = 0.0
+var float windowWins    = 0.0
+var float otherSum      = 0.0
+var float otherCnt      = 0.0
+var float otherWins     = 0.0
+var float windowLog     = 0.0
+var float allLog        = 0.0
+var int   monthsSampled = 0
+var int   turnMonths    = 0
+var int   turnMonthsPos = 0
+
+if tfOk and newDay
+    // The previous trading day just completed
+    if bar_index > 0
+        float completedClose = close[1]
+        int   completedKey   = year[1] * 12 + month[1]
+        float dayReturn      = na(lastDayClose) or lastDayClose <= 0 ? na : completedClose / lastDayClose - 1
+        lastDayClose := completedClose
+
+        if na(curMonthKey)
+            curMonthKey := completedKey
+
+        // The completed day opens a new month: the stored array holds one full month of daily returns
+        if completedKey != curMonthKey
+            int sz = array.size(monthRetArray)
+
+            if monthStartSeen and sz > 0
+                monthsSampled += 1
+                float turnLog  = 0.0
+                int   turnDays = 0
+                int   posCounted = math.min(firstDaysInput, sz)
+
+                // First +1..+M trading days of that month
+                if posCounted > 0
+                    for i = 0 to posCounted - 1
+                        float r   = array.get(monthRetArray, i)
+                        int   idx = lastDaysInput + i
+                        array.set(posSumArray, idx, array.get(posSumArray, idx) + r)
+                        array.set(posCntArray, idx, array.get(posCntArray, idx) + 1)
+                        array.set(posWinArray, idx, array.get(posWinArray, idx) + (r > 0 ? 1 : 0))
+                        windowSum  += r
+                        windowCnt  += 1
+                        windowWins += r > 0 ? 1 : 0
+                        float lr = r > -1 ? math.log(1 + r) : 0.0
+                        windowLog += lr
+                        turnLog   += lr
+                        turnDays  += 1
+
+                // Last -N..-1 trading days of that month (skipping any day already counted above)
+                if lastDaysInput > 0
+                    for k = 1 to lastDaysInput
+                        int j = sz - k
+                        if j >= posCounted
+                            float r   = array.get(monthRetArray, j)
+                            int   idx = lastDaysInput - k
+                            array.set(posSumArray, idx, array.get(posSumArray, idx) + r)
+                            array.set(posCntArray, idx, array.get(posCntArray, idx) + 1)
+                            array.set(posWinArray, idx, array.get(posWinArray, idx) + (r > 0 ? 1 : 0))
+                            windowSum  += r
+                            windowCnt  += 1
+                            windowWins += r > 0 ? 1 : 0
+                            float lr = r > -1 ? math.log(1 + r) : 0.0
+                            windowLog += lr
+                            turnLog   += lr
+                            turnDays  += 1
+
+                // Remaining mid-month days
+                int otherEnd = sz - lastDaysInput - 1
+                if otherEnd >= posCounted
+                    for i = posCounted to otherEnd
+                        float r = array.get(monthRetArray, i)
+                        otherSum  += r
+                        otherCnt  += 1
+                        otherWins += r > 0 ? 1 : 0
+
+                // Buy-and-hold accumulation over every day of the month
+                for i = 0 to sz - 1
+                    float r = array.get(monthRetArray, i)
+                    allLog += r > -1 ? math.log(1 + r) : 0.0
+
+                if turnDays > 0
+                    turnMonths += 1
+                    if turnLog > 0
+                        turnMonthsPos += 1
+
+            array.clear(monthRetArray)
+            curMonthKey    := completedKey
+            monthStartSeen := true
+
+        if not na(dayReturn)
+            array.push(monthRetArray, dayReturn)
+
+    // Register the current (new) trading day
+    int nowKey = year * 12 + month
+    if na(liveMonthKey)
+        dayPos       := 1
+        liveMonthKey := nowKey
+    else if nowKey != liveMonthKey
+        dayPos         := 1
+        liveMonthKey   := nowKey
+        liveMonthClean := true
+    else
+        dayPos += 1
+
+    obsDays += 1
+    array.set(dowSeenArray, dayofweek, true)
+
+// Anticipate the remaining trading days in the current month from the calendar
+int remainingTd = 0
+
+if tfOk
+    int dim = daysInMonth(year, month)
+    if dayofmonth < dim
+        for d = dayofmonth + 1 to dim
+            int  futureDow = (dayofweek - 1 + (d - dayofmonth)) % 7 + 1
+            bool isWeekday = futureDow != dayofweek.saturday and futureDow != dayofweek.sunday
+            bool seenDow   = array.get(dowSeenArray, futureDow)
+            bool tradable  = obsDays >= WARMUP_DAYS ? seenDow : isWeekday or seenDow
+            if tradable
+                remainingTd += 1
+
+// Live window state: first +M days are exact, last -N days are calendar-anticipated
+bool inFirst  = tfOk and liveMonthClean and dayPos >= 1 and dayPos <= firstDaysInput
+bool inLast   = tfOk and lastDaysInput > 0 and remainingTd < lastDaysInput
+bool inWindow = inFirst or inLast
+int  livePos  = inFirst ? dayPos : inLast ? -(remainingTd + 1) : 0
+
+// Symmetric scale for gradients: largest absolute per-position mean
+float maxAbsMean = 0.0
+
+if totalSlots > 0
+    for i = 0 to totalSlots - 1
+        float cnt = array.get(posCntArray, i)
+        if cnt > 0
+            maxAbsMean := math.max(maxAbsMean, math.abs(array.get(posSumArray, i) / cnt))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visualization
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Highlight color for the current window day, tinted by that day position's historical mean when available
+color windowColor = color.new(neutralColorInput, transparencyInput)
+
+if tintInput and livePos != 0
+    int liveIdx = livePos > 0 ? lastDaysInput + livePos - 1 : lastDaysInput + livePos
+    if liveIdx >= 0 and liveIdx < totalSlots
+        float cnt = array.get(posCntArray, liveIdx)
+        if cnt > 0 and maxAbsMean > 0
+            float posMean = array.get(posSumArray, liveIdx) / cnt
+            windowColor := color.new(color.from_gradient(posMean, -maxAbsMean, maxAbsMean, bearColorInput, bullColorInput), transparencyInput)
+
+bgcolor(inWindow ? windowColor : na, title = "Turn-of-month window")
+
+if showLabelsInput and inWindow and newDay
+    label.new(bar_index, na, fmtPos(livePos), xloc.bar_index, yloc.belowbar, #00000000, label.style_none, labelColorInput, size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+
+var table dashTable = na
+
+if barstate.islast and showDashInput
+    if na(dashTable)
+        dashTable := table.new(tableLocation(dashLocationInput), 4, totalSlots + 12, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+    string txtSize    = tableTextSize(dashSizeInput)
+    color  headColor  = DASH_TEXT
+    color  mutedColor = DASH_HEADER
+
+    int row = 0
+    table.cell(dashTable, 0, row, "Turn-of-Month Effects", text_color = headColor, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, row, "-" + str.tostring(lastDaysInput) + " / +" + str.tostring(firstDaysInput), text_color = mutedColor, text_size = txtSize, text_halign = text.align_right)
+
+    row += 1
+    string statusTxt = "Unsupported timeframe, use 1D or intraday"
+    if tfOk
+        if inWindow
+            statusTxt := "In window, day " + fmtPos(livePos)
+        else if totalSlots == 0
+            statusTxt := "No window configured"
+        else
+            int daysToStart = lastDaysInput > 0 ? remainingTd - lastDaysInput + 1 : remainingTd + 1
+            statusTxt := "Starts in ~" + str.tostring(daysToStart) + " trading day" + (daysToStart == 1 ? "" : "s")
+    table.cell(dashTable, 0, row, "Status", text_color = mutedColor, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, row, statusTxt, text_color = inWindow ? bullColorInput : mutedColor, text_size = txtSize, text_halign = text.align_right)
+
+    if tfOk
+        row += 1
+        table.cell(dashTable, 0, row, "Day",   text_color = mutedColor, text_size = txtSize, text_halign = text.align_left)
+        table.cell(dashTable, 1, row, "Avg %", text_color = mutedColor, text_size = txtSize, text_halign = text.align_right)
+        table.cell(dashTable, 2, row, "Win %", text_color = mutedColor, text_size = txtSize, text_halign = text.align_right)
+        table.cell(dashTable, 3, row, "N",     text_color = mutedColor, text_size = txtSize, text_halign = text.align_right)
+
+        if showBreakdownInput and totalSlots > 0
+            for i = 0 to totalSlots - 1
+                int   p    = i < lastDaysInput ? i - lastDaysInput : i - lastDaysInput + 1
+                float cnt  = array.get(posCntArray, i)
+                float mean = cnt > 0 ? array.get(posSumArray, i) / cnt : na
+                float win  = cnt > 0 ? array.get(posWinArray, i) / cnt * 100 : na
+                color meanColor = not na(mean) and maxAbsMean > 0 ? color.from_gradient(mean, -maxAbsMean, maxAbsMean, bearColorInput, bullColorInput) : mutedColor
+                row += 1
+                table.cell(dashTable, 0, row, fmtPos(p), text_color = headColor, text_size = txtSize, text_halign = text.align_left)
+                table.cell(dashTable, 1, row, fmtPct(mean * 100, "0.000"), text_color = meanColor, text_size = txtSize, text_halign = text.align_right)
+                table.cell(dashTable, 2, row, fmtPct(win, "0.0"), text_color = headColor, text_size = txtSize, text_halign = text.align_right)
+                table.cell(dashTable, 3, row, str.tostring(cnt, "0"), text_color = headColor, text_size = txtSize, text_halign = text.align_right)
+
+        float windowMean = windowCnt > 0 ? windowSum / windowCnt : na
+        float windowWin  = windowCnt > 0 ? windowWins / windowCnt * 100 : na
+        float otherMean  = otherCnt > 0 ? otherSum / otherCnt : na
+        float otherWin   = otherCnt > 0 ? otherWins / otherCnt * 100 : na
+
+        row += 1
+        table.cell(dashTable, 0, row, "Window days", text_color = headColor, text_size = txtSize, text_halign = text.align_left)
+        table.cell(dashTable, 1, row, fmtPct(windowMean * 100, "0.000"), text_color = not na(windowMean) ? (windowMean > 0 ? bullColorInput : bearColorInput) : mutedColor, text_size = txtSize, text_halign = text.align_right)
+        table.cell(dashTable, 2, row, fmtPct(windowWin, "0.0"), text_color = headColor, text_size = txtSize, text_halign = text.align_right)
+        table.cell(dashTable, 3, row, str.tostring(windowCnt, "0"), text_color = headColor, text_size = txtSize, text_halign = text.align_right)
+
+        row += 1
+        table.cell(dashTable, 0, row, "Other days", text_color = headColor, text_size = txtSize, text_halign = text.align_left)
+        table.cell(dashTable, 1, row, fmtPct(otherMean * 100, "0.000"), text_color = not na(otherMean) ? (otherMean > 0 ? bullColorInput : bearColorInput) : mutedColor, text_size = txtSize, text_halign = text.align_right)
+        table.cell(dashTable, 2, row, fmtPct(otherWin, "0.0"), text_color = headColor, text_size = txtSize, text_halign = text.align_right)
+        table.cell(dashTable, 3, row, str.tostring(otherCnt, "0"), text_color = headColor, text_size = txtSize, text_halign = text.align_right)
+
+        float windowCum = monthsSampled > 0 ? (math.exp(windowLog) - 1) * 100 : na
+        float holdCum   = monthsSampled > 0 ? (math.exp(allLog) - 1) * 100 : na
+        float gainShare = monthsSampled > 0 and allLog > 0 ? windowLog / allLog * 100 : na
+
+        row += 1
+        table.cell(dashTable, 0, row, "Window only, cumulative", text_color = mutedColor, text_size = txtSize, text_halign = text.align_left)
+        table.cell(dashTable, 1, row, fmtPct(windowCum, "0.0"), text_color = headColor, text_size = txtSize, text_halign = text.align_right)
+
+        row += 1
+        table.cell(dashTable, 0, row, "Buy & hold, cumulative", text_color = mutedColor, text_size = txtSize, text_halign = text.align_left)
+        table.cell(dashTable, 1, row, fmtPct(holdCum, "0.0"), text_color = headColor, text_size = txtSize, text_halign = text.align_right)
+
+        row += 1
+        table.cell(dashTable, 0, row, "Window share of gain", text_color = mutedColor, text_size = txtSize, text_halign = text.align_left)
+        table.cell(dashTable, 1, row, fmtPct(gainShare, "0.0"), text_color = headColor, text_size = txtSize, text_halign = text.align_right)
+
+        row += 1
+        string turnsTxt = turnMonths > 0 ? str.tostring(turnMonthsPos * 100.0 / turnMonths, "0.0") + "% of " + str.tostring(turnMonths) : "—"
+        table.cell(dashTable, 0, row, "Positive month turns", text_color = mutedColor, text_size = txtSize, text_halign = text.align_left)
+        table.cell(dashTable, 1, row, turnsTxt, text_color = headColor, text_size = txtSize, text_halign = text.align_right)
+
+        row += 1
+        table.cell(dashTable, 0, row, "Months sampled", text_color = mutedColor, text_size = txtSize, text_halign = text.align_left)
+        table.cell(dashTable, 1, row, str.tostring(monthsSampled), text_color = headColor, text_size = txtSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+var bool prevInWindow = false
+
+bool windowStart = inWindow and not prevInWindow
+bool windowEnd   = not inWindow and prevInWindow
+
+prevInWindow := inWindow
+
+alertcondition(windowStart, "Turn-of-Month Window Started", "The turn-of-month window has started on {{ticker}} ({{interval}})")
+alertcondition(windowEnd, "Turn-of-Month Window Ended", "The turn-of-month window has ended on {{ticker}} ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

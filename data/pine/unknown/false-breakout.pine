@@ -1,0 +1,202 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("False Breakout", "False Breakout", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+//Level lifecycle: watching for a break -> holding beyond the level -> re-arm wait after a failure
+STATE_ACTIVE   = 0
+STATE_PENDING  = 1
+STATE_COOLDOWN = 2
+
+TRIGGER_CLOSE = "Close"
+TRIGGER_WICK  = "Wick"
+
+//Watched levels kept per side (older boundaries stop being monitored first)
+MAX_LEVELS = 8
+
+ZONE_BG_TRANSPARENCY     = 85
+ZONE_BORDER_TRANSPARENCY = 60
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+swingLengthInput = input.int(20, "Swing Length", minval = 2, group = "Detection",
+  tooltip = "Bars to the left and right required to confirm a swing high or swing low. Confirmed swings become the watched levels - the range boundaries and prior highs or lows a breakout attempt is judged against. Larger values keep only the more significant boundaries.")
+
+breakTriggerInput = input.string(TRIGGER_CLOSE, "Break Trigger", options = [TRIGGER_CLOSE, TRIGGER_WICK], group = "Detection",
+  tooltip = "Strictness of the initial break. 'Close' starts the failure watch only once a bar closes beyond the level - the stricter school, requiring a close beyond followed by a close back inside. 'Wick' starts it as soon as price trades beyond the level intrabar, so a single poke that closes back inside confirms on the same bar.")
+
+failureWindowInput = input.int(5, "Failure Window (Bars)", minval = 1, maxval = 100, group = "Detection",
+  tooltip = "Maximum bars price may spend beyond the level. A close back on the original side within this window reclassifies the break as false; if price holds beyond the level past the window, the break is treated as genuine and the level is retired.")
+
+volumeFilterInput = input.bool(false, "Require Heavy Re-entry Volume", group = "Volume Filter",
+  tooltip = "Only confirm a false breakout when the bar closing back inside trades above its trailing average volume. Heavy volume on the re-entry points at trapped breakout traders powering the snap back rather than a pause before a second attempt. Automatically bypassed when the symbol reports no volume data.")
+
+volumeLengthInput = input.int(20, "Volume Average Length", minval = 1, group = "Volume Filter",
+  tooltip = "Number of bars in the trailing volume average used by the re-entry volume filter.")
+
+showLevelsInput = input.bool(true, "Show Swing Levels", group = "Style",
+  tooltip = "Display the confirmed swing levels being watched for breakout attempts. A level keeps extending while it holds and stops where a genuine breakout retires it.")
+
+showZonesInput = input.bool(true, "Show Trap Zones", group = "Style",
+  tooltip = "Highlight the trap once the failure confirms - the area between the broken level and the false-break extreme. The zone's outer edge is the extreme commonly used as the stop when fading back toward the other side of the range.")
+
+showLabelsInput = input.bool(true, "Show Trap Labels", group = "Style",
+  tooltip = "Mark each confirmed false breakout at its extreme: 'Bull Trap' after a failed break above resistance, 'Bear Trap' after a failed breakdown below support.")
+
+bullColorInput = input.color(#089981, "Bullish", group = "Style",
+  tooltip = "Color of support levels and of bullish false breakouts (bear traps) at the lower boundary.")
+
+bearColorInput = input.color(#f23645, "Bearish", group = "Style",
+  tooltip = "Color of resistance levels and of bearish false breakouts (bull traps) at the upper boundary.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types
+//---------------------------------------------------------------------------------------------------------------------{
+//One watched boundary and, while price holds beyond it, the running false-break excursion
+type Level
+    float price
+    int   state
+    int   breakBar
+    float extreme
+    int   extremeBar
+    line  levelLine
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+//Register a confirmed swing point as a watched level, capping the tracked set per side
+createLevel(array<Level> levelsArray, float pivotPrice, color levelColor) =>
+    line levelLine = showLevelsInput ? line.new(bar_index - swingLengthInput, pivotPrice, bar_index, pivotPrice, color = levelColor, width = 1) : line(na)
+    array.push(levelsArray, Level.new(price = pivotPrice, state = STATE_ACTIVE, breakBar = 0, extreme = pivotPrice, extremeBar = 0, levelLine = levelLine))
+    if array.size(levelsArray) > MAX_LEVELS
+        array.shift(levelsArray)
+
+//Two-stage watch on one side of the range: first the break, then the give-back
+processLevels(array<Level> levelsArray, bool isResistance, bool volumePass) =>
+    bool  trapConfirmed  = false
+    float bestPrice      = na
+    float bestExtreme    = na
+    int   bestBreakBar   = na
+    int   bestExtremeBar = na
+    int   i = 0
+    while i < array.size(levelsArray)
+        Level lvl = array.get(levelsArray, i)
+        bool removeLevel  = false
+        bool confirmNow   = false
+        bool closedInside = isResistance ? close < lvl.price : close > lvl.price
+        if lvl.state == STATE_ACTIVE
+            bool beyondWick  = isResistance ? high  > lvl.price : low   < lvl.price
+            bool beyondClose = isResistance ? close > lvl.price : close < lvl.price
+            bool brokeOut    = breakTriggerInput == TRIGGER_WICK ? beyondWick : beyondClose
+            if brokeOut
+                //At this stage it is simply a breakout attempt - start the failure watch
+                lvl.state      := STATE_PENDING
+                lvl.breakBar   := bar_index
+                lvl.extreme    := isResistance ? high : low
+                lvl.extremeBar := bar_index
+                //A poke beyond the level that closes back inside the same bar fails immediately (wick trigger)
+                if closedInside
+                    confirmNow := true
+        else if lvl.state == STATE_PENDING
+            //Track the running false-break extreme while price holds beyond the level
+            if isResistance
+                if high > lvl.extreme
+                    lvl.extreme    := high
+                    lvl.extremeBar := bar_index
+            else
+                if low < lvl.extreme
+                    lvl.extreme    := low
+                    lvl.extremeBar := bar_index
+            int elapsedBars = bar_index - lvl.breakBar
+            if closedInside
+                //The close back inside is the trigger that reclassifies the break as false
+                confirmNow := elapsedBars <= failureWindowInput
+                lvl.state  := STATE_COOLDOWN
+            else if elapsedBars >= failureWindowInput
+                //Price is accepted beyond the boundary - a genuine breakout, not a trap
+                removeLevel := true
+        else if lvl.state == STATE_COOLDOWN
+            //Re-arm only once a bar trades fully back inside, so one excursion cannot re-trigger
+            bool fullyInside = isResistance ? high < lvl.price : low > lvl.price
+            if fullyInside
+                lvl.state := STATE_ACTIVE
+        if confirmNow
+            lvl.state := STATE_COOLDOWN
+            if volumePass
+                trapConfirmed := true
+                //Anchor the drawing to the outermost boundary when stacked levels fail together
+                bool moreExtreme = na(bestPrice)
+                if not moreExtreme
+                    moreExtreme := isResistance ? lvl.price > bestPrice : lvl.price < bestPrice
+                if moreExtreme
+                    bestPrice      := lvl.price
+                    bestExtreme    := lvl.extreme
+                    bestBreakBar   := lvl.breakBar
+                    bestExtremeBar := lvl.extremeBar
+        if removeLevel
+            //End the retired level's line where the breakout occurred
+            if not na(lvl.levelLine)
+                line.set_x2(lvl.levelLine, lvl.breakBar)
+            array.remove(levelsArray, i)
+        else
+            if not na(lvl.levelLine)
+                line.set_x2(lvl.levelLine, bar_index)
+            i += 1
+    //One zone and label per side per bar, spanning break bar to re-entry bar, level to extreme
+    if trapConfirmed
+        color trapColor = isResistance ? bearColorInput : bullColorInput
+        if showZonesInput
+            float zoneTop    = isResistance ? bestExtreme : bestPrice
+            float zoneBottom = isResistance ? bestPrice   : bestExtreme
+            box.new(bestBreakBar, zoneTop, bar_index, zoneBottom
+              , border_color = color.new(trapColor, ZONE_BORDER_TRANSPARENCY)
+              , border_style = line.style_dashed
+              , border_width = 1
+              , bgcolor      = color.new(trapColor, ZONE_BG_TRANSPARENCY))
+        if showLabelsInput
+            label.new(bestExtremeBar, bestExtreme, isResistance ? "Bull Trap" : "Bear Trap"
+              , style     = isResistance ? label.style_label_down : label.style_label_up
+              , color     = trapColor
+              , textcolor = chart.bg_color
+              , size      = size.small)
+    trapConfirmed
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+var array<Level> resistanceLevelsArray = array.new<Level>()
+var array<Level> supportLevelsArray    = array.new<Level>()
+
+//Confirmed swing points, the watched boundaries (known swingLength bars after the fact)
+float pivotHighPrice = ta.pivothigh(swingLengthInput, swingLengthInput)
+float pivotLowPrice  = ta.pivotlow(swingLengthInput, swingLengthInput)
+
+//Volume context for the re-entry bar, taken one bar back so the event does not inflate its own baseline
+float volumeAverage     = ta.sma(volume, volumeLengthInput)
+float volumeAveragePrev = volumeAverage[1]
+bool  volumePass        = not volumeFilterInput or na(volumeAveragePrev) or volume > volumeAveragePrev
+
+//Run the two-stage watch on confirmed bars only: first the break, then the give-back
+bool bullTrapEvent = false
+bool bearTrapEvent = false
+
+if barstate.isconfirmed
+    bullTrapEvent := processLevels(resistanceLevelsArray, true, volumePass)
+    bearTrapEvent := processLevels(supportLevelsArray, false, volumePass)
+    if not na(pivotHighPrice)
+        createLevel(resistanceLevelsArray, pivotHighPrice, bearColorInput)
+    if not na(pivotLowPrice)
+        createLevel(supportLevelsArray, pivotLowPrice, bullColorInput)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(bearTrapEvent, "Bullish False Breakout (Bear Trap)", "Bullish false breakout - the breakdown below support failed and price closed back inside, trapping the breakdown sellers")
+alertcondition(bullTrapEvent, "Bearish False Breakout (Bull Trap)", "Bearish false breakout - the break above resistance failed and price closed back inside, trapping the breakout buyers")
+alertcondition(bullTrapEvent or bearTrapEvent, "Any False Breakout", "False breakout - a break beyond a watched level failed and price closed back inside")
+
+//---------------------------------------------------------------------------------------------------------------------}

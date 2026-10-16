@@ -1,0 +1,167 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("ROC-of-ROC", shorttitle = "ROC-of-ROC", overlay = false, format = format.price, precision = 2)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+SMA_TYPE = "SMA"
+EMA_TYPE = "EMA"
+RMA_TYPE = "RMA"
+WMA_TYPE = "WMA"
+
+ADV_ACCEL_COLOR = #089981   // advance speeding up
+ADV_DECEL_COLOR = #ff9800   // advance still rising but decelerating (early warning)
+DEC_ACCEL_COLOR = #f23645   // decline speeding up
+DEC_DECEL_COLOR = #5b9cf6   // decline still falling but decelerating (early basing cue)
+NEUTRAL_COLOR   = #787b86
+
+FILL_VALUE_TRANSP = 50      // gradient transparency at the acceleration value
+FILL_ZERO_TRANSP  = 100     // gradient transparency at the zero line
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+sourceInput = input.source(close, "Source"
+  , group   = "Calculation"
+  , tooltip = "Price series the derivatives are computed from. In the physics analogy this is position: velocity is its percent rate of change, acceleration is the change of that velocity.")
+
+velocityLengthInput = input.int(9, "Velocity Length", minval = 1
+  , group   = "Calculation"
+  , tooltip = "Lookback of the first rate of change: velocity = 100 * (source - source[N]) / source[N], the percent speed of the move over N bars.")
+
+accelerationLengthInput = input.int(9, "Acceleration Length", minval = 1
+  , group   = "Calculation"
+  , tooltip = "Bars over which the change in velocity is measured: acceleration = velocity - velocity[N]. Positive while momentum builds, zero the moment it stops building, negative while it decays - which can happen well before price itself stops rising. The second pass uses the difference form because a percent change of a series that crosses zero is unstable.")
+
+smoothingTypeInput = input.string(SMA_TYPE, "Method", options = [SMA_TYPE, EMA_TYPE, RMA_TYPE, WMA_TYPE]
+  , group   = "Smoothing"
+  , tooltip = "Moving average type used by both smoothing steps. Differencing amplifies the fastest fluctuations in a series and ROC-of-ROC differences price twice, so practical versions smooth the input or the output. Every fix adds lag, which eats into the early-warning property.")
+
+sourceSmoothingInput = input.int(1, "Source Smoothing", minval = 1
+  , group   = "Smoothing"
+  , tooltip = "Smoothing applied to the source before the first rate of change. 1 disables it, keeping the textbook construction. Pre-smoothing tames the bar-to-bar noise that double differencing amplifies.")
+
+accelerationSmoothingInput = input.int(3, "Acceleration Smoothing", minval = 1
+  , group   = "Smoothing"
+  , tooltip = "Smoothing applied to the final acceleration line. 1 disables it. Light smoothing filters the false starts the raw second derivative fires around its zero line.")
+
+showVelocityInput = input.bool(true, "Velocity Context Line"
+  , group   = "Display"
+  , tooltip = "Plots the underlying velocity (the first rate of change) as a context line. Velocity above zero with acceleration below zero is the early-warning read: the advance is still rising but decelerating, a cue to tighten risk rather than an automatic reversal call.")
+
+showMarkersInput = input.bool(false, "Deceleration Warning Markers"
+  , group   = "Display"
+  , tooltip = "Small circle on the bar where velocity and acceleration first take opposite signs - an advance or a decline that has started decelerating. Off by default to keep the pane clean; the deceleration alerts fire regardless.")
+
+advAccelColorInput = input.color(ADV_ACCEL_COLOR, "Advance Accelerating", inline = "advance"
+  , group   = "Style"
+  , tooltip = "Velocity and acceleration both positive: the advance is speeding up, thrust is building.")
+
+advDecelColorInput = input.color(ADV_DECEL_COLOR, "Decelerating", inline = "advance"
+  , group   = "Style"
+  , tooltip = "Velocity positive but acceleration negative: price is still rising, only more slowly each bar - the early warning that the thrust behind the move is fading.")
+
+decAccelColorInput = input.color(DEC_ACCEL_COLOR, "Decline Accelerating", inline = "decline"
+  , group   = "Style"
+  , tooltip = "Velocity and acceleration both negative: the decline is speeding up.")
+
+decDecelColorInput = input.color(DEC_DECEL_COLOR, "Decelerating", inline = "decline"
+  , group   = "Style"
+  , tooltip = "Velocity negative but acceleration positive: the decline is fading - an early basing cue.")
+
+velocityColorInput = input.color(NEUTRAL_COLOR, "Velocity Line"
+  , group   = "Style"
+  , tooltip = "Color of the velocity context line.")
+
+gradientFillInput = input.bool(true, "Gradient Fill"
+  , group   = "Style"
+  , tooltip = "Vertical gradient between the acceleration line and its zero line, colored by the four-state read - fully transparent at zero, more opaque at the value.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+// Every average type is computed on every bar so the selection only picks a value, never changes what executes
+sourceSma = ta.sma(sourceInput, sourceSmoothingInput)
+sourceEma = ta.ema(sourceInput, sourceSmoothingInput)
+sourceRma = ta.rma(sourceInput, sourceSmoothingInput)
+sourceWma = ta.wma(sourceInput, sourceSmoothingInput)
+
+smoothedSource = switch smoothingTypeInput
+    SMA_TYPE => sourceSma
+    EMA_TYPE => sourceEma
+    RMA_TYPE => sourceRma
+    => sourceWma
+
+// First derivative - velocity: the percent rate of change of the (optionally pre-smoothed) source
+velocity = ta.roc(smoothedSource, velocityLengthInput)
+
+// Second derivative - acceleration: the change of velocity over the acceleration lookback,
+// taken as a difference because velocity crosses zero
+accelerationRaw = ta.mom(velocity, accelerationLengthInput)
+
+accelerationSma = ta.sma(accelerationRaw, accelerationSmoothingInput)
+accelerationEma = ta.ema(accelerationRaw, accelerationSmoothingInput)
+accelerationRma = ta.rma(accelerationRaw, accelerationSmoothingInput)
+accelerationWma = ta.wma(accelerationRaw, accelerationSmoothingInput)
+
+acceleration = switch smoothingTypeInput
+    SMA_TYPE => accelerationSma
+    EMA_TYPE => accelerationEma
+    RMA_TYPE => accelerationRma
+    => accelerationWma
+
+// 4-state read: the side comes from the velocity sign, accelerating/decelerating from the acceleration sign
+dataReady      = not na(velocity) and not na(acceleration)
+velocityUp     = nz(velocity) >= 0
+accelerationUp = nz(acceleration) > 0
+
+// Velocity/acceleration divergence: momentum and its derivative disagree, the early-warning quadrants
+advanceDecelerating = dataReady and velocityUp and not accelerationUp
+declineDecelerating = dataReady and not velocityUp and accelerationUp
+
+advanceDeceleratingPrev = na(advanceDecelerating[1]) ? false : advanceDecelerating[1]
+declineDeceleratingPrev = na(declineDecelerating[1]) ? false : declineDecelerating[1]
+
+advanceDecelerationStart = advanceDecelerating and not advanceDeceleratingPrev
+declineDecelerationStart = declineDecelerating and not declineDeceleratingPrev
+
+// Acceleration sign flips: fire around the point where momentum peaks or troughs,
+// ahead of momentum's own zero cross
+accelerationCrossUp   = ta.crossover(acceleration, 0)
+accelerationCrossDown = ta.crossunder(acceleration, 0)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+stateColor = accelerationUp ? (velocityUp ? advAccelColorInput : decDecelColorInput) : (velocityUp ? advDecelColorInput : decAccelColorInput)
+
+// Vertical gradient between zero and the acceleration value, opaque end at the value
+fillTopColor    = accelerationUp ? color.new(stateColor, FILL_VALUE_TRANSP) : color.new(stateColor, FILL_ZERO_TRANSP)
+fillBottomColor = accelerationUp ? color.new(stateColor, FILL_ZERO_TRANSP) : color.new(stateColor, FILL_VALUE_TRANSP)
+
+zeroPlotId         = plot(0, "Zero Line", color.new(chart.fg_color, 50), 1)
+plot(showVelocityInput ? velocity : na, "Velocity", velocityColorInput, 1)
+accelerationPlotId = plot(acceleration, "Acceleration", stateColor, 2)
+
+fill(accelerationPlotId, zeroPlotId
+  , math.max(acceleration, 0)
+  , math.min(acceleration, 0)
+  , gradientFillInput ? fillTopColor : na
+  , gradientFillInput ? fillBottomColor : na
+  , title = "Acceleration Gradient Fill")
+
+plotshape(showMarkersInput and advanceDecelerationStart ? acceleration : na, "Advance Deceleration Marker", shape.circle, location.absolute, advDecelColorInput, size = size.tiny)
+plotshape(showMarkersInput and declineDecelerationStart ? acceleration : na, "Decline Deceleration Marker", shape.circle, location.absolute, decDecelColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(accelerationCrossUp, "Acceleration Cross Above Zero", "ROC-of-ROC: acceleration crossed above zero on {{ticker}} - momentum has stopped decaying and started building ({{interval}})")
+alertcondition(accelerationCrossDown, "Acceleration Cross Below Zero", "ROC-of-ROC: acceleration crossed below zero on {{ticker}} - momentum has stopped building and started decaying ({{interval}})")
+alertcondition(advanceDecelerationStart, "Advance Deceleration Warning", "ROC-of-ROC: velocity is still positive but acceleration turned negative on {{ticker}} - the advance is decelerating, thrust behind the move is fading ({{interval}})")
+alertcondition(declineDecelerationStart, "Decline Deceleration Warning", "ROC-of-ROC: velocity is still negative but acceleration turned positive on {{ticker}} - the decline is decelerating, downside thrust is fading ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

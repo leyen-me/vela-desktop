@@ -1,0 +1,176 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Morning Star", shorttitle = "Morning Star", overlay = true, format = format.price, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR = #089981
+BEAR_COLOR = #f23645
+
+HIGHLIGHT_BORDER_TRANSP = 60
+HIGHLIGHT_FILL_TRANSP   = 90
+
+TRIGGER_HIGH  = "Third Candle High"
+TRIGGER_CLOSE = "Third Candle Close"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+bodyLenInput = input.int(14, "Body Average Length", minval = 2, maxval = 100, group = "Pattern Detection",
+     tooltip = "Number of candles in the average real body used to size the pattern's candles. The average is taken over the bars immediately preceding the pattern, so the pattern's own candles do not distort their own yardstick.")
+
+longBodyInput = input.float(1.0, "Long Body Multiplier", minval = 0.1, maxval = 5, step = 0.1, group = "Pattern Detection",
+     tooltip = "Minimum real body of the first and third candles, as a multiple of the average real body. All three acts must be present — two ordinary candles around a small pullback bar do not qualify, so both outer candles must print committed long bodies.")
+
+smallBodyInput = input.float(0.5, "Small Body Multiplier", minval = 0.05, maxval = 1, step = 0.05, group = "Pattern Detection",
+     tooltip = "Maximum real body of the star, as a multiple of the average real body. The small body is the pattern's hinge — it records the moment the decline stopped making progress. The star may be either color.")
+
+penetrationInput = input.float(50, "Minimum Penetration %", minval = 0, maxval = 100, step = 5, group = "Pattern Detection",
+     tooltip = "How far into the first candle's real body the third candle must close, measured upward from the body's bottom. 50% is the common midpoint standard borrowed from the piercing-line convention; values toward 100% demand the stricter close near the first body's top.")
+
+gapInput = input.bool(false, "Require Star Body Gap", group = "Pattern Detection",
+     tooltip = "Classic star placement: the star's real body must gap entirely below the first candle's body. Disabled, the relaxed rule modern practice uses in around-the-clock markets applies — the star's body simply sits at or below the first candle's close.")
+
+dojiPctInput = input.float(5, "Doji Body % of Range", minval = 0, maxval = 25, step = 0.5, group = "Pattern Detection",
+     tooltip = "A star real body at or below this percentage of the star's high-low range counts as a doji, upgrading the pattern to a Morning Doji Star — often read as a slightly stronger statement of indecision.")
+
+mergeCheckInput = input.bool(false, "Merged Hammer Check", group = "Pattern Detection",
+     tooltip = "Cross-check by merging: only keep patterns whose three candles, combined into a single bar, collapse into a hammer-like shape with a dominant lower rejection — the merged lower shadow must exceed both the merged body and the merged upper shadow.")
+
+trendFilterInput = input.bool(true, "Downtrend Filter", inline = "trend", group = "Context Filters",
+     tooltip = "Require a decline into the pattern: the first candle must close below the moving average, so the pattern extends an established down leg instead of printing as mid-range noise, where the same three candles are usually no signal.")
+
+trendLenInput = input.int(50, "SMA Length", minval = 2, maxval = 500, inline = "trend", group = "Context Filters",
+     tooltip = "Length of the simple moving average used by the downtrend filter.")
+
+oversoldFilterInput = input.bool(false, "Oversold Filter", inline = "rsi", group = "Context Filters",
+     tooltip = "Only keep patterns forming into oversold conditions, a typical confirmation stacked on the pattern: the RSI reading at the star must be at or below the oversold level.")
+
+rsiLenInput = input.int(14, "RSI Length", minval = 2, maxval = 100, inline = "rsi", group = "Context Filters",
+     tooltip = "RSI length used by the oversold filter.")
+
+rsiLevelInput = input.float(30, "Level", minval = 1, maxval = 99, step = 1, inline = "rsi", group = "Context Filters",
+     tooltip = "RSI value at or below which the star bar counts as oversold.")
+
+volumeFilterInput = input.bool(false, "Volume Filter", inline = "volume", group = "Context Filters",
+     tooltip = "Require expanding participation on the reversal: the third candle's volume must exceed its moving average. Needs a symbol that provides volume data.")
+
+volLenInput = input.int(20, "SMA Length", minval = 1, maxval = 500, inline = "volume", group = "Context Filters",
+     tooltip = "Length of the volume moving average used by the volume filter.")
+
+showLevelsInput = input.bool(true, "Trigger & Stop Levels", group = "Trigger & Invalidation",
+     tooltip = "Draws the pattern's reference points as dashed levels: the conventional entry trigger, and the invalidation at the star's low — the natural stop, since that is where the market rejected lower prices.")
+
+triggerModeInput = input.string(TRIGGER_HIGH, "Trigger Level", options = [TRIGGER_HIGH, TRIGGER_CLOSE], group = "Trigger & Invalidation",
+     tooltip = "Conventional trigger: the third candle's close for immediate entries, or its high when waiting for a break above it. The trigger-break alert fires once price trades above this level after the pattern completes.")
+
+extendInput = input.int(10, "Levels Extension", minval = 1, maxval = 250, group = "Trigger & Invalidation",
+     tooltip = "Number of bars the trigger and stop levels extend to the right of the pattern.")
+
+showLabelsInput = input.bool(true, "Pattern Labels", group = "Style",
+     tooltip = "Marks each pattern with a Morning Star or Morning Doji Star label beneath its low; hovering a label reports the third candle's depth into the first body and the trigger and stop prices.")
+
+highlightInput = input.bool(true, "Pattern Highlight", group = "Style",
+     tooltip = "Shades the three candles of each detected pattern.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "colors", group = "Style",
+     tooltip = "Color of pattern labels, highlights and trigger levels.")
+
+bearColorInput = input.color(BEAR_COLOR, "Invalidation", inline = "colors", group = "Style",
+     tooltip = "Color of the invalidation level at the star's low.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Pattern Detection
+//---------------------------------------------------------------------------------------------------------------------{
+body     = math.abs(close - open)
+bodyAvg  = ta.sma(body, bodyLenInput)
+trendSma = ta.sma(close, trendLenInput)
+rsiValue = ta.rsi(close, rsiLenInput)
+volSma   = ta.sma(volume, volLenInput)
+
+// Average real body of the candles immediately preceding the three-candle pattern
+refBody = bodyAvg[3]
+
+// Act one — a long bearish candle extending the decline
+firstBearish = close[2] < open[2]
+firstLong    = body[2] >= refBody * longBodyInput
+
+// Act two — the star: a small real body of either color positioned at or below the first candle's close
+starBodyTop    = math.max(open[1], close[1])
+starBodyBottom = math.min(open[1], close[1])
+starSmall      = body[1] <= refBody * smallBodyInput
+starPlaced     = gapInput ? starBodyTop < close[2] : starBodyBottom <= close[2]
+starIsDoji     = body[1] <= (high[1] - low[1]) * dojiPctInput / 100
+
+// Act three — a long bullish candle closing well into the first candle's body
+thirdBullish    = close > open
+thirdLong       = body >= refBody * longBodyInput
+thirdPenetrates = close > close[2] + body[2] * penetrationInput / 100
+
+// Context filters — location and trend do the real work of separating tradable prints from mid-range noise
+inDowntrend = not trendFilterInput or (not na(trendSma[2]) and close[2] < trendSma[2])
+oversoldOk  = not oversoldFilterInput or (not na(rsiValue[1]) and rsiValue[1] <= rsiLevelInput)
+volumeOk    = not volumeFilterInput or (not na(volSma) and nz(volume) > volSma)
+
+// Merged-candle cross-check — a proper morning star collapses into a hammer-like bar: long lower rejection, close near the top
+patternHigh = math.max(high, high[1], high[2])
+patternLow  = math.min(low, low[1], low[2])
+mergedBody  = math.abs(close - open[2])
+mergedUpper = patternHigh - math.max(close, open[2])
+mergedLower = math.min(close, open[2]) - patternLow
+mergedOk    = not mergeCheckInput or (mergedLower > mergedUpper and mergedLower > mergedBody)
+
+morningStar     = not na(refBody) and firstBearish and firstLong and starSmall and starPlaced and thirdBullish and thirdLong and thirdPenetrates and inDowntrend and oversoldOk and volumeOk and mergedOk
+morningDojiStar = morningStar and starIsDoji
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Trigger & Invalidation Tracking
+//---------------------------------------------------------------------------------------------------------------------{
+triggerPrice = triggerModeInput == TRIGGER_HIGH ? high : close
+
+// Reference points of the most recent pattern, cleared once price resolves them
+var float triggerLevel = na
+var float stopLevel    = na
+
+bool triggerBreak      = false
+bool invalidationBreak = false
+
+if morningStar
+    triggerLevel := triggerPrice
+    stopLevel    := low[1]
+else
+    if not na(triggerLevel) and high > triggerLevel
+        triggerBreak := true
+        triggerLevel := na
+    if not na(stopLevel) and low < stopLevel
+        invalidationBreak := true
+        stopLevel         := na
+        triggerLevel      := na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+if morningStar
+    if highlightInput
+        box.new(bar_index - 2, patternHigh, bar_index, patternLow, border_color = color.new(bullColorInput, HIGHLIGHT_BORDER_TRANSP), bgcolor = color.new(bullColorInput, HIGHLIGHT_FILL_TRANSP))
+    if showLabelsInput
+        achievedPenetration = (close - close[2]) / body[2] * 100
+        patternTip = (morningDojiStar ? "Morning Doji Star" : "Morning Star") + "\nClose depth into first body: " + str.tostring(achievedPenetration, "#.#") + "%\nTrigger: " + str.tostring(triggerPrice, format.mintick) + "\nStop (star low): " + str.tostring(low[1], format.mintick)
+        label.new(bar_index - 1, patternLow, morningDojiStar ? "Morning Doji Star" : "Morning Star", style = label.style_label_up, color = bullColorInput, textcolor = chart.bg_color, size = size.small, tooltip = patternTip)
+    if showLevelsInput
+        line.new(bar_index, triggerPrice, bar_index + extendInput, triggerPrice, color = bullColorInput, style = line.style_dashed)
+        line.new(bar_index - 1, low[1], bar_index + extendInput, low[1], color = bearColorInput, style = line.style_dashed)
+        label.new(bar_index + extendInput, triggerPrice, "Trigger", style = label.style_label_left, color = #00000000, textcolor = bullColorInput, size = size.tiny)
+        label.new(bar_index + extendInput, low[1], "Stop", style = label.style_label_left, color = #00000000, textcolor = bearColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(morningStar, "Morning Star", "Morning Star confirmed on {{ticker}} ({{interval}}) — long bearish candle, small star, long bullish candle closing back into the first body")
+alertcondition(morningDojiStar, "Morning Doji Star", "Morning Doji Star confirmed on {{ticker}} ({{interval}}) — the star printed as a doji, a stronger statement of indecision")
+alertcondition(triggerBreak, "Trigger Level Break", "Morning Star trigger broken on {{ticker}} ({{interval}}) — price traded above the pattern's trigger level")
+alertcondition(invalidationBreak, "Pattern Invalidated", "Morning Star invalidated on {{ticker}} ({{interval}}) — price traded below the star's low, the pattern's natural invalidation point")
+
+//---------------------------------------------------------------------------------------------------------------------}

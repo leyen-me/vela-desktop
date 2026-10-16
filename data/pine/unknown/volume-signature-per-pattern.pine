@@ -1,0 +1,318 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Volume Signature per Pattern", shorttitle = "Volume Signature per Pattern", overlay = true, max_boxes_count = 500, max_labels_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+NEUTRAL_COLOR = #787b86 // consolidation zone while its volume signature is being audited - structure grey
+BULL_COLOR    = #089981 // bullish breakouts
+BEAR_COLOR    = #f23645 // bearish breakouts
+
+ZONE_BG_TRANSP   = 92  // zone background while forming and for signature-confirmed resolutions
+ZONE_FADE_TRANSP = 96  // zone background of signature-suspect resolutions
+FADE_TRANSP      = 60  // border and text of signature-suspect resolutions
+MUTED_TRANSP     = 40  // muted dashboard text
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+GRP_DETECT = "Pattern Detection"
+GRP_SIG    = "Volume Signature"
+GRP_DASH   = "Dashboard"
+GRP_STYLE  = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+lengthInput = input.int(14, "Detection Window", minval = 5, maxval = 100
+  , group   = GRP_DETECT
+  , tooltip = "Number of bars whose high-low span must compress before a consolidation is flagged. The flagged zone locks onto this window's extremes, the working stand-in for a coiling flag, triangle or trading range.")
+
+atrLengthInput = input.int(200, "Volatility Baseline", minval = 20, maxval = 500
+  , group   = GRP_DETECT
+  , tooltip = "Length of the long-run Average True Range used as the volatility yardstick of the compression test.")
+
+compressionInput = input.float(2.0, "Compression Threshold", minval = 0.5, maxval = 10, step = 0.1
+  , group   = GRP_DETECT
+  , tooltip = "A consolidation is flagged when the detection window's high-low span is at or below this multiple of the long-run ATR. Lower values demand a tighter coil before the audit starts.")
+
+breakBasisInput = input.string("Close", "Breakout Basis", options = ["Close", "High / Low"]
+  , group   = GRP_DETECT
+  , tooltip = "Price event that resolves the pattern at its boundary. Close waits for a close beyond the zone, High / Low reacts to any wick beyond it.")
+
+avgLengthInput = input.int(20, "Average Volume Length", minval = 2, maxval = 200
+  , group   = GRP_SIG
+  , tooltip = "Length of the simple moving average of volume taken as normal participation. It is snapshotted just ahead of the pattern as the formation baseline and read again at the break as the recent average a breakout must expand above.")
+
+expansionInput = input.float(1.5, "Breakout Expansion Multiple", minval = 1, maxval = 10, step = 0.1
+  , group   = GRP_SIG
+  , tooltip = "Breakout bar volume must reach this multiple of the recent average volume for the breakout leg of the signature to confirm. The classical expectation is a clear expansion above recent average volume as the boundary breaks.")
+
+showDashInput = input.bool(true, "Show Dashboard"
+  , group   = GRP_DASH
+  , tooltip = "Displays the live audit of the forming pattern - its volume trend, its volume versus the pre-pattern baseline, the volume a breakout needs - plus the verdict of the last resolved breakout.")
+
+dashLocInput = input.string("Top Right", "Location", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"]
+  , group   = GRP_DASH
+  , tooltip = "Chart corner the dashboard is anchored to.")
+
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"]
+  , group   = GRP_DASH
+  , tooltip = "Dashboard text size.")
+
+showZonesInput = input.bool(true, "Show Consolidation Zones"
+  , group   = GRP_STYLE
+  , tooltip = "Draws a box around each detected consolidation. Resolved zones keep the breakout's color - full strength when the volume signature confirmed, faded when it was suspect.")
+
+showLastInput = input.int(10, "Show Last", minval = 1, maxval = 250
+  , group   = GRP_STYLE
+  , tooltip = "Number of most recent consolidation zones (and their breakout tags) kept on the chart.")
+
+showReadInput = input.bool(true, "Formation Volume Read"
+  , group   = GRP_STYLE
+  , tooltip = "Writes the running volume trend inside the zone - the drift of the least-squares regression of volume from the first bar of the pattern to the latest one. Negative and falling is the textbook shape while a pattern draws.")
+
+showTagsInput = input.bool(true, "Breakout Quality Tags"
+  , group   = GRP_STYLE
+  , tooltip = "Tags each resolved breakout as Confirmed (contraction while forming plus expansion at the break) or Suspect (signature mismatch). Hover a tag for the full volume audit.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "direction"
+  , group   = GRP_STYLE
+  , tooltip = "Color of bullish breakout tags and of zones resolved upward.")
+
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "direction"
+  , group   = GRP_STYLE
+  , tooltip = "Color of bearish breakout tags and of zones resolved downward.")
+
+zoneColorInput = input.color(NEUTRAL_COLOR, "Consolidation Zone"
+  , group   = GRP_STYLE
+  , tooltip = "Color of the consolidation zone while the pattern is still forming and its signature is being audited.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// percent drift of the least-squares regression of volume across the pattern, negative = contracting participation
+volumeTrendPct(float n, float sx, float sx2, float sxy, float sy) =>
+    float denom     = n * sx2 - sx * sx
+    float slope     = denom != 0 ? (n * sxy - sx * sy) / denom : 0.
+    float intercept = n > 0 ? (sy - slope * sx) / n : 0.
+    float regEnd    = intercept + slope * math.max(n - 1, 0)
+    n >= 2 and intercept > 0 ? (regEnd - intercept) / intercept * 100 : na
+
+// formatted trend string shared by the zone read, the tags and the dashboard
+trendText(float pct) =>
+    na(pct) ? "n/a" : (pct >= 0 ? "+" : "") + str.tostring(pct, "#.#") + "%"
+
+dashLocation(string s) =>
+    switch s
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        =>                position.bottom_left
+
+dashTextSize(string s) =>
+    switch s
+        "Tiny"   => size.tiny
+        "Normal" => size.normal
+        =>          size.small
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+windowHigh = ta.highest(high, lengthInput)
+windowLow  = ta.lowest(low, lengthInput)
+atrValue   = ta.atr(atrLengthInput)
+avgVolume  = ta.sma(volume, avgLengthInput)
+
+// compression test - the detection window trades inside a span small relative to long-run volatility
+compressed = not na(atrValue) and windowHigh - windowLow <= atrValue * compressionInput
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Pattern Tracking & Signature Audit
+//---------------------------------------------------------------------------------------------------------------------{
+var bool  patternOpen    = false
+var bool  armed          = true
+var float zoneTop        = na
+var float zoneBottom     = na
+var int   zoneStart      = na
+var float baselineVolume = na
+var box   zoneBox        = na
+
+// incremental least-squares accumulators of volume across the pattern (x = bar offset inside the pattern)
+var float statN = 0.
+var float sumX  = 0.
+var float sumX2 = 0.
+var float sumXY = 0.
+var float sumY  = 0.
+
+// zone/tag housekeeping and dashboard memory
+var zoneBoxArray  = array.new<box>()
+var tagLabelArray = array.new<label>()
+
+var string lastVerdict      = "—"
+var color  lastVerdictColor = NEUTRAL_COLOR
+
+bool  newPatternEvt  = false
+bool  confirmedUpEvt = false
+bool  confirmedDnEvt = false
+bool  suspectUpEvt   = false
+bool  suspectDnEvt   = false
+float breakExpansion = na
+
+// compression must release at least once before a new pattern can arm again
+if not compressed
+    armed := true
+
+if not patternOpen and armed and compressed and bar_index >= lengthInput
+    // a coil is flagged - lock the zone on the window extremes and seed the volume statistics with its bars
+    patternOpen    := true
+    zoneTop        := windowHigh
+    zoneBottom     := windowLow
+    zoneStart      := bar_index - lengthInput + 1
+    baselineVolume := nz(avgVolume[lengthInput], nz(avgVolume))
+    statN := 0.
+    sumX  := 0.
+    sumX2 := 0.
+    sumXY := 0.
+    sumY  := 0.
+    for i = 0 to lengthInput - 1
+        float xOff = statN
+        float vol  = nz(volume[lengthInput - 1 - i])
+        sumX  += xOff
+        sumX2 += xOff * xOff
+        sumXY += xOff * vol
+        sumY  += vol
+        statN += 1
+    newPatternEvt := true
+    if showZonesInput
+        zoneBox := box.new(zoneStart, zoneTop, bar_index, zoneBottom, border_color = zoneColorInput, border_width = 1, border_style = line.style_dashed, bgcolor = color.new(zoneColorInput, ZONE_BG_TRANSP), text_size = size.tiny, text_color = zoneColorInput, text_halign = text.align_left, text_valign = text.align_top)
+        array.push(zoneBoxArray, zoneBox)
+        if array.size(zoneBoxArray) > showLastInput
+            box.delete(array.shift(zoneBoxArray))
+else if patternOpen
+    bool brokeUp = breakBasisInput == "Close" ? close > zoneTop : high > zoneTop
+    bool brokeDn = breakBasisInput == "Close" ? close < zoneBottom : low < zoneBottom
+    if brokeUp or brokeDn
+        // the boundary broke - grade both legs of the textbook signature, formation bars only
+        float formationPct = volumeTrendPct(statN, sumX, sumX2, sumXY, sumY)
+        bool  formationOk  = not na(formationPct) and formationPct < 0
+        float referenceVol = nz(avgVolume[1], nz(avgVolume))
+        float expansion    = referenceVol > 0 ? nz(volume) / referenceVol : 0.
+        bool  expansionOk  = expansion >= expansionInput
+        bool  confirmed    = formationOk and expansionOk
+
+        breakExpansion := expansion
+        confirmedUpEvt := brokeUp and confirmed
+        confirmedDnEvt := brokeDn and confirmed
+        suspectUpEvt   := brokeUp and not confirmed
+        suspectDnEvt   := brokeDn and not confirmed
+
+        color  directionColor = brokeUp ? bullColorInput : bearColorInput
+        string formationTxt   = trendText(formationPct)
+        string auditTxt       = "Formation volume: " + formationTxt + (formationOk ? " (contracting)" : " (no contraction)") + "\nBreakout volume: " + str.tostring(expansion, "#.##") + "x average, needs " + str.tostring(expansionInput, "#.##") + "x"
+
+        // resolve the zone - confirmed keeps full strength, suspect fades
+        if not na(zoneBox)
+            box.set_right(zoneBox, bar_index)
+            box.set_border_style(zoneBox, line.style_solid)
+            box.set_border_color(zoneBox, confirmed ? directionColor : color.new(directionColor, FADE_TRANSP))
+            box.set_bgcolor(zoneBox, color.new(directionColor, confirmed ? ZONE_BG_TRANSP : ZONE_FADE_TRANSP))
+            box.set_text_color(zoneBox, confirmed ? directionColor : color.new(directionColor, FADE_TRANSP))
+            if showReadInput
+                box.set_text(zoneBox, "Volume " + formationTxt)
+            zoneBox := na
+
+        // breakout quality tag - filled when the signature confirmed, hollow when it is suspect
+        if showTagsInput
+            string tagTxt   = confirmed ? "Confirmed" : "Suspect"
+            color  tagBg    = confirmed ? directionColor : color.new(directionColor, 100)
+            color  tagInk   = confirmed ? color.white : directionColor
+            label  tagLabel = na
+            if brokeUp
+                tagLabel := label.new(bar_index, low, tagTxt, yloc = yloc.belowbar, style = label.style_label_up, color = tagBg, textcolor = tagInk, size = size.small, tooltip = auditTxt)
+            else
+                tagLabel := label.new(bar_index, high, tagTxt, yloc = yloc.abovebar, style = label.style_label_down, color = tagBg, textcolor = tagInk, size = size.small, tooltip = auditTxt)
+            array.push(tagLabelArray, tagLabel)
+            if array.size(tagLabelArray) > showLastInput
+                label.delete(array.shift(tagLabelArray))
+
+        lastVerdict      := (brokeUp ? "Bull — " : "Bear — ") + (confirmed ? "Confirmed" : "Suspect") + " (" + str.tostring(expansion, "#.##") + "x)"
+        lastVerdictColor := confirmed ? directionColor : NEUTRAL_COLOR
+
+        patternOpen := false
+        armed       := false
+    else
+        // the pattern keeps forming - accumulate its volume and extend the zone
+        float xOff = statN
+        float vol  = nz(volume)
+        sumX  += xOff
+        sumX2 += xOff * xOff
+        sumXY += xOff * vol
+        sumY  += vol
+        statN += 1
+        if not na(zoneBox)
+            box.set_right(zoneBox, bar_index)
+
+// live formation metrics of the open pattern
+float trendPct = patternOpen ? volumeTrendPct(statN, sumX, sumX2, sumXY, sumY) : na
+float volRatio = patternOpen and statN > 0 and not na(baselineVolume) and baselineVolume > 0 ? sumY / statN / baselineVolume : na
+
+if patternOpen and showReadInput and not na(zoneBox)
+    box.set_text(zoneBox, "Volume " + trendText(trendPct))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dashTable = na
+
+if showDashInput and na(dashTable)
+    dashTable := table.new(dashLocation(dashLocInput), 2, 6, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+if showDashInput and barstate.islast and not na(dashTable)
+    string txtSize  = dashTextSize(dashSizeInput)
+    color  mutedCol = NEUTRAL_COLOR
+
+    table.cell(dashTable, 0, 0, "Signature", text_color = DASH_HEADER, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 0, "Reading", text_color = DASH_HEADER, text_size = txtSize, text_halign = text.align_left)
+
+    string patternTxt = patternOpen ? "Forming — " + str.tostring(bar_index - zoneStart + 1) + " bars" : "None"
+    table.cell(dashTable, 0, 1, "Pattern", text_color = DASH_HEADER, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 1, patternTxt, text_color = patternOpen ? DASH_TEXT : mutedCol, text_size = txtSize, text_halign = text.align_left)
+
+    string trendTxt = na(trendPct) ? "—" : trendText(trendPct) + (trendPct < 0 ? " Contracting" : " Expanding")
+    color  trendCol = na(trendPct) ? mutedCol : trendPct < 0 ? bullColorInput : bearColorInput
+    table.cell(dashTable, 0, 2, "Volume Trend", text_color = DASH_HEADER, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 2, trendTxt, text_color = trendCol, text_size = txtSize, text_halign = text.align_left)
+
+    string ratioTxt = na(volRatio) ? "—" : str.tostring(volRatio, "#.##") + "x baseline"
+    color  ratioCol = na(volRatio) ? mutedCol : volRatio < 1 ? bullColorInput : bearColorInput
+    table.cell(dashTable, 0, 3, "Pattern Volume", text_color = DASH_HEADER, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 3, ratioTxt, text_color = ratioCol, text_size = txtSize, text_halign = text.align_left)
+
+    table.cell(dashTable, 0, 4, "Confirm Volume", text_color = DASH_HEADER, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 4, ">= " + str.tostring(nz(avgVolume) * expansionInput, format.volume), text_color = DASH_TEXT, text_size = txtSize, text_halign = text.align_left)
+
+    table.cell(dashTable, 0, 5, "Last Breakout", text_color = DASH_HEADER, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 5, lastVerdict, text_color = lastVerdictColor, text_size = txtSize, text_halign = text.align_left)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Plots
+//---------------------------------------------------------------------------------------------------------------------{
+plot(trendPct, "Formation Volume Trend %", color = zoneColorInput, display = display.data_window, precision = 1)
+plot(volRatio, "Pattern / Baseline Volume", color = zoneColorInput, display = display.data_window, precision = 2)
+plot(breakExpansion, "Breakout Volume x Average", color = zoneColorInput, display = display.data_window, precision = 2)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(newPatternEvt, "New Consolidation Detected", "Volume Signature per Pattern on {{ticker}}: new consolidation flagged — the volume signature audit has started ({{interval}})")
+alertcondition(confirmedUpEvt, "Signature-Confirmed Bullish Breakout", "Volume Signature per Pattern on {{ticker}}: bullish breakout with the textbook signature — volume contracted while the pattern formed and expanded at the break ({{interval}})")
+alertcondition(confirmedDnEvt, "Signature-Confirmed Bearish Breakout", "Volume Signature per Pattern on {{ticker}}: bearish breakout with the textbook signature — volume contracted while the pattern formed and expanded at the break ({{interval}})")
+alertcondition(suspectUpEvt, "Signature-Suspect Bullish Breakout", "Volume Signature per Pattern on {{ticker}}: bullish breakout without the textbook volume signature — classical charting treats it as more likely to be a false move, consider waiting for a retest ({{interval}})")
+alertcondition(suspectDnEvt, "Signature-Suspect Bearish Breakout", "Volume Signature per Pattern on {{ticker}}: bearish breakout without the textbook volume signature — classical charting treats it as more likely to be a false move, consider waiting for a retest ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

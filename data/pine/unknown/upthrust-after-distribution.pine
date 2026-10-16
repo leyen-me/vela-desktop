@@ -1,0 +1,469 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Upthrust After Distribution"
+  , shorttitle       = "Upthrust After Distribution"
+  , overlay          = true
+  , format           = format.price
+  , max_boxes_count  = 250
+  , max_lines_count  = 500
+  , max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+//Tracker stages: no candidate, stall high found and awaiting the first reaction low, active range
+int STAGE_IDLE      = 0
+int STAGE_AWAIT_LOW = 1
+int STAGE_RANGE     = 2
+
+//Resolution direction of a finished range
+int RESOLVE_NONE = 0
+int RESOLVE_UP   = 1
+int RESOLVE_DOWN = -1
+
+//Share of the range height treated as the boundary-test zone on each extremity
+float TOUCH_ZONE_FRAC = 0.15
+
+//A post-UTAD wide down bar must close within this lower share of the range to count as a sign of weakness
+float SOW_CLOSE_FRAC = 0.5
+
+color BULL_COLOR    = #089981
+color BEAR_COLOR    = #f23645
+color NEUTRAL_COLOR = #787b86
+color TRANSP_COLOR  = #00000000
+
+string GROUP_TREND = "Prior Advance"
+string GROUP_RANGE = "Range Detection"
+string GROUP_UTAD  = "UTAD Detection"
+string GROUP_TEST  = "Secondary Test & Confirmation"
+string GROUP_STYLE = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+trendLookbackInput = input.int(50, "Advance Lookback (Bars)"
+  , minval  = 10
+  , group   = GROUP_TREND
+  , tooltip = "Bars used to qualify the advance preceding the range. The stall high must be the highest high of this window, with price up by at least the minimum advance across it - a UTAD only has meaning at the top of a markup leg with something to distribute.")
+
+trendMultInput = input.float(2.0, "Minimum Advance (xATR)"
+  , minval  = 0.25
+  , step    = 0.25
+  , group   = GROUP_TREND
+  , tooltip = "Net advance into the stall high, in ATR multiples measured over the advance lookback, required before the pause qualifies as candidate distribution. Raise it to demand a stronger markup leg into the range.")
+
+atrLengthInput = input.int(14, "ATR Length"
+  , minval  = 1
+  , group   = GROUP_TREND
+  , tooltip = "Average True Range length used to normalize the prior advance and the sign-of-weakness spread test.")
+
+pivotLengthInput = input.int(5, "Swing Length"
+  , minval  = 2
+  , group   = GROUP_RANGE
+  , tooltip = "Swing strength of the pivots that mark the stall high and the first reaction low - the range resistance and support. A pivot must be the extreme of this many bars on each side, so boundaries confirm this many bars after they print.")
+
+minRangeBarsInput = input.int(15, "Minimum Range Duration (Bars)"
+  , minval  = 5
+  , group   = GROUP_RANGE
+  , tooltip = "Bars the pause must last, counted from the stall high, before it is treated as an established trading range. Structures resolving earlier are discarded as simple pullbacks rather than ranges.")
+
+matureBarsInput = input.int(40, "Terminal Maturity (Bars)"
+  , minval  = 5
+  , group   = GROUP_RANGE
+  , tooltip = "Bars from the stall high before a failed break above resistance can qualify as terminal. Earlier failed pokes are ordinary upthrusts: they are tallied as failing rallies but never labeled UTAD.")
+
+minTestsInput = input.int(1, "Minimum Boundary Tests"
+  , minval  = 0
+  , group   = GROUP_RANGE
+  , tooltip = "Completed failing rallies into resistance and distinct tests of support required inside the range before the terminal break - the distributional behavior the structure is expected to show. Set to 0 to disable.")
+
+graceBarsInput = input.int(3, "Support Grace (Bars)"
+  , minval  = 1
+  , group   = GROUP_RANGE
+  , tooltip = "Before a UTAD, price may close below range support for up to this many bars and recover without ending the range, so brief undercuts read as hard tests of support. After a UTAD, the first close below support confirms weakness immediately.")
+
+failWindowInput = input.int(5, "Failure Window (Bars)"
+  , minval  = 1
+  , group   = GROUP_UTAD
+  , tooltip = "Maximum consecutive closes above the broken level before the breakout counts as accepted. A UTAD must close back inside the range within this window; holding above it resolves the range as a genuine breakout instead.")
+
+volFilterInput = input.bool(true, "Breakout Volume Multiple", inline = "vol"
+  , group   = GROUP_UTAD
+  , tooltip = "Toggle the expanded-participation requirement on the terminal break. The move above resistance commonly comes on expanded volume; disable to detect UTADs from price structure alone.")
+
+volMultInput = input.float(1.2, "", inline = "vol"
+  , minval  = 0.5
+  , step    = 0.1
+  , group   = GROUP_UTAD
+  , tooltip = "Require expanded participation on the terminal break: the highest volume printed while price holds above resistance must reach this multiple of the pre-break average volume, as breakout orders and short covering are triggered. Skipped on symbols without volume data.")
+
+volLengthInput = input.int(20, "Volume Average Length"
+  , minval  = 1
+  , group   = GROUP_UTAD
+  , tooltip = "Simple moving average length of volume used as the participation baseline for the breakout-expansion and heavy-volume checks.")
+
+testZoneInput = input.float(25, "Test Proximity (% of Range Height)"
+  , minval  = 5
+  , maxval  = 100
+  , step    = 5
+  , group   = GROUP_TEST
+  , tooltip = "How close to the UTAD high a later rally must come to count as its secondary test, as a share of the range height below that high.")
+
+testPivotInput = input.int(2, "Test Swing Length"
+  , minval  = 1
+  , group   = GROUP_TEST
+  , tooltip = "Swing strength of the smaller pivot marking the secondary-test high, so the test confirms this many bars after its swing rolls over.")
+
+testQualityInput = input.bool(true, "Shrinking Volume & Narrower Spread"
+  , group   = GROUP_TEST
+  , tooltip = "Require the secondary-test swing to print lower volume and a narrower bar spread than the UTAD itself - the weak-demand signature that makes the failing test the classic entry evidence. The volume comparison is skipped on symbols without volume data.")
+
+sowSpreadInput = input.float(1.5, "Wide Down-Bar (xATR)"
+  , minval  = 0.5
+  , step    = 0.25
+  , group   = GROUP_TEST
+  , tooltip = "After a UTAD, a down bar with a spread of at least this many ATRs on heavy volume, closing in the lower half of the range, confirms a sign of weakness even before support breaks.")
+
+showBoxInput = input.bool(true, "Show Range Box"
+  , group   = GROUP_STYLE
+  , tooltip = "Draws the trading range between the stall high and the first reaction low. Dashed while the range is live; solid once it resolves, colored by the resolution direction.")
+
+showStopInput = input.bool(true, "Show UTAD High Level"
+  , group   = GROUP_STYLE
+  , tooltip = "Dotted level at the UTAD high while the reading is live - the nearby invalidation reference traders place stops just above.")
+
+showTargetInput = input.bool(true, "Show Downside Projection"
+  , group   = GROUP_STYLE
+  , tooltip = "Dotted level one range height below support once a UTAD confirms - the downside objective a markdown from the range projects - extended until price reaches it.")
+
+fillTransparencyInput = input.int(90, "Range Fill Transparency"
+  , minval  = 50
+  , maxval  = 100
+  , group   = GROUP_STYLE)
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "colors", group = GROUP_STYLE)
+
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "colors", group = GROUP_STYLE)
+
+neutralColorInput = input.color(NEUTRAL_COLOR, "Range", inline = "colors", group = GROUP_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Prior Advance & Swings
+//---------------------------------------------------------------------------------------------------------------------{
+
+float atrValue       = ta.atr(atrLengthInput)
+float volumeSma      = ta.sma(nz(volume), volLengthInput)
+float highestHigh    = ta.highest(high, trendLookbackInput)
+float pivotHighPrice = ta.pivothigh(high, pivotLengthInput, pivotLengthInput)
+float pivotLowPrice  = ta.pivotlow(low, pivotLengthInput, pivotLengthInput)
+float testPivotPrice = ta.pivothigh(high, testPivotInput, testPivotInput)
+
+bool hasVolume = not na(volume) and nz(volumeSma) > 0
+
+//Advance qualification evaluated at the pivot bar: the stall high must be the lookback-window high and
+//price must have advanced by the minimum ATR-normalized amount into it - the significant-advance context
+float highAtPivot       = high[pivotLengthInput]
+float highestAtPivot    = highestHigh[pivotLengthInput]
+float atrAtPivot        = atrValue[pivotLengthInput]
+float priorCloseAtPivot = close[pivotLengthInput + trendLookbackInput]
+
+float gainAtPivot = not na(priorCloseAtPivot) and not na(atrAtPivot) and atrAtPivot > 0 ? (highAtPivot - priorCloseAtPivot) / atrAtPivot : na
+bool  advanceOk   = not na(pivotHighPrice) and not na(gainAtPivot) and gainAtPivot >= trendMultInput and not na(highestAtPivot) and highAtPivot >= highestAtPivot
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Range State Machine
+//---------------------------------------------------------------------------------------------------------------------{
+
+var int   stage       = STAGE_IDLE
+var float rangeTop    = na
+var float rangeBottom = na
+var float rangeHeight = na
+var int   topBar      = na
+var bool  established = false
+var box   rangeBox    = na
+
+//Boundary-test tallies: distinct failing rallies into resistance and hard tests of support
+var int  resistanceTests = 0
+var int  supportTests    = 0
+var bool wasInResZone    = false
+var bool wasInSupZone    = false
+
+//Above-resistance episode: one poke-and-resolve sequence above the broken level
+var bool  episodeActive   = false
+var bool  episodeFromUtad = false
+var bool  episodeMature   = false
+var bool  episodeTested   = false
+var float episodeHigh     = na
+var int   episodeHighBar  = na
+var float episodeVolume   = na
+var float episodeSpread   = na
+var float episodeBaseSma  = na
+var int   aboveCloses     = 0
+
+//Support penetration tracker for the pre-UTAD grace window
+var int belowSupportBar = na
+
+//Confirmed UTAD state
+var bool  utadConfirmed   = false
+var float utadHigh        = na
+var int   utadHighBar     = na
+var int   utadFailBar     = na
+var float utadVolume      = na
+var float utadSpread      = na
+var bool  testDone        = false
+var int   postAboveCloses = 0
+
+//Stop & target references
+var line stopLine     = na
+var int  stopTopBar   = na
+var line targetLine   = na
+var int  targetTopBar = na
+var bool targetActive = false
+
+//Per-bar event flags for alerts
+bool rangeEvent   = false
+bool attemptEvent = false
+bool utadEvent    = false
+bool testEvent    = false
+bool sowEvent     = false
+bool invalidEvent = false
+bool doReset      = false
+bool doCancel     = false
+int  resolveDir   = RESOLVE_NONE
+
+//A confirmed stall high at the top of a qualified advance opens a candidate
+if stage == STAGE_IDLE and advanceOk
+    stage    := STAGE_AWAIT_LOW
+    rangeTop := pivotHighPrice
+    topBar   := bar_index - pivotLengthInput
+
+//Waiting for the first reaction low that completes the boundaries. A newer, higher stall high
+//supersedes the candidate - the advance simply continued before pausing
+if stage == STAGE_AWAIT_LOW
+    if not na(pivotHighPrice) and pivotHighPrice >= rangeTop
+        rangeTop := pivotHighPrice
+        topBar   := bar_index - pivotLengthInput
+    if not na(pivotLowPrice) and bar_index - pivotLengthInput > topBar and pivotLowPrice < rangeTop
+        stage           := STAGE_RANGE
+        rangeBottom     := pivotLowPrice
+        rangeHeight     := rangeTop - rangeBottom
+        established     := false
+        resistanceTests := 0
+        supportTests    := 0
+        wasInResZone    := high >= rangeTop - TOUCH_ZONE_FRAC * rangeHeight
+        wasInSupZone    := low <= rangeBottom + TOUCH_ZONE_FRAC * rangeHeight
+        episodeActive   := false
+        utadConfirmed   := false
+        testDone        := false
+        belowSupportBar := na
+        postAboveCloses := 0
+
+//Active range: tally the boundary tests, watch both edges, and resolve on an accepted breakout,
+//a decisive loss of support, or a post-UTAD sign of weakness
+if stage == STAGE_RANGE
+    //The pause has lasted long enough to count as an extended trading range
+    if not established and bar_index - topBar >= minRangeBarsInput
+        established := true
+        rangeEvent  := true
+        if showBoxInput
+            rangeBox := box.new(topBar, rangeTop, bar_index, rangeBottom, border_color = neutralColorInput, border_width = 1, border_style = line.style_dashed, bgcolor = color.new(neutralColorInput, fillTransparencyInput))
+
+    if established and not na(rangeBox)
+        box.set_right(rangeBox, bar_index)
+
+    //Distinct visits into the boundary zones: failing rallies at resistance, hard tests at support.
+    //Only fresh entries count, so an ongoing stay is never tallied twice
+    bool inResZone = high >= rangeTop - TOUCH_ZONE_FRAC * rangeHeight
+    bool inSupZone = low <= rangeBottom + TOUCH_ZONE_FRAC * rangeHeight
+    if inResZone and not wasInResZone
+        resistanceTests += 1
+    if inSupZone and not wasInSupZone
+        supportTests += 1
+    wasInResZone := inResZone
+    wasInSupZone := inSupZone
+
+    //Support side: after a UTAD the first close below support is the corroborating sign of weakness;
+    //before one, brief undercuts inside the grace window survive as hard tests of support
+    if close < rangeBottom
+        if utadConfirmed
+            sowEvent   := true
+            doReset    := true
+            resolveDir := RESOLVE_DOWN
+            label.new(bar_index, low, "SOW", style = label.style_label_up, color = TRANSP_COLOR, textcolor = bearColorInput, size = size.small, tooltip = "Sign of weakness: close below range support (" + str.tostring(rangeBottom, format.mintick) + ") after the UTAD - markdown corroborated")
+        else if na(belowSupportBar)
+            belowSupportBar := bar_index
+        else if bar_index - belowSupportBar >= graceBarsInput
+            if established
+                doReset    := true
+                resolveDir := RESOLVE_DOWN
+            else
+                doCancel := true
+    else
+        belowSupportBar := na
+
+    //Above the broken level: arm on the poke, then demand the failure - a close back inside within
+    //the failure window - or resolve the range as a genuine breakout on acceptance
+    if not doReset and not doCancel
+        bool pokeArm   = not episodeActive and not utadConfirmed and high > rangeTop
+        bool retestArm = not episodeActive and utadConfirmed and high > utadHigh
+        if pokeArm or retestArm
+            episodeActive   := true
+            episodeFromUtad := retestArm
+            episodeHigh     := high
+            episodeHighBar  := bar_index
+            episodeVolume   := nz(volume)
+            episodeSpread   := high - low
+            episodeBaseSma  := volumeSma[1]
+            aboveCloses     := 0
+            episodeMature   := retestArm or bar_index - topBar >= matureBarsInput
+            episodeTested   := retestArm or (established and (minTestsInput == 0 or (resistanceTests - 1 >= minTestsInput and supportTests >= minTestsInput)))
+            if episodeMature and episodeTested
+                attemptEvent := true
+        else if episodeActive
+            if high > episodeHigh
+                episodeHigh    := high
+                episodeHighBar := bar_index
+            episodeVolume := math.max(episodeVolume, nz(volume))
+            episodeSpread := math.max(episodeSpread, high - low)
+
+        if episodeActive
+            if close <= rangeTop
+                //The break failed to hold: an ordinary upthrust early on, the UTAD once the range is
+                //mature, tested on both extremities and the break came with expanded participation
+                bool volumeOk = not volFilterInput or not hasVolume or na(episodeBaseSma) or episodeBaseSma <= 0 or episodeVolume >= volMultInput * episodeBaseSma
+                if episodeMature and episodeTested and volumeOk
+                    utadConfirmed   := true
+                    utadHigh        := episodeHigh
+                    utadHighBar     := episodeHighBar
+                    utadFailBar     := bar_index
+                    utadVolume      := episodeVolume
+                    utadSpread      := episodeSpread
+                    testDone        := false
+                    postAboveCloses := 0
+                    utadEvent       := true
+                    label.new(episodeHighBar, episodeHigh, "UTAD", style = label.style_label_down, color = TRANSP_COLOR, textcolor = bearColorInput, size = size.small, tooltip = "Upthrust after distribution: the late break above range resistance (" + str.tostring(rangeTop, format.mintick) + ") could not hold and closed back inside - the terminal test of remaining demand")
+                    if showStopInput
+                        if not na(stopLine) and stopTopBar == topBar
+                            line.set_xy1(stopLine, utadHighBar, utadHigh)
+                            line.set_xy2(stopLine, bar_index, utadHigh)
+                        else
+                            stopLine   := line.new(utadHighBar, utadHigh, bar_index, utadHigh, color = bearColorInput, style = line.style_dotted)
+                            stopTopBar := topBar
+                    if showTargetInput and (na(targetLine) or targetTopBar != topBar)
+                        targetLine   := line.new(bar_index, rangeBottom - rangeHeight, bar_index, rangeBottom - rangeHeight, color = bearColorInput, style = line.style_dotted)
+                        targetTopBar := topBar
+                        targetActive := true
+                else if episodeFromUtad
+                    //An unqualified re-poke above the UTAD high: the terminal level rises without a new label
+                    utadHigh        := episodeHigh
+                    utadHighBar     := episodeHighBar
+                    utadFailBar     := bar_index
+                    postAboveCloses := 0
+                episodeActive := false
+            else
+                aboveCloses += 1
+                if aboveCloses >= failWindowInput
+                    //Acceptance above the broken level: the event was a genuine breakout
+                    if established and (utadConfirmed or (episodeMature and episodeTested))
+                        invalidEvent := true
+                        label.new(bar_index, high, "Held", style = label.style_label_down, color = TRANSP_COLOR, textcolor = bullColorInput, size = size.small, tooltip = "Acceptance above the breakout level (" + str.tostring(rangeTop, format.mintick) + ") - a genuine breakout, refuting the UTAD reading")
+                        if targetActive and not na(targetLine) and targetTopBar == topBar
+                            line.delete(targetLine)
+                            targetLine   := na
+                            targetActive := false
+                    if established
+                        doReset    := true
+                        resolveDir := RESOLVE_UP
+                    else
+                        doCancel := true
+
+        //Post-UTAD watch: acceptance without a new high still refutes the reading; a weak secondary
+        //test of the UTAD high rolling over is the classic entry evidence; a wide, heavy down-leg
+        //confirms the sign of weakness before support even breaks
+        if utadConfirmed and not episodeActive and not doReset
+            postAboveCloses := close > rangeTop ? postAboveCloses + 1 : 0
+            if postAboveCloses >= failWindowInput
+                invalidEvent := true
+                doReset      := true
+                resolveDir   := RESOLVE_UP
+                label.new(bar_index, high, "Held", style = label.style_label_down, color = TRANSP_COLOR, textcolor = bullColorInput, size = size.small, tooltip = "Acceptance above the breakout level (" + str.tostring(rangeTop, format.mintick) + ") - a genuine breakout, refuting the UTAD reading")
+                if targetActive and not na(targetLine) and targetTopBar == topBar
+                    line.delete(targetLine)
+                    targetLine   := na
+                    targetActive := false
+            if not doReset and not testDone and not na(testPivotPrice)
+                int   testBar    = bar_index - testPivotInput
+                float testVolume = nz(volume[testPivotInput])
+                float testSpread = high[testPivotInput] - low[testPivotInput]
+                bool  zoneOk     = testPivotPrice <= utadHigh and testPivotPrice >= utadHigh - rangeHeight * testZoneInput / 100
+                bool  qualityOk  = not testQualityInput or ((not hasVolume or testVolume < utadVolume) and testSpread < utadSpread)
+                if testBar > utadFailBar and zoneOk and qualityOk
+                    testDone  := true
+                    testEvent := true
+                    label.new(testBar, testPivotPrice, "Test", style = label.style_label_down, color = TRANSP_COLOR, textcolor = bearColorInput, size = size.small, tooltip = "Secondary test: the rally toward the UTAD high (" + str.tostring(utadHigh, format.mintick) + ") rolled over without exceeding it - demand exhausted below the trap")
+            if not doReset and close < open and not na(atrValue) and high - low >= sowSpreadInput * atrValue and (not hasVolume or nz(volume) >= volMultInput * volumeSma) and close <= rangeBottom + SOW_CLOSE_FRAC * rangeHeight
+                sowEvent   := true
+                doReset    := true
+                resolveDir := RESOLVE_DOWN
+                label.new(bar_index, low, "SOW", style = label.style_label_up, color = TRANSP_COLOR, textcolor = bearColorInput, size = size.small, tooltip = "Sign of weakness: wide, heavy down-leg after the UTAD - markdown corroborated")
+
+    //Maintain the stop reference while the reading is live, following silent rises of the terminal level
+    if utadConfirmed and not doReset and showStopInput and not na(stopLine) and stopTopBar == topBar
+        line.set_xy1(stopLine, utadHighBar, utadHigh)
+        line.set_xy2(stopLine, bar_index, utadHigh)
+
+//Apply the resolution: recolor the box by direction, or quietly discard a pause that never ranged
+if doReset and not na(rangeBox)
+    color resolveColor = resolveDir == RESOLVE_UP ? bullColorInput : bearColorInput
+    box.set_right(rangeBox, bar_index)
+    box.set_border_style(rangeBox, line.style_solid)
+    box.set_border_color(rangeBox, resolveColor)
+    box.set_bgcolor(rangeBox, color.new(resolveColor, fillTransparencyInput))
+
+if doCancel or doReset
+    stage           := STAGE_IDLE
+    rangeTop        := na
+    rangeBottom     := na
+    rangeHeight     := na
+    topBar          := na
+    established     := false
+    rangeBox        := na
+    resistanceTests := 0
+    supportTests    := 0
+    episodeActive   := false
+    belowSupportBar := na
+    utadConfirmed   := false
+    testDone        := false
+    postAboveCloses := 0
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Downside Projection
+//---------------------------------------------------------------------------------------------------------------------{
+
+//The projection extends into the markdown until price reaches it
+if targetActive and not na(targetLine)
+    line.set_x2(targetLine, bar_index)
+    if low <= line.get_y1(targetLine)
+        targetActive := false
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(rangeEvent, "Trading Range Established", "Extended trading range established after a significant advance on {{ticker}} ({{interval}}) - candidate distribution context; a late failed break above resistance would be the UTAD")
+
+alertcondition(attemptEvent, "Terminal Breakout Attempt", "Break above the resistance of a mature trading range on {{ticker}} ({{interval}}) - the same print is either breakout or terminal failure depending on what happens next")
+
+alertcondition(utadEvent, "UTAD Detected", "Upthrust after distribution on {{ticker}} ({{interval}}) - the late break above range resistance failed back inside the range; invalidation sits just above the UTAD high")
+
+alertcondition(testEvent, "UTAD Secondary Test", "Weak secondary test of the UTAD high rolled over on {{ticker}} ({{interval}}) - the classic entry evidence, with stops placed just above that high")
+
+alertcondition(sowEvent, "Sign of Weakness", "Sign of weakness after the UTAD on {{ticker}} ({{interval}}) - support broken or a wide, heavy down-leg; markdown corroborated")
+
+alertcondition(invalidEvent, "Breakout Accepted", "Price accepted above the broken level on {{ticker}} ({{interval}}) - a genuine breakout refutes the UTAD reading; exit shorts at the predefined stop")
+
+//---------------------------------------------------------------------------------------------------------------------}

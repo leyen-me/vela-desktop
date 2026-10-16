@@ -1,0 +1,336 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Bagging", "Bagging", overlay = false, format = format.price, precision = 3)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR    = #089981 // prediction above zero - the ensemble leans bullish
+BEAR_COLOR    = #f23645 // prediction below zero - the ensemble leans bearish
+NEUTRAL_COLOR = #787b86 // member dispersion band - sample sensitivity, structure
+GRAY_COLOR    = #787b86 // unbagged reference line and levels
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+// Numerical Recipes 32-bit linear congruential generator, exact in float64 arithmetic
+LCG_A = 1664525.0
+LCG_C = 1013904223.0
+LCG_M = 4294967296.0
+
+SENTINEL = 1.0e20
+
+AGG_AVG    = "Average (Regression)"
+AGG_VOTE   = "Majority Vote (Classification)"
+BOOT_IID   = "Standard (IID)"
+BOOT_BLOCK = "Block (Time Series)"
+
+GRP_BAG   = "Bagging Ensemble"
+GRP_FEAT  = "Base Learner Features"
+GRP_DASH  = "Dashboard"
+GRP_STYLE = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+bagsInput      = input.int(50, "Bootstrap Replicates (B)", minval = 2, maxval = 100, group = GRP_BAG, tooltip = "Number of bootstrap resamples, and therefore of base models, in the ensemble. Performance typically plateaus somewhere in the tens to hundreds of replicates; adding more mostly costs computation.")
+trainInput     = input.int(100, "Training Window (n)", minval = 20, maxval = 300, group = GRP_BAG, tooltip = "Number of most recent labeled observations forming the training set D. Each bootstrap sample is drawn from this window with replacement, at the same size n.")
+kInput         = input.int(5, "Neighbors (k)", minval = 1, maxval = 50, group = GRP_BAG, tooltip = "k of the k-nearest-neighbors base learner each replicate trains. All members share this one learning algorithm, as bagging requires. A small k gives the flexible, high-variance behavior that bagging is designed to stabilize.")
+horizonInput   = input.int(5, "Label Horizon", minval = 1, maxval = 50, group = GRP_BAG, tooltip = "Bars ahead used to label each training observation: +1 when close rises over the horizon, -1 when it falls, 0 when unchanged. The ensemble predicts this directional label for the current bar.")
+aggInput       = input.string(AGG_AVG, "Aggregation", options = [AGG_AVG, AGG_VOTE], group = GRP_BAG, tooltip = "How member predictions are combined. Average treats the task as regression, f_bag = (1/B) * sum of f_b, equivalent to averaging predicted probabilities. Majority Vote counts bullish versus bearish members and returns their net share, the classification form.")
+bootInput      = input.string(BOOT_IID, "Bootstrap Type", options = [BOOT_IID, BOOT_BLOCK], group = GRP_BAG, tooltip = "Standard (IID) draws each observation independently with replacement, the canonical bootstrap. Block resamples contiguous chunks (circular block bootstrap) to respect the serial dependence of financial series, the standard adaptation for autocorrelated data.")
+blockLenInput  = input.int(10, "Block Length", minval = 2, maxval = 100, group = GRP_BAG, tooltip = "Length of the contiguous chunks resampled by the block bootstrap. Ignored when the bootstrap type is Standard (IID).")
+seedInput      = input.int(1, "Random Seed", minval = 1, maxval = 100000, group = GRP_BAG, tooltip = "Seed of the deterministic random generator that draws the bootstrap samples. The same seed always reproduces the same resamples; changing it redraws the ensemble, a quick way to inspect sampling sensitivity.")
+dispAlertInput = input.float(0.5, "Disagreement Alert Level", minval = 0.05, maxval = 1.5, step = 0.05, group = GRP_BAG, tooltip = "Dispersion level (standard deviation of member predictions) above which the High Member Disagreement alert fires. Large dispersion means the conclusion depends heavily on which observations happened to be sampled.")
+
+momLenInput     = input.int(10, "Momentum Length", minval = 2, maxval = 200, group = GRP_FEAT, tooltip = "Lookback of the rate-of-change feature. Each feature is standardized so that nearest-neighbor distances are comparable across features.")
+rsiLenInput     = input.int(14, "RSI Length", minval = 2, maxval = 200, group = GRP_FEAT, tooltip = "Lookback of the RSI feature, rescaled around its 50 midline.")
+stretchLenInput = input.int(20, "Mean Reversion Length", minval = 2, maxval = 200, group = GRP_FEAT, tooltip = "Lookback of the price-stretch feature: the z-score of close against its moving average, measuring how extended price is from its local mean.")
+
+showDashInput = input.bool(true, "Show Dashboard", group = GRP_DASH, tooltip = "Display a panel with the ensemble setup, the current bagged prediction, member agreement and dispersion, and the out-of-bag statistics. Out-of-bag scoring is computed on the last bar: each training observation is predicted only by the members that never sampled it, a nearly free estimate of generalization error.")
+dashLocInput  = input.string("Top Right", "Location", options = ["Top Right", "Top Left", "Middle Right", "Middle Left", "Bottom Right", "Bottom Left"], group = GRP_DASH, tooltip = "Dashboard position on the chart.")
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = GRP_DASH, tooltip = "Dashboard text size.")
+
+bullColorInput   = input.color(BULL_COLOR, "Bullish", group = GRP_STYLE, inline = "clr1")
+bearColorInput   = input.color(BEAR_COLOR, "Bearish", group = GRP_STYLE, inline = "clr1")
+gradientInput    = input.bool(true, "Gradient Fill", group = GRP_STYLE, tooltip = "Shade the area between zero and the bagged prediction with a vertical gradient in the prevailing direction color.")
+showBandInput    = input.bool(true, "Member Dispersion Band", group = GRP_STYLE, inline = "clr2", tooltip = "Plot a band of one standard deviation of the individual member predictions around the ensemble. A wide band flags sample sensitivity: the members disagree, so the aggregate rests on which observations were drawn.")
+dispColorInput   = input.color(NEUTRAL_COLOR, "", group = GRP_STYLE, inline = "clr2")
+showSingleInput  = input.bool(true, "Single Model Reference", group = GRP_STYLE, inline = "clr3", tooltip = "Plot the same base learner trained once on the full window without resampling. Comparing it with the bagged line shows the variance reduction: bagging does not make any single model better, it makes the aggregate steadier.")
+singleColorInput = input.color(GRAY_COLOR, "", group = GRP_STYLE, inline = "clr3")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Advances the linear congruential generator state
+lcgNextF(float stateVal) =>
+    (LCG_A * stateVal + LCG_C) % LCG_M
+
+// Draws the bootstrap samples once: a flat B x n matrix of inclusion counts per member and observation
+buildBagCountsF(int bagsN, int winN, int seedVal, bool blockMode, int blockLen) =>
+    countsArray = array.new_int(bagsN * winN, 0)
+    float stateVal = seedVal
+    for w = 1 to 5
+        stateVal := lcgNextF(stateVal)
+    for b = 0 to bagsN - 1
+        if blockMode
+            int filled = 0
+            while filled < winN
+                stateVal := lcgNextF(stateVal)
+                int startIdx = math.min(winN - 1, math.floor(stateVal / LCG_M * winN))
+                for m = 0 to blockLen - 1
+                    if filled < winN
+                        int flatIdx = b * winN + (startIdx + m) % winN
+                        array.set(countsArray, flatIdx, array.get(countsArray, flatIdx) + 1)
+                        filled += 1
+        else
+            for j = 0 to winN - 1
+                stateVal := lcgNextF(stateVal)
+                int drawIdx = math.min(winN - 1, math.floor(stateVal / LCG_M * winN))
+                int flatIdx = b * winN + drawIdx
+                array.set(countsArray, flatIdx, array.get(countsArray, flatIdx) + 1)
+    countsArray
+
+// One base model f_b: k-NN prediction over the member's bootstrap multiset, duplicates included
+memberPredictF(array<int> countsA, int memberIdx, int winN, array<float> distA, int rowOffset, array<float> labelsA, int kUse) =>
+    kdArray = array.new_float(kUse, SENTINEL)
+    klArray = array.new_float(kUse, 0.0)
+    float worstVal = SENTINEL
+    int worstIdx = 0
+    for i = 0 to winN - 1
+        int copiesN = array.get(countsA, memberIdx * winN + i)
+        if copiesN > 0
+            float distVal = array.get(distA, rowOffset + i)
+            int rep = 0
+            while rep < copiesN and distVal < worstVal
+                array.set(kdArray, worstIdx, distVal)
+                array.set(klArray, worstIdx, array.get(labelsA, i))
+                worstVal := -1.0
+                for q = 0 to kUse - 1
+                    float qVal = array.get(kdArray, q)
+                    if qVal > worstVal
+                        worstVal := qVal
+                        worstIdx := q
+                rep += 1
+    array.avg(klArray)
+
+// f_bag: averages member outputs (regression) or nets their votes (classification)
+aggregateF(array<float> predsA, bool voteMode) =>
+    float result = na
+    int szP = array.size(predsA)
+    if szP > 0
+        if voteMode
+            int bullN = 0
+            int bearN = 0
+            for i = 0 to szP - 1
+                float pv = array.get(predsA, i)
+                if pv > 0
+                    bullN += 1
+                if pv < 0
+                    bearN += 1
+            result := (bullN - bearN) * 1.0 / szP
+        else
+            result := array.avg(predsA)
+    result
+
+// Dashboard value formatting
+formatValF(float v, string fmt) =>
+    na(v) ? "-" : str.tostring(v, fmt)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Features & Training Window
+//---------------------------------------------------------------------------------------------------------------------{
+useVote  = aggInput == AGG_VOTE
+useBlock = bootInput == BOOT_BLOCK
+kNeighbors = math.min(kInput, trainInput)
+
+// standardized features shared by every base model (plain bagging uses the full feature set in every model)
+rocVal    = ta.roc(close, momLenInput)
+rocSd     = ta.stdev(rocVal, 100)
+featMom   = rocSd > 0 ? rocVal / rocSd : na
+featRsi   = (ta.rsi(close, rsiLenInput) - 50) / 25
+basisVal  = ta.sma(close, stretchLenInput)
+stretchSd = ta.stdev(close, stretchLenInput)
+featStr   = stretchSd > 0 ? (close - basisVal) / stretchSd : na
+
+// rolling training set D: the newest observation is the bar whose forward horizon just completed
+var featMomArray = array.new_float(0)
+var featRsiArray = array.new_float(0)
+var featStrArray = array.new_float(0)
+var labelArray   = array.new_float(0)
+
+obsMom   = featMom[horizonInput]
+obsRsi   = featRsi[horizonInput]
+obsStr   = featStr[horizonInput]
+refClose = close[horizonInput]
+
+if not na(obsMom) and not na(obsRsi) and not na(obsStr) and not na(refClose)
+    array.push(featMomArray, obsMom)
+    array.push(featRsiArray, obsRsi)
+    array.push(featStrArray, obsStr)
+    array.push(labelArray, close > refClose ? 1.0 : close < refClose ? -1.0 : 0.0)
+    if array.size(labelArray) > trainInput
+        array.shift(featMomArray)
+        array.shift(featRsiArray)
+        array.shift(featStrArray)
+        array.shift(labelArray)
+
+sampleCount = array.size(labelArray)
+trainReady  = sampleCount == trainInput
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Bootstrap Samples
+//---------------------------------------------------------------------------------------------------------------------{
+var bagCountsArray    = array.new_int(0)
+var singleCountsArray = array.new_int(0)
+
+if array.size(bagCountsArray) == 0
+    bagCountsArray    := buildBagCountsF(bagsInput, trainInput, seedInput, useBlock, blockLenInput)
+    singleCountsArray := array.new_int(trainInput, 1)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Ensemble Prediction
+//---------------------------------------------------------------------------------------------------------------------{
+float ensembleValue   = na
+float dispersionValue = na
+float agreementValue  = na
+float singleValue     = na
+
+if trainReady and not na(featMom) and not na(featRsi) and not na(featStr)
+    // squared distances from the current feature vector to every training observation, computed once and shared by all members
+    distArray = array.new_float(trainInput, 0.0)
+    for i = 0 to trainInput - 1
+        float dMom = featMom - array.get(featMomArray, i)
+        float dRsi = featRsi - array.get(featRsiArray, i)
+        float dStr = featStr - array.get(featStrArray, i)
+        array.set(distArray, i, dMom * dMom + dRsi * dRsi + dStr * dStr)
+    // every member predicts from its own bootstrap sample
+    memberPreds = array.new_float(bagsInput, 0.0)
+    for b = 0 to bagsInput - 1
+        array.set(memberPreds, b, memberPredictF(bagCountsArray, b, trainInput, distArray, 0, labelArray, kNeighbors))
+    ensembleValue   := aggregateF(memberPreds, useVote)
+    dispersionValue := array.stdev(memberPreds)
+    int bullMembers = 0
+    int bearMembers = 0
+    for b = 0 to bagsInput - 1
+        float pb = array.get(memberPreds, b)
+        if pb > 0
+            bullMembers += 1
+        if pb < 0
+            bearMembers += 1
+    agreementValue := 100.0 * math.max(bullMembers, bearMembers) / bagsInput
+    // unbagged reference: the same base learner trained once on the full window
+    singleValue := memberPredictF(singleCountsArray, 0, trainInput, distArray, 0, labelArray, kNeighbors)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Out-of-Bag Evaluation & Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+dashLocation = switch dashLocInput
+    "Top Right"    => position.top_right
+    "Top Left"     => position.top_left
+    "Middle Right" => position.middle_right
+    "Middle Left"  => position.middle_left
+    "Bottom Right" => position.bottom_right
+    => position.bottom_left
+
+dashTextSize = switch dashSizeInput
+    "Tiny"  => size.tiny
+    "Small" => size.small
+    => size.normal
+
+if barstate.islast and showDashInput
+    var table dashTable = table.new(dashLocation, 2, 10, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+    float oobErrorPct    = na
+    float oobCoveragePct = na
+    if trainReady
+        // pairwise squared distances between training observations
+        pairDistArray = array.new_float(trainInput * trainInput, 0.0)
+        for i = 0 to trainInput - 2
+            for j = i + 1 to trainInput - 1
+                float dMom = array.get(featMomArray, i) - array.get(featMomArray, j)
+                float dRsi = array.get(featRsiArray, i) - array.get(featRsiArray, j)
+                float dStr = array.get(featStrArray, i) - array.get(featStrArray, j)
+                float dd = dMom * dMom + dRsi * dRsi + dStr * dStr
+                array.set(pairDistArray, i * trainInput + j, dd)
+                array.set(pairDistArray, j * trainInput + i, dd)
+        // each observation is scored only by the members that never sampled it
+        int oobErrors = 0
+        int oobValid  = 0
+        int oobPairs  = 0
+        oobPredsArray = array.new_float(0)
+        for i = 0 to trainInput - 1
+            array.clear(oobPredsArray)
+            for b = 0 to bagsInput - 1
+                if array.get(bagCountsArray, b * trainInput + i) == 0
+                    array.push(oobPredsArray, memberPredictF(bagCountsArray, b, trainInput, pairDistArray, i * trainInput, labelArray, kNeighbors))
+            oobPairs += array.size(oobPredsArray)
+            if array.size(oobPredsArray) > 0
+                float oobPrediction = aggregateF(oobPredsArray, useVote)
+                float labelI = array.get(labelArray, i)
+                if labelI != 0 and oobPrediction != 0
+                    oobValid += 1
+                    if oobPrediction * labelI < 0
+                        oobErrors += 1
+        oobErrorPct    := oobValid > 0 ? 100.0 * oobErrors / oobValid : na
+        oobCoveragePct := 100.0 * oobPairs / (bagsInput * trainInput)
+
+    string stateText = trainReady ? "Active" : "Collecting " + str.tostring(sampleCount) + " / " + str.tostring(trainInput)
+    string predText  = na(ensembleValue) ? "-" : (ensembleValue > 0 ? "+" : "") + str.tostring(ensembleValue, "#.###") + (ensembleValue > 0 ? " Bullish" : ensembleValue < 0 ? " Bearish" : " Neutral")
+    color  predColor = ensembleValue > 0 ? bullColorInput : ensembleValue < 0 ? bearColorInput : DASH_TEXT
+
+    table.cell(dashTable, 0, 0, "Bagging",  text_color = DASH_TEXT, text_halign = text.align_left,  text_size = dashTextSize)
+    table.cell(dashTable, 1, 0, stateText,  text_color = trainReady ? DASH_TEXT : DASH_HEADER, text_halign = text.align_right, text_size = dashTextSize)
+    table.cell(dashTable, 0, 1, "Aggregation", text_color = DASH_HEADER, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 1, useVote ? "Majority Vote" : "Average", text_color = DASH_TEXT, text_halign = text.align_right, text_size = dashTextSize)
+    table.cell(dashTable, 0, 2, "Replicates (B)", text_color = DASH_HEADER, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 2, str.tostring(bagsInput), text_color = DASH_TEXT, text_halign = text.align_right, text_size = dashTextSize)
+    table.cell(dashTable, 0, 3, "Bootstrap", text_color = DASH_HEADER, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 3, (useBlock ? "Block (" + str.tostring(blockLenInput) + ")" : "IID") + ", n = " + str.tostring(trainInput), text_color = DASH_TEXT, text_halign = text.align_right, text_size = dashTextSize)
+    table.cell(dashTable, 0, 4, "Base Learner", text_color = DASH_HEADER, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 4, str.tostring(kNeighbors) + "-NN, 3 features", text_color = DASH_TEXT, text_halign = text.align_right, text_size = dashTextSize)
+    table.cell(dashTable, 0, 5, "Prediction", text_color = DASH_HEADER, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 5, predText, text_color = predColor, text_halign = text.align_right, text_size = dashTextSize)
+    table.cell(dashTable, 0, 6, "Member Agreement", text_color = DASH_HEADER, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 6, na(agreementValue) ? "-" : formatValF(agreementValue, "#.#") + "%", text_color = DASH_TEXT, text_halign = text.align_right, text_size = dashTextSize)
+    table.cell(dashTable, 0, 7, "Member Dispersion", text_color = DASH_HEADER, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 7, formatValF(dispersionValue, "#.###"), text_color = DASH_TEXT, text_halign = text.align_right, text_size = dashTextSize)
+    table.cell(dashTable, 0, 8, "OOB Error", text_color = DASH_HEADER, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 8, na(oobErrorPct) ? "-" : formatValF(oobErrorPct, "#.#") + "%", text_color = DASH_TEXT, text_halign = text.align_right, text_size = dashTextSize)
+    table.cell(dashTable, 0, 9, "OOB Share", text_color = DASH_HEADER, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 9, na(oobCoveragePct) ? "-" : formatValF(oobCoveragePct, "#.#") + "% (theo 36.8%)", text_color = DASH_TEXT, text_halign = text.align_right, text_size = dashTextSize)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Plots
+//---------------------------------------------------------------------------------------------------------------------{
+oscColor = ensembleValue >= 0 ? bullColorInput : bearColorInput
+
+singlePlotId   = plot(showSingleInput ? singleValue : na, "Single Model (Unbagged)", color.new(singleColorInput, 40), 1, plot.style_linebr)
+bandUpPlotId   = plot(showBandInput ? ensembleValue + dispersionValue : na, "Member Dispersion Upper", color.new(dispColorInput, 65), 1, plot.style_linebr)
+bandLoPlotId   = plot(showBandInput ? ensembleValue - dispersionValue : na, "Member Dispersion Lower", color.new(dispColorInput, 65), 1, plot.style_linebr)
+fill(bandUpPlotId, bandLoPlotId, color.new(dispColorInput, 90), "Member Dispersion Fill")
+
+ensemblePlotId = plot(ensembleValue, "Bagged Prediction", oscColor, 1)
+zeroPlotId     = plot(0, "Zero Baseline", color(na), editable = false, display = display.none)
+fill(ensemblePlotId, zeroPlotId, math.max(nz(ensembleValue), 0), math.min(nz(ensembleValue), 0), gradientInput ? color.new(oscColor, 50) : color(na), gradientInput ? color.new(oscColor, 100) : color(na), title = "Prediction Gradient")
+
+hline(1, "Unanimous Bullish", color.new(GRAY_COLOR, 60), hline.style_dotted)
+hline(0, "Zero Line", color.new(GRAY_COLOR, 60), hline.style_dotted)
+hline(-1, "Unanimous Bearish", color.new(GRAY_COLOR, 60), hline.style_dotted)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+bullishFlip    = ta.crossover(ensembleValue, 0)
+bearishFlip    = ta.crossunder(ensembleValue, 0)
+disagreeSpike  = ta.crossover(dispersionValue, dispAlertInput)
+
+alertcondition(bullishFlip, "Bullish Bagged Signal", "bagging: the aggregated prediction crossed above zero — the bootstrap ensemble leans bullish.")
+alertcondition(bearishFlip, "Bearish Bagged Signal", "bagging: the aggregated prediction crossed below zero — the bootstrap ensemble leans bearish.")
+alertcondition(disagreeSpike, "High Member Disagreement", "bagging: dispersion across the bagged members crossed above the alert level — the current prediction is sensitive to which observations were sampled.")
+
+//---------------------------------------------------------------------------------------------------------------------}

@@ -1,0 +1,411 @@
+// This work is licensed under Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("High Tight Flag", shorttitle = "High Tight Flag", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+color BULL_COLOR        = #089981
+color BEAR_COLOR        = #f23645
+color NEUTRAL_COLOR     = #787b86
+color TRANSPARENT_COLOR = #00000000
+
+int FLAG_FILL_TRANSP   = 88
+int FLAG_BORDER_TRANSP = 40
+int DIM_TRANSP         = 65
+
+string POLE_GROUP  = 'Pole'
+string FLAG_GROUP  = 'Flag'
+string BREAK_GROUP = 'Breakout'
+string TRADE_GROUP = 'Trade Levels'
+string DASH_GROUP  = 'Dashboard'
+string STYLE_GROUP = 'Style'
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+minGainInput = input.float(90.0, 'Minimum Pole Gain (%)', minval = 10, maxval = 1000, step = 5, group = POLE_GROUP, tooltip = 'Rise from the lowest low of the pole window to the pole high. The pattern asks for roughly a doubling; 90% admits near-doublings, lower values turn the scan into an ordinary flag finder.')
+
+maxPoleBarsInput = input.int(40, 'Maximum Pole Length (bars)', minval = 2, maxval = 300, group = POLE_GROUP, tooltip = 'Bars the pole may take to make its gain: about eight weeks or less, 40 daily bars or 8 weekly bars.')
+
+minFlagBarsInput = input.int(5, 'Flag Length (bars)', minval = 1, maxval = 200, inline = 'flen', group = FLAG_GROUP, tooltip = 'Fewest bars of pause after the pole high before a breakout can count. Fewer bars is just the pole extending.')
+maxFlagBarsInput = input.int(25, '', minval = 2, maxval = 300, inline = 'flen', group = FLAG_GROUP, tooltip = 'Most bars the flag may run. The pause is typically three to five weeks: up to 25 daily bars, 5 weekly bars. A longer drift is a different, weaker base.')
+
+maxDepthInput = input.float(25.0, 'Maximum Flag Depth (%)', minval = 1, maxval = 60, step = 0.5, group = FLAG_GROUP, tooltip = 'Deepest allowed correction from the pole high. The pattern gives back no more than about 20 to 25 percent; a flag that deepens past this is voided.')
+
+flagDryInput = input.bool(false, 'Require Flag Volume Dry-up', group = FLAG_GROUP, tooltip = 'Only accept the breakout when average flag volume stayed below average pole volume. Always graded in the dashboard; off by default because volume quality varies across markets. Ignored on symbols without volume data.')
+
+pivotMarginInput = input.float(0.1, 'Pivot Margin (%)', minval = 0, maxval = 5, step = 0.05, group = BREAK_GROUP, tooltip = 'Margin added above the flag high to form the buy trigger, so the breakout needs a decisive close through it.')
+
+volConfirmInput = input.bool(true, 'Breakout Volume Confirmation', group = BREAK_GROUP, tooltip = 'Require the close through the flag high to come on volume well above average. A close through it without that expansion is marked as a low-volume break and treated as the pole extending. Ignored on symbols without volume data.')
+volLengthInput  = input.int(50, 'Volume Average Length', minval = 1, maxval = 200, group = BREAK_GROUP, tooltip = 'Length of the simple moving average of volume used for the breakout test.')
+volMultInput    = input.float(1.4, 'Breakout Volume Multiplier', minval = 1, maxval = 10, step = 0.1, group = BREAK_GROUP, tooltip = 'The breakout bar volume must exceed the volume average multiplied by this factor; 1.4 matches the growth-stock guideline of volume at least 40 percent above average on the breakout.')
+
+targetModeInput = input.string('Flag Height', 'Measured Target', options = ['Flag Height', 'Pole Height', 'None'], group = TRADE_GROUP, tooltip = 'Objective projected from the breakout level. Flag Height adds the flag range, a conservative first objective; Pole Height adds the whole pole, the classical flag measure, which after a doubling is a very distant level. Practitioners often hold a core position past any first objective, so treat it as a planning reference.')
+
+failBarsInput = input.int(2, 'Failure Closes Back Inside', minval = 1, maxval = 10, group = TRADE_GROUP, tooltip = 'Consecutive closes back below the flag high after the breakout that count as acceptance back inside the flag, which voids the setup.')
+
+monitorLengthInput = input.int(60, 'Post-Breakout Watch (bars)', minval = 5, maxval = 500, group = TRADE_GROUP, tooltip = 'Bars the target and stop are tracked after a breakout. The watch ends early on a target, a stop or a failure.')
+
+showDashInput     = input.bool(true, 'Show Dashboard', group = DASH_GROUP, tooltip = 'Grade the active or last flag: pole gain and speed, flag depth and length, flag volume against pole volume, and breakout volume.')
+dashLocationInput = input.string('Bottom Right', 'Location', options = ['Top Right', 'Top Left', 'Bottom Right', 'Bottom Left', 'Middle Right'], group = DASH_GROUP, tooltip = 'Position of the dashboard. Bottom right stays clear of the candles after an upside breakout.')
+dashSizeInput     = input.string('Small', 'Size', options = ['Tiny', 'Small', 'Normal'], group = DASH_GROUP, tooltip = 'Text size of the dashboard.')
+
+bullColorInput    = input.color(BULL_COLOR, 'Confirmed', inline = 'colors', group = STYLE_GROUP)
+bearColorInput    = input.color(BEAR_COLOR, 'Stop', inline = 'colors', group = STYLE_GROUP)
+neutralColorInput = input.color(NEUTRAL_COLOR, 'Pending', inline = 'colors', group = STYLE_GROUP)
+
+showInvalidatedInput = input.bool(false, 'Keep Voided Flags', group = STYLE_GROUP, tooltip = 'Keep the drawings of voided flags on the chart, dimmed, instead of removing them.')
+
+int   effMaxFlagBars = math.max(minFlagBarsInput, maxFlagBarsInput)
+color DIM_COLOR      = color.new(neutralColorInput, DIM_TRANSP)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Variables
+//---------------------------------------------------------------------------------------------------------------------{
+
+// 0 = scanning, 1 = flag forming after a qualifying pole
+var int   state       = 0
+var int   poleLowBar  = na
+var float poleLow     = na
+var int   topBar      = na
+var float topPrice    = na
+var float flagLow     = na
+var int   flagLowBar  = na
+var float poleVolAvg  = na
+var float candGain    = na
+var int   candBars    = na
+var bool  drawn       = false
+
+// Graded values of the last flag, kept for the dashboard
+var float gradeGain     = na
+var int   gradePoleBars = na
+var float gradeDepth    = na
+var int   gradeFlagBars = na
+var float gradeFlagVol  = na
+var float gradeBreakVol = na
+var string statusText   = 'Scanning'
+
+// Post-breakout watch
+var bool  tradeActive   = false
+var float tradePivot    = na
+var float tradeTarget   = na
+var float tradeStop     = na
+var int   tradeStartBar = na
+var int   insideCount   = 0
+
+// Drawings of the forming flag
+var line  poleLineId   = na
+var label poleLabelId  = na
+var box   flagBoxId    = na
+var label flagLabelId  = na
+var label titleLabelId = na
+var label pivotLabelId = na
+
+// Drawings of the post-breakout watch
+var line  targetLineId  = na
+var label targetLabelId = na
+var line  stopLineId    = na
+var label stopLabelId   = na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+getTablePosition(string positionText) =>
+    switch positionText
+        'Top Left'     => position.top_left
+        'Top Right'    => position.top_right
+        'Bottom Left'  => position.bottom_left
+        'Middle Right' => position.middle_right
+        =>                position.bottom_right
+
+getTableSize(string sizeText) =>
+    switch sizeText
+        'Tiny'   => size.tiny
+        'Normal' => size.normal
+        =>          size.small
+
+// Removes the forming flag drawings, or dims them in place when voided flags are kept
+clearFlag(bool keepDimmed) =>
+    if keepDimmed
+        if not na(poleLineId)
+            line.set_color(poleLineId, DIM_COLOR)
+        if not na(poleLabelId)
+            label.set_textcolor(poleLabelId, DIM_COLOR)
+        if not na(flagBoxId)
+            box.set_border_color(flagBoxId, DIM_COLOR)
+            box.set_bgcolor(flagBoxId, color.new(neutralColorInput, 96))
+        if not na(flagLabelId)
+            label.set_textcolor(flagLabelId, DIM_COLOR)
+        if not na(titleLabelId)
+            label.set_textcolor(titleLabelId, DIM_COLOR)
+        label.delete(pivotLabelId)
+    else
+        line.delete(poleLineId)
+        label.delete(poleLabelId)
+        box.delete(flagBoxId)
+        label.delete(flagLabelId)
+        label.delete(titleLabelId)
+        label.delete(pivotLabelId)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Pole & Flag Detection
+//---------------------------------------------------------------------------------------------------------------------{
+
+float volSma  = ta.sma(nz(volume), volLengthInput)
+bool  hasVol  = volSma > 0
+float winLow  = ta.lowest(low, maxPoleBarsInput + 1)
+int   winLowOffset = ta.lowestbars(low, maxPoleBarsInput + 1)
+float winHigh = ta.highest(high, maxPoleBarsInput + 1)
+
+// Cumulative volume turns the average volume of any leg into a difference of two values
+var float cumVol = 0.0
+cumVol += nz(volume)
+var array<float> cumVolArray = array.new_float()
+array.push(cumVolArray, cumVol)
+
+legVolume(int fromBar, int toBar) =>
+    fromBar < toBar ? (array.get(cumVolArray, toBar) - array.get(cumVolArray, fromBar)) / (toBar - fromBar) : na
+
+// A bar printing the high of the pole window with a qualifying gain off the window low is a pole high
+bool  poleHighNow = high >= winHigh and winLow > 0 and 100 * (high / winLow - 1) >= minGainInput
+
+bool flagEvent       = false
+bool breakoutEvent   = false
+bool weakVolumeEvent = false
+bool voidEvent       = false
+bool targetEvent     = false
+bool stopEvent       = false
+bool failEvent       = false
+
+if barstate.isconfirmed
+    bool breakoutNow = false
+
+    if state == 1
+        int   flagBars  = bar_index - topBar - 1
+        float pivot     = topPrice * (1 + pivotMarginInput / 100)
+
+        if high > topPrice
+            bool qualified = flagBars >= minFlagBarsInput
+            if qualified and close > pivot
+                float flagVol  = legVolume(topBar, bar_index - 1)
+                bool  volumeOk = not volConfirmInput or not hasVol or nz(volume) > volMultInput * volSma
+                bool  dryOk    = not flagDryInput or not hasVol or (not na(flagVol) and not na(poleVolAvg) and flagVol < poleVolAvg)
+                if volumeOk and dryOk
+                    breakoutNow := true
+                else
+                    weakVolumeEvent := not volumeOk
+                    if drawn and showInvalidatedInput
+                        label.new(bar_index, high, volumeOk ? 'Flag volume heavy' : 'Low-volume break', style = label.style_label_down, color = TRANSPARENT_COLOR, textcolor = DIM_COLOR, size = size.tiny, tooltip = volumeOk ? 'Close through the flag high, but flag volume did not dry up against the pole' : 'Close through the flag high on ' + (hasVol ? str.tostring(nz(volume) / volSma, '#.##') + 'x' : 'unknown') + ' average volume, below the ' + str.tostring(volMultInput, '#.##') + 'x requirement. Treated as the pole extending.')
+
+            if breakoutNow
+                breakoutEvent := true
+                statusText    := 'Breakout'
+                float flagHeight = topPrice - flagLow
+                float flagVol    = legVolume(topBar, bar_index - 1)
+                gradeDepth    := 100 * flagHeight / topPrice
+                gradeFlagBars := flagBars
+                gradeFlagVol  := not na(flagVol) and not na(poleVolAvg) and poleVolAvg > 0 ? flagVol / poleVolAvg : na
+                gradeBreakVol := hasVol ? nz(volume) / volSma : na
+
+                // Make sure the flag is on the chart even if it qualified on this very bar
+                if not drawn
+                    gradeGain     := candGain
+                    gradePoleBars := candBars
+                    poleLineId   := line.new(poleLowBar, poleLow, topBar, topPrice, color = bullColorInput, width = 2)
+                    poleLabelId  := label.new(poleLowBar, poleLow, 'Pole +' + str.tostring(gradeGain, '#') + '% in ' + str.tostring(gradePoleBars) + ' bars', style = label.style_label_up, color = TRANSPARENT_COLOR, textcolor = bullColorInput, size = size.small)
+                    flagBoxId    := box.new(topBar, topPrice, bar_index - 1, flagLow, border_color = color.new(bullColorInput, FLAG_BORDER_TRANSP), bgcolor = color.new(bullColorInput, FLAG_FILL_TRANSP))
+                    flagLabelId  := label.new(flagLowBar, flagLow, '', style = label.style_label_up, color = TRANSPARENT_COLOR, textcolor = bullColorInput, size = size.small)
+                    titleLabelId := label.new(topBar, topPrice, 'High Tight Flag', style = label.style_label_down, color = TRANSPARENT_COLOR, textcolor = bullColorInput, size = size.small)
+
+                line.set_color(poleLineId, bullColorInput)
+                label.set_textcolor(poleLabelId, bullColorInput)
+                box.set_right(flagBoxId, bar_index - 1)
+                box.set_bottom(flagBoxId, flagLow)
+                box.set_border_color(flagBoxId, color.new(bullColorInput, FLAG_BORDER_TRANSP))
+                box.set_bgcolor(flagBoxId, color.new(bullColorInput, FLAG_FILL_TRANSP))
+                label.set_xy(flagLabelId, flagLowBar, flagLow)
+                label.set_text(flagLabelId, 'Flag -' + str.tostring(gradeDepth, '#.#') + '%, ' + str.tostring(flagBars) + ' bars')
+                label.set_textcolor(flagLabelId, bullColorInput)
+                label.set_textcolor(titleLabelId, bullColorInput)
+                label.delete(pivotLabelId)
+
+                string breakTip = 'Close through the flag high ' + str.tostring(topPrice, format.mintick) + (hasVol ? ' on ' + str.tostring(nz(volume) / volSma, '#.##') + 'x average volume' : '') + '\nPole +' + str.tostring(gradeGain, '#.#') + '% in ' + str.tostring(gradePoleBars) + ' bars, flag -' + str.tostring(gradeDepth, '#.#') + '% over ' + str.tostring(flagBars) + ' bars' + (not na(gradeFlagVol) ? '\nFlag volume ' + str.tostring(gradeFlagVol, '#.##') + 'x the pole average' : '')
+                label.new(bar_index, low, 'Breakout', style = label.style_label_up, color = bullColorInput, textcolor = chart.bg_color, size = size.small, tooltip = breakTip)
+
+                // Trade levels: measured objective above, flag low below
+                tradeActive   := true
+                tradePivot    := topPrice
+                tradeStop     := flagLow
+                tradeStartBar := bar_index
+                insideCount   := 0
+                tradeTarget   := targetModeInput == 'Flag Height' ? topPrice + flagHeight : targetModeInput == 'Pole Height' ? topPrice + (topPrice - poleLow) : na
+
+                if not na(tradeTarget)
+                    targetLineId  := line.new(bar_index, tradeTarget, bar_index, tradeTarget, color = bullColorInput, style = line.style_dashed)
+                    targetLabelId := label.new(bar_index, tradeTarget, 'Target ' + str.tostring(tradeTarget, format.mintick), style = label.style_label_right, color = TRANSPARENT_COLOR, textcolor = bullColorInput, size = size.small, tooltip = (targetModeInput == 'Flag Height' ? 'Flag range' : 'Pole height') + ' projected from the flag high')
+                stopLineId  := line.new(bar_index, tradeStop, bar_index, tradeStop, color = bearColorInput, style = line.style_dotted)
+                stopLabelId := label.new(bar_index, tradeStop, 'Stop ' + str.tostring(tradeStop, format.mintick), style = label.style_label_left, color = TRANSPARENT_COLOR, textcolor = bearColorInput, size = size.small, tooltip = 'Flag low: a close below it voids the setup')
+
+                // Release the drawings so the completed pattern stays as history
+                poleLineId   := na
+                poleLabelId  := na
+                flagBoxId    := na
+                flagLabelId  := na
+                titleLabelId := na
+                pivotLabelId := na
+                drawn        := false
+                state        := 0
+            else
+                // A higher high without a qualifying breakout is the pole extending: re-anchor it, or drop it when the
+                // pole window no longer holds the required gain
+                clearFlag(drawn and showInvalidatedInput)
+                poleLineId   := na
+                poleLabelId  := na
+                flagBoxId    := na
+                flagLabelId  := na
+                titleLabelId := na
+                pivotLabelId := na
+                drawn        := false
+                state        := 0
+        else
+            if low < flagLow
+                flagLow    := low
+                flagLowBar := bar_index
+            flagBars := bar_index - topBar
+            float depth = 100 * (topPrice - flagLow) / topPrice
+
+            if depth > maxDepthInput or flagBars > effMaxFlagBars
+                voidEvent  := drawn
+                statusText := drawn ? 'Voided' : statusText
+                if drawn
+                    clearFlag(showInvalidatedInput)
+                    if showInvalidatedInput
+                        label.new(bar_index, low, 'Voided', style = label.style_label_up, color = TRANSPARENT_COLOR, textcolor = DIM_COLOR, size = size.tiny, tooltip = depth > maxDepthInput ? 'Flag deepened past ' + str.tostring(maxDepthInput, '#.#') + '% from the pole high' : 'Flag ran longer than ' + str.tostring(effMaxFlagBars) + ' bars')
+                poleLineId   := na
+                poleLabelId  := na
+                flagBoxId    := na
+                flagLabelId  := na
+                titleLabelId := na
+                pivotLabelId := na
+                drawn        := false
+                state        := 0
+            else if flagBars >= minFlagBarsInput
+                if not drawn
+                    // The pause has run its minimum length: the flag is on, draw pole and flag in the pending color
+                    drawn        := true
+                    flagEvent    := true
+                    statusText   := 'Flag forming'
+                    gradeGain     := candGain
+                    gradePoleBars := candBars
+                    poleLineId   := line.new(poleLowBar, poleLow, topBar, topPrice, color = neutralColorInput, width = 2)
+                    poleLabelId  := label.new(poleLowBar, poleLow, 'Pole +' + str.tostring(gradeGain, '#') + '% in ' + str.tostring(gradePoleBars) + ' bars', style = label.style_label_up, color = TRANSPARENT_COLOR, textcolor = neutralColorInput, size = size.small)
+                    flagBoxId    := box.new(topBar, topPrice, bar_index, flagLow, border_color = color.new(neutralColorInput, FLAG_BORDER_TRANSP), border_style = line.style_dashed, bgcolor = color.new(neutralColorInput, FLAG_FILL_TRANSP))
+                    flagLabelId  := label.new(flagLowBar, flagLow, '', style = label.style_label_up, color = TRANSPARENT_COLOR, textcolor = neutralColorInput, size = size.small)
+                    titleLabelId := label.new(topBar, topPrice, 'High Tight Flag', style = label.style_label_down, color = TRANSPARENT_COLOR, textcolor = neutralColorInput, size = size.small)
+                    pivotLabelId := label.new(bar_index, topPrice, '', style = label.style_label_left, color = TRANSPARENT_COLOR, textcolor = neutralColorInput, size = size.small)
+                box.set_right(flagBoxId, bar_index)
+                box.set_bottom(flagBoxId, flagLow)
+                label.set_xy(flagLabelId, flagLowBar, flagLow)
+                label.set_text(flagLabelId, 'Flag -' + str.tostring(depth, '#.#') + '%, ' + str.tostring(flagBars) + ' bars')
+                label.set_xy(pivotLabelId, bar_index, topPrice)
+                label.set_text(pivotLabelId, 'Pivot ' + str.tostring(pivot, format.mintick))
+                gradeDepth    := depth
+                gradeFlagBars := flagBars
+                float flagVolNow = legVolume(topBar, bar_index)
+                gradeFlagVol  := not na(flagVolNow) and not na(poleVolAvg) and poleVolAvg > 0 ? flagVolNow / poleVolAvg : na
+                gradeBreakVol := na
+
+    // A new pole high (re)starts the search for a flag
+    if state == 0 and not breakoutNow and poleHighNow
+        state        := 1
+        topBar       := bar_index
+        topPrice     := high
+        poleLowBar   := bar_index + winLowOffset
+        poleLow      := winLow
+        flagLow      := low
+        flagLowBar   := bar_index
+        poleVolAvg   := legVolume(poleLowBar, bar_index)
+        candGain     := 100 * (topPrice / poleLow - 1)
+        candBars     := topBar - poleLowBar
+
+    // -- post-breakout watch -------------------------------------------------------------------------------------
+    if tradeActive and bar_index > tradeStartBar
+        // The target label stays at the breakout bar, left of the line, where the space above the flag is clear
+        if not na(targetLineId)
+            line.set_x2(targetLineId, bar_index)
+        line.set_x2(stopLineId, bar_index)
+        label.set_x(stopLabelId, bar_index)
+
+        insideCount := close < tradePivot ? insideCount + 1 : 0
+
+        if close < tradeStop
+            stopEvent   := true
+            tradeActive := false
+            statusText  := 'Stop hit'
+            label.new(bar_index, high, 'Stop hit', style = label.style_label_down, color = bearColorInput, textcolor = chart.bg_color, size = size.small, tooltip = 'Close below the flag low ' + str.tostring(tradeStop, format.mintick))
+        else if not na(tradeTarget) and high >= tradeTarget
+            targetEvent := true
+            tradeActive := false
+            statusText  := 'Target reached'
+            label.new(bar_index, high, 'Target', style = label.style_label_down, color = bullColorInput, textcolor = chart.bg_color, size = size.small, tooltip = 'Measured target ' + str.tostring(tradeTarget, format.mintick) + ' reached')
+        else if insideCount >= failBarsInput
+            failEvent   := true
+            tradeActive := false
+            statusText  := 'Failed'
+            label.new(bar_index, high, 'Back inside', style = label.style_label_down, color = TRANSPARENT_COLOR, textcolor = bearColorInput, size = size.small, tooltip = str.tostring(failBarsInput) + ' closes back below the flag high: acceptance back inside the flag voids the setup')
+        else if bar_index - tradeStartBar >= monitorLengthInput
+            tradeActive := false
+            statusText  := 'Watch ended'
+
+        if not tradeActive
+            targetLineId  := na
+            targetLabelId := na
+            stopLineId    := na
+            stopLabelId   := na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+
+var table dashTable = table.new(getTablePosition(dashLocationInput), 2, 7, bgcolor = color.new(chart.bg_color, 25), frame_color = color.new(chart.fg_color, 85), frame_width = 1)
+
+dashRow(int row, string labelText, string valueText, color valueColor, string textSize) =>
+    table.cell(dashTable, 0, row, labelText, text_color = color.new(chart.fg_color, 40), text_size = textSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, row, valueText, text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+
+if showDashInput and barstate.islast
+    string dashSize  = getTableSize(dashSizeInput)
+    color  fadedText = color.new(chart.fg_color, 40)
+    bool   showFlag  = drawn or not na(gradeBreakVol) or tradeActive
+
+    color statusColor = drawn ? neutralColorInput : statusText == 'Breakout' or statusText == 'Target reached' ? bullColorInput : statusText == 'Stop hit' or statusText == 'Failed' or statusText == 'Voided' ? bearColorInput : fadedText
+    color fVolColor   = not na(gradeFlagVol) ? (gradeFlagVol < 1 ? bullColorInput : bearColorInput) : fadedText
+
+    table.cell(dashTable, 0, 0, 'High Tight Flag', text_color = chart.fg_color, text_size = dashSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 0, statusText, text_color = statusColor, text_size = dashSize, text_halign = text.align_right)
+    dashRow(1, 'Pole gain', showFlag and not na(gradeGain) ? '+' + str.tostring(gradeGain, '#.#') + '%' : '-', chart.fg_color, dashSize)
+    dashRow(2, 'Pole length', showFlag and not na(gradePoleBars) ? str.tostring(gradePoleBars) + ' bars' : '-', chart.fg_color, dashSize)
+    dashRow(3, 'Flag depth', showFlag and not na(gradeDepth) ? '-' + str.tostring(gradeDepth, '#.#') + '%' : '-', chart.fg_color, dashSize)
+    dashRow(4, 'Flag length', showFlag and not na(gradeFlagBars) ? str.tostring(gradeFlagBars) + ' bars' : '-', chart.fg_color, dashSize)
+    dashRow(5, 'Flag vs pole volume', showFlag and not na(gradeFlagVol) ? str.tostring(gradeFlagVol, '#.##') + 'x' + (gradeFlagVol < 1 ? ' dry' : ' heavy') : '-', showFlag ? fVolColor : fadedText, dashSize)
+    dashRow(6, 'Breakout volume', not na(gradeBreakVol) ? str.tostring(gradeBreakVol, '#.##') + 'x avg' : '-', chart.fg_color, dashSize)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(flagEvent, 'Flag Forming', 'High tight flag forming: a pole of the required gain is pausing in a shallow flag. Pivot at the flag high.')
+alertcondition(breakoutEvent, 'Breakout Confirmed', 'High tight flag breakout: close through the flag high on qualifying volume.')
+alertcondition(weakVolumeEvent, 'Low-volume Break', 'Price closed through the high tight flag high without the required volume expansion.')
+alertcondition(voidEvent, 'Flag Voided', 'High tight flag voided: the flag deepened past the limit or ran too long.')
+alertcondition(targetEvent, 'Target Reached', 'High tight flag measured target reached.')
+alertcondition(stopEvent, 'Stop Hit', 'Price closed below the high tight flag low after the breakout.')
+alertcondition(failEvent, 'Back Inside Flag', 'High tight flag breakout failed: price accepted back below the flag high.')
+
+//---------------------------------------------------------------------------------------------------------------------}

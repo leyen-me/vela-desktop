@@ -1,0 +1,273 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Tweezer Top/bottom", "Tweezer Top/bottom", overlay = true, format = format.price, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+const color BULL_DEFAULT = #089981
+const color BEAR_DEFAULT = #f23645
+const color FADE_DEFAULT = #787b86
+const color INVISIBLE    = #00000000
+
+const string RULE_ANY = "Any"
+const string RULE_CT  = "Counter-Trend Close"
+const string RULE_OPP = "Opposite Colors"
+
+const string DET_GROUP   = "Detection"
+const string MOVE_GROUP  = "Preceding Move"
+const string CONF_GROUP  = "Confluence"
+const string LEVEL_GROUP = "Matched Levels"
+const string STYLE_GROUP = "Style"
+
+const int MAX_PIVOTS = 15
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types
+//---------------------------------------------------------------------------------------------------------------------{
+
+type ActiveLevel
+    line  levelLine
+    float price
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+tickTolInput   = input.int(2, "Tolerance (Ticks)", minval = 0, group = DET_GROUP, tooltip = "Maximum difference between the two matched extremes, in ticks. A tick or two is the standard strictness — demanding exact matches filters out otherwise valid rejections.")
+atrTolInput    = input.float(0.10, "Tolerance (ATR Fraction)", minval = 0, step = 0.05, group = DET_GROUP, tooltip = "Volatility-scaled tolerance expressed as a fraction of ATR, so the allowed difference adapts to the instrument. The effective tolerance is the larger of the tick and ATR components.")
+atrLenInput    = input.int(14, "ATR Length", minval = 1, maxval = 200, group = DET_GROUP, tooltip = "ATR length used for the volatility-scaled tolerance, the preceding move requirement, and the support/resistance proximity distance.")
+gapInput       = input.int(0, "Allowed Gap Candles", minval = 0, maxval = 2, group = DET_GROUP, tooltip = "Candles allowed between the two matched candles. 0 keeps the strict form of two consecutive candles, 1-2 accepts the looser form where a candle or two separates the matched extremes.")
+closeRuleInput = input.string(RULE_CT, "Second Candle Filter", options = [RULE_ANY, RULE_CT, RULE_OPP], group = DET_GROUP, tooltip = "Requirement on the pattern's second candle. 'Counter-Trend Close' wants it closing against the prior trend (bearish at tops, bullish at bottoms), 'Opposite Colors' additionally wants the first candle colored with the trend, 'Any' only requires the matched extremes.")
+
+trendFilterInput = input.bool(true, "Require Preceding Move", group = MOVE_GROUP, tooltip = "Require a preceding directional move into the pattern, with the matched extreme being the extreme of the lookback window. Matched extremes inside a flat range are routine noise.")
+trendLenInput    = input.int(10, "Move Lookback (Bars)", minval = 2, maxval = 200, group = MOVE_GROUP, tooltip = "Number of bars, ending at the pattern's first candle, over which the preceding move is measured.")
+moveMultInput    = input.float(1.0, "Minimum Net Move (ATR)", minval = 0, step = 0.25, group = MOVE_GROUP, tooltip = "Minimum net close-to-close change over the lookback, in ATR multiples, that must point into the pattern — up into tweezer tops, down into tweezer bottoms.")
+
+minScoreInput = input.int(0, "Minimum Confluence Score", minval = 0, maxval = 2, group = CONF_GROUP, tooltip = "Minimum number of confluence conditions (rejection wick, prior support/resistance) a tweezer must meet to be reported. 0 reports every valid pattern; higher values keep only tweezers with independent supporting context.")
+wickMultInput = input.float(2.0, "Rejection Wick (× Body)", minval = 0, step = 0.25, group = CONF_GROUP, tooltip = "A pattern candle counts as an additional rejection shape when its wick on the matched side is at least this multiple of its body — shooting star-like at tops, hammer-like at bottoms.")
+pivLenInput   = input.int(5, "Swing Pivot Length", minval = 2, maxval = 50, group = CONF_GROUP, tooltip = "Pivot length used to collect prior swing highs and lows acting as tested support/resistance for the location check.")
+srProxInput   = input.float(0.25, "S/R Proximity (ATR)", minval = 0, step = 0.05, group = CONF_GROUP, tooltip = "Maximum distance, in ATR multiples, between the matched extreme and a prior swing level for the tweezer to count as located at support/resistance.")
+
+maxActiveInput = input.int(3, "Active Levels per Side", minval = 1, maxval = 10, group = LEVEL_GROUP, tooltip = "Maximum number of matched levels per side that keep extending to the right while awaiting invalidation. Older levels stop extending but remain drawn.")
+
+showLabelsInput  = input.bool(true, "Pattern Labels", group = STYLE_GROUP)
+showBoxInput     = input.bool(true, "Highlight Pattern Candles", group = STYLE_GROUP)
+showLevelInput   = input.bool(true, "Matched Level Lines", group = STYLE_GROUP)
+markInvalidInput = input.bool(true, "Mark Invalidation", group = STYLE_GROUP, tooltip = "Flag a matched level with ✕ once a candle closes beyond it — the level the pattern is built on has failed.")
+
+bullColorInput    = input.color(BULL_DEFAULT, "Bullish", inline = "col", group = STYLE_GROUP)
+bearColorInput    = input.color(BEAR_DEFAULT, "Bearish", inline = "col", group = STYLE_GROUP)
+invalidColorInput = input.color(FADE_DEFAULT, "Invalidated", inline = "col", group = STYLE_GROUP)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+// wick on the matched side is prominent relative to the candle body (shooting star-like / hammer-like)
+wickRejection(float openPrice, float highPrice, float lowPrice, float closePrice, bool isTop) =>
+    float bodySize = math.abs(closePrice - openPrice)
+    float wickSize = isTop ? highPrice - math.max(openPrice, closePrice) : math.min(openPrice, closePrice) - lowPrice
+    wickSize > 0 and wickSize >= wickMultInput * bodySize
+
+// matched extreme sits within proximity of a swing level formed before the pattern's first candle
+nearPivot(array<float> pivotLevels, array<int> pivotBars, float matchedLevel, int firstBar, float proximity) =>
+    bool found = false
+    int n = array.size(pivotLevels)
+    if n > 0 and proximity > 0
+        for i = 0 to n - 1
+            if array.get(pivotBars, i) < firstBar and math.abs(array.get(pivotLevels, i) - matchedLevel) <= proximity
+                found := true
+                break
+    found
+
+yesNo(bool condition) =>
+    condition ? "yes" : "no"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+
+var array<float> pivotHighLevels = array.new<float>()
+var array<int>   pivotHighBars   = array.new<int>()
+var array<float> pivotLowLevels  = array.new<float>()
+var array<int>   pivotLowBars    = array.new<int>()
+
+var array<ActiveLevel> activeTops    = array.new<ActiveLevel>()
+var array<ActiveLevel> activeBottoms = array.new<ActiveLevel>()
+
+var int lastTopEnd    = na
+var int lastBottomEnd = na
+
+float atrValue       = ta.atr(atrLenInput)
+int   windowLen      = trendLenInput + gapInput + 2
+float highestWindow  = ta.highest(high, windowLen)
+float lowestWindow   = ta.lowest(low, windowLen)
+float pivotHighPrice = ta.pivothigh(pivLenInput, pivLenInput)
+float pivotLowPrice  = ta.pivotlow(pivLenInput, pivLenInput)
+
+float tolerance = math.max(tickTolInput * syminfo.mintick, atrTolInput * nz(atrValue))
+
+// store confirmed swing levels for the location check
+if not na(pivotHighPrice)
+    array.push(pivotHighLevels, pivotHighPrice)
+    array.push(pivotHighBars, bar_index - pivLenInput)
+    if array.size(pivotHighLevels) > MAX_PIVOTS
+        array.shift(pivotHighLevels)
+        array.shift(pivotHighBars)
+
+if not na(pivotLowPrice)
+    array.push(pivotLowLevels, pivotLowPrice)
+    array.push(pivotLowBars, bar_index - pivLenInput)
+    if array.size(pivotLowLevels) > MAX_PIVOTS
+        array.shift(pivotLowLevels)
+        array.shift(pivotLowBars)
+
+// manage matched levels — extend while active, invalidate once a candle closes beyond the extreme
+bool topInvalidated    = false
+bool bottomInvalidated = false
+
+array<ActiveLevel> keptTops = array.new<ActiveLevel>()
+for activeTop in activeTops
+    if barstate.isconfirmed and close > activeTop.price
+        topInvalidated := true
+        if not na(activeTop.levelLine)
+            line.set_x2(activeTop.levelLine, bar_index)
+            line.set_color(activeTop.levelLine, invalidColorInput)
+            line.set_style(activeTop.levelLine, line.style_dashed)
+        if markInvalidInput
+            label.new(bar_index, activeTop.price, "✕", style = label.style_label_center, color = INVISIBLE, textcolor = invalidColorInput, size = size.small, tooltip = "Tweezer top invalidated — close above the matched high")
+    else
+        if not na(activeTop.levelLine)
+            line.set_x2(activeTop.levelLine, bar_index)
+        array.push(keptTops, activeTop)
+activeTops := keptTops
+
+array<ActiveLevel> keptBottoms = array.new<ActiveLevel>()
+for activeBottom in activeBottoms
+    if barstate.isconfirmed and close < activeBottom.price
+        bottomInvalidated := true
+        if not na(activeBottom.levelLine)
+            line.set_x2(activeBottom.levelLine, bar_index)
+            line.set_color(activeBottom.levelLine, invalidColorInput)
+            line.set_style(activeBottom.levelLine, line.style_dashed)
+        if markInvalidInput
+            label.new(bar_index, activeBottom.price, "✕", style = label.style_label_center, color = INVISIBLE, textcolor = invalidColorInput, size = size.small, tooltip = "Tweezer bottom invalidated — close below the matched low")
+    else
+        if not na(activeBottom.levelLine)
+            line.set_x2(activeBottom.levelLine, bar_index)
+        array.push(keptBottoms, activeBottom)
+activeBottoms := keptBottoms
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Detection & Visuals
+//---------------------------------------------------------------------------------------------------------------------{
+
+bool topDetected    = false
+bool bottomDetected = false
+
+bool enoughBars = bar_index > windowLen + atrLenInput
+
+if barstate.isconfirmed and enoughBars
+    // locate the nearest prior candle whose extreme matches the current candle's extreme,
+    // requiring any candles in between to stay strictly inside the matched level
+    int topOffset    = 0
+    int bottomOffset = 0
+    float interHigh  = na
+    float interLow   = na
+
+    for k = 1 to gapInput + 1
+        bool interOkTop = na(interHigh) or (high > interHigh and high[k] > interHigh)
+        bool interOkBot = na(interLow) or (low < interLow and low[k] < interLow)
+        if topOffset == 0 and interOkTop and math.abs(high - high[k]) <= tolerance
+            topOffset := k
+        if bottomOffset == 0 and interOkBot and math.abs(low - low[k]) <= tolerance
+            bottomOffset := k
+        interHigh := na(interHigh) ? high[k] : math.max(interHigh, high[k])
+        interLow  := na(interLow) ? low[k] : math.min(interLow, low[k])
+
+    // tweezer top — two highs matched after an advance
+    if topOffset > 0
+        float matchedHigh = math.max(high, high[topOffset])
+        bool advanceOk = not trendFilterInput or (matchedHigh >= highestWindow and close[topOffset] - close[topOffset + trendLenInput] >= moveMultInput * atrValue)
+        bool closeOk = switch closeRuleInput
+            RULE_CT  => close < open
+            RULE_OPP => close < open and close[topOffset] > open[topOffset]
+            => true
+        bool rejectionWick = wickRejection(open, high, low, close, true) or wickRejection(open[topOffset], high[topOffset], low[topOffset], close[topOffset], true)
+        bool atResistance  = nearPivot(pivotHighLevels, pivotHighBars, matchedHigh, bar_index - topOffset, srProxInput * atrValue)
+        int confluence     = (rejectionWick ? 1 : 0) + (atResistance ? 1 : 0)
+        bool overlapOk     = na(lastTopEnd) or bar_index - topOffset > lastTopEnd
+
+        if advanceOk and closeOk and overlapOk and confluence >= minScoreInput
+            topDetected := true
+            lastTopEnd  := bar_index
+
+            float patternLow = low
+            for j = 1 to topOffset
+                patternLow := math.min(patternLow, low[j])
+
+            line topLine = showLevelInput ? line.new(bar_index - topOffset, matchedHigh, bar_index, matchedHigh, color = bearColorInput) : line(na)
+            array.push(activeTops, ActiveLevel.new(topLine, matchedHigh))
+            if array.size(activeTops) > maxActiveInput
+                array.shift(activeTops)
+
+            if showBoxInput
+                box.new(bar_index - topOffset, matchedHigh, bar_index, patternLow, border_color = color.new(bearColorInput, 60), bgcolor = color.new(bearColorInput, 85))
+            if showLabelsInput
+                string starText = confluence == 2 ? " ★★" : confluence == 1 ? " ★" : ""
+                string tipText = "Matched high: " + str.tostring(matchedHigh, format.mintick)
+                tipText += "\nCounter-trend close: " + yesNo(close < open)
+                tipText += "\nRejection wick: " + yesNo(rejectionWick)
+                tipText += "\nAt prior resistance: " + yesNo(atResistance)
+                label.new(bar_index, matchedHigh, "Tweezer Top" + starText, style = label.style_label_down, color = bearColorInput, textcolor = chart.bg_color, size = size.small, tooltip = tipText)
+
+    // tweezer bottom — two lows matched after a decline
+    if bottomOffset > 0
+        float matchedLow = math.min(low, low[bottomOffset])
+        bool declineOk = not trendFilterInput or (matchedLow <= lowestWindow and close[bottomOffset + trendLenInput] - close[bottomOffset] >= moveMultInput * atrValue)
+        bool closeOk = switch closeRuleInput
+            RULE_CT  => close > open
+            RULE_OPP => close > open and close[bottomOffset] < open[bottomOffset]
+            => true
+        bool rejectionWick = wickRejection(open, high, low, close, false) or wickRejection(open[bottomOffset], high[bottomOffset], low[bottomOffset], close[bottomOffset], false)
+        bool atSupport     = nearPivot(pivotLowLevels, pivotLowBars, matchedLow, bar_index - bottomOffset, srProxInput * atrValue)
+        int confluence     = (rejectionWick ? 1 : 0) + (atSupport ? 1 : 0)
+        bool overlapOk     = na(lastBottomEnd) or bar_index - bottomOffset > lastBottomEnd
+
+        if declineOk and closeOk and overlapOk and confluence >= minScoreInput
+            bottomDetected := true
+            lastBottomEnd  := bar_index
+
+            float patternHigh = high
+            for j = 1 to bottomOffset
+                patternHigh := math.max(patternHigh, high[j])
+
+            line bottomLine = showLevelInput ? line.new(bar_index - bottomOffset, matchedLow, bar_index, matchedLow, color = bullColorInput) : line(na)
+            array.push(activeBottoms, ActiveLevel.new(bottomLine, matchedLow))
+            if array.size(activeBottoms) > maxActiveInput
+                array.shift(activeBottoms)
+
+            if showBoxInput
+                box.new(bar_index - bottomOffset, patternHigh, bar_index, matchedLow, border_color = color.new(bullColorInput, 60), bgcolor = color.new(bullColorInput, 85))
+            if showLabelsInput
+                string starText = confluence == 2 ? " ★★" : confluence == 1 ? " ★" : ""
+                string tipText = "Matched low: " + str.tostring(matchedLow, format.mintick)
+                tipText += "\nCounter-trend close: " + yesNo(close > open)
+                tipText += "\nRejection wick: " + yesNo(rejectionWick)
+                tipText += "\nAt prior support: " + yesNo(atSupport)
+                label.new(bar_index, matchedLow, "Tweezer Bottom" + starText, style = label.style_label_up, color = bullColorInput, textcolor = chart.bg_color, size = size.small, tooltip = tipText)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(topDetected, "Tweezer Top", "Tweezer top on {{ticker}} ({{interval}}): consecutive highs matched and rejected after an advance. Invalidation: a close above the matched high.")
+alertcondition(bottomDetected, "Tweezer Bottom", "Tweezer bottom on {{ticker}} ({{interval}}): consecutive lows matched and rejected after a decline. Invalidation: a close below the matched low.")
+alertcondition(topInvalidated, "Tweezer Top Invalidated", "Tweezer top invalidated on {{ticker}} ({{interval}}): price closed above the matched high.")
+alertcondition(bottomInvalidated, "Tweezer Bottom Invalidated", "Tweezer bottom invalidated on {{ticker}} ({{interval}}): price closed below the matched low.")
+
+//---------------------------------------------------------------------------------------------------------------------}

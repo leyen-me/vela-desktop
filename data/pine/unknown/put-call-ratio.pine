@@ -1,0 +1,191 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Put/call Ratio", "Put/call Ratio", overlay = false, format = format.price, precision = 2)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+NEUTRAL_COLOR = #787b86
+GRAY_COLOR    = #787b86
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+EQUITY_MODE = "Equity-only (Cboe)"
+INDEX_MODE  = "Index (Cboe)"
+TOTAL_MODE  = "Total (Cboe)"
+CUSTOM_MODE = "Custom"
+
+EQUITY_TICKER = "USI:PCC"
+INDEX_TICKER  = "USI:PCI"
+TOTAL_TICKER  = "USI:PC"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+seriesInput = input.string(EQUITY_MODE, "Ratio Series", options = [EQUITY_MODE, INDEX_MODE, TOTAL_MODE, CUSTOM_MODE], group = "Data", tooltip = "Which put/call volume series to chart. Equity-only is dominated by directional speculation and is the classic crowd sentiment read, the index series mostly reflects institutional hedging demand, and the total series blends both. Custom uses the ticker set below, for a single name, a crypto options venue, or an open interest based ratio.")
+
+equityTickerInput = input.symbol(EQUITY_TICKER, "Equity-only Ticker", group = "Data", tooltip = "Symbol of the Cboe equity-only put/call ratio series, built from single stock options volume.")
+indexTickerInput  = input.symbol(INDEX_TICKER, "Index Ticker", group = "Data", tooltip = "Symbol of the Cboe index-only put/call ratio series. It runs persistently higher than the equity ratio because institutions buy index puts as portfolio insurance.")
+totalTickerInput  = input.symbol(TOTAL_TICKER, "Total Ticker", group = "Data", tooltip = "Symbol of the Cboe total put/call ratio series, mixing equity and index options volume.")
+customTickerInput = input.symbol(EQUITY_TICKER, "Custom Ticker", group = "Data", tooltip = "Any put/call ratio symbol from your data provider, used when Ratio Series is set to Custom. Per-symbol and open interest based ratios read the same contrarian way, judged against their own baseline.")
+tfInput           = input.timeframe("D", "Data Timeframe", group = "Data", tooltip = "Sampling timeframe of the ratio series. Cboe put/call ratios are end-of-day prints, so the daily default is the standard choice. Higher timeframe data is requested on confirmed bars only, so values do not repaint.")
+
+smoothTypeInput = input.string("SMA", "Smoothing", options = ["SMA", "EMA", "RMA", "WMA"], inline = "ma", group = "Calculation", tooltip = "Moving average type used to smooth the raw ratio.")
+smoothLenInput  = input.int(10, "", minval = 1, maxval = 200, inline = "ma", group = "Calculation", tooltip = "Smoothing length. Raw daily prints are jagged, and the 10 period simple average is the long-standing choice for turning noise into a readable swing.")
+windowInput     = input.int(252, "Rolling Window", minval = 20, maxval = 1000, group = "Calculation", tooltip = "Rolling lookback used to rank the smoothed ratio against its own recent distribution, 252 daily bars being roughly one trading year. Extremes are defined relative to this window rather than fixed decade-old thresholds, since typical levels drift as market structure evolves.")
+upperPctInput   = input.int(90, "Extreme Percentiles", minval = 55, maxval = 100, inline = "pct", group = "Calculation", tooltip = "Percentile of the rolling window marking the upper, fear side band.")
+lowerPctInput   = input.int(10, "", minval = 0, maxval = 45, inline = "pct", group = "Calculation", tooltip = "Percentile of the rolling window marking the lower, complacency side band. The smoothed ratio holding above the upper band flags crowd fear, a contrarian bullish condition, while readings below the lower band flag complacency. Extremes can extend, so most frameworks wait for price confirmation.")
+
+fearColorInput    = input.color(BULL_COLOR, "Fear Extreme", group = "Style", tooltip = "Color of fear side readings, heavy put activity. On the contrarian reading an unusually high ratio is treated as bullish, on the logic that fear is close to exhaustion.")
+calmColorInput    = input.color(BEAR_COLOR, "Complacency Extreme", group = "Style", tooltip = "Color of complacency side readings, unusually light put activity. On the contrarian reading an unusually low ratio is a bearish warning of speculative appetite.")
+lineColorInput    = input.color(NEUTRAL_COLOR, "Ratio Line", group = "Style", tooltip = "Neutral color of the smoothed ratio line when it sits mid range. The line shifts toward the extreme colors as its rolling percentile rank rises or falls.")
+neutralColorInput = input.color(GRAY_COLOR, "Raw & Median", group = "Style", tooltip = "Color of the faint raw ratio line and of the rolling median.")
+showRawInput      = input.bool(true, "Show Raw Ratio", group = "Style", tooltip = "Plot the unsmoothed ratio as a faint context line behind the smoothed series.")
+showBandsInput    = input.bool(true, "Show Extreme Bands & Median", group = "Style", tooltip = "Plot the rolling upper and lower percentile bands together with the rolling median of the smoothed ratio.")
+fillInput         = input.bool(true, "Gradient Fill", group = "Style", tooltip = "Vertical gradient between the smoothed ratio and its rolling median, fear color above the median and complacency color below, fading out toward the median.")
+bgInput           = input.bool(true, "Highlight Extremes", group = "Style", tooltip = "Highlight the pane background while the smoothed ratio holds beyond an extreme band.")
+
+dashInput     = input.bool(true, "Show Dashboard", group = "Dashboard", tooltip = "Compact panel showing the selected series, latest raw and smoothed readings, rolling percentile rank, and the current sentiment state. Also reports when the selected ticker returns no data.")
+dashPosInput  = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = "Dashboard", tooltip = "Dashboard location on the pane.")
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = "Dashboard", tooltip = "Dashboard text size.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+fmtValue(float value, string fmt) =>
+    na(value) ? "-" : str.tostring(value, fmt)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+string ratioTicker = switch seriesInput
+    EQUITY_MODE => equityTickerInput
+    INDEX_MODE  => indexTickerInput
+    TOTAL_MODE  => totalTickerInput
+    => customTickerInput
+
+string requestTf  = tfInput == "" ? timeframe.period : tfInput
+bool   isHigherTf = timeframe.in_seconds(requestTf) > timeframe.in_seconds(timeframe.period)
+
+//Non-repainting requests, confirmed bars only for higher timeframes, chart timeframe as-is
+float htfRatio = request.security(ratioTicker, requestTf, close[1], lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+float ctfRatio = request.security(ratioTicker, requestTf, close, lookahead = barmerge.lookahead_off, ignore_invalid_symbol = true)
+float rawRatio = isHigherTf ? htfRatio : ctfRatio
+
+//Carry the last available print across session gaps
+var float ratioSeries = na
+if not na(rawRatio)
+    ratioSeries := rawRatio
+
+bool hasData = not na(ratioSeries)
+
+//Smoothed ratio, all moving averages evaluated on every bar
+float smaRatio = ta.sma(ratioSeries, smoothLenInput)
+float emaRatio = ta.ema(ratioSeries, smoothLenInput)
+float rmaRatio = ta.rma(ratioSeries, smoothLenInput)
+float wmaRatio = ta.wma(ratioSeries, smoothLenInput)
+
+float smoothRatio = switch smoothTypeInput
+    "EMA" => emaRatio
+    "RMA" => rmaRatio
+    "WMA" => wmaRatio
+    => smaRatio
+
+//Rolling distribution of the smoothed ratio
+float upperBand = ta.percentile_nearest_rank(smoothRatio, windowInput, upperPctInput)
+float lowerBand = ta.percentile_nearest_rank(smoothRatio, windowInput, lowerPctInput)
+float midBand   = ta.percentile_nearest_rank(smoothRatio, windowInput, 50)
+float rankValue = ta.percentrank(smoothRatio, windowInput)
+
+//Extreme states and their transitions
+bool fearExtreme = not na(upperBand) and not na(smoothRatio) and smoothRatio >= upperBand
+bool calmExtreme = not na(lowerBand) and not na(smoothRatio) and smoothRatio <= lowerBand
+
+bool fearStart = fearExtreme and not fearExtreme[1]
+bool fearEnd   = not fearExtreme and fearExtreme[1]
+bool calmStart = calmExtreme and not calmExtreme[1]
+bool calmEnd   = not calmExtreme and calmExtreme[1]
+
+string stateText  = fearExtreme ? "Fear extreme" : calmExtreme ? "Complacency extreme" : "Neutral"
+color  stateColor = fearExtreme ? fearColorInput : calmExtreme ? calmColorInput : DASH_TEXT
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Plots
+//---------------------------------------------------------------------------------------------------------------------{
+//Percentile rank gradient, complacency color at the bottom of the range, fear color at the top
+color rankColor = na(rankValue) ? lineColorInput : rankValue <= 50 ? color.from_gradient(rankValue, 0, 50, calmColorInput, lineColorInput) : color.from_gradient(rankValue, 50, 100, lineColorInput, fearColorInput)
+
+plot(ratioSeries, "Raw Ratio", showRawInput ? color.new(neutralColorInput, 62) : na, 1)
+
+smoothPlot = plot(smoothRatio, "Smoothed Ratio", rankColor, 2)
+midPlot    = plot(midBand, "Rolling Median", showBandsInput ? color.new(neutralColorInput, 40) : na, 1)
+
+plot(upperBand, "Fear Band", showBandsInput ? color.new(fearColorInput, 45) : na, 1)
+plot(lowerBand, "Complacency Band", showBandsInput ? color.new(calmColorInput, 45) : na, 1)
+
+//Vertical gradient from the rolling median to the smoothed ratio
+bool  aboveMid = not na(smoothRatio) and not na(midBand) and smoothRatio >= midBand
+float fillTop  = math.max(smoothRatio, midBand)
+float fillBot  = math.min(smoothRatio, midBand)
+
+color fillTopColor = not fillInput ? na : aboveMid ? color.new(fearColorInput, 50) : color.new(calmColorInput, 100)
+color fillBotColor = not fillInput ? na : aboveMid ? color.new(fearColorInput, 100) : color.new(calmColorInput, 50)
+
+fill(smoothPlot, midPlot, top_value = fillTop, bottom_value = fillBot, top_color = fillTopColor, bottom_color = fillBotColor, title = "Distribution Gradient")
+
+bgcolor(bgInput and fearExtreme ? color.new(fearColorInput, 92) : bgInput and calmExtreme ? color.new(calmColorInput, 92) : na, title = "Extreme Regime Highlight")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+string dashPosition = switch dashPosInput
+    "Top Right"    => position.top_right
+    "Top Left"     => position.top_left
+    "Bottom Right" => position.bottom_right
+    => position.bottom_left
+
+string dashTextSize = switch dashSizeInput
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    => size.small
+
+var table dashTable = table(na)
+
+if dashInput and barstate.islast
+    if na(dashTable)
+        dashTable := table.new(dashPosition, 2, 6, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+    table.clear(dashTable, 0, 0, 1, 5)
+    table.cell(dashTable, 0, 0, "Put/Call Ratio", text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 0, seriesInput, text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 1, "Ticker", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 1, ratioTicker, text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+    if hasData
+        table.cell(dashTable, 0, 2, "Ratio", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left)
+        table.cell(dashTable, 1, 2, fmtValue(ratioSeries, "#.##"), text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+        table.cell(dashTable, 0, 3, "Smoothed", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left)
+        table.cell(dashTable, 1, 3, fmtValue(smoothRatio, "#.##"), text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+        table.cell(dashTable, 0, 4, "Percentile", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left)
+        table.cell(dashTable, 1, 4, na(rankValue) ? "-" : fmtValue(rankValue, "#.#") + "%", text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+        table.cell(dashTable, 0, 5, "State", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left)
+        table.cell(dashTable, 1, 5, stateText, text_color = stateColor, text_size = dashTextSize, text_halign = text.align_right)
+    else
+        table.cell(dashTable, 0, 2, "Status", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left)
+        table.cell(dashTable, 1, 2, "No data returned", text_color = calmColorInput, text_size = dashTextSize, text_halign = text.align_right)
+        table.cell(dashTable, 0, 3, "Hint", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left)
+        table.cell(dashTable, 1, 3, "Set a valid ratio ticker in the Data settings", text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(fearStart, "Fear Extreme Entered", "Put/call Ratio: smoothed ratio entered the upper extreme band of its rolling range, crowd fear, contrarian bullish watch, seek price confirmation")
+alertcondition(fearEnd, "Fear Extreme Exited", "Put/call Ratio: smoothed ratio fell back inside its rolling range after a fear extreme")
+alertcondition(calmStart, "Complacency Extreme Entered", "Put/call Ratio: smoothed ratio entered the lower extreme band of its rolling range, complacency, contrarian bearish watch")
+alertcondition(calmEnd, "Complacency Extreme Exited", "Put/call Ratio: smoothed ratio rose back inside its rolling range after a complacency extreme")
+
+//---------------------------------------------------------------------------------------------------------------------}

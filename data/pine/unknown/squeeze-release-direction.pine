@@ -1,0 +1,327 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Squeeze Release Direction", shorttitle = "Squeeze Release Direction", overlay = true, max_boxes_count = 500, max_labels_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR    = #089981 // bullish release read
+BEAR_COLOR    = #f23645 // bearish release read
+NEUTRAL_COLOR = #ff9800 // compression zone while the squeeze is on - the one accent: the squeeze itself is direction-neutral, but it is the "look here"
+AMBIG_COLOR   = #787b86 // ambiguous release read - evidence does not agree on a side
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+VOTE_COUNT   = 5 // evidence pieces polled at the release
+STRONG_MIN   = 4 // minimum absolute score for a Strong grade
+MODERATE_MIN = 2 // minimum absolute score for a Moderate grade
+
+ZONE_BG_TRANSP = 92 // compression zone background transparency
+
+TRIGGER_GROUP  = "Squeeze Trigger"
+EVIDENCE_GROUP = "Release Evidence"
+DASH_GROUP     = "Dashboard"
+STYLE_GROUP    = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+lengthInput = input.int(20, "Squeeze Length", minval = 2
+  , group   = TRIGGER_GROUP
+  , tooltip = "Shared lookback for the Bollinger Bands and Keltner Channels forming the squeeze trigger. The squeeze is on while the bands sit inside the channels and fires on the bar they re-emerge - the moment this script polls its directional evidence. The compression itself is direction-neutral.")
+
+srcInput = input.source(close, "Source"
+  , group   = TRIGGER_GROUP
+  , tooltip = "Price series used for the trigger bands and for the momentum evidence. Default close.")
+
+bbMultInput = input.float(2.0, "Bollinger Bands Multiplier", minval = 0.1, step = 0.1
+  , group   = TRIGGER_GROUP
+  , tooltip = "Standard deviation multiplier of the Bollinger Bands used by the squeeze trigger. Default 2.")
+
+kcMultInput = input.float(1.5, "Keltner Channels Multiplier", minval = 0.1, step = 0.1
+  , group   = TRIGGER_GROUP
+  , tooltip = "ATR multiplier of the Keltner Channels used by the squeeze trigger. Default 1.5. A smaller multiplier demands a tighter compression before a squeeze can fire.")
+
+momLengthInput = input.int(20, "Momentum Length", minval = 2
+  , group   = EVIDENCE_GROUP
+  , tooltip = "Length of the momentum histogram sampled on the fire bar. In the TTM convention the release is read in the direction of momentum at the moment the bands re-emerge, so its sign is the first evidence vote.")
+
+tiltLookbackInput = input.int(3, "Band Tilt Lookback", minval = 1
+  , group   = EVIDENCE_GROUP
+  , tooltip = "Bars over which the slope of the band basis is measured. A basis tilting up into the release adds a bullish vote, tilting down a bearish vote.")
+
+volLengthInput = input.int(20, "Volume Average Length", minval = 1
+  , group   = EVIDENCE_GROUP
+  , tooltip = "Length of the simple moving average used as the baseline for the volume expansion test.")
+
+volMultInput = input.float(1.5, "Volume Expansion Multiplier", minval = 1.0, step = 0.1
+  , group   = EVIDENCE_GROUP
+  , tooltip = "Fire-bar volume must exceed its average times this multiplier to count as expansion. Expanding volume votes with the fire-bar candle direction; without expansion the volume evidence stays neutral.")
+
+htfTimeframeInput = input.timeframe("D", "Higher Timeframe", inline = "htf"
+  , group   = EVIDENCE_GROUP
+  , tooltip = "Timeframe of the trend used as the directional bias vote. Set it above the chart timeframe so the release is judged against the larger trend.")
+
+htfLengthInput = input.int(50, "EMA Length", minval = 1, inline = "htf"
+  , group   = EVIDENCE_GROUP
+  , tooltip = "EMA length defining the higher-timeframe trend: price above the EMA casts a bullish vote, below it a bearish vote.")
+
+htfFilterInput = input.bool(false, "Skip Counter-Trend Fires"
+  , group   = EVIDENCE_GROUP
+  , tooltip = "Bias overlay mode: take only the releases that agree with the higher-timeframe trend. A read pointing against it is downgraded to ambiguous instead of being given a direction.")
+
+showDashboardInput = input.bool(true, "Show Dashboard"
+  , group   = DASH_GROUP
+  , tooltip = "Panel with the live squeeze state and the full evidence breakdown of the most recent release read.")
+
+dashLocationInput = input.string("Top Right", "Location", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left", "Middle Right"]
+  , group   = DASH_GROUP
+  , tooltip = "Position of the dashboard on the chart.")
+
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"]
+  , group   = DASH_GROUP
+  , tooltip = "Text size of the dashboard.")
+
+showLabelsInput = input.bool(true, "Show Release Labels"
+  , group   = STYLE_GROUP
+  , tooltip = "Marks each squeeze fire with its directional read and confidence grade. Hover a label for the evidence breakdown behind the read.")
+
+showZoneInput = input.bool(true, "Show Compression Zone"
+  , group   = STYLE_GROUP
+  , tooltip = "Outlines the price range built while the squeeze is on, then recolors it by the directional read once the squeeze fires.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish Release", inline = "read"
+  , group   = STYLE_GROUP
+  , tooltip = "Color of bullish release reads.")
+
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "read"
+  , group   = STYLE_GROUP
+  , tooltip = "Color of bearish release reads.")
+
+ambiguousColorInput = input.color(AMBIG_COLOR, "Ambiguous", inline = "read"
+  , group   = STYLE_GROUP
+  , tooltip = "Color of ambiguous releases - fires where the evidence does not agree on a side, the setting where head fakes live.")
+
+zoneColorInput = input.color(NEUTRAL_COLOR, "Compression Zone"
+  , group   = STYLE_GROUP
+  , tooltip = "Color of the compression zone while the squeeze is on. Neutral by design - the squeeze flags expansion, not direction.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+getLocation(string pos) =>
+    switch pos
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        "Bottom Left"  => position.bottom_left
+        =>                position.middle_right
+
+getSize(string sizeOption) =>
+    switch sizeOption
+        "Tiny"  => size.tiny
+        "Small" => size.small
+        =>         size.normal
+
+directionText(int dirV) =>
+    dirV > 0 ? "Bullish" : dirV < 0 ? "Bearish" : "Ambiguous"
+
+voteText(int voteV) =>
+    voteV > 0 ? "▲ Bullish" : voteV < 0 ? "▼ Bearish" : "— Neutral"
+
+voteColor(int voteV) =>
+    voteV > 0 ? bullColorInput : voteV < 0 ? bearColorInput : ambiguousColorInput
+
+scoreText(int scoreV) =>
+    (scoreV > 0 ? "+" : "") + str.tostring(scoreV)
+
+breakdownText(int momV, int tiltV, int breakV, int volV, int htfV, int scoreV, int dirV, string gradeV, int barsV, bool filteredV) =>
+    string readV = dirV == 0 ? "Ambiguous" : directionText(dirV) + " - " + gradeV
+    string txt = "Read: " + readV + " (" + scoreText(scoreV) + " of ±" + str.tostring(VOTE_COUNT) + ")"
+    txt += "\nSqueeze length: " + str.tostring(barsV) + (barsV == 1 ? " bar" : " bars")
+    txt += "\nMomentum sign: " + voteText(momV)
+    txt += "\nBand tilt: " + voteText(tiltV)
+    txt += "\nBreakout side: " + voteText(breakV)
+    txt += "\nVolume: " + voteText(volV)
+    txt += "\nHTF trend: " + voteText(htfV)
+    txt += filteredV ? "\nCounter-trend fire - downgraded by the higher-timeframe filter" : ""
+    txt
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Squeeze State
+//---------------------------------------------------------------------------------------------------------------------{
+// Minimal TTM-convention trigger - both band systems centered on the same basis. The squeeze is only the
+// context here: it says expansion is likely, while the release read below says which way it leans
+basis    = ta.sma(srcInput, lengthInput)
+dev      = bbMultInput * ta.stdev(srcInput, lengthInput)
+atrValue = ta.atr(lengthInput)
+
+bbUpper = basis + dev
+bbLower = basis - dev
+kcUpper = basis + kcMultInput * atrValue
+kcLower = basis - kcMultInput * atrValue
+
+bandsReady = not na(bbUpper) and not na(kcUpper)
+
+squeezeOn    = bandsReady and bbUpper < kcUpper and bbLower > kcLower
+squeezeStart = squeezeOn and not squeezeOn[1]
+squeezeFire  = not squeezeOn and squeezeOn[1]
+
+// Compression range and duration - the price extent built while volatility was compressed
+var float compressionHigh = na
+var float compressionLow  = na
+var int   squeezeLength   = 0
+
+if squeezeStart
+    compressionHigh := high
+    compressionLow  := low
+    squeezeLength   := 1
+else if squeezeOn
+    compressionHigh := math.max(nz(compressionHigh, high), high)
+    compressionLow  := math.min(nz(compressionLow, low), low)
+    squeezeLength   += 1
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Release Evidence
+//---------------------------------------------------------------------------------------------------------------------{
+// Momentum - least-squares regression of the source's displacement from an anchor midway between the range
+// midpoint and the average. Its sign on the fire bar is the TTM-convention directional cue
+momBasis      = ta.sma(srcInput, momLengthInput)
+momAnchor     = math.avg(math.avg(ta.highest(high, momLengthInput), ta.lowest(low, momLengthInput)), momBasis)
+momentumValue = ta.linreg(srcInput - momAnchor, momLengthInput, 0)
+
+// Volume expansion baseline
+volumeAverage = ta.sma(volume, volLengthInput)
+
+// Higher-timeframe trend - the bias overlay side of the release question
+[htfClose, htfEma] = request.security(syminfo.tickerid, htfTimeframeInput, [close, ta.ema(close, htfLengthInput)], lookahead = barmerge.lookahead_off)
+
+// Each evidence piece casts one vote: +1 bullish, -1 bearish, 0 neutral
+momentumVote = na(momentumValue) ? 0 : momentumValue > 0 ? 1 : momentumValue < 0 ? -1 : 0
+
+tiltVote = na(basis) or na(basis[tiltLookbackInput]) ? 0 : basis > basis[tiltLookbackInput] ? 1 : basis < basis[tiltLookbackInput] ? -1 : 0
+
+// Breakout side is read from the close, not from a tick beyond the band - the confirmation Bollinger urged
+// against the head fake
+breakoutVote = na(bbUpper) or na(bbLower) ? 0 : close > bbUpper ? 1 : close < bbLower ? -1 : 0
+
+volumeExpanding = not na(volume) and not na(volumeAverage) and volume > volumeAverage * volMultInput
+volumeVote      = volumeExpanding ? (close > open ? 1 : close < open ? -1 : 0) : 0
+
+htfVote = na(htfClose) or na(htfEma) ? 0 : htfClose > htfEma ? 1 : htfClose < htfEma ? -1 : 0
+
+// Net read - the direction call stays a hypothesis, so it is graded rather than asserted
+evidenceScore    = momentumVote + tiltVote + breakoutVote + volumeVote + htfVote
+rawDirection     = evidenceScore > 0 ? 1 : evidenceScore < 0 ? -1 : 0
+counterTrendFire = htfFilterInput and rawDirection != 0 and htfVote != 0 and rawDirection != htfVote
+releaseDirection = counterTrendFire ? 0 : rawDirection
+scoreStrength    = math.abs(evidenceScore)
+releaseGrade     = releaseDirection == 0 ? "Ambiguous" : scoreStrength >= STRONG_MIN ? "Strong" : scoreStrength >= MODERATE_MIN ? "Moderate" : "Weak"
+
+bullishRelease   = squeezeFire and releaseDirection == 1
+bearishRelease   = squeezeFire and releaseDirection == -1
+ambiguousRelease = squeezeFire and releaseDirection == 0
+
+// Snapshot of the most recent release for the dashboard
+var int    lastDirection    = 0
+var int    lastScore        = 0
+var string lastGrade        = "Ambiguous"
+var int    lastMomentumVote = 0
+var int    lastTiltVote     = 0
+var int    lastBreakoutVote = 0
+var int    lastVolumeVote   = 0
+var int    lastHtfVote      = 0
+var int    lastSqueezeBars  = 0
+var bool   lastCounterTrend = false
+var bool   releaseSeen      = false
+
+if squeezeFire
+    lastDirection    := releaseDirection
+    lastScore        := evidenceScore
+    lastGrade        := releaseGrade
+    lastMomentumVote := momentumVote
+    lastTiltVote     := tiltVote
+    lastBreakoutVote := breakoutVote
+    lastVolumeVote   := volumeVote
+    lastHtfVote      := htfVote
+    lastSqueezeBars  := squeezeLength
+    lastCounterTrend := counterTrendFire
+    releaseSeen      := true
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+var box zoneBox = na
+
+if squeezeStart and showZoneInput
+    // a compression begins - open a neutral zone, the squeeze itself has no side
+    zoneBox := box.new(bar_index, compressionHigh, bar_index, compressionLow, border_color = zoneColorInput, border_width = 1, border_style = line.style_dashed, bgcolor = color.new(zoneColorInput, ZONE_BG_TRANSP))
+else if squeezeOn and not na(zoneBox)
+    box.set_top(zoneBox, compressionHigh)
+    box.set_bottom(zoneBox, compressionLow)
+    box.set_right(zoneBox, bar_index)
+else if squeezeFire and not na(zoneBox)
+    // the squeeze fires - freeze the zone and hand it the color of the directional read
+    color releaseColor = releaseDirection == 1 ? bullColorInput : releaseDirection == -1 ? bearColorInput : ambiguousColorInput
+    box.set_right(zoneBox, bar_index)
+    box.set_border_color(zoneBox, releaseColor)
+    box.set_border_style(zoneBox, line.style_solid)
+    box.set_bgcolor(zoneBox, color.new(releaseColor, ZONE_BG_TRANSP))
+    zoneBox := na
+
+if squeezeFire and showLabelsInput
+    color  markerColor   = releaseDirection == 1 ? bullColorInput : releaseDirection == -1 ? bearColorInput : ambiguousColorInput
+    string markerTooltip = breakdownText(momentumVote, tiltVote, breakoutVote, volumeVote, htfVote, evidenceScore, releaseDirection, releaseGrade, squeezeLength, counterTrendFire)
+    if releaseDirection == 1
+        label.new(bar_index, low, releaseGrade, yloc = yloc.belowbar, style = label.style_label_up, color = markerColor, textcolor = chart.bg_color, size = size.small, tooltip = markerTooltip)
+    else
+        label.new(bar_index, high, releaseGrade, yloc = yloc.abovebar, style = label.style_label_down, color = markerColor, textcolor = chart.bg_color, size = size.small, tooltip = markerTooltip)
+
+plot(evidenceScore, "Evidence Score", color = color.new(AMBIG_COLOR, 0), editable = false, display = display.data_window, precision = 0)
+plot(squeezeOn ? squeezeLength : 0, "Squeeze Bars", color = color.new(AMBIG_COLOR, 0), editable = false, display = display.data_window, precision = 0)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dashboardTable = showDashboardInput ? table.new(getLocation(dashLocationInput), 2, 8, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1) : table(na)
+
+if barstate.isfirst and showDashboardInput and not na(dashboardTable)
+    table.merge_cells(dashboardTable, 0, 0, 1, 0)
+
+if barstate.islast and showDashboardInput and not na(dashboardTable)
+    textSize = getSize(dashSizeInput)
+    dimColor = DASH_HEADER
+
+    string stateText  = squeezeOn ? "On - " + str.tostring(squeezeLength) + (squeezeLength == 1 ? " bar" : " bars") : "Off"
+    string readText   = not releaseSeen ? "None yet" : lastDirection == 0 ? "Ambiguous (" + scoreText(lastScore) + ")" : directionText(lastDirection) + " - " + lastGrade + " (" + scoreText(lastScore) + ")"
+    color  readColor  = releaseSeen ? voteColor(lastDirection) : dimColor
+    string readNote   = not releaseSeen ? "No squeeze release yet" : "Fired after " + str.tostring(lastSqueezeBars) + (lastSqueezeBars == 1 ? " bar" : " bars") + " of compression - net score across " + str.tostring(VOTE_COUNT) + " evidence votes" + (lastCounterTrend ? " - counter-trend fire downgraded by the higher-timeframe filter" : "")
+
+    table.cell(dashboardTable, 0, 0, "Squeeze Release Direction", text_color = DASH_TEXT, text_size = textSize)
+    table.cell(dashboardTable, 0, 1, "Squeeze", text_color = dimColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 1, stateText, text_color = squeezeOn ? zoneColorInput : dimColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 2, "Last Release", text_color = dimColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 2, readText, text_color = readColor, text_size = textSize, text_halign = text.align_right, tooltip = readNote)
+    table.cell(dashboardTable, 0, 3, "Momentum Sign", text_color = dimColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 3, releaseSeen ? voteText(lastMomentumVote) : "—", text_color = releaseSeen ? voteColor(lastMomentumVote) : dimColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 4, "Band Tilt", text_color = dimColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 4, releaseSeen ? voteText(lastTiltVote) : "—", text_color = releaseSeen ? voteColor(lastTiltVote) : dimColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 5, "Breakout Side", text_color = dimColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 5, releaseSeen ? voteText(lastBreakoutVote) : "—", text_color = releaseSeen ? voteColor(lastBreakoutVote) : dimColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 6, "Volume", text_color = dimColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 6, releaseSeen ? voteText(lastVolumeVote) : "—", text_color = releaseSeen ? voteColor(lastVolumeVote) : dimColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 7, "HTF Trend", text_color = dimColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 7, releaseSeen ? voteText(lastHtfVote) : "—", text_color = releaseSeen ? voteColor(lastHtfVote) : dimColor, text_size = textSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(bullishRelease, "Bullish Squeeze Release", "Squeeze release on {{ticker}}: the evidence stack reads bullish - momentum sign, band tilt, breakout side, volume and higher-timeframe trend lean up on net; confirm follow-through against the head fake ({{interval}})")
+alertcondition(bearishRelease, "Bearish Squeeze Release", "Squeeze release on {{ticker}}: the evidence stack reads bearish - momentum sign, band tilt, breakout side, volume and higher-timeframe trend lean down on net; confirm follow-through against the head fake ({{interval}})")
+alertcondition(ambiguousRelease, "Ambiguous Squeeze Release", "Squeeze release on {{ticker}}: evidence is mixed, no directional read - stand aside or wait for a confirming close or structure break ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

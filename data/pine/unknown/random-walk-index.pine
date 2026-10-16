@@ -1,0 +1,306 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Random Walk Index"
+  , shorttitle       = "Random Walk Index"
+  , overlay          = false
+  , format           = format.price
+  , precision        = 2
+  , max_lines_count  = 500
+  , max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+int MAX_LOOKBACK = 500 // History buffer reserved for the lookback scan
+int FULL_TRANSP  = 100
+int HALF_TRANSP  = 50
+
+color BULL_COLOR    = #089981 // RWI High - upside displacement beyond a random walk
+color BEAR_COLOR    = #f23645 // RWI Low - downside displacement beyond a random walk
+color NEUTRAL_COLOR = #787b86 // levels and the random walk regime
+color ACCENT_COLOR  = #ff9800 // the one accent - exhaustion drawings
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+string GROUP_RWI   = "Random Walk Index"
+string GROUP_EXH   = "Exhaustion Checks"
+string GROUP_DASH  = "Dashboard"
+string GROUP_STYLE = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+minLengthInput = input.int(8, "Minimum Lookback"
+  , minval  = 1
+  , maxval  = 250
+  , group   = GROUP_RWI
+  , tooltip = "Shortest lookback (n) included in the scan. Each candidate n compares the range price actually covered over n bars with ATR(n) * sqrt(n), the displacement a random walk of the same volatility would be expected to produce. A common fast variant scans 2 to 7 bars; set both bounds to the same value to fix a single lookback instead of scanning a span.")
+
+maxLengthInput = input.int(64, "Maximum Lookback"
+  , minval  = 1
+  , maxval  = 250
+  , group   = GROUP_RWI
+  , tooltip = "Longest lookback (n) included in the scan. The maximum reading across the span is kept for each line, so the indicator finds the horizon over which the move looks least random. Short spans flag noise as trend while long spans miss young trends, so match the span to the holding period being traded.")
+
+thresholdInput = input.float(1.0, "Random Walk Threshold"
+  , minval  = 0
+  , step    = 0.1
+  , group   = GROUP_RWI
+  , tooltip = "Statistical benchmark of the indicator: readings above it mean price displaced further over the lookback than a random walk with the same average true range would be expected to, the working definition of a trend. It anchors the regime events and filters out weak line crossovers occurring below it.")
+
+showExhaustionInput = input.bool(false, "Show Exhaustion Checks"
+  , group   = GROUP_EXH
+  , tooltip = "Draws a dashed line and label when an extended trend prints a declining RWI peak while price makes a new extreme, the sign the move is losing its non-random character. The alerts cover these events even when the drawings are hidden.")
+
+pivotLengthInput = input.int(5, "Peak Pivot Length"
+  , minval  = 1
+  , maxval  = 50
+  , group   = GROUP_EXH
+  , tooltip = "Bars required on each side of a peak on an RWI line before the peak is confirmed. Larger values keep only major peaks at the cost of later confirmation.")
+
+maxPeakDistanceInput = input.int(80, "Max Peak Distance"
+  , minval  = 5
+  , maxval  = 500
+  , group   = GROUP_EXH
+  , tooltip = "Maximum number of bars allowed between two consecutive peaks of an RWI line for them to form an exhaustion pair.")
+
+showDashboardInput = input.bool(true, "Show Dashboard"
+  , group   = GROUP_DASH
+  , tooltip = "Displays the latest reading of each line, the lookback horizon where its scan peaked, and the resulting regime call.")
+
+dashLocationInput = input.string("Top Right", "Location"
+  , options = ["Top Right", "Top Left", "Middle Right", "Middle Left", "Bottom Right", "Bottom Left"]
+  , group   = GROUP_DASH
+  , tooltip = "Corner of the pane anchoring the dashboard.")
+
+dashSizeInput = input.string("Small", "Size"
+  , options = ["Tiny", "Small", "Normal"]
+  , group   = GROUP_DASH
+  , tooltip = "Text size of the dashboard.")
+
+showCrossMarkersInput = input.bool(false, "Crossover Markers"
+  , group   = GROUP_STYLE
+  , tooltip = "Shows circles where one RWI line overtakes the other while above the threshold. The alerts cover these crossovers even when the markers are hidden.")
+
+gradientInput = input.bool(true, "Gradient Fill"
+  , group   = GROUP_STYLE
+  , tooltip = "Fills the gap between the two lines with a gradient in the dominant line's color, strongest at the dominant line.")
+
+bullColorInput = input.color(BULL_COLOR, "RWI High", group = GROUP_STYLE)
+
+bearColorInput = input.color(BEAR_COLOR, "RWI Low", group = GROUP_STYLE)
+
+exhaustionColorInput = input.color(ACCENT_COLOR, "Exhaustion", group = GROUP_STYLE)
+
+levelsColorInput = input.color(NEUTRAL_COLOR, "Levels", group = GROUP_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Dashboard reading: the value of an RWI line plus the horizon (n) where its scan peaked
+formatReading(float value, int horizon) =>
+    na(value) ? "-" : str.tostring(value, "0.00") + " (n = " + str.tostring(horizon) + ")"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Effective scan bounds, tolerant of inverted inputs
+int effMinLength = math.min(minLengthInput, maxLengthInput)
+int effMaxLength = math.max(minLengthInput, maxLengthInput)
+
+// True range, the volatility yardstick averaged into ATR(n) inside the scan
+float trueRange = ta.tr(true)
+
+max_bars_back(trueRange, MAX_LOOKBACK)
+max_bars_back(high, MAX_LOOKBACK)
+max_bars_back(low, MAX_LOOKBACK)
+
+// Scan the lookback span. For each candidate n:
+//   RWI_high(n) = (H_t - L_(t-n)) / (ATR(n) * sqrt(n))
+//   RWI_low(n)  = (H_(t-n) - L_t) / (ATR(n) * sqrt(n))
+// where ATR(n) is the average true range over the last n bars and sqrt(n) is the
+// expected random walk scaling. The maximum of each line across the span is kept,
+// along with the horizon where it occurred
+float rwiHigh  = na
+float rwiLow   = na
+int   rwiHighN = na
+int   rwiLowN  = na
+
+float trSum  = 0.0
+bool  spanOk = true
+
+for n = 1 to effMaxLength
+    float trBack = trueRange[n - 1]
+    spanOk := spanOk and not na(trBack)
+    if spanOk
+        trSum += trBack
+        if n >= effMinLength
+            float pastHigh = high[n]
+            float pastLow  = low[n]
+            if not na(pastLow) and trSum > 0
+                float atrN    = trSum / n
+                float denom   = atrN * math.sqrt(n)
+                float highLeg = (high - pastLow) / denom
+                float lowLeg  = (pastHigh - low) / denom
+                if na(rwiHigh) or highLeg > rwiHigh
+                    rwiHigh  := highLeg
+                    rwiHighN := n
+                if na(rwiLow) or lowLeg > rwiLow
+                    rwiLow  := lowLeg
+                    rwiLowN := n
+
+// Regime grading against the random walk benchmark
+bool upTrending   = rwiHigh > thresholdInput and rwiHigh >= rwiLow
+bool downTrending = rwiLow > thresholdInput and rwiLow > rwiHigh
+
+// Threshold events: displacement leaves or rejoins random walk territory
+bool uptrendConfirmed   = ta.crossover(rwiHigh, thresholdInput)
+bool downtrendConfirmed = ta.crossover(rwiLow, thresholdInput)
+bool bothBelow          = rwiHigh < thresholdInput and rwiLow < thresholdInput
+bool randomWalkStart    = bothBelow and (rwiHigh[1] >= thresholdInput or rwiLow[1] >= thresholdInput)
+
+// Line crossovers, filtered so weak sub-threshold crossings are ignored
+bool bullCross = ta.crossover(rwiHigh, rwiLow) and rwiHigh > thresholdInput
+bool bearCross = ta.crossover(rwiLow, rwiHigh) and rwiLow > thresholdInput
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Exhaustion Checks
+//---------------------------------------------------------------------------------------------------------------------{
+
+int confirmWindow = pivotLengthInput * 2 + 1
+
+// Price extremes across the confirmation window centered on an RWI peak
+float windowHigh = ta.highest(high, confirmWindow)
+float windowLow  = ta.lowest(low, confirmWindow)
+
+// Confirmed peaks on each RWI line
+float rwiHighPeak = ta.pivothigh(rwiHigh, pivotLengthInput, pivotLengthInput)
+float rwiLowPeak  = ta.pivothigh(rwiLow, pivotLengthInput, pivotLengthInput)
+
+var float prevUpPeakRwi   = na
+var int   prevUpPeakBar   = na
+var float prevUpPeakPrice = na
+var float prevDnPeakRwi   = na
+var int   prevDnPeakBar   = na
+var float prevDnPeakPrice = na
+
+bool upExhaustion   = false
+bool downExhaustion = false
+
+if not na(rwiHighPeak)
+    int   peakBar   = bar_index - pivotLengthInput
+    float peakPrice = windowHigh
+
+    if not na(prevUpPeakRwi) and peakBar - prevUpPeakBar <= maxPeakDistanceInput
+        upExhaustion := peakPrice > prevUpPeakPrice and rwiHighPeak < prevUpPeakRwi and prevUpPeakRwi > thresholdInput
+
+    if upExhaustion and showExhaustionInput
+        line.new(prevUpPeakBar, prevUpPeakRwi, peakBar, rwiHighPeak, color = exhaustionColorInput, style = line.style_dashed)
+        label.new(peakBar, rwiHighPeak, "Exhaustion"
+          , style     = label.style_label_down
+          , color     = #00000000
+          , textcolor = exhaustionColorInput
+          , size      = size.tiny)
+
+    prevUpPeakRwi   := rwiHighPeak
+    prevUpPeakBar   := peakBar
+    prevUpPeakPrice := peakPrice
+
+if not na(rwiLowPeak)
+    int   peakBar   = bar_index - pivotLengthInput
+    float peakPrice = windowLow
+
+    if not na(prevDnPeakRwi) and peakBar - prevDnPeakBar <= maxPeakDistanceInput
+        downExhaustion := peakPrice < prevDnPeakPrice and rwiLowPeak < prevDnPeakRwi and prevDnPeakRwi > thresholdInput
+
+    if downExhaustion and showExhaustionInput
+        line.new(prevDnPeakBar, prevDnPeakRwi, peakBar, rwiLowPeak, color = exhaustionColorInput, style = line.style_dashed)
+        label.new(peakBar, rwiLowPeak, "Exhaustion"
+          , style     = label.style_label_up
+          , color     = #00000000
+          , textcolor = exhaustionColorInput
+          , size      = size.tiny)
+
+    prevDnPeakRwi   := rwiLowPeak
+    prevDnPeakBar   := peakBar
+    prevDnPeakPrice := peakPrice
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+
+color dominantColor = rwiHigh >= rwiLow ? bullColorInput : bearColorInput
+
+rwiHighPlotId = plot(rwiHigh, "RWI High", bullColorInput, 2)
+rwiLowPlotId  = plot(rwiLow, "RWI Low", bearColorInput, 2)
+
+fill(rwiHighPlotId, rwiLowPlotId
+  , top_value    = math.max(rwiHigh, rwiLow)
+  , bottom_value = math.min(rwiHigh, rwiLow)
+  , top_color    = gradientInput ? color.new(dominantColor, HALF_TRANSP) : color(na)
+  , bottom_color = gradientInput ? color.new(dominantColor, FULL_TRANSP) : color(na)
+  , title        = "Dominance Gradient")
+
+hline(thresholdInput, "Random Walk Threshold", levelsColorInput, hline.style_dashed)
+hline(0, "Zero Line", levelsColorInput, hline.style_dotted)
+
+plotshape(showCrossMarkersInput and bullCross ? rwiHigh : na, "Bullish Crossover", shape.circle, location.absolute, bullColorInput, size = size.tiny)
+plotshape(showCrossMarkersInput and bearCross ? rwiLow : na, "Bearish Crossover", shape.circle, location.absolute, bearColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+
+dashLocation = switch dashLocationInput
+    "Top Right"    => position.top_right
+    "Top Left"     => position.top_left
+    "Middle Right" => position.middle_right
+    "Middle Left"  => position.middle_left
+    "Bottom Right" => position.bottom_right
+    => position.bottom_left
+
+dashTextSize = switch dashSizeInput
+    "Tiny"  => size.tiny
+    "Small" => size.small
+    => size.normal
+
+string regimeText  = na(rwiHigh) ? "-" : upTrending ? "Trending Up" : downTrending ? "Trending Down" : "Random Walk"
+color  regimeColor = upTrending ? bullColorInput : downTrending ? bearColorInput : NEUTRAL_COLOR
+
+if barstate.islast and showDashboardInput
+    var table dashTable = table.new(dashLocation, 2, 4, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+    table.cell(dashTable, 0, 0, "Random Walk Index", text_color = DASH_TEXT, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 0, "n = " + str.tostring(effMinLength) + "-" + str.tostring(effMaxLength), text_color = DASH_HEADER, text_halign = text.align_right, text_size = dashTextSize)
+
+    table.cell(dashTable, 0, 1, "RWI High", text_color = bullColorInput, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 1, formatReading(rwiHigh, rwiHighN), text_color = DASH_TEXT, text_halign = text.align_right, text_size = dashTextSize)
+
+    table.cell(dashTable, 0, 2, "RWI Low", text_color = bearColorInput, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 2, formatReading(rwiLow, rwiLowN), text_color = DASH_TEXT, text_halign = text.align_right, text_size = dashTextSize)
+
+    table.cell(dashTable, 0, 3, "Regime", text_color = DASH_HEADER, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 3, regimeText, text_color = regimeColor, text_halign = text.align_right, text_size = dashTextSize)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(uptrendConfirmed, "Uptrend Confirmed", "Random Walk Index: RWI High crossed above the random walk threshold on {{ticker}} ({{interval}})")
+alertcondition(downtrendConfirmed, "Downtrend Confirmed", "Random Walk Index: RWI Low crossed above the random walk threshold on {{ticker}} ({{interval}})")
+alertcondition(randomWalkStart, "Random Walk Regime", "Random Walk Index: both lines fell below the random walk threshold on {{ticker}} ({{interval}})")
+alertcondition(bullCross, "Bullish Crossover", "Random Walk Index: RWI High crossed above RWI Low beyond the threshold on {{ticker}} ({{interval}})")
+alertcondition(bearCross, "Bearish Crossover", "Random Walk Index: RWI Low crossed above RWI High beyond the threshold on {{ticker}} ({{interval}})")
+alertcondition(upExhaustion, "Uptrend Exhaustion", "Random Walk Index: new price high with a declining RWI High peak on {{ticker}} ({{interval}})")
+alertcondition(downExhaustion, "Downtrend Exhaustion", "Random Walk Index: new price low with a declining RWI Low peak on {{ticker}} ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

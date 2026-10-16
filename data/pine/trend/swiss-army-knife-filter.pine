@@ -1,0 +1,244 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Swiss Army Knife Filter", "Swiss Army Knife Filter", overlay = false)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+// Rows of the coefficient table: one generalized second-order recursion, many filter types
+const string TYPE_EMA    = "EMA"
+const string TYPE_GAUSS  = "Gaussian"
+const string TYPE_BUTTER = "Butterworth"
+const string TYPE_HP     = "High Pass"
+const string TYPE_HP2    = "2 Pole High Pass"
+const string TYPE_BP     = "Band Pass"
+const string TYPE_BS     = "Band Stop"
+
+// Pole placement constant of the two-pole Gaussian row, 1 / (2^(1/2) - 1)
+const float GAUSS_K = 2.415
+
+// Butterworth pole constant, sqrt(2), as published for the two-pole design
+const float BUTTER_K = 1.414
+
+const color BULL_COLOR    = #089981
+const color BEAR_COLOR    = #f23645
+const color NEUTRAL_COLOR = #787b86
+const color COMP_COLOR    = #ff9800
+
+const color DASH_BG     = #161616
+const color DASH_FRAME  = #2E2E2E
+const color DASH_HEADER = #808080
+const color DASH_TEXT   = #DBDBDB
+
+const string GRP_FILTER = "Filter"
+const string GRP_COMP   = "Comparison Filter"
+const string GRP_TABLE  = "Coefficient Table"
+const string GRP_STYLE  = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+srcInput = input.source(close, "Source", group = GRP_FILTER, tooltip = "Input series fed to the generalized second-order recursion. Close is the usual choice.")
+
+typeInput = input.string(TYPE_GAUSS, "Filter Type", options = [TYPE_EMA, TYPE_GAUSS, TYPE_BUTTER, TYPE_HP, TYPE_HP2, TYPE_BP, TYPE_BS], group = GRP_FILTER, tooltip = "Coefficient set plugged into the single recursion. EMA, Gaussian, Butterworth and Band Stop follow price and draw on the main chart. High Pass, 2 Pole High Pass and Band Pass are centered oscillators drawn in this pane: the high-pass rows detrend the source, the band-pass row isolates one cycle wavelength while the band-stop row removes it.")
+
+periodInput = input.int(20, "Period", minval = 3, group = GRP_FILTER, tooltip = "Period P, in bars, from which the coefficient set is computed: the cutoff period of the low-pass and high-pass rows, and the center wavelength of the band-pass and band-stop rows.")
+
+deltaInput = input.float(0.1, "Bandwidth", minval = 0.05, maxval = 0.3, step = 0.05, group = GRP_FILTER, tooltip = "Half-bandwidth delta of the band-pass and band-stop rows, as a fraction of the center period. Narrow bands are more selective but ring longer and need more warm-up bars. Ignored by the other filter types.")
+
+compareInput = input.bool(false, "Enable Comparison Filter", group = GRP_COMP, tooltip = "Runs a second instance of the exact same recursion on the same source with its own coefficient set. Because nothing changes except the coefficients, output differences reflect the filter responses and not implementation quirks.")
+
+compTypeInput = input.string(TYPE_BP, "Type", options = [TYPE_EMA, TYPE_GAUSS, TYPE_BUTTER, TYPE_HP, TYPE_HP2, TYPE_BP, TYPE_BS], group = GRP_COMP, tooltip = "Coefficient set of the comparison filter.")
+
+compPeriodInput = input.int(20, "Period", minval = 3, group = GRP_COMP, tooltip = "Period of the comparison filter. The bandwidth setting is shared with the primary filter.")
+
+showTableInput = input.bool(true, "Show Coefficient Table", group = GRP_TABLE, tooltip = "Displays the five effective coefficients (b0, b1, b2, a1, a2) of each active configuration - the complete definition of the running filter, since every type is the same equation wearing different settings.")
+
+tableLocationInput = input.string("Top Right", "Location", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = GRP_TABLE, tooltip = "Coefficient table position on the chart.")
+
+tableSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = GRP_TABLE, tooltip = "Coefficient table text size.")
+
+lineWidthInput = input.int(2, "Line Width", minval = 1, maxval = 5, group = GRP_STYLE, tooltip = "Width of the primary filter line.")
+
+showMarkersInput = input.bool(false, "Crossing Markers", group = GRP_STYLE, tooltip = "Shows small triangles when the source crosses a price-domain filter, or when an oscillator configuration crosses zero. Off by default; the matching alerts are always available.")
+
+priceColorInput = input.color(NEUTRAL_COLOR, "Price Domain", inline = "colors", group = GRP_STYLE)
+bullColorInput  = input.color(BULL_COLOR, "Osc Up", inline = "colors", group = GRP_STYLE)
+bearColorInput  = input.color(BEAR_COLOR, "Down", inline = "colors", group = GRP_STYLE)
+compColorInput  = input.color(COMP_COLOR, "Comparison", group = GRP_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Ehlers' cutoff-matched one-pole alpha, alpha = (cos(w) + sin(w) - 1) / cos(w) with w = 2 * pi / period,
+// evaluated through the algebraically identical form 1 - tan(pi/4 - w/2), which stays finite at
+// period = 4 where cos(w) crosses zero
+onePoleAlpha(int period) =>
+    1.0 - math.tan(math.pi / 4.0 - math.pi / period)
+
+// Two-pole Gaussian pole parameter: beta = 2.415 * (1 - cos(w)), alpha = -beta + sqrt(beta^2 + 2 * beta)
+twoPoleAlpha(int period) =>
+    float beta = GAUSS_K * (1.0 - math.cos(2.0 * math.pi / period))
+    -beta + math.sqrt(beta * beta + 2.0 * beta)
+
+// Parameters shared by the band-pass and band-stop rows: beta places the center wavelength at the period,
+// alpha narrows as the half-bandwidth delta (fraction of the center period) shrinks
+bandParameters(int period, float delta) =>
+    float w     = 2.0 * math.pi / period
+    float beta  = math.cos(w)
+    float gamma = 1.0 / math.cos(2.0 * delta * w)
+    float alpha = gamma - math.sqrt(gamma * gamma - 1.0)
+    [alpha, beta]
+
+// The coefficient table: maps a filter type and period to the five effective coefficients of the page's
+// recursion y = b0*x + b1*x[1] + b2*x[2] + a1*y[1] + a2*y[2] (normalization folded into b0, b1, b2)
+getCoefficients(string filterType, int period, float delta) =>
+    [bandAlpha, bandBeta] = bandParameters(period, delta)
+    switch filterType
+        TYPE_EMA =>
+            float emaAlpha = onePoleAlpha(period)
+            [emaAlpha, 0.0, 0.0, 1.0 - emaAlpha, 0.0]
+        TYPE_GAUSS =>
+            float gaussAlpha = twoPoleAlpha(period)
+            [gaussAlpha * gaussAlpha, 0.0, 0.0, 2.0 * (1.0 - gaussAlpha), -(1.0 - gaussAlpha) * (1.0 - gaussAlpha)]
+        TYPE_BUTTER =>
+            // Published two-pole Butterworth: a = exp(-1.414*pi/P), b = 2*a*cos(1.414*pi/P),
+            // matching the named filter so both packagings produce the same line
+            float butterA  = math.exp(-BUTTER_K * math.pi / period)
+            float butterB  = 2.0 * butterA * math.cos(BUTTER_K * math.pi / period)
+            float butterC0 = (1.0 - butterB + butterA * butterA) / 4.0
+            [butterC0, 2.0 * butterC0, butterC0, butterB, -butterA * butterA]
+        TYPE_HP =>
+            float hpAlpha = onePoleAlpha(period)
+            float hpC0    = 1.0 - hpAlpha / 2.0
+            [hpC0, -hpC0, 0.0, 1.0 - hpAlpha, 0.0]
+        TYPE_HP2 =>
+            float hp2Alpha = onePoleAlpha(period)
+            float hp2C0    = (1.0 - hp2Alpha / 2.0) * (1.0 - hp2Alpha / 2.0)
+            [hp2C0, -2.0 * hp2C0, hp2C0, 2.0 * (1.0 - hp2Alpha), -(1.0 - hp2Alpha) * (1.0 - hp2Alpha)]
+        TYPE_BP =>
+            float bpC0 = (1.0 - bandAlpha) / 2.0
+            [bpC0, 0.0, -bpC0, bandBeta * (1.0 + bandAlpha), -bandAlpha]
+        => // Band Stop
+            float bsC0 = (1.0 + bandAlpha) / 2.0
+            [bsC0, -2.0 * bandBeta * bsC0, bsC0, bandBeta * (1.0 + bandAlpha), -bandAlpha]
+
+// The one biquad routine every configuration runs through, seeded by setting the first outputs
+// equal to the input as published; sharper band settings need more warm-up bars afterwards
+runFilter(float sourceIn, float b0, float b1, float b2, float a1, float a2) =>
+    float x1 = nz(sourceIn[1], sourceIn)
+    float x2 = nz(sourceIn[2], sourceIn)
+    float result = na
+    float y1 = nz(result[1], sourceIn)
+    float y2 = nz(result[2], sourceIn)
+    result := bar_index < 2 ? sourceIn : b0 * sourceIn + b1 * x1 + b2 * x2 + a1 * y1 + a2 * y2
+    result
+
+// Price-domain rows track price and draw on the main chart; the remaining rows are centered oscillators
+isPriceDomain(string filterType) =>
+    filterType == TYPE_EMA or filterType == TYPE_GAUSS or filterType == TYPE_BUTTER or filterType == TYPE_BS
+
+// Maps the table location option to a table position constant
+tablePosition(string positionText) =>
+    switch positionText
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        => position.bottom_left
+
+// Maps the table size option to a text size constant
+tableSize(string sizeText) =>
+    switch sizeText
+        "Tiny"  => size.tiny
+        "Small" => size.small
+        => size.normal
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+[b0Main, b1Main, b2Main, a1Main, a2Main] = getCoefficients(typeInput, periodInput, deltaInput)
+[b0Comp, b1Comp, b2Comp, a1Comp, a2Comp] = getCoefficients(compTypeInput, compPeriodInput, deltaInput)
+
+// Both instances run through the same routine on every bar; only the coefficients differ
+float filterMain = runFilter(srcInput, b0Main, b1Main, b2Main, a1Main, a2Main)
+float filterComp = runFilter(srcInput, b0Comp, b1Comp, b2Comp, a1Comp, a2Comp)
+
+bool onChartMain = isPriceDomain(typeInput)
+bool onChartComp = isPriceDomain(compTypeInput)
+bool anyOscActive = not onChartMain or compareInput and not onChartComp
+
+// Crossing events of the primary filter, computed on every bar
+bool srcCrossUp   = ta.crossover(srcInput, filterMain)
+bool srcCrossDown = ta.crossunder(srcInput, filterMain)
+bool zeroCrossUp   = ta.crossover(filterMain, 0)
+bool zeroCrossDown = ta.crossunder(filterMain, 0)
+
+bool eventUp   = onChartMain ? srcCrossUp : zeroCrossUp
+bool eventDown = onChartMain ? srcCrossDown : zeroCrossDown
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+color oscColor = filterMain > 0 ? bullColorInput : bearColorInput
+
+// Price-domain line colored by its slope - rising bullish, falling bearish, flat in the price-domain color
+float filterSlope = filterMain - nz(filterMain[1], filterMain)
+color priceLineColor = filterSlope > 0 ? bullColorInput : filterSlope < 0 ? bearColorInput : priceColorInput
+
+// Price-domain configurations draw over price on the main chart
+plot(onChartMain ? filterMain : na, "Filter (price domain)", priceLineColor, lineWidthInput, plot.style_linebr, force_overlay = true)
+plot(compareInput and onChartComp ? filterComp : na, "Comparison (price domain)", compColorInput, 1, plot.style_linebr, force_overlay = true)
+
+// Oscillator configurations draw around zero in the pane
+color neutralZeroColor = NEUTRAL_COLOR
+oscPlotId  = plot(onChartMain ? na : filterMain, "Filter (oscillator)", oscColor, lineWidthInput, plot.style_linebr)
+zeroPlotId = plot(anyOscActive ? 0.0 : na, "Zero Line", neutralZeroColor, 1, plot.style_linebr)
+plot(compareInput and not onChartComp ? filterComp : na, "Comparison (oscillator)", compColorInput, 1, plot.style_linebr)
+
+fill(oscPlotId, zeroPlotId, math.max(filterMain, 0), math.min(filterMain, 0), filterMain > 0 ? color.new(bullColorInput, 50) : color.new(bearColorInput, 100), filterMain > 0 ? color.new(bullColorInput, 100) : color.new(bearColorInput, 50), title = "Oscillator Gradient")
+
+plotshape(showMarkersInput and eventUp, "Bullish Crossing", shape.triangleup, location.belowbar, bullColorInput, size = size.tiny, force_overlay = true)
+plotshape(showMarkersInput and eventDown, "Bearish Crossing", shape.triangledown, location.abovebar, bearColorInput, size = size.tiny, force_overlay = true)
+
+var table coefTable = table.new(tablePosition(tableLocationInput), 3, 8, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+if showTableInput and barstate.islast
+    string textSize   = tableSize(tableSizeInput)
+    color  labelColor = DASH_HEADER
+    table.cell(coefTable, 0, 0, "Swiss Army Knife", text_color = DASH_TEXT, text_size = textSize, text_halign = text.align_left)
+    table.cell(coefTable, 1, 0, "Filter", text_color = DASH_TEXT, text_size = textSize, text_halign = text.align_right)
+    table.cell(coefTable, 0, 1, "Type", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(coefTable, 1, 1, typeInput, text_color = DASH_TEXT, text_size = textSize, text_halign = text.align_right)
+    table.cell(coefTable, 0, 2, "Period", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(coefTable, 1, 2, str.tostring(periodInput), text_color = DASH_TEXT, text_size = textSize, text_halign = text.align_right)
+    table.cell(coefTable, 0, 3, "b0", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(coefTable, 1, 3, str.tostring(b0Main, "#.#####"), text_color = DASH_TEXT, text_size = textSize, text_halign = text.align_right)
+    table.cell(coefTable, 0, 4, "b1", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(coefTable, 1, 4, str.tostring(b1Main, "#.#####"), text_color = DASH_TEXT, text_size = textSize, text_halign = text.align_right)
+    table.cell(coefTable, 0, 5, "b2", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(coefTable, 1, 5, str.tostring(b2Main, "#.#####"), text_color = DASH_TEXT, text_size = textSize, text_halign = text.align_right)
+    table.cell(coefTable, 0, 6, "a1", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(coefTable, 1, 6, str.tostring(a1Main, "#.#####"), text_color = DASH_TEXT, text_size = textSize, text_halign = text.align_right)
+    table.cell(coefTable, 0, 7, "a2", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(coefTable, 1, 7, str.tostring(a2Main, "#.#####"), text_color = DASH_TEXT, text_size = textSize, text_halign = text.align_right)
+    if compareInput
+        table.cell(coefTable, 2, 0, "Comparison", text_color = compColorInput, text_size = textSize, text_halign = text.align_right)
+        table.cell(coefTable, 2, 1, compTypeInput, text_color = DASH_TEXT, text_size = textSize, text_halign = text.align_right)
+        table.cell(coefTable, 2, 2, str.tostring(compPeriodInput), text_color = DASH_TEXT, text_size = textSize, text_halign = text.align_right)
+        table.cell(coefTable, 2, 3, str.tostring(b0Comp, "#.#####"), text_color = DASH_TEXT, text_size = textSize, text_halign = text.align_right)
+        table.cell(coefTable, 2, 4, str.tostring(b1Comp, "#.#####"), text_color = DASH_TEXT, text_size = textSize, text_halign = text.align_right)
+        table.cell(coefTable, 2, 5, str.tostring(b2Comp, "#.#####"), text_color = DASH_TEXT, text_size = textSize, text_halign = text.align_right)
+        table.cell(coefTable, 2, 6, str.tostring(a1Comp, "#.#####"), text_color = DASH_TEXT, text_size = textSize, text_halign = text.align_right)
+        table.cell(coefTable, 2, 7, str.tostring(a2Comp, "#.#####"), text_color = DASH_TEXT, text_size = textSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(onChartMain and srcCrossUp, "Source Crossed Over Filter", "Source crossed over the Swiss Army Knife filter on {{ticker}} ({{interval}})")
+alertcondition(onChartMain and srcCrossDown, "Source Crossed Under Filter", "Source crossed under the Swiss Army Knife filter on {{ticker}} ({{interval}})")
+alertcondition(not onChartMain and zeroCrossUp, "Oscillator Crossed Over Zero", "Swiss Army Knife filter oscillator crossed over zero on {{ticker}} ({{interval}})")
+alertcondition(not onChartMain and zeroCrossDown, "Oscillator Crossed Under Zero", "Swiss Army Knife filter oscillator crossed under zero on {{ticker}} ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

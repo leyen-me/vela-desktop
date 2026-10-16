@@ -1,0 +1,425 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Predictive Monte Carlo Engine", "Predictive Monte Carlo Engine", overlay = true, max_polylines_count = 100, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types
+//---------------------------------------------------------------------------------------------------------------------{
+type LCG
+    int seed
+
+method next(LCG this) =>
+    this.seed := (1103515245 * this.seed + 12345) % 2147483647
+    if this.seed < 0
+        this.seed += 2147483647
+    float(this.seed) / 2147483647.0
+
+method nextInt(LCG this, int min, int max) =>
+    this.seed := (1103515245 * this.seed + 12345) % 2147483647
+    if this.seed < 0
+        this.seed += 2147483647
+    min + (this.seed % (max - min + 1))
+
+method nextGaussian(LCG this) =>
+    float u1 = this.next()
+    if u1 <= 0.00001
+        u1 := 0.00001
+    float u2 = this.next()
+    math.sqrt(-2.0 * math.log(u1)) * math.cos(2.0 * math.pi * u2)
+
+type Path
+    array<chart.point> pts
+    float endPrice
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Inputs
+//---------------------------------------------------------------------------------------------------------------------{
+string METHOD_GBM = "Geometric Brownian Motion"
+string METHOD_SRW = "Simple Random Walk"
+string METHOD_HS  = "Historical Shuffle"
+
+string REGIME_NONE = "None"
+string REGIME_TREND = "Trend (SMA)"
+string REGIME_MOMENTUM = "Momentum (RSI)"
+
+color DATA                    = #DBDBDB
+color HEADERS                 = #808080
+color BACKGROUND              = #161616
+color BORDERS                 = #2E2E2E
+
+string TOP_RIGHT               = 'Top Right'
+string BOTTOM_RIGHT            = 'Bottom Right'
+string BOTTOM_LEFT             = 'Bottom Left'
+
+string TINY                    = 'Tiny'
+string SMALL                   = 'Small'
+string NORMAL                  = 'Normal'
+string LARGE                   = 'Large'
+string HUGE                    = 'Huge'
+
+string DASHBOARD_GROUP         = 'Dashboard'
+string DASH2_GROUP             = 'Next Candle Prediction'
+
+string dashboardTooltip        = 'Enable or disable the dashboard.'
+string dashboardPositionTooltip= 'Select the dashboard location.'
+string dashboardSizeTooltip    = 'Select the dashboard size.'
+
+string methodInput = input.string(METHOD_GBM, "Simulation Method", options = [METHOD_GBM, METHOD_SRW, METHOD_HS], group = "Monte Carlo Settings", tooltip = "Select the mathematical method used to project the future price paths.")
+string regimeInput = input.string(REGIME_NONE, "Regime Filter", options = [REGIME_NONE, REGIME_TREND, REGIME_MOMENTUM], group = "Monte Carlo Settings", tooltip = "Only sample past returns and volatilities that match the current market regime. Works for all methods.")
+
+int lookbackInput  = input.int(100, "Historical Lookback", minval = 10, maxval = 1000, group = "Monte Carlo Settings", tooltip = "Number of historical bars used to calculate drift and volatility.")
+int projInput      = input.int(50, "Projection Length", minval = 5, maxval = 200, group = "Monte Carlo Settings", tooltip = "Number of bars to project into the future.")
+int simInput       = input.int(200, "Simulation Count", minval = 2, maxval = 200, group = "Monte Carlo Settings", tooltip = "Number of paths to simulate. Max 200.")
+float volMulti     = input.float(1.0, "Volatility Multiplier", minval = 0.1, maxval = 5.0, step = 0.1, group = "Monte Carlo Settings", tooltip = "Multiply the historical volatility to stress-test projections. Higher values make GBM and SRW deviate more.")
+int seedInput      = input.int(12345, "Random Seed", group = "Monte Carlo Settings", tooltip = "Change this value to generate an entirely new set of random paths.")
+
+bool anchorInput   = input.bool(true, "Enable Anchor Mode", group = "Monte Carlo Settings", tooltip = "Locks the projection and only updates every X bars, leaving historical S/R zones on the chart to see how price reacted.")
+int anchorStep     = input.int(100, "Anchor Update Step (Bars)", minval = 10, group = "Monte Carlo Settings", tooltip = "How often to cast a new historical projection when Anchor Mode is enabled.")
+bool anchorPaths   = input.bool(false, "Draw Paths in Anchor Mode", group = "Monte Carlo Settings", tooltip = "TradingView only allows 100 polylines per chart. Enabling this in Anchor Mode will cause older envelopes to disappear.")
+
+float topPercentile= input.float(90.0, "Top Path Percentile", minval = 50.0, maxval = 100.0, group = "Style", tooltip = "Paths ending above this percentile are colored with the Top Color.")
+float botPercentile= input.float(10.0, "Bottom Path Percentile", minval = 0.0, maxval = 50.0, group = "Style", tooltip = "Paths ending below this percentile are colored with the Bottom Color.")
+
+color topColor     = input.color(#089981, "Top Color", group = "Style", inline = "colors")
+color midColor     = input.color(color.gray, "Middle Color", group = "Style", inline = "colors")
+color bottomColor  = input.color(#f23645, "Bottom Color", group = "Style", inline = "colors")
+int transpInput    = input.int(60, "Path Transparency", minval = 0, maxval = 100, group = "Style")
+color avgColor     = input.color(color.new(color.white, 0), "Average Line Color", group = "Style")
+color envColor     = input.color(color.new(color.gray, 90), "Envelope Fill Color", group = "Style")
+bool srInput       = input.bool(true, "Show S/R Levels", group = "Style", tooltip = "Display horizontal support and resistance lines based on the projection limits.")
+
+bool dashboardInput            = input.bool(true, 'Show Dashboard', group = DASHBOARD_GROUP, tooltip = dashboardTooltip)
+string dashboardPositionInput  = input.string(TOP_RIGHT, 'Position', group = DASHBOARD_GROUP, tooltip = dashboardPositionTooltip , options = [TOP_RIGHT,BOTTOM_RIGHT,BOTTOM_LEFT])
+string dashboardSizeInput      = input.string(NORMAL, 'Size', group = DASHBOARD_GROUP, tooltip = dashboardSizeTooltip, options = [TINY,SMALL,NORMAL,LARGE,HUGE])
+
+bool dash2Input                = input.bool(true, 'Show Next Candle Prediction', group = DASHBOARD_GROUP)
+color bullColor                = input.color(#089981, "Bullish Color", group = DASHBOARD_GROUP, inline = "c1")
+color bearColor                = input.color(#f23645, "Bearish Color", group = DASHBOARD_GROUP, inline = "c1")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Helper Functions
+//---------------------------------------------------------------------------------------------------------------------{
+var string parsedDashboardPosition = switch dashboardPositionInput
+    TOP_RIGHT       => position.top_right
+    BOTTOM_RIGHT    => position.bottom_right
+    BOTTOM_LEFT     => position.bottom_left
+
+var string parsedDashboardSize     = switch dashboardSizeInput
+    TINY            => size.tiny
+    SMALL           => size.small
+    NORMAL          => size.normal
+    LARGE           => size.large
+    HUGE            => size.huge
+
+cell(table t_able, int column, int row, string data, color text_col = #FFFFFF, string align = text.align_right, color background = na, float height = 0) => 
+    t_able.cell(column, row, data, text_color = text_col, text_size = parsedDashboardSize, text_halign = align, bgcolor = background, height = height)
+
+divider(table t_able, int row, int lastColumn) =>    
+    string rowDivider = '━━━━━━━━━━━━━━'
+    t_able.merge_cells(0, row, lastColumn, row)
+    cell(t_able, 0, row, rowDivider, text_col = BORDERS, align = text.align_center, height = 0.5)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+var array<float> logReturns = array.new<float>()
+var array<float> simReturns = array.new<float>()
+var array<int>   regimes    = array.new<int>()
+var array<polyline> polylines = array.new<polyline>()
+var array<line> srLines = array.new<line>()
+var array<label> srLabels = array.new<label>()
+var array<box> srBoxes = array.new<box>()
+
+float lr = math.log(close / nz(close[1], close))
+float sr = close - nz(close[1], close)
+
+float sma50 = ta.sma(close, 50)
+float rsi14 = ta.rsi(close, 14)
+
+int currentRegime = 0
+if regimeInput == REGIME_TREND
+    currentRegime := close > nz(sma50, close) ? 1 : -1
+else if regimeInput == REGIME_MOMENTUM
+    currentRegime := nz(rsi14, 50) > 50 ? 1 : -1
+
+if barstate.isnew
+    logReturns.push(lr)
+    simReturns.push(sr)
+    regimes.push(currentRegime)
+    if logReturns.size() > lookbackInput
+        logReturns.shift()
+        simReturns.shift()
+        regimes.shift()
+else if logReturns.size() > 0
+    logReturns.set(logReturns.size() - 1, lr)
+    simReturns.set(simReturns.size() - 1, sr)
+    regimes.set(regimes.size() - 1, currentRegime)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visualization
+//---------------------------------------------------------------------------------------------------------------------{
+bool isTrigger = barstate.islast
+if anchorInput
+    isTrigger := (bar_index % anchorStep == 0)
+
+if isTrigger
+    if not anchorInput
+        for pl in polylines
+            pl.delete()
+        polylines.clear()
+        for l in srLines
+            l.delete()
+        srLines.clear()
+        for lbl in srLabels
+            lbl.delete()
+        srLabels.clear()
+        for b in srBoxes
+            b.delete()
+        srBoxes.clear()
+    
+    if logReturns.size() >= 2
+        // Filter valid indices for Regime
+        array<int> validIndices = array.new<int>()
+        array<float> validLogReturns = array.new<float>()
+        array<float> validSimReturns = array.new<float>()
+        
+        for k = 0 to simReturns.size() - 1
+            if regimeInput == REGIME_NONE or regimes.get(k) == currentRegime
+                validIndices.push(k)
+                validLogReturns.push(logReturns.get(k))
+                validSimReturns.push(simReturns.get(k))
+                
+        if validIndices.size() == 0 // Fallback if no matching regime found
+            for k = 0 to simReturns.size() - 1
+                validIndices.push(k)
+                validLogReturns.push(logReturns.get(k))
+                validSimReturns.push(simReturns.get(k))
+                
+        float muLog = validLogReturns.avg()
+        float sigmaLog = nz(validLogReturns.stdev() * volMulti)
+        
+        float muSimp = validSimReturns.avg()
+        float sigmaSimp = nz(validSimReturns.stdev() * volMulti)
+        
+        int seedSalt = 0
+        if methodInput == METHOD_GBM
+            seedSalt := 1000
+        else if methodInput == METHOD_SRW
+            seedSalt := 2000
+            
+        LCG rng = LCG.new(int(time) + seedInput + seedSalt)
+        array<Path> paths = array.new<Path>()
+        
+        array<float> avgPathPoints = array.new<float>(projInput + 1, 0.0)
+        
+        for i = 0 to simInput - 1
+            array<chart.point> pts = array.new<chart.point>()
+            pts.push(chart.point.now(close))
+            avgPathPoints.set(0, avgPathPoints.get(0) + close)
+            
+            float currentPrice = close
+            
+            for j = 1 to projInput
+                float stepReturn = 0.0
+                
+                if methodInput == METHOD_HS
+                    int idx = rng.nextInt(0, validIndices.size() - 1)
+                    stepReturn := simReturns.get(validIndices.get(idx))
+                    currentPrice += stepReturn
+                    
+                else if methodInput == METHOD_SRW
+                    float z = rng.nextGaussian()
+                    stepReturn := muSimp + sigmaSimp * z
+                    currentPrice += stepReturn
+                    
+                else if methodInput == METHOD_GBM
+                    float z = rng.nextGaussian()
+                    stepReturn := math.exp((muLog - math.pow(sigmaLog, 2) / 2.0) + sigmaLog * z)
+                    currentPrice *= stepReturn
+                
+                pts.push(chart.point.from_index(bar_index + j, currentPrice))
+                avgPathPoints.set(j, avgPathPoints.get(j) + currentPrice)
+                
+            paths.push(Path.new(pts, currentPrice))
+            
+        // Get Percentiles for Path Coloring
+        array<float> endPrices = array.new<float>()
+        for p in paths
+            endPrices.push(p.endPrice)
+            
+        endPrices.sort()
+        float pTopRaw = endPrices.percentile_nearest_rank(topPercentile)
+        float pBotRaw = endPrices.percentile_nearest_rank(botPercentile)
+        
+        float pMean = endPrices.avg()
+        float pMedian = endPrices.percentile_nearest_rank(50.0)
+        float pMaxRaw = endPrices.max()
+        float pMinRaw = endPrices.min()
+        
+        float pTop = math.max(pTopRaw, close)
+        float pBot = math.min(pBotRaw, close)
+        float pMax = math.max(pMaxRaw, pTop + syminfo.mintick)
+        float pMin = math.min(pMinRaw, pBot - syminfo.mintick)
+        
+        if srInput
+            int endIdx = bar_index + projInput
+            
+            float zHeight = (pMax - pMin) * 0.015
+            int hSteps = math.min(50, projInput)
+            float stepSize = float(projInput) / hSteps
+            
+            for i = 0 to hSteps - 1
+                int leftBar = bar_index + math.round(i * stepSize)
+                int rightBar = bar_index + math.round((i + 1) * stepSize)
+                int transp = 30 + int(70 * (float(i) / (hSteps - 1)))
+                
+                srBoxes.push(box.new(leftBar, pMax + zHeight, rightBar, pMax - zHeight, border_color = na, bgcolor = color.new(topColor, transp)))
+                srBoxes.push(box.new(leftBar, pTop + zHeight, rightBar, pTop - zHeight, border_color = na, bgcolor = color.new(topColor, transp)))
+                srBoxes.push(box.new(leftBar, pBot + zHeight, rightBar, pBot - zHeight, border_color = na, bgcolor = color.new(bottomColor, transp)))
+                srBoxes.push(box.new(leftBar, pMin + zHeight, rightBar, pMin - zHeight, border_color = na, bgcolor = color.new(bottomColor, transp)))
+            
+            srLabels.push(label.new(endIdx, pMax, "Max", color = #00000000, textcolor = topColor, style = label.style_label_left, size = size.small))
+            srLabels.push(label.new(endIdx, pTop, "R1", color = #00000000, textcolor = topColor, style = label.style_label_left, size = size.small))
+            srLabels.push(label.new(endIdx, pBot, "S1", color = #00000000, textcolor = bottomColor, style = label.style_label_left, size = size.small))
+            srLabels.push(label.new(endIdx, pMin, "Min", color = #00000000, textcolor = bottomColor, style = label.style_label_left, size = size.small))
+                
+        // Draw the simulation polylines
+        for p in paths
+            color pathColor = midColor
+            if p.endPrice >= pTop
+                pathColor := topColor
+            else if p.endPrice <= pBot
+                pathColor := bottomColor
+                
+            polylines.push(polyline.new(p.pts, line_color = color.new(pathColor, transpInput), line_width = 1))
+            
+        // Calculate Envelope Coordinates
+        array<chart.point> maxPts = array.new<chart.point>()
+        array<chart.point> minPts = array.new<chart.point>()
+        
+        for j = 0 to projInput
+            float maxAtJ = na
+            float minAtJ = na
+            for i = 0 to simInput - 1
+                float val = paths.get(i).pts.get(j).price
+                if na(maxAtJ) or val > maxAtJ
+                    maxAtJ := val
+                if na(minAtJ) or val < minAtJ
+                    minAtJ := val
+            
+            maxPts.push(chart.point.from_index(bar_index + j, maxAtJ))
+            minPts.unshift(chart.point.from_index(bar_index + j, minAtJ))
+            
+        array<chart.point> envPts = array.copy(maxPts)
+        for pt in minPts
+            envPts.push(pt)
+        envPts.push(maxPts.get(0))
+        
+        // Draw the envelope and average
+        polylines.push(polyline.new(envPts, line_color = na, fill_color = envColor))
+        
+        array<chart.point> avgPts = array.new<chart.point>()
+        for j = 0 to projInput
+            avgPts.push(chart.point.from_index(bar_index + j, avgPathPoints.get(j) / simInput))
+            
+        polylines.push(polyline.new(avgPts, line_color = avgColor, line_width = 2))
+
+        // Combine Dashboard
+        if dashboardInput
+            var table t_able = table.new(parsedDashboardPosition, dash2Input ? 5 : 2, 9, bgcolor = BACKGROUND, border_width = 0, frame_color = BORDERS, frame_width = 1, force_overlay = false)
+            
+            t_able.merge_cells(0, 0, 1, 0)
+            cell(t_able, 0, 0, 'Monte Carlo Metrics', text_col = DATA, align = text.align_center)
+            
+            divider(t_able, 1, dash2Input ? 4 : 1)
+            
+            cell(t_able, 0, 2, 'Mean Expected', text_col = HEADERS, align = text.align_left)
+            cell(t_able, 1, 2, str.tostring(pMean, format.mintick), text_col = DATA)
+            
+            divider(t_able, 3, dash2Input ? 4 : 1)
+            
+            cell(t_able, 0, 4, 'Median Expected', text_col = HEADERS, align = text.align_left)
+            cell(t_able, 1, 4, str.tostring(pMedian, format.mintick), text_col = DATA)
+            
+            divider(t_able, 5, dash2Input ? 4 : 1)
+            
+            cell(t_able, 0, 6, 'Max Projection', text_col = HEADERS, align = text.align_left)
+            cell(t_able, 1, 6, str.tostring(pMax, format.mintick), text_col = DATA)
+            
+            divider(t_able, 7, dash2Input ? 4 : 1)
+            
+            cell(t_able, 0, 8, 'Min Projection', text_col = HEADERS, align = text.align_left)
+            cell(t_able, 1, 8, str.tostring(pMin, format.mintick), text_col = DATA)
+            
+            // Render the candle next to the metrics if dashed input is on
+            if dash2Input
+                if endPrices.size() > 0
+                    float pred_open = close
+                    float pred_close = pMean
+                    float p90 = endPrices.percentile_nearest_rank(90.0)
+                    float p10 = endPrices.percentile_nearest_rank(10.0)
+                    
+                    float pred_high = math.max(p90, math.max(pred_open, pred_close))
+                    float pred_low = math.min(p10, math.min(pred_open, pred_close))
+                    
+                    color pred_color = pred_close >= pred_open ? bullColor : bearColor
+                    
+                    t_able.merge_cells(2, 0, 4, 0)
+                    cell(t_able, 2, 0, 'Forecasted Candle', text_col = DATA, align = text.align_center)
+                    
+                    cell(t_able, 2, 2, 'Direction', text_col = HEADERS, align = text.align_left)
+                    cell(t_able, 3, 2, pred_close >= pred_open ? "Bullish" : "Bearish", text_col = pred_color)
+                    
+                    cell(t_able, 2, 4, 'Expected High', text_col = HEADERS, align = text.align_left)
+                    cell(t_able, 3, 4, str.tostring(pred_high, format.mintick), text_col = DATA)
+                    
+                    cell(t_able, 2, 6, 'Expected Close', text_col = HEADERS, align = text.align_left)
+                    cell(t_able, 3, 6, str.tostring(pred_close, format.mintick), text_col = DATA)
+                    
+                    cell(t_able, 2, 8, 'Expected Low', text_col = HEADERS, align = text.align_left)
+                    cell(t_able, 3, 8, str.tostring(pred_low, format.mintick), text_col = DATA)
+                    
+                    t_able.merge_cells(4, 2, 4, 8)
+                    
+                    float pRange = math.max(pred_high - pred_low, syminfo.mintick)
+                    float bodyTop = math.max(pred_open, pred_close)
+                    float bodyBot = math.min(pred_open, pred_close)
+                    
+                    int totalLevels = 9
+                    int topWickLevels = math.max(0, math.round((pred_high - bodyTop) / pRange * totalLevels))
+                    int botWickLevels = math.max(0, math.round((bodyBot - pred_low) / pRange * totalLevels))
+                    int bodyLevels = math.max(1, math.round((bodyTop - bodyBot) / pRange * totalLevels))
+                    
+                    int currentTotal = topWickLevels + botWickLevels + bodyLevels
+                    if currentTotal > totalLevels
+                        int diff = currentTotal - totalLevels
+                        while diff > 0
+                            if topWickLevels >= botWickLevels and topWickLevels > 0
+                                topWickLevels -= 1
+                            else if botWickLevels > 0
+                                botWickLevels -= 1
+                            else
+                                bodyLevels -= 1
+                            diff -= 1
+                    else if currentTotal < totalLevels
+                        int diff = totalLevels - currentTotal
+                        bodyLevels += diff
+                    
+                    string visualCandle = ""
+                    if topWickLevels > 0
+                        for i = 1 to topWickLevels
+                            visualCandle += "│\n"
+                    if bodyLevels > 0
+                        for i = 1 to bodyLevels
+                            visualCandle += "██\n"
+                    if botWickLevels > 0
+                        for i = 1 to botWickLevels
+                            visualCandle += "│\n"
+                    
+                    visualCandle := str.substring(visualCandle, 0, math.max(0, str.length(visualCandle) - 1))
+                    
+                    cell(t_able, 4, 2, visualCandle, text_col = pred_color, align = text.align_center)
+
+//---------------------------------------------------------------------------------------------------------------------}

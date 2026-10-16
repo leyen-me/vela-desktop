@@ -1,0 +1,334 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("TPO Profile", shorttitle = "TPO Profile", overlay = true, format = format.price, max_boxes_count = 500, max_labels_count = 500, max_lines_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+TPO_LETTERS   = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+LETTER_COUNT  = 52
+COLOR_NONE    = #00000000
+VA_COLOR      = #5b9cf6
+OUTSIDE_COLOR = #787b86
+POC_COLOR     = #ff5d00
+IB_COLOR      = #ab47bc
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+anchorInput = input.timeframe("D", "Profile Anchor", group = "Profile",
+     tooltip = "Span each TPO profile covers. Every anchor period builds its own letter distribution — select a weekly or monthly anchor to merge sessions into a composite profile framing the larger bracket.")
+
+periodInput = input.timeframe("30", "TPO Period", group = "Profile",
+     tooltip = "Duration of one TPO period. Every price touched during a period prints that period's letter once; 30 minutes is the traditional setting. Must not be lower than the chart timeframe.")
+
+rowsInput = input.int(25, "Price Rows", minval = 10, maxval = 40, group = "Profile",
+     tooltip = "Number of price rows the profile range is divided into. Each row stacks the letters of every period that traded through it — the longest row is the TPO point of control.")
+
+valueAreaInput = input.float(70, "Value Area %", minval = 40, maxval = 95, step = 1, group = "Profile",
+     tooltip = "Percentage of all TPOs held by the value area, expanded outward from the point of control. 70% is customary.")
+
+showIbInput = input.bool(true, "Initial Balance", inline = "ib", group = "Profile",
+     tooltip = "Show the initial balance — the range set by the session's opening periods — as dashed lines across the session, the yardstick for range extension.")
+
+ibPeriodsInput = input.int(2, "", minval = 1, maxval = 8, inline = "ib", group = "Profile",
+     tooltip = "Number of opening TPO periods forming the initial balance, customarily the first two.")
+
+extendPriorInput = input.bool(true, "Extend Prior POC & Value Area", group = "Profile",
+     tooltip = "Carry the prior session's TPO POC and value area edges forward across the current session as reference levels where responsive or initiative behavior is expected.")
+
+profilesInput = input.int(5, "Profiles Shown", minval = 1, maxval = 10, group = "Profile",
+     tooltip = "Number of TPO profiles kept on the chart, including the developing session.")
+
+displayInput = input.string("Blocks + Letters", "Display", options = ["Blocks", "Letters", "Blocks + Letters"], group = "Style",
+     tooltip = "Render each profile as count-scaled blocks, as stacked TPO letters, or both.")
+
+letterSizeInput = input.string("Small", "Letters Size", options = ["Tiny", "Small", "Normal"], group = "Style",
+     tooltip = "Font size of the TPO letters.")
+
+widthInput = input.float(40, "Profile Width %", minval = 20, maxval = 100, step = 5, group = "Style",
+     tooltip = "Horizontal share of the session span occupied by the longest row (the POC) when blocks are displayed.")
+
+gradientInput = input.bool(true, "Count Gradient", group = "Style",
+     tooltip = "Shade each block by its TPO count so denser rows appear more opaque.")
+
+vaColorInput = input.color(VA_COLOR, "Value Area", inline = "col1", group = "Style",
+     tooltip = "Color of rows inside the value area and of the projected prior value area edges.")
+
+outsideColorInput = input.color(OUTSIDE_COLOR, "Outside", inline = "col1", group = "Style",
+     tooltip = "Color of rows outside the value area.")
+
+pocColorInput = input.color(POC_COLOR, "POC", inline = "col2", group = "Style",
+     tooltip = "Color of the point of control row and of the projected prior POC level.")
+
+ibColorInput = input.color(IB_COLOR, "Initial Balance", inline = "col2", group = "Style",
+     tooltip = "Color of the initial balance range lines.")
+
+letterSize = switch letterSizeInput
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    => size.small
+
+showBlocks  = displayInput != "Letters"
+showLetters = displayInput != "Blocks"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types & Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// All drawing objects belonging to one session profile, so old sessions can be pruned as a unit
+type SessionDrawing
+    array<box>   boxArray
+    array<label> labelArray
+    array<line>  lineArray
+
+newDrawing() =>
+    SessionDrawing.new(array.new<box>(), array.new<label>(), array.new<line>())
+
+letterOf(int periodIndex) =>
+    int letterIndex = periodIndex % LETTER_COUNT
+    str.substring(TPO_LETTERS, letterIndex, letterIndex + 1)
+
+clearDrawing(SessionDrawing sessionDrawing) =>
+    if not na(sessionDrawing)
+        for eachBox in sessionDrawing.boxArray
+            box.delete(eachBox)
+        for eachLabel in sessionDrawing.labelArray
+            label.delete(eachLabel)
+        for eachLine in sessionDrawing.lineArray
+            line.delete(eachLine)
+        array.clear(sessionDrawing.boxArray)
+        array.clear(sessionDrawing.labelArray)
+        array.clear(sessionDrawing.lineArray)
+
+// Builds one TPO distribution from the collected period ranges and draws it, returning the drawing and its POC / value area levels
+drawProfile(array<float> periodHighs, array<float> periodLows, int startIndex, int endIndex, float profileHigh, float profileLow) =>
+    SessionDrawing drawing = newDrawing()
+    float pocPrice = na
+    float vahPrice = na
+    float valPrice = na
+    int periods = array.size(periodHighs)
+    if periods > 0 and not na(profileHigh) and not na(profileLow)
+        // letter counts per price row — each period prints its letter once on every row its range touched
+        float rowHeight = math.max((profileHigh - profileLow) / rowsInput, syminfo.mintick / 2)
+        array<int> countsArray = array.new<int>(rowsInput, 0)
+        array<string> lettersArray = array.new<string>(rowsInput, "")
+        for periodIndex = 0 to periods - 1
+            float periodHigh = array.get(periodHighs, periodIndex)
+            float periodLow = array.get(periodLows, periodIndex)
+            int rowBottom = math.min(rowsInput - 1, math.max(0, math.floor((periodLow - profileLow) / rowHeight)))
+            int rowTop = math.min(rowsInput - 1, math.max(0, math.floor((periodHigh - profileLow) / rowHeight)))
+            string periodLetter = letterOf(periodIndex)
+            for rowIndex = rowBottom to rowTop
+                array.set(countsArray, rowIndex, array.get(countsArray, rowIndex) + 1)
+                array.set(lettersArray, rowIndex, array.get(lettersArray, rowIndex) + periodLetter)
+        // point of control — the longest TPO row, ties resolved toward the middle of the range
+        int pocRow = 0
+        int maxCount = -1
+        float bestDistance = 0.0
+        float midPrice = (profileHigh + profileLow) / 2
+        for rowIndex = 0 to rowsInput - 1
+            int rowCount = array.get(countsArray, rowIndex)
+            float rowDistance = math.abs(profileLow + (rowIndex + 0.5) * rowHeight - midPrice)
+            if rowCount > maxCount or (rowCount == maxCount and rowDistance < bestDistance)
+                maxCount := rowCount
+                pocRow := rowIndex
+                bestDistance := rowDistance
+        // value area — expand outward from the POC by two-row blocks until the target share of TPOs is contained
+        float targetTpo = array.sum(countsArray) * valueAreaInput / 100
+        int vaTopRow = pocRow
+        int vaBottomRow = pocRow
+        float vaTotal = maxCount
+        int upIndex = pocRow + 1
+        int downIndex = pocRow - 1
+        while vaTotal < targetTpo and (upIndex < rowsInput or downIndex >= 0)
+            float upTotal = 0
+            float downTotal = 0
+            if upIndex < rowsInput
+                upTotal += array.get(countsArray, upIndex)
+                if upIndex + 1 < rowsInput
+                    upTotal += array.get(countsArray, upIndex + 1)
+            if downIndex >= 0
+                downTotal += array.get(countsArray, downIndex)
+                if downIndex - 1 >= 0
+                    downTotal += array.get(countsArray, downIndex - 1)
+            if downIndex < 0 or (upIndex < rowsInput and upTotal >= downTotal)
+                vaTopRow := math.min(upIndex + 1, rowsInput - 1)
+                vaTotal += upTotal
+                upIndex := vaTopRow + 1
+            else
+                vaBottomRow := math.max(downIndex - 1, 0)
+                vaTotal += downTotal
+                downIndex := vaBottomRow - 1
+        pocPrice := profileLow + (pocRow + 0.5) * rowHeight
+        vahPrice := profileLow + (vaTopRow + 1) * rowHeight
+        valPrice := profileLow + vaBottomRow * rowHeight
+        // render the rows from the session start, sized by their letter counts
+        int spanBars = math.max(endIndex - startIndex, 1)
+        int maxRowWidth = math.max(1, math.round(spanBars * widthInput / 100))
+        for rowIndex = 0 to rowsInput - 1
+            int rowCount = array.get(countsArray, rowIndex)
+            if rowCount > 0
+                color rowColor = rowIndex == pocRow ? pocColorInput : (rowIndex >= vaBottomRow and rowIndex <= vaTopRow ? vaColorInput : outsideColorInput)
+                float rowLow = profileLow + rowIndex * rowHeight
+                float rowHigh = rowLow + rowHeight
+                if showBlocks
+                    color fillColor = gradientInput ? color.from_gradient(rowCount, 0, maxCount, color.new(rowColor, 90), color.new(rowColor, 55)) : color.new(rowColor, 70)
+                    int rowWidth = math.max(1, math.round(maxRowWidth * rowCount / (maxCount * 1.0)))
+                    array.push(drawing.boxArray, box.new(startIndex, rowHigh, startIndex + rowWidth, rowLow, border_color = color(na), bgcolor = fillColor))
+                if showLetters
+                    array.push(drawing.labelArray, label.new(startIndex, (rowHigh + rowLow) / 2, array.get(lettersArray, rowIndex), style = label.style_label_left,
+                      color = COLOR_NONE, textcolor = color.new(rowColor, 0), size = letterSize, text_font_family = font.family_monospace))
+        // initial balance — the combined range of the session's opening periods, extended across the session
+        if showIbInput and periods >= ibPeriodsInput
+            float ibHighLevel = array.get(periodHighs, 0)
+            float ibLowLevel = array.get(periodLows, 0)
+            for periodIndex = 0 to math.min(ibPeriodsInput, periods) - 1
+                ibHighLevel := math.max(ibHighLevel, array.get(periodHighs, periodIndex))
+                ibLowLevel := math.min(ibLowLevel, array.get(periodLows, periodIndex))
+            array.push(drawing.lineArray, line.new(startIndex, ibHighLevel, endIndex, ibHighLevel, color = ibColorInput, style = line.style_dashed))
+            array.push(drawing.lineArray, line.new(startIndex, ibLowLevel, endIndex, ibLowLevel, color = ibColorInput, style = line.style_dashed))
+    [drawing, pocPrice, vahPrice, valPrice]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// TPO Data Collection
+//---------------------------------------------------------------------------------------------------------------------{
+if timeframe.in_seconds(timeframe.period) > timeframe.in_seconds(periodInput)
+    runtime.error("The TPO period must be greater than or equal to the chart timeframe — lower the chart timeframe or raise the TPO period.")
+if timeframe.in_seconds(periodInput) >= timeframe.in_seconds(anchorInput)
+    runtime.error("The profile anchor must be greater than the TPO period — raise the anchor or lower the TPO period.")
+
+var array<float> periodHighArray = array.new<float>()
+var array<float> periodLowArray  = array.new<float>()
+var array<SessionDrawing> completedArray = array.new<SessionDrawing>()
+var SessionDrawing developingDrawing = newDrawing()
+
+var int   sessionStartIndex = 0
+var float sessionHigh = na
+var float sessionLow  = na
+
+var float priorPoc = na
+var float priorVah = na
+var float priorVal = na
+var line  priorPocLine = na
+var line  priorVahLine = na
+var line  priorValLine = na
+
+var bool extensionUpFired   = false
+var bool extensionDownFired = false
+
+bool anchorChange = timeframe.change(anchorInput) or barstate.isfirst
+bool periodChange = timeframe.change(periodInput)
+
+// A completed session is frozen into its final profile, and its POC / value area become the next session's references
+if anchorChange
+    if array.size(periodHighArray) > 0
+        clearDrawing(developingDrawing)
+        [finalDrawing, finalPoc, finalVah, finalVal] = drawProfile(periodHighArray, periodLowArray, sessionStartIndex, bar_index - 1, sessionHigh, sessionLow)
+        if not na(priorPocLine)
+            line.set_x2(priorPocLine, bar_index - 1)
+            array.push(finalDrawing.lineArray, priorPocLine)
+        if not na(priorVahLine)
+            line.set_x2(priorVahLine, bar_index - 1)
+            array.push(finalDrawing.lineArray, priorVahLine)
+        if not na(priorValLine)
+            line.set_x2(priorValLine, bar_index - 1)
+            array.push(finalDrawing.lineArray, priorValLine)
+        array.push(completedArray, finalDrawing)
+        while array.size(completedArray) > profilesInput - 1
+            clearDrawing(array.shift(completedArray))
+        priorPoc := finalPoc
+        priorVah := finalVah
+        priorVal := finalVal
+        priorPocLine := na
+        priorVahLine := na
+        priorValLine := na
+        if extendPriorInput and not na(priorPoc)
+            priorPocLine := line.new(bar_index, priorPoc, bar_index, priorPoc, color = pocColorInput, style = line.style_dashed)
+            priorVahLine := line.new(bar_index, priorVah, bar_index, priorVah, color = vaColorInput, style = line.style_dotted)
+            priorValLine := line.new(bar_index, priorVal, bar_index, priorVal, color = vaColorInput, style = line.style_dotted)
+    array.clear(periodHighArray)
+    array.clear(periodLowArray)
+    sessionStartIndex := bar_index
+    sessionHigh := high
+    sessionLow  := low
+    extensionUpFired   := false
+    extensionDownFired := false
+
+// A new letter opens on every TPO period and on the session's first bar; the running letter absorbs each bar's range
+if array.size(periodHighArray) == 0 or periodChange
+    array.push(periodHighArray, high)
+    array.push(periodLowArray, low)
+else
+    int lastIndex = array.size(periodHighArray) - 1
+    array.set(periodHighArray, lastIndex, math.max(array.get(periodHighArray, lastIndex), high))
+    array.set(periodLowArray, lastIndex, math.min(array.get(periodLowArray, lastIndex), low))
+
+sessionHigh := math.max(nz(sessionHigh, high), high)
+sessionLow  := math.min(nz(sessionLow, low), low)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Session Events
+//---------------------------------------------------------------------------------------------------------------------{
+// Initial balance range — complete once a period beyond the opening bracket has begun
+int periodsCount = array.size(periodHighArray)
+bool ibComplete = periodsCount > ibPeriodsInput
+float ibHigh = na
+float ibLow  = na
+if periodsCount > 0
+    float highestIb = array.get(periodHighArray, 0)
+    float lowestIb  = array.get(periodLowArray, 0)
+    for periodIndex = 0 to math.min(ibPeriodsInput, periodsCount) - 1
+        highestIb := math.max(highestIb, array.get(periodHighArray, periodIndex))
+        lowestIb  := math.min(lowestIb, array.get(periodLowArray, periodIndex))
+    ibHigh := highestIb
+    ibLow  := lowestIb
+
+// Range extension — the first push beyond the completed initial balance on each side of the session
+bool rangeExtensionUp   = false
+bool rangeExtensionDown = false
+if ibComplete and not na(ibHigh)
+    if high > ibHigh and not extensionUpFired
+        rangeExtensionUp := true
+        extensionUpFired := true
+    if low < ibLow and not extensionDownFired
+        rangeExtensionDown := true
+        extensionDownFired := true
+
+// Prior-session reference tests — the carried-forward level map for the current session
+float previousClose = nz(close[1], close)
+bool priorPocCross = false
+bool priorVahCross = false
+bool priorValCross = false
+if not na(priorPoc)
+    priorPocCross := (close > priorPoc and previousClose <= priorPoc) or (close < priorPoc and previousClose >= priorPoc)
+if not na(priorVah)
+    priorVahCross := (close > priorVah and previousClose <= priorVah) or (close < priorVah and previousClose >= priorVah)
+if not na(priorVal)
+    priorValCross := (close > priorVal and previousClose <= priorVal) or (close < priorVal and previousClose >= priorVal)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Developing Profile
+//---------------------------------------------------------------------------------------------------------------------{
+// The live session is redrawn as a distribution under construction, and the prior references extend with it
+if barstate.islast and array.size(periodHighArray) > 0
+    clearDrawing(developingDrawing)
+    [liveDrawing, livePoc, liveVah, liveVal] = drawProfile(periodHighArray, periodLowArray, sessionStartIndex, bar_index, sessionHigh, sessionLow)
+    developingDrawing := liveDrawing
+    if not na(priorPocLine)
+        line.set_x2(priorPocLine, bar_index)
+    if not na(priorVahLine)
+        line.set_x2(priorVahLine, bar_index)
+    if not na(priorValLine)
+        line.set_x2(priorValLine, bar_index)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(rangeExtensionUp, "Range Extension Up", "Range extension up on {{ticker}} ({{interval}}) — price pushed above the initial balance high")
+alertcondition(rangeExtensionDown, "Range Extension Down", "Range extension down on {{ticker}} ({{interval}}) — price pushed below the initial balance low")
+alertcondition(priorPocCross, "Prior TPO POC Cross", "{{ticker}} ({{interval}}) crossed the prior session TPO point of control")
+alertcondition(priorVahCross, "Prior VAH Cross", "{{ticker}} ({{interval}}) crossed the prior session value area high")
+alertcondition(priorValCross, "Prior VAL Cross", "{{ticker}} ({{interval}}) crossed the prior session value area low")
+
+//---------------------------------------------------------------------------------------------------------------------}

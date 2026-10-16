@@ -1,0 +1,488 @@
+// This work is licensed under Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Premium & Discount Dealing Range", "Premium & Discount", overlay = true, max_boxes_count = 200, max_lines_count = 200, max_labels_count = 200)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+color GREEN = #089981
+color RED   = #f23645
+color GRAY  = #787b86
+color BLUE  = #2157f3
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+int BULLISH = 1
+int BEARISH = -1
+
+string BREAK_CLOSE = "Close"
+string BREAK_WICK  = "Wick"
+
+string SIZE_TINY   = "Tiny"
+string SIZE_SMALL  = "Small"
+string SIZE_NORMAL = "Normal"
+
+string POS_TR = "Top Right"
+string POS_TL = "Top Left"
+string POS_BR = "Bottom Right"
+string POS_BL = "Bottom Left"
+
+string GRP_RANGE = "Dealing Range"
+string GRP_LVL   = "Levels"
+string GRP_EVT   = "Zone Events"
+string GRP_DISP  = "Display"
+string GRP_DASH  = "Dashboard"
+string GRP_STYLE = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+swingLenInput = input.int(10, "Swing Length"
+  , minval  = 2
+  , maxval  = 50
+  , group   = GRP_RANGE
+  , tooltip = "Bars on each side a swing high or low must dominate. Swings define the legs that anchor the dealing range: larger values keep only meaningful legs, smaller values follow minor ones and produce noisier midpoints.")
+
+breakInput = input.string(BREAK_CLOSE, "Break Confirmation"
+  , options = [BREAK_CLOSE, BREAK_WICK]
+  , group   = GRP_RANGE
+  , tooltip = "What retires the current dealing range. Close: a candle must close beyond the protected extreme (a wick through it is read as a sweep and the range stays). Wick: any trade beyond the extreme re-anchors the range.")
+
+showQuadInput = input.bool(true, "Quadrants (25% / 75%)"
+  , group   = GRP_LVL
+  , tooltip = "Dotted quarter levels inside each half. The deeper an entry sits in discount (or premium for shorts), the more room it leaves toward the opposite extreme.")
+
+showOteInput = input.bool(true, "OTE Band"
+  , inline  = "ote"
+  , group   = GRP_LVL
+  , tooltip = "Optimal trade entry pocket: the retracement band of the current leg between the two levels below (62% to 79% by default). It always sits inside the trade-side half: discount in a bullish range, premium in a bearish one.")
+oteShallowInput = input.float(0.62, ""
+  , minval  = 0.5
+  , maxval  = 0.95
+  , step    = 0.01
+  , inline  = "ote"
+  , group   = GRP_LVL)
+oteDeepInput = input.float(0.79, ""
+  , minval  = 0.5
+  , maxval  = 0.99
+  , step    = 0.01
+  , inline  = "ote"
+  , group   = GRP_LVL)
+
+showEventsInput = input.bool(true, "Zone Entry Marks"
+  , group   = GRP_EVT
+  , tooltip = "Mark the first trade into the trade-side half of each range: discount in a bullish range, premium in a bearish range, plus the first tag of the OTE band. These are locations to look for an entry array, not signals by themselves.")
+
+showStructInput = input.bool(true, "Range Re-anchor Labels"
+  , group   = GRP_EVT
+  , tooltip = "Label the structure events that re-anchor the range: BOS when price breaks the range extreme in the range's direction (a new leg, so the range ratchets), CHoCH when it breaks the protected extreme and the range flips.")
+
+pastRangesInput = input.int(0, "Past Ranges"
+  , minval  = 0
+  , maxval  = 20
+  , group   = GRP_DISP
+  , tooltip = "How many retired dealing ranges stay on the chart, faded, so you can review how price traded each half.")
+
+showZoneTagsInput = input.bool(true, "Zone Names"
+  , group   = GRP_DISP
+  , tooltip = "Name the live range's levels (Premium, EQ, OTE, Discount) just right of the last candle.")
+
+extendInput = input.int(8, "Extend Right"
+  , minval  = 0
+  , maxval  = 50
+  , group   = GRP_DISP
+  , tooltip = "Bars the live range is projected past the last candle.")
+
+showDashInput = input.bool(true, "Show Dashboard"
+  , group   = GRP_DASH
+  , tooltip = "Live read of the dealing range: direction, extremes, equilibrium, where price sits inside the range (0% at the low, 100% at the high) and which side the convention favors.")
+
+dashPosInput = input.string(POS_TR, "Position"
+  , options = [POS_TR, POS_TL, POS_BR, POS_BL]
+  , group   = GRP_DASH)
+
+dashSizeInput = input.string(SIZE_SMALL, "Size"
+  , options = [SIZE_TINY, SIZE_SMALL, SIZE_NORMAL]
+  , group   = GRP_DASH)
+
+premiumColorInput  = input.color(RED,   "Premium",     inline = "zones", group = GRP_STYLE)
+discountColorInput = input.color(GREEN, "Discount",    inline = "zones", group = GRP_STYLE)
+eqColorInput       = input.color(GRAY,  "Equilibrium", inline = "lvls",  group = GRP_STYLE)
+oteColorInput      = input.color(BLUE,  "OTE",         inline = "lvls",  group = GRP_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types
+//---------------------------------------------------------------------------------------------------------------------{
+// @type            one dealing range and the drawings that render it
+// @field dir       1 for a bullish range (leg up from the low), -1 for a bearish range
+// @field top       range high
+// @field bottom    range low
+// @field left      first bar of the range
+// @field premBox   premium half
+// @field discBox   discount half
+// @field oteBox    optimal trade entry band
+// @field eqLine    equilibrium
+// @field q1Line    25% level
+// @field q3Line    75% level
+type dealingRange
+    int   dir
+    float top
+    float bottom
+    int   left
+    box   premBox
+    box   discBox
+    box   oteBox
+    line  eqLine
+    line  q1Line
+    line  q3Line
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+textSize(string s) =>
+    switch s
+        SIZE_TINY   => size.tiny
+        SIZE_NORMAL => size.normal
+        => size.small
+
+tablePos(string s) =>
+    switch s
+        POS_TL => position.top_left
+        POS_BR => position.bottom_right
+        POS_BL => position.bottom_left
+        => position.top_right
+
+// @function    OTE band bounds for a range: always measured as a retracement of the leg, inside the trade-side half
+oteBounds(int d, float top, float bottom) =>
+    float r = top - bottom
+    float a = d == BULLISH ? top - oteShallowInput * r : bottom + oteShallowInput * r
+    float b = d == BULLISH ? top - oteDeepInput * r    : bottom + oteDeepInput * r
+    [math.max(a, b), math.min(a, b)]
+
+// @function    create the drawings of a new range
+newRange(int d, float top, float bottom, int left) =>
+    box  pb = box.new(left, top, bar_index, bottom, border_color = color(na), bgcolor = color(na))
+    box  db = box.new(left, top, bar_index, bottom, border_color = color(na), bgcolor = color(na))
+    box  ob = box.new(left, top, bar_index, bottom, border_color = color(na), bgcolor = color(na))
+    line el = line.new(left, top, bar_index, top, color = eqColorInput, style = line.style_dashed, width = 1)
+    line l1 = line.new(left, top, bar_index, top, color = color(na), style = line.style_dotted, width = 1)
+    line l3 = line.new(left, top, bar_index, top, color = color(na), style = line.style_dotted, width = 1)
+    dealingRange.new(d, top, bottom, left, pb, db, ob, el, l1, l3)
+
+// @function    refresh the geometry and style of a range; live ranges are vivid, retired ones keep a faint outline of their halves
+renderRange(dealingRange r, int right, bool isLive) =>
+    float eq  = math.avg(r.top, r.bottom)
+    float rng = r.top - r.bottom
+    [oteTop, oteBottom] = oteBounds(r.dir, r.top, r.bottom)
+    r.premBox.set_lefttop(r.left, r.top)
+    r.premBox.set_rightbottom(right, eq)
+    r.premBox.set_bgcolor(color.new(premiumColorInput, isLive ? 88 : 96))
+    r.discBox.set_lefttop(r.left, eq)
+    r.discBox.set_rightbottom(right, r.bottom)
+    r.discBox.set_bgcolor(color.new(discountColorInput, isLive ? 88 : 96))
+    r.oteBox.set_lefttop(r.left, oteTop)
+    r.oteBox.set_rightbottom(right, oteBottom)
+    r.oteBox.set_bgcolor(showOteInput and isLive ? color.new(oteColorInput, 80) : color(na))
+    r.eqLine.set_xy1(r.left, eq)
+    r.eqLine.set_xy2(right, eq)
+    r.eqLine.set_color(color.new(eqColorInput, isLive ? 0 : 60))
+    r.q1Line.set_xy1(r.left, r.bottom + 0.25 * rng)
+    r.q1Line.set_xy2(right, r.bottom + 0.25 * rng)
+    r.q1Line.set_color(showQuadInput and isLive ? color.new(eqColorInput, 45) : color(na))
+    r.q3Line.set_xy1(r.left, r.bottom + 0.75 * rng)
+    r.q3Line.set_xy2(right, r.bottom + 0.75 * rng)
+    r.q3Line.set_color(showQuadInput and isLive ? color.new(eqColorInput, 45) : color(na))
+
+deleteRange(dealingRange r) =>
+    r.premBox.delete()
+    r.discBox.delete()
+    r.oteBox.delete()
+    r.eqLine.delete()
+    r.q1Line.delete()
+    r.q3Line.delete()
+
+// @function    structure label on the broken extreme, with the broken level drawn from its origin
+structureMark(int fromBar, float level, string tag, color css, bool up) =>
+    line.new(fromBar, level, bar_index, level, color = css, style = line.style_dashed, width = 1)
+    label.new(int(math.round(0.5 * (fromBar + bar_index))), level, tag, color = color(na), textcolor = css, style = up ? label.style_label_down : label.style_label_up, size = size.small)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Swings
+//---------------------------------------------------------------------------------------------------------------------{
+float ph = ta.pivothigh(high, swingLenInput, swingLenInput)
+float pl = ta.pivotlow(low, swingLenInput, swingLenInput)
+
+var float lastPh    = na
+var int   lastPhBar = na
+var float lastPl    = na
+var int   lastPlBar = na
+
+//highest high / lowest low printed since the most recent confirmed swing: the origin of the leg that breaks structure
+var float maxSincePh    = na
+var int   maxSincePhBar = na
+var float minSincePl    = na
+var int   minSincePlBar = na
+
+if not na(ph)
+    lastPh        := ph
+    lastPhBar     := bar_index - swingLenInput
+    maxSincePh    := ph
+    maxSincePhBar := lastPhBar
+else if not na(maxSincePh) and high > maxSincePh
+    maxSincePh    := high
+    maxSincePhBar := bar_index
+
+if not na(pl)
+    lastPl        := pl
+    lastPlBar     := bar_index - swingLenInput
+    minSincePl    := pl
+    minSincePlBar := lastPlBar
+else if not na(minSincePl) and low < minSincePl
+    minSincePl    := low
+    minSincePlBar := bar_index
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dealing range state machine
+//---------------------------------------------------------------------------------------------------------------------{
+var int   dir       = 0
+var float rHi       = na
+var int   rHiBar    = na
+var float rLo       = na
+var int   rLoBar    = na
+var bool  openSide  = false   //true while the range's working extreme is still extending with the leg
+var float pullback  = na      //deepest retracement since the working extreme printed
+var int   pullBar   = na
+
+var dealingRange live = na
+var array<dealingRange> pastRanges = array.new<dealingRange>()
+
+var bool discTagged = false
+var bool oteTagged  = false
+
+bool newBull  = false
+bool newBear  = false
+bool bosEvt   = false
+bool chochEvt = false
+float brokenLevel = na
+int   brokenBar   = na
+
+// retire the live range and start a new one
+startRange(int d, float top, int topBar, float bottom, int bottomBar) =>
+    if not na(live)
+        renderRange(live, bar_index, false)
+        pastRanges.push(live)
+        while pastRanges.size() > pastRangesInput
+            deleteRange(pastRanges.shift())
+    newRange(d, top, bottom, math.min(topBar, bottomBar))
+
+// first range: the most recent completed swing leg
+if dir == 0 and not na(lastPh) and not na(lastPl)
+    dir      := lastPlBar < lastPhBar ? BULLISH : BEARISH
+    rHi      := lastPh
+    rHiBar   := lastPhBar
+    rLo      := lastPl
+    rLoBar   := lastPlBar
+    openSide := false
+    live     := startRange(dir, rHi, rHiBar, rLo, rLoBar)
+
+else if dir != 0
+    // the working extreme follows the leg until it has been left for a swing's worth of bars or price retraces to equilibrium
+    if openSide
+        if dir == BULLISH and high > rHi
+            rHi    := high
+            rHiBar := bar_index
+            pullback := na
+        else if dir == BEARISH and low < rLo
+            rLo    := low
+            rLoBar := bar_index
+            pullback := na
+        float eqNow = math.avg(rHi, rLo)
+        bool  aged  = bar_index - (dir == BULLISH ? rHiBar : rLoBar) >= swingLenInput
+        bool  atEq  = dir == BULLISH ? low <= eqNow : high >= eqNow
+        if aged or atEq
+            openSide := false
+
+    // track the retracement since the working extreme printed
+    if dir == BULLISH and bar_index > rHiBar
+        if na(pullback) or low < pullback
+            pullback := low
+            pullBar  := bar_index
+    if dir == BEARISH and bar_index > rLoBar
+        if na(pullback) or high > pullback
+            pullback := high
+            pullBar  := bar_index
+
+    float upProbe = breakInput == BREAK_CLOSE ? close : high
+    float dnProbe = breakInput == BREAK_CLOSE ? close : low
+
+    if dir == BULLISH
+        if dnProbe < rLo
+            // protected low broken: the range flips; the new range runs from the leg's origin high
+            brokenLevel := rLo
+            brokenBar   := rLoBar
+            float originHi    = na(maxSincePh) or maxSincePhBar < rLoBar ? rHi : maxSincePh
+            int   originHiBar = na(maxSincePh) or maxSincePhBar < rLoBar ? rHiBar : maxSincePhBar
+            dir      := BEARISH
+            rHi      := originHi
+            rHiBar   := originHiBar
+            rLo      := low
+            rLoBar   := bar_index
+            openSide := true
+            pullback := na
+            chochEvt := true
+            newBear  := true
+        else if not openSide and upProbe > rHi and not na(pullback)
+            // range high taken after a retracement: a new leg, the range ratchets up from the pullback low
+            brokenLevel := rHi
+            brokenBar   := rHiBar
+            rLo      := pullback
+            rLoBar   := pullBar
+            rHi      := high
+            rHiBar   := bar_index
+            openSide := true
+            pullback := na
+            bosEvt   := true
+            newBull  := true
+    else
+        if upProbe > rHi
+            brokenLevel := rHi
+            brokenBar   := rHiBar
+            float originLo    = na(minSincePl) or minSincePlBar < rHiBar ? rLo : minSincePl
+            int   originLoBar = na(minSincePl) or minSincePlBar < rHiBar ? rLoBar : minSincePlBar
+            dir      := BULLISH
+            rLo      := originLo
+            rLoBar   := originLoBar
+            rHi      := high
+            rHiBar   := bar_index
+            openSide := true
+            pullback := na
+            chochEvt := true
+            newBull  := true
+        else if not openSide and dnProbe < rLo and not na(pullback)
+            brokenLevel := rLo
+            brokenBar   := rLoBar
+            rHi      := pullback
+            rHiBar   := pullBar
+            rLo      := low
+            rLoBar   := bar_index
+            openSide := true
+            pullback := na
+            bosEvt   := true
+            newBear  := true
+
+    if newBull or newBear
+        live := startRange(dir, rHi, rHiBar, rLo, rLoBar)
+        discTagged := false
+        oteTagged  := false
+        if showStructInput
+            color css = newBull ? discountColorInput : premiumColorInput
+            structureMark(brokenBar, brokenLevel, bosEvt ? "BOS" : "CHoCH", css, newBull)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Position & zone events
+//---------------------------------------------------------------------------------------------------------------------{
+float eqLevel = math.avg(rHi, rLo)
+float rangeH  = rHi - rLo
+float posPct  = dir != 0 and rangeH > 0 ? 100 * (close - rLo) / rangeH : na
+[oteTopLvl, oteBotLvl] = oteBounds(dir, rHi, rLo)
+
+bool bullDiscount = false
+bool bullOte      = false
+bool bearPremium  = false
+bool bearOte      = false
+
+// zone entries only count once the leg has stopped extending, i.e. on the retracement
+if dir != 0 and not openSide and not newBull and not newBear
+    if dir == BULLISH
+        if not discTagged and low < eqLevel
+            discTagged   := true
+            bullDiscount := true
+        if not oteTagged and low <= oteTopLvl
+            oteTagged := true
+            bullOte   := true
+    else
+        if not discTagged and high > eqLevel
+            discTagged  := true
+            bearPremium := true
+        if not oteTagged and high >= oteBotLvl
+            oteTagged := true
+            bearOte   := true
+
+if showEventsInput
+    if bullOte or bullDiscount
+        label.new(bar_index, low, "", color = bullOte ? oteColorInput : discountColorInput, style = label.style_triangleup, size = size.small, tooltip = bullOte ? "OTE band reached in a bullish dealing range" : "Discount reached in a bullish dealing range")
+    if bearOte or bearPremium
+        label.new(bar_index, high, "", color = bearOte ? oteColorInput : premiumColorInput, style = label.style_triangledown, size = size.small, tooltip = bearOte ? "OTE band reached in a bearish dealing range" : "Premium reached in a bearish dealing range")
+
+bool eqUp      = ta.crossover(close, eqLevel)
+bool eqDn      = ta.crossunder(close, eqLevel)
+bool eqCrossUp = dir != 0 and eqUp and not newBull and not newBear
+bool eqCrossDn = dir != 0 and eqDn and not newBull and not newBear
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visuals
+//---------------------------------------------------------------------------------------------------------------------{
+if not na(live)
+    live.top    := rHi
+    live.bottom := rLo
+    live.left   := math.min(rHiBar, rLoBar)
+    renderRange(live, bar_index + extendInput, true)
+
+//zone names pinned just right of the last candle, on the live range's levels
+var label premTag = label.new(na, na, "Premium",  color = color(na), style = label.style_label_left, size = size.small)
+var label eqTag   = label.new(na, na, "EQ",       color = color(na), style = label.style_label_left, size = size.small)
+var label oteTag  = label.new(na, na, "OTE",      color = color(na), style = label.style_label_left, size = size.small)
+var label discTag = label.new(na, na, "Discount", color = color(na), style = label.style_label_left, size = size.small)
+if barstate.islast and dir != 0 and showZoneTagsInput
+    int tagX = bar_index + 1
+    premTag.set_xy(tagX, rLo + 0.875 * rangeH)
+    premTag.set_textcolor(premiumColorInput)
+    eqTag.set_xy(tagX, eqLevel)
+    eqTag.set_textcolor(eqColorInput)
+    discTag.set_xy(tagX, rLo + 0.125 * rangeH)
+    discTag.set_textcolor(discountColorInput)
+    if showOteInput
+        oteTag.set_xy(tagX, math.avg(oteTopLvl, oteBotLvl))
+        oteTag.set_textcolor(oteColorInput)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dash = table.new(tablePos(dashPosInput), 2, 5, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+if barstate.islast and showDashInput and dir != 0
+    string sz       = textSize(dashSizeInput)
+    color  dirCss   = dir == BULLISH ? discountColorInput : premiumColorInput
+    bool   inPrem   = posPct > 50
+    string zoneTxt  = posPct > 100 ? "Above range" : posPct < 0 ? "Below range" : inPrem ? "Premium" : "Discount"
+    color  zoneCss  = inPrem ? premiumColorInput : discountColorInput
+    bool   tradeSide = dir == BULLISH ? not inPrem : inPrem
+    string readTxt  = dir == BULLISH ? (tradeSide ? "Longs from discount" : "Wait for discount") : (tradeSide ? "Shorts from premium" : "Wait for premium")
+    table.cell(dash, 0, 0, "Dealing Range", text_color = DASH_TEXT, text_halign = text.align_left, text_size = sz)
+    table.cell(dash, 1, 0, dir == BULLISH ? "Bullish" : "Bearish", text_color = dirCss, text_halign = text.align_right, text_size = sz)
+    table.cell(dash, 0, 1, "High / Low", text_color = DASH_HEADER, text_halign = text.align_left, text_size = sz)
+    table.cell(dash, 1, 1, str.tostring(rHi, format.mintick) + " / " + str.tostring(rLo, format.mintick), text_color = DASH_TEXT, text_halign = text.align_right, text_size = sz)
+    table.cell(dash, 0, 2, "Equilibrium", text_color = DASH_HEADER, text_halign = text.align_left, text_size = sz)
+    table.cell(dash, 1, 2, str.tostring(eqLevel, format.mintick), text_color = DASH_TEXT, text_halign = text.align_right, text_size = sz)
+    table.cell(dash, 0, 3, "Position", text_color = DASH_HEADER, text_halign = text.align_left, text_size = sz)
+    table.cell(dash, 1, 3, str.tostring(posPct, "#") + "% " + zoneTxt, text_color = zoneCss, text_halign = text.align_right, text_size = sz)
+    table.cell(dash, 0, 4, "Read", text_color = DASH_HEADER, text_halign = text.align_left, text_size = sz)
+    table.cell(dash, 1, 4, readTxt, text_color = tradeSide ? dirCss : DASH_TEXT, text_halign = text.align_right, text_size = sz)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(bullDiscount, "Discount Entered (Bullish Range)", "Price traded into the discount half of a bullish dealing range on {{ticker}}")
+alertcondition(bullOte,      "OTE Tagged (Bullish Range)",       "Price reached the OTE band of a bullish dealing range on {{ticker}}")
+alertcondition(bearPremium,  "Premium Entered (Bearish Range)",  "Price traded into the premium half of a bearish dealing range on {{ticker}}")
+alertcondition(bearOte,      "OTE Tagged (Bearish Range)",       "Price reached the OTE band of a bearish dealing range on {{ticker}}")
+alertcondition(eqCrossUp,    "Equilibrium Crossed Up",           "Price closed above the dealing range equilibrium on {{ticker}}")
+alertcondition(eqCrossDn,    "Equilibrium Crossed Down",         "Price closed below the dealing range equilibrium on {{ticker}}")
+alertcondition(newBull,      "New Bullish Dealing Range",        "A bullish dealing range was anchored on {{ticker}} (BOS or CHoCH)")
+alertcondition(newBear,      "New Bearish Dealing Range",        "A bearish dealing range was anchored on {{ticker}} (BOS or CHoCH)")
+
+//---------------------------------------------------------------------------------------------------------------------}

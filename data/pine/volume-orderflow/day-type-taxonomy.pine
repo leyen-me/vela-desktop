@@ -1,0 +1,431 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Day-type Taxonomy", "Day-type Taxonomy", overlay = true
+  , max_labels_count = 500
+  , max_lines_count  = 500
+  , max_boxes_count  = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+int TYPE_NONE        = -1
+int TYPE_NORMAL      = 0
+int TYPE_NORMAL_VAR  = 1
+int TYPE_TREND       = 2
+int TYPE_DD_TREND    = 3
+int TYPE_NEUTRAL     = 4
+int TYPE_NEUTRAL_EXT = 5
+int TYPE_NON_TREND   = 6
+
+int TYPE_COUNT = 7
+
+color COLOR_HIDDEN = #00000000
+
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+NEUTRAL_COLOR = #787b86  // rotational structure - normal days, the initial balance
+ACCENT_COLOR  = #ff9800  // neutral days - genuine two-sided conflict, the one accent
+DASH_BG       = #161616
+DASH_FRAME    = #2E2E2E
+DASH_HEADER   = #808080
+DASH_TEXT     = #DBDBDB
+
+int   PROFILE_ROWS      = 25
+int   SINGLE_PRINT_MAX  = 1
+int   DISTRIBUTION_BARS = 3
+float INTERIOR_MARGIN   = 0.15
+
+string GRP_IB  = "Initial Balance"
+string GRP_CLS = "Classification"
+string GRP_DSP = "Display"
+string GRP_STL = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Inputs
+//---------------------------------------------------------------------------------------------------------------------{
+ibMinutesInput = input.int(60, "Initial Balance Length (minutes)", minval = 5, step = 5, group = GRP_IB
+  , tooltip = "Duration of the initial balance, measured from the first bar of each trading day on the chart. The canonical initial balance is the first hour (60 minutes). Use a chart timeframe that divides this length evenly (e.g. 5/15/30 min for a 60 min IB).")
+
+minExtPctInput = input.float(15, "Min Range Extension (% of IB width)", minval = 0, step = 5, group = GRP_CLS
+  , tooltip = "Smallest push beyond an initial balance extreme, as a percentage of the IB width, that counts as a genuine range extension. Smaller pokes are ignored, so the session can still grade as a normal day. Mechanical thresholds vary between authors.")
+
+trendMultInput = input.float(1, "Trend Threshold (x IB width)", minval = 0.25, step = 0.25, group = GRP_CLS
+  , tooltip = "One-sided range extension, in IB widths beyond the IB extreme, at or above which a session grades as a trend day (subject to the close confirming near the extreme). The default of 1 means the session roughly doubles its initial balance - the customary boundary between a normal variation day and a trend day. Authors vary on the exact multiple.")
+
+extremePctInput = input.float(25, "Close-at-Extreme Zone (%)", minval = 5, maxval = 50, step = 5, group = GRP_CLS
+  , tooltip = "A close within this top/bottom percentage of the session range counts as a close 'at the extreme'. It confirms trend days and turns a both-side-extension session into a neutral extreme day; mid-range closes confirm balance.")
+
+detectNonTrendInput = input.bool(true, "Detect Non-Trend Days", group = GRP_CLS
+  , tooltip = "Grade sessions with no range extension and an unusually narrow range as non-trend days (a common addition to the canonical set). When disabled they grade as normal days.")
+
+narrowMultInput = input.float(0.6, "Non-Trend Range (x average)", minval = 0.1, step = 0.1, group = GRP_CLS
+  , tooltip = "A no-extension session grades as non-trend when its total range is at or below this multiple of the average session range.")
+
+rangeLookbackInput = input.int(10, "Average Range Lookback (sessions)", minval = 3, group = GRP_CLS
+  , tooltip = "Number of prior completed sessions used to compute the average session range for the non-trend test. At least 3 completed sessions are required before non-trend days can be graded.")
+
+detectDdInput = input.bool(true, "Detect Double-Distribution Trend Days", group = GRP_CLS
+  , tooltip = "Grade trend-magnitude sessions that traded in two distinct distributions - separated by a thin single-print band inside the session range - as double-distribution trend days (a common addition to the canonical set).")
+
+showDevInput = input.bool(true, "Developing Day Type Label", group = GRP_DSP
+  , tooltip = "Show a live label with the day type currently developing. Early reads are frequently revised - the classification is only certain at the close.")
+
+showFinalInput = input.bool(true, "Final Day Type Labels", group = GRP_DSP
+  , tooltip = "Stamp each completed session with its final classification and the size of its range extension in IB widths.")
+
+showIbInput = input.bool(true, "Initial Balance Zone", group = GRP_DSP
+  , tooltip = "Outline each session's initial balance and extend it across the session, so range extensions beyond it are visible at a glance.")
+
+showTargetsInput = input.bool(true, "Trend Extension Levels", group = GRP_DSP
+  , tooltip = "Dashed levels at the trend threshold distance beyond each IB extreme. Reaching one marks trend-day magnitude; stopping short keeps the session in normal variation territory.")
+
+shadeIbInput = input.bool(false, "Shade Initial Balance Period", group = GRP_DSP
+  , tooltip = "Highlight the bars that form the initial balance with a background tint.")
+
+showTableInput = input.bool(true, "Day-Type Statistics", group = GRP_DSP
+  , tooltip = "Dashboard with the frequency of each finalized day type on this chart plus the currently developing type. Trend days being a minority in most markets is what justifies rotational tactics as the default.")
+
+tablePosInput = input.string("Top Right", "Table Position", group = GRP_DSP
+  , options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left", "Middle Right", "Middle Left"]
+  , tooltip = "Position of the statistics dashboard on the chart.")
+
+tableSizeInput = input.string("Small", "Table Size", group = GRP_DSP
+  , options = ["Tiny", "Small", "Normal"]
+  , tooltip = "Text size of the statistics dashboard.")
+
+bullColorInput       = input.color(BULL_COLOR, "Bullish", group = GRP_STL, inline = "c1")
+bearColorInput       = input.color(BEAR_COLOR, "Bearish", group = GRP_STL, inline = "c1")
+neutralColorInput    = input.color(ACCENT_COLOR, "Neutral", group = GRP_STL, inline = "c2")
+rotationalColorInput = input.color(NEUTRAL_COLOR, "Rotational", group = GRP_STL, inline = "c2")
+ibColorInput         = input.color(NEUTRAL_COLOR, "Initial Balance", group = GRP_STL, inline = "c3")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Human-readable name of a day type
+typeName(int dayType) =>
+    switch dayType
+        TYPE_NORMAL      => "Normal Day"
+        TYPE_NORMAL_VAR  => "Normal Variation Day"
+        TYPE_TREND       => "Trend Day"
+        TYPE_DD_TREND    => "Double-Distribution Trend Day"
+        TYPE_NEUTRAL     => "Neutral Day"
+        TYPE_NEUTRAL_EXT => "Neutral Extreme Day"
+        TYPE_NON_TREND   => "Non-Trend Day"
+        => "-"
+
+// Color of a day type, directional types colored by extension/close side
+typeColor(int dayType, int dir) =>
+    color out = rotationalColorInput
+    if dayType == TYPE_TREND or dayType == TYPE_DD_TREND or dayType == TYPE_NORMAL_VAR
+        out := dir < 0 ? bearColorInput : bullColorInput
+    else if dayType == TYPE_NEUTRAL or dayType == TYPE_NEUTRAL_EXT
+        out := neutralColorInput
+    else if dayType == TYPE_NON_TREND
+        out := color.new(rotationalColorInput, 25)
+    out
+
+// Direction arrow suffix for directional day types
+dirArrow(int dayType, int dir) =>
+    bool directional = dayType == TYPE_TREND or dayType == TYPE_DD_TREND or dayType == TYPE_NORMAL_VAR or dayType == TYPE_NEUTRAL_EXT
+    directional and dir != 0 ? (dir > 0 ? " ▲" : " ▼") : ""
+
+// Classify a session from its initial balance and range extensions
+// Returns [dayType, direction] with direction +1 up / -1 down / 0 none
+classifySession(float ibWidth, float extUp, float extDn, float closePos, bool narrowFlag) =>
+    float minExt    = ibWidth * minExtPctInput / 100
+    bool  upOk      = extUp > minExt
+    bool  dnOk      = extDn > minExt
+    bool  upExtreme = closePos >= 1 - extremePctInput / 100
+    bool  dnExtreme = closePos <= extremePctInput / 100
+    int dayType = TYPE_NONE
+    int dir     = 0
+    if upOk and dnOk
+        dayType := upExtreme or dnExtreme ? TYPE_NEUTRAL_EXT : TYPE_NEUTRAL
+        dir     := upExtreme ? 1 : dnExtreme ? -1 : 0
+    else if upOk or dnOk
+        float ext         = math.max(extUp, extDn)
+        bool trendMag     = ext >= trendMultInput * ibWidth
+        bool closeConfirm = upOk ? upExtreme : dnExtreme
+        dayType := trendMag and closeConfirm ? TYPE_TREND : TYPE_NORMAL_VAR
+        dir     := upOk ? 1 : -1
+    else
+        dayType := narrowFlag ? TYPE_NON_TREND : TYPE_NORMAL
+    [dayType, dir]
+
+// Detect two distributions separated by a thin single-print band inside the session range
+detectDoubleDistribution(array<float> highsArray, array<float> lowsArray, float sessLo, float sessHi) =>
+    bool found = false
+    int  n     = array.size(highsArray)
+    float rng  = sessHi - sessLo
+    if n >= 10 and rng > 0
+        float step = rng / PROFILE_ROWS
+        array<int> countsArray = array.new_int(PROFILE_ROWS, 0)
+        for i = 0 to n - 1
+            float barHi = array.get(highsArray, i)
+            float barLo = array.get(lowsArray, i)
+            int r0 = math.max(0, math.min(PROFILE_ROWS - 1, math.floor((barLo - sessLo) / step)))
+            int r1 = math.max(0, math.min(PROFILE_ROWS - 1, math.floor((barHi - sessLo) / step)))
+            for r = r0 to r1
+                array.set(countsArray, r, array.get(countsArray, r) + 1)
+        int interiorMargin = math.max(2, math.round(PROFILE_ROWS * INTERIOR_MARGIN))
+        for r = interiorMargin to PROFILE_ROWS - 1 - interiorMargin
+            if array.get(countsArray, r) <= SINGLE_PRINT_MAX and not found
+                int maxAbove = 0
+                for r2 = r + 1 to PROFILE_ROWS - 1
+                    maxAbove := math.max(maxAbove, array.get(countsArray, r2))
+                int maxBelow = 0
+                for r2 = 0 to r - 1
+                    maxBelow := math.max(maxBelow, array.get(countsArray, r2))
+                if maxAbove >= DISTRIBUTION_BARS and maxBelow >= DISTRIBUTION_BARS
+                    found := true
+    found
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+bool validSetup = timeframe.isintraday and timeframe.in_seconds(timeframe.period) <= ibMinutesInput * 60
+bool dayChange  = timeframe.change("D")
+bool newSession = validSetup and dayChange
+
+// session state
+var float ibHigh    = na
+var float ibLow     = na
+var bool  ibDone    = false
+var float sessHigh  = na
+var float sessLow   = na
+var int   sessStart = na
+var bool  sawStart  = false
+
+var array<float> barHighsArray   = array.new<float>()
+var array<float> barLowsArray    = array.new<float>()
+var array<int>   typeCountsArray = array.new_int(TYPE_COUNT, 0)
+var array<float> rangeArray      = array.new<float>()
+
+var box  ibBox        = na
+var line upTargetLine = na
+var line dnTargetLine = na
+
+var bool extUpFlagged = false
+var bool extDnFlagged = false
+var bool bothFlagged  = false
+var bool trendFlagged = false
+
+// per-bar outputs
+int  finalizedType = TYPE_NONE
+int  finalizedDir  = 0
+int  devType       = TYPE_NONE
+int  devDir        = 0
+bool extUpEvent    = false
+bool extDnEvent    = false
+bool bothExtEvent  = false
+bool trendDevEvent = false
+
+if newSession
+    // finalize the session that just ended
+    if sawStart and ibDone and not na(ibHigh) and array.size(barHighsArray) > 0
+        float rng      = sessHigh - sessLow
+        float ibWidth  = math.max(ibHigh - ibLow, syminfo.mintick)
+        float extUp    = math.max(sessHigh - ibHigh, 0)
+        float extDn    = math.max(ibLow - sessLow, 0)
+        float closePos = rng > 0 ? (close[1] - sessLow) / rng : 0.5
+        bool narrowFlag = false
+        if detectNonTrendInput and array.size(rangeArray) >= 3
+            float avgRng = array.avg(rangeArray)
+            narrowFlag := avgRng > 0 and rng <= narrowMultInput * avgRng
+        [type0, dir0] = classifySession(ibWidth, extUp, extDn, closePos, narrowFlag)
+        int finalType = type0
+        if finalType == TYPE_TREND and detectDdInput and detectDoubleDistribution(barHighsArray, barLowsArray, sessLow, sessHigh)
+            finalType := TYPE_DD_TREND
+        finalizedType := finalType
+        finalizedDir  := dir0
+        // statistics
+        array.set(typeCountsArray, finalType, array.get(typeCountsArray, finalType) + 1)
+        array.push(rangeArray, rng)
+        if array.size(rangeArray) > rangeLookbackInput
+            array.shift(rangeArray)
+        // final classification stamp
+        if showFinalInput
+            bool hasExt = finalType == TYPE_NORMAL_VAR or finalType == TYPE_TREND or finalType == TYPE_DD_TREND
+            string extLine = finalType == TYPE_NEUTRAL or finalType == TYPE_NEUTRAL_EXT
+              ? "RE ▲" + str.tostring(extUp / ibWidth, "0.00") + " ▼" + str.tostring(extDn / ibWidth, "0.00") + " x IB"
+              : hasExt
+                  ? "RE " + str.tostring(math.max(extUp, extDn) / ibWidth, "0.00") + " x IB"
+                  : "no range extension"
+            float labelPad = math.max(rng * 0.08, syminfo.mintick * 2)
+            label.new(bar_index - 1, sessHigh + labelPad, typeName(finalType) + dirArrow(finalType, dir0) + "\n" + extLine
+              , xloc = xloc.bar_index, yloc = yloc.price, color = COLOR_HIDDEN, style = label.style_label_down
+              , textcolor = typeColor(finalType, dir0), size = size.small)
+    // reset state for the new session
+    sessStart := time
+    sessHigh  := high
+    sessLow   := low
+    ibHigh    := high
+    ibLow     := low
+    ibDone    := false
+    sawStart  := true
+    extUpFlagged := false
+    extDnFlagged := false
+    bothFlagged  := false
+    trendFlagged := false
+    array.clear(barHighsArray)
+    array.clear(barLowsArray)
+    array.push(barHighsArray, high)
+    array.push(barLowsArray, low)
+    upTargetLine := na
+    dnTargetLine := na
+    ibBox := showIbInput ? box.new(bar_index, high, bar_index, low, border_color = ibColorInput, border_width = 1
+      , bgcolor = color.new(ibColorInput, 90)) : na
+else if validSetup and sawStart
+    sessHigh := math.max(sessHigh, high)
+    sessLow  := math.min(sessLow, low)
+    array.push(barHighsArray, high)
+    array.push(barLowsArray, low)
+    bool inIb = time < sessStart + ibMinutesInput * 60 * 1000
+    if not ibDone
+        if inIb
+            ibHigh := math.max(ibHigh, high)
+            ibLow  := math.min(ibLow, low)
+        else
+            ibDone := true
+            if showTargetsInput
+                float ibWidthNow = math.max(ibHigh - ibLow, syminfo.mintick)
+                upTargetLine := line.new(bar_index, ibHigh + trendMultInput * ibWidthNow, bar_index, ibHigh + trendMultInput * ibWidthNow
+                  , color = color.new(bullColorInput, 30), style = line.style_dashed)
+                dnTargetLine := line.new(bar_index, ibLow - trendMultInput * ibWidthNow, bar_index, ibLow - trendMultInput * ibWidthNow
+                  , color = color.new(bearColorInput, 30), style = line.style_dashed)
+    if not na(ibBox)
+        box.set_right(ibBox, bar_index)
+        if inIb
+            box.set_top(ibBox, ibHigh)
+            box.set_bottom(ibBox, ibLow)
+    if not na(upTargetLine)
+        line.set_x2(upTargetLine, bar_index)
+    if not na(dnTargetLine)
+        line.set_x2(dnTargetLine, bar_index)
+
+// developing classification and first-occurrence events
+if validSetup and sawStart and ibDone
+    float rngDev      = sessHigh - sessLow
+    float ibWidthDev  = math.max(ibHigh - ibLow, syminfo.mintick)
+    float extUpDev    = math.max(sessHigh - ibHigh, 0)
+    float extDnDev    = math.max(ibLow - sessLow, 0)
+    float closePosDev = rngDev > 0 ? (close - sessLow) / rngDev : 0.5
+    [typeDev, dirDev] = classifySession(ibWidthDev, extUpDev, extDnDev, closePosDev, false)
+    devType := typeDev
+    devDir  := dirDev
+    float minExtAbs = ibWidthDev * minExtPctInput / 100
+    bool upNow = extUpDev > minExtAbs
+    bool dnNow = extDnDev > minExtAbs
+    if upNow and not extUpFlagged
+        extUpFlagged := true
+        extUpEvent   := true
+    if dnNow and not extDnFlagged
+        extDnFlagged := true
+        extDnEvent   := true
+    if upNow and dnNow and not bothFlagged
+        bothFlagged  := true
+        bothExtEvent := true
+    if devType == TYPE_TREND and not trendFlagged
+        trendFlagged  := true
+        trendDevEvent := true
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+// developing day type label
+var label devLabel = na
+
+if showDevInput and na(devLabel)
+    devLabel := label.new(bar_index, close, "", xloc = xloc.bar_index, yloc = yloc.price, color = COLOR_HIDDEN
+      , style = label.style_label_left, textcolor = DASH_TEXT, size = size.small)
+
+if not na(devLabel)
+    if validSetup and sawStart
+        float devPad = math.max((sessHigh - sessLow) * 0.08, syminfo.mintick * 2)
+        label.set_xy(devLabel, bar_index + 2, sessHigh + devPad)
+        if ibDone
+            label.set_text(devLabel, "Developing: " + typeName(devType) + dirArrow(devType, devDir))
+            label.set_textcolor(devLabel, typeColor(devType, devDir))
+        else
+            label.set_text(devLabel, "Initial Balance forming...")
+            label.set_textcolor(devLabel, color.new(ibColorInput, 25))
+    else
+        label.set_text(devLabel, "")
+
+bgcolor(validSetup and shadeIbInput and sawStart and not ibDone ? color.new(ibColorInput, 92) : na, title = "IB Shading")
+
+// data window readouts
+plot(validSetup and sawStart and ibDone ? ibHigh : na, "IB High", ibColorInput, 1, plot.style_linebr, display = display.data_window)
+plot(validSetup and sawStart and ibDone ? ibLow : na, "IB Low", ibColorInput, 1, plot.style_linebr, display = display.data_window)
+plot(validSetup and sawStart and ibDone ? math.max(sessHigh - ibHigh, 0) / math.max(ibHigh - ibLow, syminfo.mintick) : na
+  , "Extension Up (x IB)", bullColorInput, 1, display = display.data_window)
+plot(validSetup and sawStart and ibDone ? math.max(ibLow - sessLow, 0) / math.max(ibHigh - ibLow, syminfo.mintick) : na
+  , "Extension Down (x IB)", bearColorInput, 1, display = display.data_window)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+string tablePos = switch tablePosInput
+    "Top Right"    => position.top_right
+    "Top Left"     => position.top_left
+    "Bottom Right" => position.bottom_right
+    "Bottom Left"  => position.bottom_left
+    "Middle Right" => position.middle_right
+    => position.middle_left
+
+string tableTextSize = switch tableSizeInput
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    => size.small
+
+if barstate.islast and validSetup and showTableInput
+    var table statsTable = table.new(tablePos, 3, 11, bgcolor = DASH_BG
+      , frame_color = DASH_FRAME, frame_width = 1
+      , border_width = 0)
+    table.cell(statsTable, 0, 0, "Day-Type Taxonomy", text_color = DASH_TEXT, text_size = tableTextSize, text_halign = text.align_center)
+    table.merge_cells(statsTable, 0, 0, 2, 0)
+    table.cell(statsTable, 0, 1, "Day Type", text_color = DASH_HEADER, text_size = tableTextSize, text_halign = text.align_left)
+    table.cell(statsTable, 1, 1, "Count", text_color = DASH_HEADER, text_size = tableTextSize, text_halign = text.align_right)
+    table.cell(statsTable, 2, 1, "%", text_color = DASH_HEADER, text_size = tableTextSize, text_halign = text.align_right)
+    int totalSessions = 0
+    for i = 0 to TYPE_COUNT - 1
+        totalSessions += array.get(typeCountsArray, i)
+    for i = 0 to TYPE_COUNT - 1
+        int cnt   = array.get(typeCountsArray, i)
+        float pct = totalSessions > 0 ? 100.0 * cnt / totalSessions : 0
+        table.cell(statsTable, 0, 2 + i, typeName(i), text_color = DASH_HEADER, text_size = tableTextSize, text_halign = text.align_left)
+        table.cell(statsTable, 1, 2 + i, str.tostring(cnt), text_color = DASH_TEXT, text_size = tableTextSize, text_halign = text.align_right)
+        table.cell(statsTable, 2, 2 + i, str.tostring(pct, "0.0") + "%", text_color = DASH_TEXT, text_size = tableTextSize, text_halign = text.align_right)
+    table.cell(statsTable, 0, 9, "Sessions", text_color = DASH_HEADER, text_size = tableTextSize, text_halign = text.align_left)
+    table.cell(statsTable, 1, 9, str.tostring(totalSessions), text_color = DASH_TEXT, text_size = tableTextSize, text_halign = text.align_right)
+    table.cell(statsTable, 2, 9, "", text_color = DASH_TEXT, text_size = tableTextSize)
+    string devCellText = not sawStart ? "waiting for session" : not ibDone ? "IB forming" : typeName(devType) + dirArrow(devType, devDir)
+    color devCellColor = sawStart and ibDone ? typeColor(devType, devDir) : DASH_TEXT
+    table.cell(statsTable, 0, 10, "Developing", text_color = DASH_HEADER, text_size = tableTextSize, text_halign = text.align_left)
+    table.cell(statsTable, 1, 10, devCellText, text_color = devCellColor, text_size = tableTextSize, text_halign = text.align_right)
+    table.merge_cells(statsTable, 1, 10, 2, 10)
+
+if barstate.islast and not validSetup
+    var table warnTable = table.new(position.middle_center, 1, 1, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+    table.cell(warnTable, 0, 0, "Day-type taxonomy requires an intraday chart\nwith a timeframe not larger than the Initial Balance length"
+      , text_color = BEAR_COLOR, bgcolor = DASH_BG, text_size = size.small)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(extUpEvent, "Range Extension Up", "Session extended above the initial balance high - one-sided upside activity (normal variation / trend day watch)")
+alertcondition(extDnEvent, "Range Extension Down", "Session extended below the initial balance low - one-sided downside activity (normal variation / trend day watch)")
+alertcondition(bothExtEvent, "Both-Side Range Extension", "Range extension beyond both initial balance extremes - neutral day conditions, genuine two-sided conflict")
+alertcondition(trendDevEvent, "Trend Day Developing", "One-sided range extension reached the trend threshold with price holding near the extreme - trend day developing")
+alertcondition(finalizedType == TYPE_NORMAL, "Session Classified - Normal Day", "Completed session classified as a normal day - the initial balance contained the whole session")
+alertcondition(finalizedType == TYPE_NORMAL_VAR, "Session Classified - Normal Variation Day", "Completed session classified as a normal variation day - one-sided range extension beyond the initial balance")
+alertcondition(finalizedType == TYPE_TREND, "Session Classified - Trend Day", "Completed session classified as a trend day - persistent one-sided extension closing near the extreme")
+alertcondition(finalizedType == TYPE_DD_TREND, "Session Classified - Double-Distribution Trend Day", "Completed session classified as a double-distribution trend day - two distributions separated by single prints")
+alertcondition(finalizedType == TYPE_NEUTRAL, "Session Classified - Neutral Day", "Completed session classified as a neutral day - extension on both sides with a mid-range close")
+alertcondition(finalizedType == TYPE_NEUTRAL_EXT, "Session Classified - Neutral Extreme Day", "Completed session classified as a neutral extreme day - extension on both sides with a close at an extreme")
+alertcondition(finalizedType == TYPE_NON_TREND, "Session Classified - Non-Trend Day", "Completed session classified as a non-trend day - no range extension and a narrow session range")
+
+//---------------------------------------------------------------------------------------------------------------------}

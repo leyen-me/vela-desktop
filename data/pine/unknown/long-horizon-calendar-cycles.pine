@@ -1,0 +1,325 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator('Long-horizon Calendar Cycles', 'Long-horizon Calendar Cycles', overlay = false, format = format.percent, precision = 2, max_lines_count = 500, max_labels_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+NEUTRAL_COLOR = #787b86 // structure - zero line, unmarked readings
+ACCENT_COLOR  = #ff9800 // the one accent - current bucket highlight and Benner panic years
+PANIC_COLOR   = ACCENT_COLOR
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+MODE_PRESIDENTIAL = 'Presidential (4-Year)'
+MODE_DECENNIAL    = 'Decennial (Year Digit)'
+MODE_BENNER       = 'Benner Schedule'
+MODE_CUSTOM       = 'Custom Fixed-Year'
+
+GRP_CYCLE = 'Calendar Cycle'
+GRP_MAP   = 'Cycle Map'
+GRP_STYLE = 'Style'
+
+int FIRST_BENNER_YEAR = 1819 // first panic year on the published Benner chart
+int MAX_FUTURE_BARS   = 480  // headroom under the ~500-bar platform limit for future drawing coordinates
+
+// Samuel Benner pre-scheduled years (Benner, 1875), as published in the widely reproduced 1924-2059 revision of the
+// chart, with the earlier panic years from the original. Each row is extended past the published range strictly by
+// the interval rotations the chart itself states: panic years repeat at 16-18-20 year intervals, high years (good
+// times - time to sell) at 8-9-10 years, and low years (hard times - time to buy) at 7-11-9 years. Years listed on
+// more than one row (1945, 1999, 2053) are classified with panic taking precedence over high, and high over low.
+var array<int> bennerPanicYearArray = array.from(1819, 1837, 1857, 1873, 1891, 1911, 1927, 1945, 1965, 1981, 1999, 2019, 2035, 2053, 2073, 2089)
+var array<int> bennerHighYearArray  = array.from(1926, 1935, 1945, 1954, 1962, 1972, 1980, 1989, 1999, 2007, 2016, 2026, 2034, 2043, 2053, 2061, 2070, 2080, 2088, 2097)
+var array<int> bennerLowYearArray   = array.from(1924, 1931, 1942, 1951, 1958, 1969, 1978, 1985, 1996, 2005, 2012, 2023, 2032, 2039, 2050, 2059, 2066, 2077, 2086, 2093)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+cycleModeInput = input.string(MODE_PRESIDENTIAL, 'Cycle Model', options = [MODE_PRESIDENTIAL, MODE_DECENNIAL, MODE_BENNER, MODE_CUSTOM], group = GRP_CYCLE, tooltip = 'Which long-horizon calendar cycle the yearly statistics are bucketed by. Presidential (4-Year): position within the four-year US presidential term - in long US samples the pre-election (third) year has averaged the strongest returns. Decennial (Year Digit): market history sorted by the last digit of the year, 0 to 9. Benner Schedule: years classified per the published Benner chart as scheduled high / sell, low / buy or panic years. Custom Fixed-Year: any whole-year cycle length with a chosen anchor year, for approximate business-cycle rhythms such as Kitchin or Juglar.')
+
+customLengthInput = input.int(9, 'Custom Cycle Length (years)', minval = 2, maxval = 60, group = GRP_CYCLE, tooltip = 'Length in whole years of the Custom Fixed-Year cycle. Business-cycle lengths from the literature are approximate rather than exact dates: the Kitchin inventory cycle runs about 3 to 4 years, the Juglar investment cycle 7 to 11 years, and the Kondratieff wave spans several decades. Ignored by the other cycle models.')
+customAnchorInput = input.int(2009, 'Custom Anchor Year', minval = 1700, maxval = 2100, group = GRP_CYCLE, tooltip = 'Calendar year counted as Year 1 of the Custom Fixed-Year cycle - it only sets the phase of the count. Example: length 4 with anchor 2021 reproduces the presidential-term grouping. Ignored by the other cycle models.')
+sampleFromInput   = input.int(1800, 'Sample From Year', minval = 1700, maxval = 2100, group = GRP_CYCLE, tooltip = 'Completed years earlier than this are excluded from all statistics. Raise it to check whether a tendency still holds in the modern sample instead of leaning on century-old observations.')
+
+markBennerInput   = input.bool(true, 'Benner Year Lines On Chart', group = GRP_CYCLE, tooltip = 'Benner Schedule model only. Draws a dotted vertical line on the price chart at every scheduled Benner year in view and a small H (high / sell), L (low / buy) or P (panic) letter on the zero line of this pane. Traders drop these years onto weekly or monthly charts as windows to watch for actual reversal behavior, not dates to trade blind.')
+projectYearsInput = input.int(12, 'Project Ahead (years)', minval = 0, maxval = 40, group = GRP_CYCLE, tooltip = 'Benner Schedule model only. How many years beyond the newest bar upcoming scheduled years are projected. Drawings cannot sit more than roughly 480 bars past the last bar, so distant years are clipped on daily charts - use weekly or monthly charts to see far-out projections.')
+
+showMapInput     = input.bool(true, 'Show Cycle Map', group = GRP_MAP, tooltip = 'Shows the cycle map table: one row per calendar bucket with the number of completed years (n), the mean and median yearly close-to-close return, and the share of positive years. The bucket containing the current year is highlighted, and the footer states where now sits together with the year-to-date return.')
+mapPositionInput = input.string('Top Right', 'Position', inline = 'map', group = GRP_MAP, options = ['Top Right', 'Top Left', 'Bottom Right', 'Bottom Left', 'Middle Right'], tooltip = 'Location of the cycle map on the chart.')
+mapSizeInput     = input.string('Small', 'Size', inline = 'map', group = GRP_MAP, options = ['Tiny', 'Small', 'Normal'], tooltip = 'Text size of the cycle map.')
+minSamplesInput  = input.int(10, 'Small-Sample Warning (n below)', minval = 2, maxval = 100, group = GRP_MAP, tooltip = 'Buckets with fewer completed years than this are dimmed as a small-sample caution. A four-year cycle repeats only about twenty-five times per century and the longer waves far fewer, so every bucket average rests on a handful of observations with wide variance - background context, not a trigger.')
+
+bullColorInput   = input.color(BULL_COLOR, 'Bullish', inline = 'direction', group = GRP_STYLE, tooltip = 'Color for positive cycle tilt, positive yearly returns and bullish table readings.')
+bearColorInput   = input.color(BEAR_COLOR, 'Bearish', inline = 'direction', group = GRP_STYLE, tooltip = 'Color for negative cycle tilt, negative yearly returns and bearish table readings.')
+accentColorInput = input.color(ACCENT_COLOR, 'Highlight', group = GRP_STYLE, tooltip = 'Accent color for the current bucket row in the cycle map and the timeframe notice frame.')
+showDotsInput    = input.bool(true, 'Yearly Return Dots', group = GRP_STYLE, tooltip = 'Plots each completed calendar year as a dot at its close-to-close return, on the first bar of the following year. The dispersion of the dots around the tilt line is the honest picture of how loose calendar tendencies are.')
+showNowLabelInput = input.bool(true, 'Current Position Label', group = GRP_STYLE, tooltip = 'Shows a label at the right edge of the pane with the current year, its cycle bucket, and the historical mean, win rate and sample size of that bucket.')
+bennerHighColorInput  = input.color(BEAR_COLOR, 'Benner High', inline = 'benner', group = GRP_STYLE, tooltip = 'Color of scheduled Benner high / sell year lines and letters.')
+bennerLowColorInput   = input.color(BULL_COLOR, 'Low', inline = 'benner', group = GRP_STYLE, tooltip = 'Color of scheduled Benner low / buy year lines and letters.')
+bennerPanicColorInput = input.color(PANIC_COLOR, 'Panic', inline = 'benner', group = GRP_STYLE, tooltip = 'Color of scheduled Benner panic year lines and letters. Panic takes precedence when a year appears on more than one row of the published chart.')
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Cycle Context
+//---------------------------------------------------------------------------------------------------------------------{
+int  modeId      = cycleModeInput == MODE_PRESIDENTIAL ? 0 : cycleModeInput == MODE_DECENNIAL ? 1 : cycleModeInput == MODE_BENNER ? 2 : 3
+int  bucketTotal = modeId == 0 ? 4 : modeId == 1 ? 10 : modeId == 2 ? 4 : customLengthInput
+bool tfOk        = not timeframe.isintraday
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+f_tablePosition(string positionText) =>
+    switch positionText
+        'Top Right'    => position.top_right
+        'Top Left'     => position.top_left
+        'Bottom Right' => position.bottom_right
+        'Bottom Left'  => position.bottom_left
+        => position.middle_right
+
+f_tableSize(string sizeText) =>
+    switch sizeText
+        'Tiny'  => size.tiny
+        'Small' => size.small
+        => size.normal
+
+//Signed percent formatting for table and label readouts
+f_pct(float value) =>
+    na(value) ? 'n/a' : (value >= 0 ? '+' : '') + str.tostring(value, '#.##') + '%'
+
+//Benner classification of a calendar year: 0 = scheduled high, 1 = scheduled low, 2 = scheduled panic, 3 = unmarked
+f_bennerClass(int calendarYear) =>
+    array.includes(bennerPanicYearArray, calendarYear) ? 2 : array.includes(bennerHighYearArray, calendarYear) ? 0 : array.includes(bennerLowYearArray, calendarYear) ? 1 : 3
+
+//Bucket a calendar year according to the selected cycle model. US presidential election years divide evenly by four,
+//so Year 1 of the term (post-election year) satisfies year % 4 == 1
+f_bucketId(int calendarYear) =>
+    switch modeId
+        0 => calendarYear % 4 == 1 ? 0 : calendarYear % 4 == 2 ? 1 : calendarYear % 4 == 3 ? 2 : 3
+        1 => calendarYear % 10
+        2 => f_bennerClass(calendarYear)
+        => ((calendarYear - customAnchorInput) % customLengthInput + customLengthInput) % customLengthInput
+
+f_bucketName(int bucketId) =>
+    switch modeId
+        0 => bucketId == 0 ? 'Post-Election (Y1)' : bucketId == 1 ? 'Midterm (Y2)' : bucketId == 2 ? 'Pre-Election (Y3)' : 'Election (Y4)'
+        1 => 'Years ending in ' + str.tostring(bucketId)
+        2 => bucketId == 0 ? 'High / Sell years' : bucketId == 1 ? 'Low / Buy years' : bucketId == 2 ? 'Panic years' : 'Unmarked years'
+        => 'Year ' + str.tostring(bucketId + 1) + ' / ' + str.tostring(customLengthInput)
+
+//First scheduled year in a Benner row at or after the given year, na when the stored row ends earlier
+f_nextScheduled(array<int> scheduleArray, int fromYear) =>
+    int nextYear = na
+    if array.size(scheduleArray) > 0
+        for i = 0 to array.size(scheduleArray) - 1
+            int rowYear = array.get(scheduleArray, i)
+            if rowYear >= fromYear
+                nextYear := rowYear
+                break
+    nextYear
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Yearly Sampling
+//---------------------------------------------------------------------------------------------------------------------{
+// Buckets are built from calendar time only. The close of the last bar opening inside each calendar year is that
+// year close (exact on daily and monthly bars, off by at most a few sessions on weekly bars), and every completed
+// close-to-close yearly return is filed under the bucket of the year it belongs to. The year in progress is never
+// included, so each reading is walk-forward: statistics only contain years that had already finished.
+var float prevYearClose  = na // close of the most recently completed calendar year
+var int   prevYearNumber = na // that year number - guards against data gaps spanning whole years
+
+var array<float> bucketSumArray   = array.new<float>(bucketTotal, 0.0)
+var array<int>   bucketCountArray = array.new<int>(bucketTotal, 0)
+var array<int>   bucketWinArray   = array.new<int>(bucketTotal, 0)
+var array<float> yearReturnArray  = array.new<float>()
+var array<int>   yearBucketArray  = array.new<int>()
+
+bool  isNewYear          = tfOk and bar_index > 0 and year != year[1]
+float justRecordedReturn = na
+
+if isNewYear
+    int finishedYear = year[1]
+    if not na(prevYearClose) and not na(prevYearNumber) and finishedYear == prevYearNumber + 1 and finishedYear >= sampleFromInput
+        float yearReturn     = (close[1] / prevYearClose - 1) * 100
+        int finishedBucketId = f_bucketId(finishedYear)
+        array.set(bucketSumArray, finishedBucketId, array.get(bucketSumArray, finishedBucketId) + yearReturn)
+        array.set(bucketCountArray, finishedBucketId, array.get(bucketCountArray, finishedBucketId) + 1)
+        if yearReturn > 0
+            array.set(bucketWinArray, finishedBucketId, array.get(bucketWinArray, finishedBucketId) + 1)
+        array.push(yearReturnArray, yearReturn)
+        array.push(yearBucketArray, finishedBucketId)
+        justRecordedReturn := yearReturn
+    prevYearClose  := close[1]
+    prevYearNumber := finishedYear
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Cycle Position & Tilt
+//---------------------------------------------------------------------------------------------------------------------{
+int   currentBucketId    = tfOk ? f_bucketId(year) : 0
+int   currentBennerClass = tfOk ? f_bennerClass(year) : 3
+int   currentCount       = array.get(bucketCountArray, currentBucketId)
+float currentWinPct      = currentCount > 0 ? 100.0 * array.get(bucketWinArray, currentBucketId) / currentCount : na
+float tilt               = tfOk and currentCount > 0 ? array.get(bucketSumArray, currentBucketId) / currentCount : na
+float ytdReturn          = tfOk and not na(prevYearClose) ? (close / prevYearClose - 1) * 100 : na
+
+bool strongYearStart  = isNewYear and not na(tilt) and tilt > 0
+bool weakYearStart    = isNewYear and not na(tilt) and tilt < 0
+bool bennerHighStart  = isNewYear and currentBennerClass == 0
+bool bennerLowStart   = isNewYear and currentBennerClass == 1
+bool bennerPanicStart = isNewYear and currentBennerClass == 2
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Benner Schedule Markers
+//---------------------------------------------------------------------------------------------------------------------{
+var int  firstBarTime = time
+var bool bennerDrawn  = false
+
+if barstate.islast and tfOk and modeId == 2 and markBennerInput and not bennerDrawn
+    bennerDrawn      := true
+    int maxFutureTime = time + MAX_FUTURE_BARS * timeframe.in_seconds(timeframe.period) * 1000
+    int lastMarkYear  = math.max(year + projectYearsInput, FIRST_BENNER_YEAR)
+    for markYear = FIRST_BENNER_YEAR to lastMarkYear
+        int markClass = f_bennerClass(markYear)
+        if markClass < 3
+            int markTime = timestamp('GMT', markYear, 1, 1, 0, 0)
+            if markTime >= firstBarTime and markTime <= maxFutureTime
+                color  markColor  = markClass == 2 ? bennerPanicColorInput : markClass == 0 ? bennerHighColorInput : bennerLowColorInput
+                string markLetter = markClass == 2 ? 'P' : markClass == 0 ? 'H' : 'L'
+                line.new(markTime, 0, markTime, 1, xloc = xloc.bar_time, extend = extend.both, color = color.new(markColor, 35), style = line.style_dotted, force_overlay = true)
+                label.new(markTime, 0, markLetter, xloc = xloc.bar_time, style = label.style_label_center, color = #00000000, textcolor = markColor, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Current Position Label
+//---------------------------------------------------------------------------------------------------------------------{
+var label nowLabel = na
+
+if barstate.islast and tfOk and showNowLabelInput
+    if na(nowLabel)
+        nowLabel := label.new(bar_index, 0, '', style = label.style_label_left, color = #00000000, size = size.small)
+    string statsText = na(tilt) ? '\nno completed years in this bucket yet' : '\nmean ' + f_pct(tilt) + ' · win ' + (na(currentWinPct) ? 'n/a' : str.tostring(currentWinPct, '#.#') + '%') + ' · n=' + str.tostring(currentCount)
+    label.set_xy(nowLabel, bar_index + 3, nz(tilt))
+    label.set_text(nowLabel, str.tostring(year) + ' · ' + f_bucketName(currentBucketId) + statsText)
+    label.set_textcolor(nowLabel, na(tilt) ? NEUTRAL_COLOR : tilt >= 0 ? bullColorInput : bearColorInput)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Cycle Map
+//---------------------------------------------------------------------------------------------------------------------{
+string modeTitle = switch modeId
+    0 => 'Presidential Cycle'
+    1 => 'Decennial Pattern'
+    2 => 'Benner Schedule'
+    => 'Custom ' + str.tostring(customLengthInput) + '-Year Cycle'
+
+var table mapTable = na
+
+if barstate.islast and tfOk and showMapInput
+    if na(mapTable)
+        mapTable := table.new(f_tablePosition(mapPositionInput), 5, bucketTotal + 3, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+    string textSize    = f_tableSize(mapSizeInput)
+    color  headerColor = DASH_HEADER
+
+    //Pass 1 - bucket statistics and the gradient scale
+    float maxAbsMean = 0.0
+    array<float> meanValueArray   = array.new<float>()
+    array<float> medianValueArray = array.new<float>()
+    array<float> winPctArray      = array.new<float>()
+    int totalReturns = array.size(yearReturnArray)
+    for b = 0 to bucketTotal - 1
+        int nCount      = array.get(bucketCountArray, b)
+        float meanValue = nCount > 0 ? array.get(bucketSumArray, b) / nCount : na
+        float winValue  = nCount > 0 ? 100.0 * array.get(bucketWinArray, b) / nCount : na
+        array<float> filteredArray = array.new<float>()
+        if totalReturns > 0
+            for i = 0 to totalReturns - 1
+                if array.get(yearBucketArray, i) == b
+                    array.push(filteredArray, array.get(yearReturnArray, i))
+        float medianValue = array.size(filteredArray) > 0 ? array.median(filteredArray) : na
+        array.push(meanValueArray, meanValue)
+        array.push(medianValueArray, medianValue)
+        array.push(winPctArray, winValue)
+        if not na(meanValue)
+            maxAbsMean := math.max(maxAbsMean, math.abs(meanValue))
+
+    //Header rows
+    table.cell(mapTable, 0, 0, modeTitle + ' · ' + str.tostring(totalReturns) + ' completed years', text_color = DASH_TEXT, text_size = textSize, text_halign = text.align_left)
+    table.merge_cells(mapTable, 0, 0, 4, 0)
+    table.cell(mapTable, 0, 1, 'Cycle year', text_color = headerColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(mapTable, 1, 1, 'n', text_color = headerColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(mapTable, 2, 1, 'Mean', text_color = headerColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(mapTable, 3, 1, 'Median', text_color = headerColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(mapTable, 4, 1, 'Win %', text_color = headerColor, text_size = textSize, text_halign = text.align_right)
+
+    //Pass 2 - one row per bucket, current bucket highlighted, thin samples dimmed
+    for b = 0 to bucketTotal - 1
+        int  rowIndex     = b + 2
+        int  nCount       = array.get(bucketCountArray, b)
+        bool isCurrentRow = b == currentBucketId
+        bool thinSample   = nCount < minSamplesInput
+        float meanValue   = array.get(meanValueArray, b)
+        float medianValue = array.get(medianValueArray, b)
+        float winValue    = array.get(winPctArray, b)
+        int   dimTransp   = thinSample ? 45 : 0
+        color rowBg       = isCurrentRow ? color.new(accentColorInput, 80) : na
+        color nameColor   = thinSample ? DASH_HEADER : DASH_TEXT
+        color meanColor   = na(meanValue) ? DASH_HEADER : color.new(meanValue >= 0 ? bullColorInput : bearColorInput, dimTransp)
+        color medianColor = na(medianValue) ? DASH_HEADER : color.new(medianValue >= 0 ? bullColorInput : bearColorInput, dimTransp)
+        color winColor    = na(winValue) ? DASH_HEADER : color.new(winValue >= 50 ? bullColorInput : bearColorInput, dimTransp)
+        color meanBg      = na
+        if not na(meanValue) and maxAbsMean > 0
+            meanBg := meanValue >= 0 ? color.from_gradient(meanValue, 0, maxAbsMean, color.new(bullColorInput, 94), color.new(bullColorInput, 60)) : color.from_gradient(meanValue, -maxAbsMean, 0, color.new(bearColorInput, 60), color.new(bearColorInput, 94))
+        table.cell(mapTable, 0, rowIndex, f_bucketName(b), text_color = nameColor, text_size = textSize, text_halign = text.align_left, bgcolor = rowBg)
+        table.cell(mapTable, 1, rowIndex, str.tostring(nCount), text_color = thinSample ? DASH_HEADER : DASH_TEXT, text_size = textSize, text_halign = text.align_right, bgcolor = rowBg)
+        table.cell(mapTable, 2, rowIndex, f_pct(meanValue), text_color = meanColor, text_size = textSize, text_halign = text.align_right, bgcolor = na(meanBg) ? rowBg : meanBg)
+        table.cell(mapTable, 3, rowIndex, f_pct(medianValue), text_color = medianColor, text_size = textSize, text_halign = text.align_right, bgcolor = rowBg)
+        table.cell(mapTable, 4, rowIndex, na(winValue) ? 'n/a' : str.tostring(winValue, '#.#') + '%', text_color = winColor, text_size = textSize, text_halign = text.align_right, bgcolor = rowBg)
+
+    //Footer - where now sits on the cycle
+    string footerText = 'Now: ' + str.tostring(year) + ' · ' + f_bucketName(currentBucketId) + ' · YTD ' + f_pct(ytdReturn)
+    if modeId == 2
+        int nextHigh  = f_nextScheduled(bennerHighYearArray, year)
+        int nextLow   = f_nextScheduled(bennerLowYearArray, year)
+        int nextPanic = f_nextScheduled(bennerPanicYearArray, year)
+        footerText += '\nNext scheduled · H ' + (na(nextHigh) ? 'n/a' : str.tostring(nextHigh)) + ' · L ' + (na(nextLow) ? 'n/a' : str.tostring(nextLow)) + ' · P ' + (na(nextPanic) ? 'n/a' : str.tostring(nextPanic))
+    table.cell(mapTable, 0, bucketTotal + 2, footerText, text_color = DASH_TEXT, text_size = textSize, text_halign = text.align_left)
+    table.merge_cells(mapTable, 0, bucketTotal + 2, 4, bucketTotal + 2)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Timeframe Guard
+//---------------------------------------------------------------------------------------------------------------------{
+var table guardTable = na
+
+if barstate.islast and not tfOk
+    if na(guardTable)
+        guardTable := table.new(position.middle_center, 1, 1, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+    table.cell(guardTable, 0, 0, 'Long-horizon calendar cycles compare whole calendar years.\nSwitch to a Daily, Weekly or Monthly chart.', text_color = DASH_TEXT, text_size = size.small, text_halign = text.align_center)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Plots
+//---------------------------------------------------------------------------------------------------------------------{
+color tiltColor           = na(tilt) ? na : tilt >= 0 ? bullColorInput : bearColorInput
+color dotColor            = na(justRecordedReturn) ? na : justRecordedReturn >= 0 ? color.new(bullColorInput, 25) : color.new(bearColorInput, 25)
+color gradientTopColor    = na(tilt) ? na : tilt >= 0 ? color.new(bullColorInput, 55) : color.new(bearColorInput, 100)
+color gradientBottomColor = na(tilt) ? na : tilt >= 0 ? color.new(bullColorInput, 100) : color.new(bearColorInput, 55)
+
+tiltPlotId = plot(tilt, 'Cycle Tilt (bucket mean)', color = tiltColor, linewidth = 2, style = plot.style_stepline)
+zeroPlotId = plot(tfOk ? 0 : na, 'Zero Line', color = NEUTRAL_COLOR)
+fill(tiltPlotId, zeroPlotId, math.max(nz(tilt), 0), math.min(nz(tilt), 0), gradientTopColor, gradientBottomColor, title = 'Tilt Gradient')
+plot(showDotsInput ? justRecordedReturn : na, 'Yearly Returns', color = dotColor, linewidth = 2, style = plot.style_circles)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(isNewYear, 'New Cycle Year Started', 'Long-horizon Calendar Cycles on {{ticker}}: a new calendar year began and the symbol advanced one position on the selected cycle - check the cycle map for the tilt of the year ahead ({{interval}})')
+alertcondition(strongYearStart, 'Historically Strong Year Started', 'Long-horizon Calendar Cycles on {{ticker}}: the year that just began sits in a cycle bucket with a positive historical mean return - bullish calendar tilt, to be confirmed by trend and breadth ({{interval}})')
+alertcondition(weakYearStart, 'Historically Weak Year Started', 'Long-horizon Calendar Cycles on {{ticker}}: the year that just began sits in a cycle bucket with a negative historical mean return - cautious calendar tilt, to be confirmed by trend and breadth ({{interval}})')
+alertcondition(bennerHighStart, 'Benner High Year Started', 'Long-horizon Calendar Cycles on {{ticker}}: a year scheduled as a Benner high - good times, time to sell - has begun; treat it as a window to watch for topping behavior, not a standalone signal ({{interval}})')
+alertcondition(bennerLowStart, 'Benner Low Year Started', 'Long-horizon Calendar Cycles on {{ticker}}: a year scheduled as a Benner low - hard times, time to buy - has begun; treat it as a window to watch for bottoming behavior, not a standalone signal ({{interval}})')
+alertcondition(bennerPanicStart, 'Benner Panic Year Started', 'Long-horizon Calendar Cycles on {{ticker}}: a year scheduled as a Benner panic year has begun; the published chart marks it as a window for stress and major turns - watch price structure for confirmation ({{interval}})')
+
+//---------------------------------------------------------------------------------------------------------------------}

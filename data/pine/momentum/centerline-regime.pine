@@ -1,0 +1,307 @@
+// This work is licensed under Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Centerline Regime", "Centerline Regime", overlay = false, format = format.price, precision = 2, max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR  = #089981
+BEAR_COLOR  = #f23645
+TEST_COLOR  = #787b86 // regime contested: the oscillator sits on the far side of its midline, flip not confirmed
+MID_COLOR   = #787b86
+BAND_COLOR  = #5b9cf6
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+OSC_RSI   = "RSI"
+OSC_STOCH = "Stochastic"
+OSC_CCI   = "CCI"
+OSC_CMO   = "CMO"
+OSC_TSI   = "TSI"
+OSC_ROC   = "ROC"
+OSC_MACD  = "MACD"
+
+BAND_ADAPTIVE = "Adaptive"
+BAND_FIXED    = "Fixed"
+
+OSC_GROUP    = "Oscillator"
+REGIME_GROUP = "Regime"
+HOLD_GROUP   = "Midline Holds"
+STYLE_GROUP  = "Style"
+DASH_GROUP   = "Dashboard"
+
+FILL_LINE_TRANSP = 55
+FILL_MID_TRANSP  = 100
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+oscInput = input.string(OSC_RSI, "Oscillator", options = [OSC_RSI, OSC_STOCH, OSC_CCI, OSC_CMO, OSC_TSI, OSC_ROC, OSC_MACD], group = OSC_GROUP
+  , tooltip = "Oscillator whose midline side defines the regime. RSI and the Stochastic center on 50; CCI, CMO, TSI, ROC and the MACD line center on zero. The midline has structural meaning in each: RSI 50 is average gains equal to average losses, MACD zero is the fast average equal to the slow one, ROC zero is price flat against its lookback.")
+
+srcInput = input.source(close, "Source", group = OSC_GROUP)
+
+lengthInput = input.int(14, "Length", minval = 2, group = OSC_GROUP
+  , tooltip = "Lookback of RSI, Stochastic, CCI, CMO and ROC. TSI and MACD use their own pair of lengths below.")
+
+fastInput = input.int(12, "MACD Fast", minval = 1, inline = "macd", group = OSC_GROUP)
+slowInput = input.int(26, "Slow", minval = 2, inline = "macd", group = OSC_GROUP
+  , tooltip = "EMA lengths of the MACD line. Its zero cross is the fast/slow moving-average crossover in disguise.")
+
+tsiLongInput  = input.int(25, "TSI Long", minval = 1, inline = "tsi", group = OSC_GROUP)
+tsiShortInput = input.int(13, "Short", minval = 1, inline = "tsi", group = OSC_GROUP
+  , tooltip = "Double-smoothing lengths of the True Strength Index, scaled to -100 to 100.")
+
+bandModeInput = input.string(BAND_ADAPTIVE, "Neutral Band", options = [BAND_ADAPTIVE, BAND_FIXED], group = REGIME_GROUP
+  , tooltip = "Buffer around the midline treated as neutral, so single pokes across the line do not flip the regime. Adaptive sizes it from the oscillator's own typical distance from the midline, which works on any oscillator and symbol (on daily RSI it lands near the classic 45-55 band). Fixed uses the width below in oscillator units.")
+
+bandMultInput = input.float(0.5, "Adaptive Width (x typical swing)", minval = 0.05, step = 0.05, group = REGIME_GROUP
+  , tooltip = "Half-width of the adaptive band as a multiple of the average distance between the oscillator and its midline over the swing window.")
+
+bandFixedInput = input.float(5, "Fixed Width (units)", minval = 0, step = 0.5, group = REGIME_GROUP
+  , tooltip = "Half-width of the fixed band in oscillator units: 5 on RSI gives the 45-55 neutral zone.")
+
+swingLenInput = input.int(200, "Swing Window", minval = 20, group = REGIME_GROUP
+  , tooltip = "Bars used to measure the typical swing for the adaptive band and the occupancy share reported in the dashboard.")
+
+confirmInput = input.int(3, "Confirmation Closes", minval = 1, maxval = 20, group = REGIME_GROUP
+  , tooltip = "Consecutive closes beyond the far edge of the band required before the regime flips: sustained occupation of the other side rather than the first tick across. More closes mean fewer false flips and later ones.")
+
+priceLenInput = input.int(50, "Price Check EMA", minval = 2, group = REGIME_GROUP
+  , tooltip = "EMA of price used to cross-check the regime against the chart: a bull regime with price below it, or a bear regime with price above it, is reported as a conflict, the condition where chop is most likely.")
+
+showHoldsInput = input.bool(true, "Show Midline Holds", group = HOLD_GROUP
+  , tooltip = "Mark pullbacks that stall at the midline and turn back with the regime: an oscillator that stretched away from the midline, returned into the band without crossing its far edge, then left the band again on the regime side. The momentum-side continuation cue.")
+
+stretchInput = input.float(2, "Minimum Stretch (x band)", minval = 1, step = 0.25, group = HOLD_GROUP
+  , tooltip = "How far beyond the midline, in band half-widths, the oscillator must travel before a return to the band counts as a pullback. Keeps holds to genuine swings rather than drift along the band edge.")
+
+colorBarsInput = input.bool(true, "Color Candles by Regime", group = STYLE_GROUP
+  , tooltip = "Paint the price candles in the regime color, grey while the regime is contested.")
+
+showFlipsInput = input.bool(true, "Regime Flip Labels", group = STYLE_GROUP
+  , tooltip = "Tag each confirmed flip on the price chart, at the bar the regime changed.")
+
+showBandInput = input.bool(true, "Show Neutral Band", group = STYLE_GROUP)
+
+bullColorInput = input.color(BULL_COLOR, "Bull", inline = "colors", group = STYLE_GROUP)
+bearColorInput = input.color(BEAR_COLOR, "Bear", inline = "colors", group = STYLE_GROUP)
+testColorInput = input.color(TEST_COLOR, "Contested", inline = "colors", group = STYLE_GROUP)
+
+showDashInput = input.bool(true, "Show Dashboard", group = DASH_GROUP
+  , tooltip = "Regime, time in regime, the operating range the oscillator has used since the flip, occupancy above the midline, the last pullback low and the price cross-check.")
+dashPosInput  = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], inline = "dash", group = DASH_GROUP)
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], inline = "dash", group = DASH_GROUP)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+getSize(string s) =>
+    switch s
+        "Tiny"  => size.tiny
+        "Small" => size.small
+        => size.normal
+
+getPosition(string p) =>
+    switch p
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        => position.bottom_left
+
+fmt(float x) =>
+    na(x) ? "-" : math.abs(x) >= 100 ? str.tostring(x, "#") : math.abs(x) >= 1 ? str.tostring(x, "#.#") : str.tostring(x, "#.###")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Oscillator & Neutral Band
+//---------------------------------------------------------------------------------------------------------------------{
+//Every oscillator is computed on every bar, so switching the selection never changes what executes
+rsiValue   = ta.rsi(srcInput, lengthInput)
+stochValue = ta.sma(ta.stoch(close, high, low, lengthInput), 3)
+cciValue   = ta.cci(srcInput, lengthInput)
+cmoValue   = ta.cmo(srcInput, lengthInput)
+tsiValue   = 100 * ta.tsi(srcInput, tsiShortInput, tsiLongInput)
+rocValue   = ta.roc(srcInput, lengthInput)
+macdValue  = ta.ema(srcInput, fastInput) - ta.ema(srcInput, slowInput)
+
+osc = switch oscInput
+    OSC_RSI   => rsiValue
+    OSC_STOCH => stochValue
+    OSC_CCI   => cciValue
+    OSC_CMO   => cmoValue
+    OSC_TSI   => tsiValue
+    OSC_ROC   => rocValue
+    => macdValue
+
+mid = oscInput == OSC_RSI or oscInput == OSC_STOCH ? 50.0 : 0.0
+
+//Typical swing: average distance from the midline, seeded with the running mean until the window fills
+distance  = math.abs(osc - mid)
+swingAvg  = ta.sma(distance, swingLenInput)
+runAvg    = ta.cum(nz(distance)) / math.max(ta.cum(na(distance) ? 0 : 1), 1)
+typSwing  = nz(swingAvg, runAvg)
+
+band      = bandModeInput == BAND_ADAPTIVE ? bandMultInput * typSwing : bandFixedInput
+upperEdge = mid + band
+lowerEdge = mid - band
+
+priceEma  = ta.ema(close, priceLenInput)
+occupancy = 100 * ta.sma(osc > mid ? 1.0 : 0.0, swingLenInput)
+occRun    = 100 * ta.cum(osc > mid ? 1.0 : 0.0) / math.max(ta.cum(na(osc) ? 0 : 1), 1)
+aboveShare = nz(occupancy, occRun)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Regime State Machine
+//---------------------------------------------------------------------------------------------------------------------{
+var int   regime      = 0
+var int   aboveCount  = 0
+var int   belowCount  = 0
+var int   flipBar     = na
+var float rangeLow    = na
+var float rangeHigh   = na
+var bool  stretched   = false
+var bool  inPullback  = false
+var float pullExtreme = na
+var int   pullBar     = na
+var float lastPull    = na
+var bool  lastPullOk  = false
+
+bool bullFlip = false
+bool bearFlip = false
+bool bullHold = false
+bool bearHold = false
+
+if barstate.isconfirmed and not na(osc) and not na(band)
+    aboveCount := osc > upperEdge ? aboveCount + 1 : 0
+    belowCount := osc < lowerEdge ? belowCount + 1 : 0
+
+    //Flip only on sustained occupation beyond the far edge of the band
+    if regime != 1 and aboveCount >= confirmInput
+        regime   := 1
+        bullFlip := true
+    else if regime != -1 and belowCount >= confirmInput
+        regime   := -1
+        bearFlip := true
+
+    if bullFlip or bearFlip
+        flipBar     := bar_index
+        rangeLow    := osc
+        rangeHigh   := osc
+        stretched   := false
+        inPullback  := false
+        pullExtreme := na
+    else if regime != 0
+        rangeLow  := math.min(rangeLow, osc)
+        rangeHigh := math.max(rangeHigh, osc)
+
+        //Midline holds: stretch away from the midline, return into the band, leave it again on the regime side
+        float side      = regime
+        float extension = side * (osc - mid)
+        if not inPullback and extension >= stretchInput * band
+            stretched := true
+        if stretched and not inPullback and extension <= band
+            inPullback  := true
+            pullExtreme := osc
+            pullBar     := bar_index
+        if inPullback
+            if side * (pullExtreme - osc) > 0
+                pullExtreme := osc
+                pullBar     := bar_index
+            if extension > band
+                bool held  = side * (pullExtreme - mid) >= -band
+                lastPull   := pullExtreme
+                lastPullOk := held
+                if held
+                    bullHold := regime == 1
+                    bearHold := regime == -1
+                inPullback := false
+                stretched  := false
+
+//Contested: the regime stands but the oscillator sits on the far side of its midline
+contested = regime != 0 and regime * (osc - mid) < 0
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visuals
+//---------------------------------------------------------------------------------------------------------------------{
+regimeColor = regime == 1 ? bullColorInput : regime == -1 ? bearColorInput : testColorInput
+lineColor   = contested ? testColorInput : regimeColor
+
+oscPlot = plot(osc, "Oscillator", lineColor, 2)
+midPlot = plot(mid, "Midline", color.new(MID_COLOR, 30), 1, style = plot.style_line)
+upPlot  = plot(upperEdge, "Band Upper Edge", showBandInput ? color.new(BAND_COLOR, 60) : na, 1)
+dnPlot  = plot(lowerEdge, "Band Lower Edge", showBandInput ? color.new(BAND_COLOR, 60) : na, 1)
+
+fill(upPlot, dnPlot, showBandInput ? color.new(BAND_COLOR, 90) : na, title = "Neutral Band")
+
+//Gradient between the oscillator and its midline, in the side the oscillator occupies
+oscAbove = osc >= mid
+fill(oscPlot, midPlot, math.max(osc, mid), math.min(osc, mid)
+  , oscAbove ? color.new(lineColor, FILL_LINE_TRANSP) : color.new(lineColor, FILL_MID_TRANSP)
+  , oscAbove ? color.new(lineColor, FILL_MID_TRANSP) : color.new(lineColor, FILL_LINE_TRANSP)
+  , title = "Oscillator Gradient")
+
+//Flips are tagged on the price chart, where the regime is traded
+if showFlipsInput and (bullFlip or bearFlip)
+    label.new(bar_index, bullFlip ? low : high, bullFlip ? "Bull Regime" : "Bear Regime"
+      , style         = bullFlip ? label.style_label_up : label.style_label_down
+      , color         = regimeColor
+      , textcolor     = color.white
+      , size          = size.small
+      , tooltip       = (bullFlip ? "Bull regime: " : "Bear regime: ") + oscInput + " closed " + str.tostring(confirmInput) + " bars in a row beyond the " + (bullFlip ? "upper" : "lower") + " band edge (" + fmt(bullFlip ? upperEdge : lowerEdge) + "), now " + fmt(osc)
+      , force_overlay = true)
+
+if showHoldsInput and (bullHold or bearHold)
+    label.new(pullBar, pullExtreme, "Hold"
+      , style     = bullHold ? label.style_label_up : label.style_label_down
+      , color     = color.new(regimeColor, 80)
+      , textcolor = regimeColor
+      , size      = size.tiny
+      , tooltip   = "Midline hold: the pullback stalled at " + fmt(pullExtreme) + " inside the neutral band and turned back with the " + (bullHold ? "bull" : "bear") + " regime")
+
+barcolor(colorBarsInput and regime != 0 ? (contested ? testColorInput : regimeColor) : na, title = "Regime Candles")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dash = na
+
+if barstate.islast and showDashInput
+    if na(dash)
+        dash := table.new(getPosition(dashPosInput), 2, 6, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+    ts = getSize(dashSizeInput)
+    string regimeText = regime == 0 ? "Forming" : (regime == 1 ? "Bull" : "Bear") + (contested ? ", contested" : "")
+    string sinceText  = na(flipBar) ? "-" : str.tostring(bar_index - flipBar) + " bars"
+    string rangeText  = na(rangeLow) ? "-" : fmt(rangeLow) + " to " + fmt(rangeHigh)
+    string occText    = str.tostring(aboveShare, "#") + "% above"
+    string pullText   = na(lastPull) ? "-" : fmt(lastPull) + (lastPullOk ? " held" : " broke")
+    bool   agrees     = regime == 0 or (regime == 1 ? close >= priceEma : close <= priceEma)
+    string priceText  = regime == 0 ? "-" : agrees ? "Agrees" : "Conflict"
+
+    table.cell(dash, 0, 0, oscInput + " Regime", text_color = DASH_HEADER, text_size = ts, text_halign = text.align_left)
+    table.cell(dash, 1, 0, regimeText, text_color = contested ? testColorInput : regimeColor, text_size = ts, text_halign = text.align_right)
+    table.cell(dash, 0, 1, "Since Flip", text_color = DASH_HEADER, text_size = ts, text_halign = text.align_left)
+    table.cell(dash, 1, 1, sinceText, text_color = DASH_TEXT, text_size = ts, text_halign = text.align_right)
+    table.cell(dash, 0, 2, "Operating Range", text_color = DASH_HEADER, text_size = ts, text_halign = text.align_left)
+    table.cell(dash, 1, 2, rangeText, text_color = DASH_TEXT, text_size = ts, text_halign = text.align_right)
+    table.cell(dash, 0, 3, "Occupancy", text_color = DASH_HEADER, text_size = ts, text_halign = text.align_left)
+    table.cell(dash, 1, 3, occText, text_color = DASH_TEXT, text_size = ts, text_halign = text.align_right)
+    table.cell(dash, 0, 4, "Last Pullback", text_color = DASH_HEADER, text_size = ts, text_halign = text.align_left)
+    table.cell(dash, 1, 4, pullText, text_color = lastPullOk ? regimeColor : DASH_TEXT, text_size = ts, text_halign = text.align_right)
+    table.cell(dash, 0, 5, "Price Check", text_color = DASH_HEADER, text_size = ts, text_halign = text.align_left)
+    table.cell(dash, 1, 5, priceText, text_color = agrees ? DASH_TEXT : testColorInput, text_size = ts, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(bullFlip, "Bull Regime", "Centerline Regime: the oscillator held above its neutral band for the confirmation closes, bull regime on {{ticker}} ({{interval}})")
+alertcondition(bearFlip, "Bear Regime", "Centerline Regime: the oscillator held below its neutral band for the confirmation closes, bear regime on {{ticker}} ({{interval}})")
+alertcondition(bullHold, "Bull Midline Hold", "Centerline Regime: pullback stalled at the midline and turned up inside the bull regime on {{ticker}} ({{interval}})")
+alertcondition(bearHold, "Bear Midline Hold", "Centerline Regime: rally faded at the midline and turned down inside the bear regime on {{ticker}} ({{interval}})")
+alertcondition(contested and not contested[1], "Regime Contested", "Centerline Regime: the oscillator crossed its midline against the standing regime on {{ticker}}, flip not yet confirmed ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

@@ -1,0 +1,114 @@
+//@version=6
+indicator("Volume Flow Indicator", shorttitle = "Volume Flow Indicator", overlay = false, format = format.price, precision = 2)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR        = #089981 // directional bullish color
+BEAR_COLOR        = #f23645 // directional bearish color
+SIGNAL_COLOR      = #ff9800 // signal line color
+FILL_VALUE_TRANSP = 50      // gradient transparency at the VFI value
+FILL_ZERO_TRANSP  = 100     // gradient transparency at the zero line
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+lengthInput       = input.int(130, "Length", minval = 2, group = "Settings",
+     tooltip = "Rolling summation window, also used for the average volume that scales the result. The published default of 130 bars targets position-horizon work on daily charts - roughly half a trading year. Shorter windows respond faster but surrender the steadiness that is the design's point.")
+
+coefInput         = input.float(0.2, "Cutoff Coefficient", minval = 0, step = 0.05, group = "Settings",
+     tooltip = "Scales the volatility-based minimum change in typical price. Each bar's cutoff is this coefficient times the standard deviation of the log change in typical price, converted to price units; moves in typical price smaller than the cutoff count as noise and contribute no volume. Published default: 0.2.")
+
+volCoefInput      = input.float(2.5, "Volume Cap Multiplier", minval = 0.1, step = 0.1, group = "Settings",
+     tooltip = "Caps each bar's volume contribution at this multiple of the average volume, so a single climactic print stays influential but bounded instead of distorting the line for months. Published default: 2.5.")
+
+volLengthInput    = input.int(30, "Volatility Length", minval = 2, group = "Settings",
+     tooltip = "Window of the standard deviation of the log change in typical price used to build the adaptive cutoff, so the noise threshold scales with each instrument's own volatility. The published version uses 30 bars.")
+
+smoothInput       = input.bool(true, "Smooth VFI", inline = "smooth", group = "Settings",
+     tooltip = "Applies the published light smoothing - an EMA of the summed line - before plotting. The published version plots the smoothed line.")
+
+smoothLengthInput = input.int(3, "", minval = 1, inline = "smooth", group = "Settings",
+     tooltip = "Length of the smoothing EMA. The published version uses 3 bars.")
+
+showSignalInput   = input.bool(true, "Signal Line", inline = "signal", group = "Settings",
+     tooltip = "Plots an EMA of VFI as a signal line, the crossover addition some implementations layer on the published design.")
+
+signalLengthInput = input.int(5, "", minval = 1, inline = "signal", group = "Settings",
+     tooltip = "Length of the signal-line EMA.")
+
+bullColorInput    = input.color(BULL_COLOR, "Bullish", inline = "direction", group = "Style",
+     tooltip = "Color of the VFI line and gradient fill above the zero line - the net accumulation regime.")
+
+bearColorInput    = input.color(BEAR_COLOR, "Bearish", inline = "direction", group = "Style",
+     tooltip = "Color of the VFI line and gradient fill below the zero line - the net distribution regime.")
+
+signalColorInput  = input.color(SIGNAL_COLOR, "Signal Line", group = "Style",
+     tooltip = "Color of the signal line.")
+
+gradientInput     = input.bool(true, "Gradient Fill", group = "Style",
+     tooltip = "Fills the area between the zero line and the VFI line with a vertical gradient, fully transparent at zero and strongest at the current value.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+// Volume Flow Indicator per Katsanos' published design (2004). Each bar's volume is signed by the direction of the
+// change in typical price - but only when that change clears a volatility-scaled cutoff - capped at a multiple of
+// average volume, summed over the window and scaled by average volume so the line oscillates around zero
+typicalPrice = hlc3
+logChange    = math.log(typicalPrice) - math.log(typicalPrice[1])
+
+// Adaptive noise threshold - the cutoff coefficient times the volatility of the log change, in price units
+volatility = ta.stdev(logChange, volLengthInput)
+cutoff     = coefInput * volatility * close
+
+// Volume cap - the prior bar's average volume times the cap multiplier bounds each bar's contribution. While the
+// average is still filling (or volume is unreported) the bar's own volume stands in, keeping early history defined
+vol          = nz(volume)
+avgVolume    = ta.sma(vol, lengthInput)[1]
+volumeCap    = avgVolume * volCoefInput
+cappedVolume = math.min(vol, nz(volumeCap, vol))
+
+// Signed, filtered volume - positive on meaningful up-moves in typical price, negative on meaningful down-moves,
+// zero when the change stays inside the noise cutoff
+typicalChange = typicalPrice - typicalPrice[1]
+signedVolume  = typicalChange > cutoff ? cappedVolume : typicalChange < -cutoff ? -cappedVolume : 0
+
+// Rolling sum scaled by average volume, with the published light smoothing applied when enabled
+flowSum     = math.sum(signedVolume, lengthInput)
+rawVfi      = avgVolume > 0 ? flowSum / avgVolume : na
+smoothedVfi = ta.ema(rawVfi, smoothLengthInput)
+vfi         = smoothInput ? smoothedVfi : rawVfi
+
+// Signal line - EMA of the plotted VFI
+signalLine = ta.ema(vfi, signalLengthInput)
+
+// Signal grammar - zero-line regime changes and signal-line crosses
+zeroCrossUp     = ta.crossover(vfi, 0)
+zeroCrossDown   = ta.crossunder(vfi, 0)
+signalCrossUp   = ta.crossover(vfi, signalLine)
+signalCrossDown = ta.crossunder(vfi, signalLine)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+zeroPlotId = plot(0, "Zero Line", color = color.new(chart.fg_color, 90), linewidth = 1)
+
+plot(showSignalInput ? signalLine : na, "Signal Line", color = signalColorInput, linewidth = 1)
+
+vfiPlotId = plot(vfi, "VFI", color = vfi > 0 ? bullColorInput : bearColorInput, linewidth = 1)
+
+// Centered-oscillator gradient - fully transparent at the zero line, strongest at the VFI value
+fillTopColor    = vfi > 0 ? color.new(bullColorInput, FILL_VALUE_TRANSP) : color.new(bearColorInput, FILL_ZERO_TRANSP)
+fillBottomColor = vfi > 0 ? color.new(bullColorInput, FILL_ZERO_TRANSP) : color.new(bearColorInput, FILL_VALUE_TRANSP)
+
+fill(vfiPlotId, zeroPlotId, top_value = math.max(vfi, 0), bottom_value = math.min(vfi, 0), top_color = gradientInput ? fillTopColor : na, bottom_color = gradientInput ? fillBottomColor : na, title = "Zero-line Gradient Fill")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(zeroCrossUp, "Bullish Zero Cross", "Volume Flow Indicator crossed above zero on {{ticker}} - volume flow regime turning to accumulation ({{interval}})")
+alertcondition(zeroCrossDown, "Bearish Zero Cross", "Volume Flow Indicator crossed below zero on {{ticker}} - volume flow regime turning to distribution ({{interval}})")
+alertcondition(signalCrossUp, "Bullish Signal Cross", "Volume Flow Indicator crossed above its signal line on {{ticker}} - volume flow turning up ({{interval}})")
+alertcondition(signalCrossDown, "Bearish Signal Cross", "Volume Flow Indicator crossed below its signal line on {{ticker}} - volume flow turning down ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

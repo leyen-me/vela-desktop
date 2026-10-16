@@ -1,0 +1,260 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Stop-and-reverse", shorttitle = "Stop-and-reverse", overlay = true)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+LONG_SIDE  =  1
+SHORT_SIDE = -1
+
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+WHIPSAW_COLOR = #ff9800 // the one accent - chop warning
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+FILL_PRICE_TRANSP = 50  // gradient transparency at the price end of the fill
+FILL_STOP_TRANSP  = 100 // gradient transparency at the stop end of the fill
+
+LINE_MODE = "Line"
+DOTS_MODE = "Dots"
+
+TOP_RIGHT    = "Top Right"
+TOP_LEFT     = "Top Left"
+BOTTOM_RIGHT = "Bottom Right"
+BOTTOM_LEFT  = "Bottom Left"
+
+SIZE_TINY   = "Tiny"
+SIZE_SMALL  = "Small"
+SIZE_NORMAL = "Normal"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+afStartInput     = input.float(0.02, "Acceleration Start", minval = 0.001, maxval = 1, step = 0.01, group = "Stop & Reverse Engine",
+     tooltip = "Starting acceleration factor of the parabolic stop-and-reverse level (published default 0.02). The level trails the open leg and accelerates toward price as the trend extends, until it is touched and the position reverses.")
+
+afStepInput      = input.float(0.02, "Acceleration Step", minval = 0, maxval = 1, step = 0.01, group = "Stop & Reverse Engine",
+     tooltip = "Amount added to the acceleration factor each time the leg makes a new extreme (published default 0.02). Larger steps tighten the trail faster.")
+
+afMaxInput       = input.float(0.2, "Acceleration Maximum", minval = 0.01, maxval = 1, step = 0.05, group = "Stop & Reverse Engine",
+     tooltip = "Ceiling of the acceleration factor (published default 0.2). Higher ceilings hug price sooner, protecting more of the move but flipping more often in chop.")
+
+whipsawWindowInput    = input.int(50, "Flip Count Window", minval = 2, maxval = 500, group = "Whipsaw Monitor",
+     tooltip = "Number of most recent bars over which position flips are counted. Tight alternation inside a congestion zone is the signature whipsaw cost of always-in logic.")
+
+whipsawThresholdInput = input.int(4, "Whipsaw Threshold", minval = 2, group = "Whipsaw Monitor",
+     tooltip = "Flip count at which the window is flagged as a whipsaw cluster. Every false flip books a loss and immediately exposes the account in the new, equally wrong direction — always-in logic pays for chop twice.")
+
+showDashboardInput     = input.bool(true, "Position Dashboard", group = "Dashboard",
+     tooltip = "Position-state dashboard: current side and age, the flip fill price, the level in force, the initial risk (1R), the open result in R-multiples, and the flip count inside the whipsaw window.")
+
+dashboardPositionInput = input.string(TOP_RIGHT, "Location", options = [TOP_RIGHT, TOP_LEFT, BOTTOM_RIGHT, BOTTOM_LEFT], group = "Dashboard",
+     tooltip = "Chart corner where the dashboard is anchored.")
+
+dashboardSizeInput     = input.string(SIZE_SMALL, "Size", options = [SIZE_TINY, SIZE_SMALL, SIZE_NORMAL], group = "Dashboard",
+     tooltip = "Text size of the dashboard.")
+
+stopStyleInput   = input.string(LINE_MODE, "Level Display", options = [LINE_MODE, DOTS_MODE], group = "Style",
+     tooltip = "Draw the stop-and-reverse level as a continuous stepped line or as classic parabolic-style dots.")
+
+lineWidthInput   = input.int(1, "Level Width", minval = 1, maxval = 5, group = "Style",
+     tooltip = "Width of the stop-and-reverse level.")
+
+showFillInput    = input.bool(true, "Gradient Trail Fill", group = "Style",
+     tooltip = "Vertical gradient between the level and price — fully transparent at the stop, strongest near price — visualizing the flip distance that defines the risk on every leg.")
+
+showMarkersInput = input.bool(true, "Flip Markers", group = "Style",
+     tooltip = "Mark every flip bar. Each marker is one act with two meanings: the exit of the stopped leg and the entry of the opposite leg — the system is never flat.")
+
+highlightWhipsawInput = input.bool(true, "Whipsaw Highlight", group = "Style",
+     tooltip = "Shade the background while the flip count inside the window sits at or above the threshold — ranging tape where practical implementations often demote reversals to alerts pending separate confirmation.")
+
+bullColorInput   = input.color(BULL_COLOR, "Bullish", inline = "side", group = "Style",
+     tooltip = "Color of the level, fill and markers while the system holds the long leg (level trailing below price).")
+
+bearColorInput   = input.color(BEAR_COLOR, "Bearish", inline = "side", group = "Style",
+     tooltip = "Color of the level, fill and markers while the system holds the short leg (level trailing above price).")
+
+whipsawColorInput = input.color(WHIPSAW_COLOR, "Whipsaw", group = "Style",
+     tooltip = "Color of the whipsaw-cluster background highlight and its dashboard flag.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Format a price-denominated value at symbol precision, with a placeholder while it is not yet available
+formatPrice(float value) =>
+    na(value) ? "n/a" : str.tostring(value, format.mintick)
+
+// Table corner from the dashboard position option
+tableLocation(string positionText) =>
+    switch
+        positionText == TOP_RIGHT    => position.top_right
+        positionText == TOP_LEFT     => position.top_left
+        positionText == BOTTOM_RIGHT => position.bottom_right
+        => position.bottom_left
+
+// Table text size from the dashboard size option
+tableTextSize(string sizeText) =>
+    switch
+        sizeText == SIZE_TINY  => size.tiny
+        sizeText == SIZE_SMALL => size.small
+        => size.normal
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Stop & Reverse Engine
+//---------------------------------------------------------------------------------------------------------------------{
+// Parabolic stop-and-reverse state machine (Wilder 1978): the level trails the open leg, accelerating toward price
+// each time the leg makes a new extreme. The stop is also the next entry — touching it closes the position and opens
+// the opposite one in the same act, so the system is always in the market, alternating long and short with no flat state.
+var int   positionSide   = LONG_SIDE
+var float stopLevel      = na
+var float extremePoint   = na
+var float accelFactor    = na
+var float legEntryPrice  = na
+var float legInitialRisk = na
+var int   legBars        = 0
+
+bool flipToLong  = false
+bool flipToShort = false
+
+if bar_index == 1
+    // Seed — open the first leg in the direction of the last price change, stop at the recent opposite extreme
+    positionSide := close >= close[1] ? LONG_SIDE : SHORT_SIDE
+    stopLevel    := positionSide == LONG_SIDE ? math.min(low, low[1]) : math.max(high, high[1])
+    extremePoint := positionSide == LONG_SIDE ? math.max(high, high[1]) : math.min(low, low[1])
+    accelFactor  := afStartInput
+else if bar_index > 1
+    // Level in force for this bar, projected from the prior bar's state
+    float nextStop = stopLevel + accelFactor * (extremePoint - stopLevel)
+
+    if positionSide == LONG_SIDE
+        // The level may never rise into the prior two bars' range
+        nextStop := math.min(nextStop, low[1], low[2])
+
+        if low <= nextStop
+            // Stop hit — the same touch closes the long and opens the short: exit and entry are one act
+            positionSide    := SHORT_SIDE
+            flipToShort     := true
+            float fillPrice  = math.min(open, nextStop)
+            stopLevel       := math.max(extremePoint, high)
+            extremePoint    := low
+            accelFactor     := afStartInput
+            legEntryPrice   := fillPrice
+            legInitialRisk  := math.abs(stopLevel - fillPrice)
+        else
+            stopLevel := nextStop
+            if high > extremePoint
+                extremePoint := high
+                accelFactor  := math.min(accelFactor + afStepInput, afMaxInput)
+    else
+        // The level may never fall into the prior two bars' range
+        nextStop := math.max(nextStop, high[1], high[2])
+
+        if high >= nextStop
+            // Stop hit — the same touch closes the short and opens the long: exit and entry are one act
+            positionSide    := LONG_SIDE
+            flipToLong      := true
+            float fillPrice  = math.max(open, nextStop)
+            stopLevel       := math.min(extremePoint, low)
+            extremePoint    := high
+            accelFactor     := afStartInput
+            legEntryPrice   := fillPrice
+            legInitialRisk  := math.abs(fillPrice - stopLevel)
+        else
+            stopLevel := nextStop
+            if low < extremePoint
+                extremePoint := low
+                accelFactor  := math.min(accelFactor + afStepInput, afMaxInput)
+
+bool flipped  = flipToLong or flipToShort
+bool bullSide = positionSide == LONG_SIDE
+
+legBars := flipped ? 1 : legBars + 1
+
+// Open result of the current leg in R-multiples — the flip distance at entry is the risk on every leg
+float openLegR = not na(legInitialRisk) and legInitialRisk > 0 and not na(legEntryPrice) ?
+     (bullSide ? close - legEntryPrice : legEntryPrice - close) / legInitialRisk : na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Whipsaw Monitor
+//---------------------------------------------------------------------------------------------------------------------{
+// Count flips inside the most recent window — tight alternation is the signature whipsaw cost of always-in logic
+int  flipsInWindow  = math.round(nz(math.sum(flipped ? 1 : 0, whipsawWindowInput)))
+bool whipsawCluster = flipsInWindow >= whipsawThresholdInput
+bool whipsawOnset   = whipsawCluster and not whipsawCluster[1]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+color sideColor = bullSide ? bullColorInput : bearColorInput
+
+// Vertical gradient between the stop-and-reverse level and price — fully transparent at the stop, strongest near price
+color fillTopColor    = showFillInput ? (bullSide ? color.new(bullColorInput, FILL_PRICE_TRANSP) : color.new(bearColorInput, FILL_STOP_TRANSP)) : na
+color fillBottomColor = showFillInput ? (bullSide ? color.new(bullColorInput, FILL_STOP_TRANSP) : color.new(bearColorInput, FILL_PRICE_TRANSP)) : na
+
+stopPlotId  = plot(stopLevel, "Stop & Reverse Level", color = flipped ? na : sideColor, linewidth = lineWidthInput, style = stopStyleInput == DOTS_MODE ? plot.style_circles : plot.style_linebr)
+pricePlotId = plot(close, "Price Anchor", color = na, editable = false, display = display.none)
+
+fill(stopPlotId, pricePlotId, top_value = math.max(stopLevel, close), bottom_value = math.min(stopLevel, close), top_color = fillTopColor, bottom_color = fillBottomColor, title = "Trail Gradient Fill")
+
+plotshape(showMarkersInput and flipToLong, "Flip to Long", shape.triangleup, location.belowbar, bullColorInput, size = size.tiny)
+plotshape(showMarkersInput and flipToShort, "Flip to Short", shape.triangledown, location.abovebar, bearColorInput, size = size.tiny)
+
+bgcolor(highlightWhipsawInput and whipsawCluster ? color.new(whipsawColorInput, 92) : na, title = "Whipsaw Cluster Highlight")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dashboardTable = na
+
+if barstate.islast and showDashboardInput
+    if na(dashboardTable)
+        dashboardTable := table.new(tableLocation(dashboardPositionInput), 2, 6, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+    string textSize   = tableTextSize(dashboardSizeInput)
+    color  labelColor = DASH_HEADER
+    color  valueColor = DASH_TEXT
+
+    string sideText   = (bullSide ? "LONG" : "SHORT") + " · " + str.tostring(legBars) + (legBars == 1 ? " bar" : " bars")
+    float  riskPct    = na(legInitialRisk) or na(legEntryPrice) or legEntryPrice == 0 ? na : legInitialRisk / legEntryPrice * 100
+    string riskText   = na(legInitialRisk) ? "n/a" : formatPrice(legInitialRisk) + (na(riskPct) ? "" : " (" + str.tostring(riskPct, "#.##") + "%)")
+    string openRText  = na(openLegR) ? "n/a" : (openLegR >= 0 ? "+" : "") + str.tostring(openLegR, "#.##") + "R"
+    color  openRColor = na(openLegR) ? valueColor : openLegR >= 0 ? bullColorInput : bearColorInput
+    string flipsLabel = "Flips (last " + str.tostring(whipsawWindowInput) + " bars)"
+    string flipsText  = str.tostring(flipsInWindow) + (whipsawCluster ? " · whipsaw" : "")
+    color  flipsColor = whipsawCluster ? whipsawColorInput : valueColor
+
+    table.cell(dashboardTable, 0, 0, "Position", text_color = labelColor, text_size = textSize, text_halign = text.align_left,
+         tooltip = "A pure stop-and-reverse system is always in the market — each leg ends exactly where the next begins, alternating long and short with no flat state.")
+    table.cell(dashboardTable, 1, 0, sideText, text_color = sideColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 1, "Entry (Flip Fill)", text_color = labelColor, text_size = textSize, text_halign = text.align_left,
+         tooltip = "Fill price of the current leg: the stop level that was touched, or the bar's open where price gapped through it. The same touch closed the prior leg, so the reversal order executed double size.")
+    table.cell(dashboardTable, 1, 1, formatPrice(legEntryPrice), text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 2, "Stop & Reverse Level", text_color = labelColor, text_size = textSize, text_halign = text.align_left,
+         tooltip = "The level in force. Touching it closes this leg and opens the opposite one in the same act.")
+    table.cell(dashboardTable, 1, 2, formatPrice(stopLevel), text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 3, "Initial Risk (1R)", text_color = labelColor, text_size = textSize, text_halign = text.align_left,
+         tooltip = "The flip distance at entry is the risk on this leg — back-solve position size so this distance times size equals the risk budget.")
+    table.cell(dashboardTable, 1, 3, riskText, text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 4, "Open Leg", text_color = labelColor, text_size = textSize, text_halign = text.align_left,
+         tooltip = "Open result of the current leg, measured in R-multiples of its initial risk.")
+    table.cell(dashboardTable, 1, 4, openRText, text_color = openRColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 5, flipsLabel, text_color = labelColor, text_size = textSize, text_halign = text.align_left,
+         tooltip = "Flip count inside the window. A cluster is the signature of always-in logic in ranging tape — every false flip is charged twice.")
+    table.cell(dashboardTable, 1, 5, flipsText, text_color = flipsColor, text_size = textSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(flipToLong, "Flip to Long", "Stop-and-reverse on {{ticker}} ({{interval}}) — the short leg was stopped out and the same touch opened the long leg; the level now trails below price. Reversal orders execute double size")
+alertcondition(flipToShort, "Flip to Short", "Stop-and-reverse on {{ticker}} ({{interval}}) — the long leg was stopped out and the same touch opened the short leg; the level now trails above price. Reversal orders execute double size")
+alertcondition(flipped, "Any Flip", "Stop-and-reverse flip on {{ticker}} ({{interval}}) — the level was hit: one leg closed and the opposite leg opened in the same act")
+alertcondition(whipsawOnset, "Whipsaw Cluster", "Stop-and-reverse whipsaw cluster on {{ticker}} ({{interval}}) — the flip count inside the window reached the threshold; always-in logic pays every false flip twice, consider demoting reversals to alerts pending separate confirmation")
+
+//---------------------------------------------------------------------------------------------------------------------}

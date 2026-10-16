@@ -1,0 +1,674 @@
+// This work is licensed under Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Open Types", shorttitle = "Open Types", overlay = true
+  , max_boxes_count  = 500
+  , max_lines_count  = 500
+  , max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+int TYPE_NONE = -1
+int TYPE_OD   = 0
+int TYPE_OTD  = 1
+int TYPE_ORR  = 2
+int TYPE_OA   = 3
+
+int LOC_NONE        = 0
+int LOC_IN_VALUE    = 1
+int LOC_ABOVE_VALUE = 2
+int LOC_BELOW_VALUE = 3
+int LOC_ABOVE_RANGE = 4
+int LOC_BELOW_RANGE = 5
+
+int MIN_BASELINE = 3
+
+BULL_COLOR    = #089981 // upward conviction opens
+BEAR_COLOR    = #f23645 // downward conviction opens
+ACCENT_COLOR  = #ff9800 // rejection-reverse opens, the one accent: an attempt the market refused
+NEUTRAL_COLOR = #787b86 // open-auction sessions and prior-session references
+VWAP_COLOR    = #5b9cf6
+
+color COLOR_HIDDEN = #00000000
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+string TZ_EXCHANGE = "Exchange"
+string TXT_NA      = "-"
+
+string GRP_SESSION = "Session"
+string GRP_CLASS   = "Classification"
+string GRP_REFS    = "Prior Session References"
+string GRP_DISPLAY = "Display"
+string GRP_DASH    = "Dashboard"
+string GRP_STYLE   = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+sessionInput = input.session("0930-1600", "Regular Session", group = GRP_SESSION
+  , tooltip = "The session whose open is classified, 09:30-16:00 for US equities and index products. Bars outside it (pre-market, overnight) are tracked as the overnight range but never classified. The window must not cross midnight.")
+
+tzInput = input.string(TZ_EXCHANGE, "Timezone", group = GRP_SESSION
+  , options = [TZ_EXCHANGE, "America/New_York", "America/Chicago", "Europe/London", "Europe/Berlin", "Asia/Tokyo", "Asia/Hong_Kong", "Australia/Sydney", "UTC"]
+  , tooltip = "Timezone the Regular Session is expressed in. Exchange uses the symbol's own timezone, correct for US stocks. For CME index futures (exchange time Chicago) select America/New_York to keep the 09:30 cash open.")
+
+windowInput = input.int(30, "Classification Window (minutes)", minval = 5, maxval = 120, step = 5, group = GRP_CLASS
+  , tooltip = "Minutes after the open the type is read over. Dalton's framework gives the open about half an hour to declare itself; 60 minutes trades speed for fewer revisions. Use a chart timeframe of a third of this window or less (5 minutes or lower for the default).")
+
+toleranceInput = input.float(0.05, "Open Tolerance (x ADR)", minval = 0, maxval = 0.5, step = 0.01, group = GRP_CLASS
+  , tooltip = "How far price may trade past the opening print, in multiples of the average session range, and still count as not having traded back through it. Absorbs one-tick noise around the open. The same tolerance decides when a conviction open is voided.")
+
+probeInput = input.float(0.10, "Probe Threshold (x ADR)", minval = 0.01, maxval = 1, step = 0.01, group = GRP_CLASS
+  , tooltip = "Smallest initial excursion from the open, in average-session-range multiples, that counts as a directional attempt. An attempt that is then traded back through the open is the rejection in an open-rejection-reverse.")
+
+driveInput = input.float(0.20, "Drive Threshold (x ADR)", minval = 0.05, maxval = 2, step = 0.01, group = GRP_CLASS
+  , tooltip = "Net progress away from the open by the end of the window, in average-session-range multiples, required for an open-drive or an open-test-drive. Windows that make less progress grade as rejection-reverse or auction opens.")
+
+dominanceInput = input.float(2.0, "Test-Drive Dominance", minval = 1, maxval = 10, step = 0.1, group = GRP_CLASS
+  , tooltip = "An open-test-drive needs its drive to reach at least this multiple of the failed probe that came first. Lower values let deeper probes qualify; a drive that cannot dominate its probe is not a test that found no business.")
+
+baselineInput = input.int(10, "Baseline Sessions", minval = 3, maxval = 50, group = GRP_CLASS
+  , tooltip = "Completed sessions averaged for the session range baseline (ADR) every threshold is scaled by, and for the opening volume baseline behind the opening RVOL read.")
+
+showValueInput = input.bool(true, "Prior Value Area & POC", group = GRP_REFS
+  , tooltip = "Shade the prior session's value area and mark its point of control across each session. Open location is graded against it: inside value argues rotation, outside value asks whether new prices will be accepted.")
+
+rowsInput = input.int(24, "Profile Rows", minval = 8, maxval = 100, group = GRP_REFS
+  , tooltip = "Price rows the prior session's volume profile is split into to locate its point of control and value area. Symbols without volume fall back to time at price (TPO).")
+
+vaPctInput = input.float(70, "Value Area (%)", minval = 50, maxval = 95, step = 1, group = GRP_REFS
+  , tooltip = "Share of the prior session's volume contained in its value area, expanded outward from the point of control. 70% is the convention.")
+
+showRangeInput = input.bool(true, "Prior High & Low", group = GRP_REFS
+  , tooltip = "Mark the prior session's high and low. An open beyond them is an out-of-range open, the strongest location read in the framework.")
+
+showOvernightInput = input.bool(true, "Overnight High & Low", group = GRP_REFS
+  , tooltip = "Mark the high and low traded outside the regular session since the prior close. Drawn only when the chart carries extended-hours bars.")
+
+showOpenLineInput = input.bool(true, "Open Price Line", group = GRP_DISPLAY
+  , tooltip = "Extend the opening print across the session in the color of its type. On a drive or test-drive the open is the invalidation line: a close back through it voids the premise, marked with a dot, and the line turns dashed.")
+
+showWindowInput = input.bool(true, "Classification Window Box", group = GRP_DISPLAY
+  , tooltip = "Outline the range traded during the classification window, colored by the type it produced.")
+
+showProbeInput = input.bool(true, "Test & Rejection Levels", group = GRP_DISPLAY
+  , tooltip = "Extend the failed probe of an open-test-drive (its natural stop reference) and the rejected extreme of an open-rejection-reverse across the rest of the session.")
+
+showVwapInput = input.bool(false, "Session VWAP", group = GRP_DISPLAY
+  , tooltip = "Plot the session VWAP. Conviction opens tend to hold one side of it while open-auction sessions straddle it; the dashboard reports the side either way.")
+
+keepInput = input.int(15, "Sessions Kept", minval = 1, maxval = 60, group = GRP_DISPLAY
+  , tooltip = "Most recent sessions whose drawings stay on the chart. Older drawings are removed; the dashboard statistics keep counting every session.")
+
+showDashInput = input.bool(true, "Show Dashboard", group = GRP_DASH
+  , tooltip = "Today's type, open location, opening volume and premise status, plus every classified session on the chart by type: count, average session range in ADR multiples, and the share of conviction opens whose open held all session.")
+
+dashPosInput = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left", "Middle Right"], group = GRP_DASH
+  , tooltip = "Dashboard position on the chart.")
+
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = GRP_DASH
+  , tooltip = "Dashboard text size.")
+
+bullColorInput    = input.color(BULL_COLOR, "Upward", inline = "dir", group = GRP_STYLE)
+bearColorInput    = input.color(BEAR_COLOR, "Downward", inline = "dir", group = GRP_STYLE
+  , tooltip = "Colors of open-drive and open-test-drive sessions by direction.")
+rejectColorInput  = input.color(ACCENT_COLOR, "Rejection-Reverse", inline = "two", group = GRP_STYLE)
+auctionColorInput = input.color(NEUTRAL_COLOR, "Open-Auction", inline = "two", group = GRP_STYLE
+  , tooltip = "Colors of rejection-reverse and open-auction sessions.")
+refColorInput     = input.color(NEUTRAL_COLOR, "References", inline = "ref", group = GRP_STYLE)
+vwapColorInput    = input.color(VWAP_COLOR, "VWAP", inline = "ref", group = GRP_STYLE
+  , tooltip = "Colors of the prior-session references and of the session VWAP.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types & Variables
+//---------------------------------------------------------------------------------------------------------------------{
+//All drawings of one session, removed together once the session ages out
+type SessionDraw
+    box   valueBox
+    line  pocLine
+    line  highLine
+    line  lowLine
+    line  onHighLine
+    line  onLowLine
+    line  openLine
+    box   windowBox
+    line  probeLine
+    label probeLabel
+    label typeLabel
+    label voidMark
+
+var array<SessionDraw> drawArray   = array.new<SessionDraw>()
+var SessionDraw        cur         = na
+var array<label>       refTagArray = array.new<label>()
+
+//Bars of the session in progress, for its volume profile
+var array<float> sessHighArray = array.new_float()
+var array<float> sessLowArray  = array.new_float()
+var array<float> sessVolArray  = array.new_float()
+
+//Baselines from completed sessions
+var array<float> rangeArray     = array.new_float()
+var array<float> openVolArray   = array.new_float()
+
+//Statistics per type
+var array<int>   typeCountArray = array.new_int(4, 0)
+var array<float> typeRangeArray = array.new_float(4, 0.)
+var array<int>   typeHeldArray  = array.new_int(4, 0)
+
+//Prior session references
+var float prevHigh = na
+var float prevLow  = na
+var float prevVah  = na
+var float prevVal  = na
+var float prevPoc  = na
+
+//Overnight range
+var float onHigh = na
+var float onLow  = na
+
+//Session state
+var bool  sessActive   = false
+var int   sessStartBar = na
+var int   sessStartTime = na
+var float openPrice    = na
+var float sessHigh     = na
+var float sessLow      = na
+var float sessAdr      = na
+var float sessVolBase  = na
+var int   openLoc      = LOC_NONE
+
+//Classification window state
+var bool  winDone      = false
+var float winHigh      = na
+var float winLow       = na
+var int   winHighBar   = na
+var int   winLowBar    = na
+var float winVol       = 0.
+var int   firstSide    = 0
+var bool  crossedBack  = false
+var int   winBars      = 0
+
+//Result
+var int   openType     = TYPE_NONE
+var int   openDir      = 0
+var float openRvol     = na
+var bool  voided       = false
+
+//Session VWAP
+var float sumPv = 0.
+var float sumV  = 0.
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+//Name of an open type
+typeName(int t) =>
+    switch t
+        TYPE_OD  => "Open-Drive"
+        TYPE_OTD => "Open-Test-Drive"
+        TYPE_ORR => "Open-Rejection-Reverse"
+        TYPE_OA  => "Open-Auction"
+        => TXT_NA
+
+//Standard Market Profile abbreviation of an open type, for the dashboard statistics
+shortName(int t) =>
+    switch t
+        TYPE_OD  => "OD"
+        TYPE_OTD => "OTD"
+        TYPE_ORR => "ORR"
+        TYPE_OA  => "OA"
+        => TXT_NA
+
+//Direction suffix of a typed open
+dirText(int t, int d) =>
+    t != TYPE_OA and t != TYPE_NONE and d != 0 ? (d > 0 ? " ▲" : " ▼") : ""
+
+//Color of a typed open
+typeColor(int t, int d) =>
+    switch t
+        TYPE_OD  => d > 0 ? bullColorInput : bearColorInput
+        TYPE_OTD => d > 0 ? bullColorInput : bearColorInput
+        TYPE_ORR => rejectColorInput
+        => auctionColorInput
+
+//Name of an open location
+locName(int l) =>
+    switch l
+        LOC_IN_VALUE    => "Inside Value"
+        LOC_ABOVE_VALUE => "Above Value"
+        LOC_BELOW_VALUE => "Below Value"
+        LOC_ABOVE_RANGE => "Above Range"
+        LOC_BELOW_RANGE => "Below Range"
+        => "No prior session"
+
+//Deletes a drawing when it exists
+dropBox(box b) =>
+    if not na(b)
+        box.delete(b)
+dropLine(line l) =>
+    if not na(l)
+        line.delete(l)
+dropLabel(label l) =>
+    if not na(l)
+        label.delete(l)
+
+//Removes every drawing of an aged-out session
+dropSession(SessionDraw s) =>
+    dropBox(s.valueBox)
+    dropLine(s.pocLine)
+    dropLine(s.highLine)
+    dropLine(s.lowLine)
+    dropLine(s.onHighLine)
+    dropLine(s.onLowLine)
+    dropLine(s.openLine)
+    dropBox(s.windowBox)
+    dropLine(s.probeLine)
+    dropLabel(s.probeLabel)
+    dropLabel(s.typeLabel)
+    dropLabel(s.voidMark)
+
+//Tags a reference line of the newest session at its right end, above or below the line
+addRefTag(float price, string txt, bool above, color c) =>
+    refTagArray.push(label.new(bar_index, price, txt, color = COLOR_HIDDEN, style = above ? label.style_label_lower_right : label.style_label_upper_right, textcolor = c, size = size.tiny))
+
+//Extends a session's horizontal drawings to the given bar
+extendSession(SessionDraw s, int x) =>
+    if not na(s.valueBox)
+        box.set_right(s.valueBox, x)
+    if not na(s.pocLine)
+        line.set_x2(s.pocLine, x)
+    if not na(s.highLine)
+        line.set_x2(s.highLine, x)
+    if not na(s.lowLine)
+        line.set_x2(s.lowLine, x)
+    if not na(s.onHighLine)
+        line.set_x2(s.onHighLine, x)
+    if not na(s.onLowLine)
+        line.set_x2(s.onLowLine, x)
+    if not na(s.openLine)
+        line.set_x2(s.openLine, x)
+    if not na(s.probeLine)
+        line.set_x2(s.probeLine, x)
+    if not na(s.probeLabel)
+        label.set_x(s.probeLabel, x)
+
+//Point of control and value area of the completed session, volume weighted (time at price without volume)
+valueArea(float pHigh, float pLow) =>
+    float vah = na
+    float val = na
+    float poc = na
+    int   n   = sessHighArray.size()
+    float rowHeight = (pHigh - pLow) / rowsInput
+    if n > 0 and rowHeight > 0
+        bool useVolume = sessVolArray.sum() > 0
+        array<float> rowArray = array.new_float(rowsInput, 0.)
+        for i = 0 to n - 1
+            float bHigh  = sessHighArray.get(i)
+            float bLow   = sessLowArray.get(i)
+            float bRange = bHigh - bLow
+            float weight = useVolume ? sessVolArray.get(i) : 1.
+            int   r0 = math.max(0, math.min(rowsInput - 1, int(math.floor((bLow - pLow) / rowHeight))))
+            int   r1 = math.max(r0, math.min(rowsInput - 1, int(math.floor((bHigh - pLow) / rowHeight))))
+            for r = r0 to r1
+                float rowBottom = pLow + r * rowHeight
+                float share = bRange > 0 ? math.max(math.min(bHigh, rowBottom + rowHeight) - math.max(bLow, rowBottom), 0.) / bRange : 1. / (r1 - r0 + 1)
+                rowArray.set(r, rowArray.get(r) + weight * share)
+        float total = rowArray.sum()
+        int   pocRow = 0
+        float best   = -1.
+        float middle = (rowsInput - 1) / 2.
+        for r = 0 to rowsInput - 1
+            float v = rowArray.get(r)
+            if v > best or (v == best and math.abs(r - middle) < math.abs(pocRow - middle))
+                best   := v
+                pocRow := r
+        int   loRow = pocRow
+        int   hiRow = pocRow
+        float acc   = best
+        float target = total * vaPctInput / 100
+        while acc < target and (loRow > 0 or hiRow < rowsInput - 1)
+            float below = loRow > 0 ? rowArray.get(loRow - 1) : -1.
+            float above = hiRow < rowsInput - 1 ? rowArray.get(hiRow + 1) : -1.
+            if above >= below
+                hiRow += 1
+                acc   += above
+            else
+                loRow -= 1
+                acc   += below
+        poc := pLow + (pocRow + 0.5) * rowHeight
+        vah := pLow + (hiRow + 1) * rowHeight
+        val := pLow + loRow * rowHeight
+    else if n > 0
+        poc := pLow
+        vah := pHigh
+        val := pLow
+    [vah, val, poc]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Session Tracking
+//---------------------------------------------------------------------------------------------------------------------{
+string tz          = tzInput == TZ_EXCHANGE ? syminfo.timezone : tzInput
+bool   validChart  = timeframe.isintraday and timeframe.in_seconds() * 3 <= windowInput * 60
+bool   inSession   = timeframe.isintraday and not na(time(timeframe.period, sessionInput, tz))
+bool   newDay      = timeframe.change("D")
+bool   sessStart   = validChart and inSession and (not inSession[1] or newDay)
+int    barMs       = timeframe.in_seconds() * 1000
+
+bool odUpEvent   = false
+bool odDnEvent   = false
+bool otdUpEvent  = false
+bool otdDnEvent  = false
+bool orrUpEvent  = false
+bool orrDnEvent  = false
+bool oaEvent     = false
+bool voidEvent   = false
+bool outsideOpen = false
+
+//Completed session: baselines, statistics and the references the next open is read against
+if sessActive and (sessStart or not inSession)
+    float sessRange = sessHigh - sessLow
+    if openType != TYPE_NONE and sessAdr > 0
+        typeCountArray.set(openType, typeCountArray.get(openType) + 1)
+        typeRangeArray.set(openType, typeRangeArray.get(openType) + sessRange / sessAdr)
+        if (openType == TYPE_OD or openType == TYPE_OTD) and not voided
+            typeHeldArray.set(openType, typeHeldArray.get(openType) + 1)
+    rangeArray.push(sessRange)
+    if rangeArray.size() > baselineInput
+        rangeArray.shift()
+    if winDone
+        openVolArray.push(winVol)
+        if openVolArray.size() > baselineInput
+            openVolArray.shift()
+    [vah, val, poc] = valueArea(sessHigh, sessLow)
+    prevHigh := sessHigh
+    prevLow  := sessLow
+    prevVah  := vah
+    prevVal  := val
+    prevPoc  := poc
+    sessHighArray.clear()
+    sessLowArray.clear()
+    sessVolArray.clear()
+    sessActive := false
+    onHigh := na
+    onLow  := na
+
+//Overnight range, from bars outside the regular session
+if timeframe.isintraday and not inSession and not sessActive
+    onHigh := na(onHigh) ? high : math.max(onHigh, high)
+    onLow  := na(onLow) ? low : math.min(onLow, low)
+
+//New session: reset state, grade the open location, lay down the references
+if sessStart
+    sessActive    := true
+    sessStartBar  := bar_index
+    sessStartTime := time
+    openPrice     := open
+    sessHigh      := high
+    sessLow       := low
+    sessAdr       := rangeArray.size() >= MIN_BASELINE ? rangeArray.avg() : na
+    sessVolBase   := openVolArray.size() >= MIN_BASELINE ? openVolArray.avg() : na
+    winDone       := false
+    winHigh       := high
+    winLow        := low
+    winHighBar    := bar_index
+    winLowBar     := bar_index
+    winVol        := 0.
+    winBars       := 0
+    firstSide     := 0
+    crossedBack   := false
+    openType      := TYPE_NONE
+    openDir       := 0
+    openRvol      := na
+    voided        := false
+    sumPv         := 0.
+    sumV          := 0.
+    openLoc := na(prevVah) ? LOC_NONE : open > prevHigh ? LOC_ABOVE_RANGE : open < prevLow ? LOC_BELOW_RANGE : open > prevVah ? LOC_ABOVE_VALUE : open < prevVal ? LOC_BELOW_VALUE : LOC_IN_VALUE
+    outsideOpen := openLoc == LOC_ABOVE_RANGE or openLoc == LOC_BELOW_RANGE
+
+    cur := SessionDraw.new()
+    //only the newest session carries reference tags, older sessions keep the same layout untagged
+    for oldTag in refTagArray
+        label.delete(oldTag)
+    refTagArray.clear()
+    if showValueInput and not na(prevVah)
+        cur.valueBox := box.new(bar_index, prevVah, bar_index, prevVal, border_color = color.new(refColorInput, 70), border_width = 1, border_style = line.style_dotted, bgcolor = color.new(refColorInput, 88))
+        cur.pocLine  := line.new(bar_index, prevPoc, bar_index, prevPoc, color = color.new(refColorInput, 15), style = line.style_dotted, width = 1)
+        addRefTag(prevPoc, "pPOC", true, refColorInput)
+    if showRangeInput and not na(prevHigh)
+        cur.highLine := line.new(bar_index, prevHigh, bar_index, prevHigh, color = color.new(refColorInput, 30), style = line.style_dashed, width = 1)
+        cur.lowLine  := line.new(bar_index, prevLow, bar_index, prevLow, color = color.new(refColorInput, 30), style = line.style_dashed, width = 1)
+        addRefTag(prevHigh, "PDH", true, refColorInput)
+        addRefTag(prevLow, "PDL", false, refColorInput)
+    if showOvernightInput and not na(onHigh)
+        cur.onHighLine := line.new(bar_index, onHigh, bar_index, onHigh, color = color.new(vwapColorInput, 40), style = line.style_dotted, width = 1)
+        cur.onLowLine  := line.new(bar_index, onLow, bar_index, onLow, color = color.new(vwapColorInput, 40), style = line.style_dotted, width = 1)
+        addRefTag(onHigh, "ONH", true, vwapColorInput)
+        addRefTag(onLow, "ONL", false, vwapColorInput)
+    if showOpenLineInput
+        cur.openLine := line.new(bar_index, open, bar_index, open, color = color.new(auctionColorInput, 30), width = 2)
+    if showWindowInput
+        cur.windowBox := box.new(bar_index, high, bar_index, low, border_color = color.new(auctionColorInput, 50), border_width = 1, bgcolor = color.new(auctionColorInput, 90))
+    cur.typeLabel := label.new(bar_index, high, "", color = COLOR_HIDDEN, style = label.style_label_down, textcolor = auctionColorInput, size = size.small)
+    drawArray.push(cur)
+    while drawArray.size() > keepInput
+        dropSession(drawArray.shift())
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Classification
+//---------------------------------------------------------------------------------------------------------------------{
+if sessActive and inSession
+    sessHigh  := math.max(sessHigh, high)
+    sessLow   := math.min(sessLow, low)
+    sessHighArray.push(high)
+    sessLowArray.push(low)
+    sessVolArray.push(nz(volume))
+    sumPv += hlc3 * nz(volume)
+    sumV  += nz(volume)
+
+    if not winDone
+        winBars += 1
+        winVol  += nz(volume)
+        if high > winHigh
+            winHigh    := high
+            winHighBar := bar_index
+        if low < winLow
+            winLow    := low
+            winLowBar := bar_index
+        if not na(sessAdr)
+            float probeDist = probeInput * sessAdr
+            float tolDist   = toleranceInput * sessAdr
+            if firstSide == 0
+                bool upHit = high - openPrice >= probeDist
+                bool dnHit = openPrice - low >= probeDist
+                if upHit and dnHit
+                    //both sides reached on one bar: a bearish bar most likely printed its high first
+                    firstSide   := close < open ? 1 : -1
+                    crossedBack := true
+                else if upHit
+                    firstSide := 1
+                else if dnHit
+                    firstSide := -1
+            else if not crossedBack
+                crossedBack := firstSide == 1 ? openPrice - low > tolDist : high - openPrice > tolDist
+
+        bool windowClosed = time + barMs >= sessStartTime + windowInput * 60000
+        if windowClosed
+            winDone := true
+            if not na(sessAdr) and sessAdr > 0
+                float upEx   = winHigh - openPrice
+                float dnEx   = openPrice - winLow
+                float net    = close - openPrice
+                float tolD   = toleranceInput * sessAdr
+                float driveD = driveInput * sessAdr
+                if net >= driveD and dnEx <= tolD
+                    openType := TYPE_OD
+                    openDir  := 1
+                else if net <= -driveD and upEx <= tolD
+                    openType := TYPE_OD
+                    openDir  := -1
+                else if net >= driveD and winLowBar <= winHighBar and upEx >= dominanceInput * dnEx
+                    openType := TYPE_OTD
+                    openDir  := 1
+                else if net <= -driveD and winHighBar <= winLowBar and dnEx >= dominanceInput * upEx
+                    openType := TYPE_OTD
+                    openDir  := -1
+                else if firstSide != 0 and crossedBack and (firstSide == 1 ? close < openPrice : close > openPrice)
+                    openType := TYPE_ORR
+                    openDir  := -firstSide
+                else
+                    openType := TYPE_OA
+                    openDir  := 0
+                openRvol := sessVolBase > 0 ? winVol / sessVolBase : na
+
+                odUpEvent  := openType == TYPE_OD and openDir == 1
+                odDnEvent  := openType == TYPE_OD and openDir == -1
+                otdUpEvent := openType == TYPE_OTD and openDir == 1
+                otdDnEvent := openType == TYPE_OTD and openDir == -1
+                orrUpEvent := openType == TYPE_ORR and openDir == 1
+                orrDnEvent := openType == TYPE_ORR and openDir == -1
+                oaEvent    := openType == TYPE_OA
+
+                color tc = typeColor(openType, openDir)
+                if not na(cur.windowBox)
+                    box.set_border_color(cur.windowBox, color.new(tc, 30))
+                    box.set_bgcolor(cur.windowBox, color.new(tc, 85))
+                if not na(cur.openLine)
+                    line.set_color(cur.openLine, tc)
+                //the failed probe of a test-drive and the rejected extreme of a rejection-reverse stay as session references
+                if showProbeInput and (openType == TYPE_OTD or openType == TYPE_ORR)
+                    //both sit on the side of the first move: below the open for an upward test-drive or reversal
+                    bool  refIsLow  = openDir == 1
+                    float refPrice  = refIsLow ? winLow : winHigh
+                    int   refBar    = refIsLow ? winLowBar : winHighBar
+                    cur.probeLine  := line.new(refBar, refPrice, bar_index, refPrice, color = tc, style = line.style_dotted, width = 1)
+                    //tagged at the line's right end, on the side away from price
+                    cur.probeLabel := label.new(bar_index, refPrice, openType == TYPE_OTD ? (refIsLow ? "Test low" : "Test high") : (refIsLow ? "Rejected low" : "Rejected high"), color = COLOR_HIDDEN
+                      , style = refIsLow ? label.style_label_upper_right : label.style_label_lower_right, textcolor = tc, size = size.tiny)
+                string rvolText = na(openRvol) ? "" : " · RVOL " + str.tostring(openRvol, "0.0") + "x"
+                //the type label sits on the side the session moved away from, so the follow-through never runs over it
+                bool   below    = openType == TYPE_OA or openDir == 1
+                label.set_xy(cur.typeLabel, sessStartBar, below ? winLow : winHigh)
+                label.set_style(cur.typeLabel, below ? label.style_label_upper_left : label.style_label_lower_left)
+                label.set_text(cur.typeLabel, typeName(openType) + dirText(openType, openDir) + "\n" + locName(openLoc) + rvolText)
+                label.set_textcolor(cur.typeLabel, tc)
+                label.set_tooltip(cur.typeLabel, "Excursion above the open: " + str.tostring(upEx / sessAdr, "0.00") + " ADR\nExcursion below the open: " + str.tostring(dnEx / sessAdr, "0.00") + " ADR\nNet progress at window end: " + str.tostring(net / sessAdr, "0.00") + " ADR\nOpen location: " + locName(openLoc))
+            else
+                label.set_text(cur.typeLabel, "")
+
+        if not na(cur) and not na(cur.windowBox)
+            box.set_right(cur.windowBox, bar_index)
+            box.set_top(cur.windowBox, winHigh)
+            box.set_bottom(cur.windowBox, winLow)
+        if not winDone and not na(cur)
+            label.set_xy(cur.typeLabel, sessStartBar, winHigh)
+            label.set_style(cur.typeLabel, label.style_label_lower_left)
+            label.set_text(cur.typeLabel, na(sessAdr) ? "Building baseline" : "Classifying " + str.tostring(math.round(winBars * timeframe.in_seconds() / 60.0)) + "/" + str.tostring(windowInput) + " min")
+            label.set_textcolor(cur.typeLabel, auctionColorInput)
+
+    //A close back through the open voids the premise of a conviction open
+    else if (openType == TYPE_OD or openType == TYPE_OTD) and not voided and bar_index > sessStartBar
+        float tolDist = toleranceInput * sessAdr
+        bool  back    = openDir == 1 ? close < openPrice - tolDist : close > openPrice + tolDist
+        if back
+            voided    := true
+            voidEvent := true
+            if not na(cur.openLine)
+                line.set_style(cur.openLine, line.style_dashed)
+                line.set_color(cur.openLine, color.new(typeColor(openType, openDir), 40))
+            cur.voidMark := label.new(bar_index, openPrice, "", color = typeColor(openType, openDir), style = label.style_circle, size = size.tiny
+              , tooltip = "Closed back through the open: the " + typeName(openType) + " premise is void")
+
+    if not na(cur)
+        extendSession(cur, bar_index)
+    for tag in refTagArray
+        label.set_x(tag, bar_index)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+float sessionVwap = sessActive and inSession and sumV > 0 ? sumPv / sumV : na
+plot(showVwapInput ? sessionVwap : na, "Session VWAP", vwapColorInput, 1, plot.style_linebr)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+dashPosition = switch dashPosInput
+    "Top Right"    => position.top_right
+    "Top Left"     => position.top_left
+    "Bottom Left"  => position.bottom_left
+    "Middle Right" => position.middle_right
+    => position.bottom_right
+
+dashTextSize = switch dashSizeInput
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    => size.small
+
+var table dashTable = na
+
+//One merged label/value row of the dashboard
+dashRow(int row, string name, string value, color nameColor, color valueColor, string tip) =>
+    table.cell(dashTable, 0, row, name, text_color = nameColor, text_size = dashTextSize, text_halign = text.align_left, tooltip = tip)
+    table.cell(dashTable, 1, row, value, text_color = valueColor, text_size = dashTextSize, text_halign = text.align_right)
+    table.merge_cells(dashTable, 1, row, 3, row)
+
+if barstate.islast
+    if not na(dashTable)
+        table.delete(dashTable)
+        dashTable := na
+    if showDashInput and validChart
+        dashTable := table.new(dashPosition, 4, 11, bgcolor = DASH_BG, frame_color = DASH_FRAME, frame_width = 1, border_width = 0)
+        string todayText = not sessActive ? "Waiting" : na(sessAdr) ? "Baseline" : not winDone ? str.tostring(math.round(winBars * timeframe.in_seconds() / 60.0)) + "/" + str.tostring(windowInput) + " min" : typeName(openType) + dirText(openType, openDir)
+        color  todayColor = sessActive and winDone and openType != TYPE_NONE ? typeColor(openType, openDir) : DASH_TEXT
+        string premiseText = not sessActive or not winDone or openType == TYPE_NONE ? TXT_NA : openType == TYPE_OD or openType == TYPE_OTD ? (voided ? "Voided" : "Holding") : openType == TYPE_ORR ? "Two-sided" : "Rotational"
+        color  premiseColor = openType == TYPE_OD or openType == TYPE_OTD ? (voided ? rejectColorInput : typeColor(openType, openDir)) : DASH_TEXT
+        string vwapText = na(sessionVwap) ? TXT_NA : close >= sessionVwap ? "Above" : "Below"
+
+        dashRow(0, "Open Types", str.tostring(windowInput) + " min", DASH_TEXT, DASH_HEADER, "Classification window after the open.")
+        dashRow(1, "Today", todayText, DASH_HEADER, todayColor, "Type of the latest session's open, or the minutes elapsed while the window is still forming.")
+        dashRow(2, "Location", sessActive ? locName(openLoc) : TXT_NA, DASH_HEADER, DASH_TEXT, "Where the session opened against the prior session's value area and range.")
+        dashRow(3, "Open RVOL", na(openRvol) ? TXT_NA : str.tostring(openRvol, "0.00") + "x", DASH_HEADER, DASH_TEXT, "Volume of the classification window against the same window's average over the baseline sessions. Drives on thin opening volume stall more easily.")
+        dashRow(4, "Premise", premiseText, DASH_HEADER, premiseColor, "Drive and test-drive opens hold while price stays beyond the open; a close back through it voids them. Rejection-reverse opens argue for two-sided trade, auction opens for rotation.")
+        dashRow(5, "VWAP", vwapText, DASH_HEADER, DASH_TEXT, "Side of the session VWAP price trades on. Conviction opens tend to hold one side of it; auction opens straddle it.")
+
+        table.cell(dashTable, 0, 6, "Type", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left)
+        table.cell(dashTable, 1, 6, "Days", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_right)
+        table.cell(dashTable, 2, 6, "Range", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_right
+          , tooltip = "Average full-session range of each type in multiples of the ADR baseline at its open. Drive opens tend to elongate the session; auction opens tend to keep it inside a normal range.")
+        table.cell(dashTable, 3, 6, "Held", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_right
+          , tooltip = "Share of drive and test-drive sessions whose open was never closed back through for the rest of the session.")
+        for t = 0 to 3
+            int    n        = typeCountArray.get(t)
+            float  avgRng   = n > 0 ? typeRangeArray.get(t) / n : na
+            bool   conv     = t == TYPE_OD or t == TYPE_OTD
+            string heldText = conv and n > 0 ? str.tostring(100.0 * typeHeldArray.get(t) / n, "0") + "%" : TXT_NA
+            table.cell(dashTable, 0, 7 + t, shortName(t), text_color = t == TYPE_ORR ? rejectColorInput : DASH_TEXT, text_size = dashTextSize, text_halign = text.align_left, tooltip = typeName(t))
+            table.cell(dashTable, 1, 7 + t, str.tostring(n), text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+            table.cell(dashTable, 2, 7 + t, na(avgRng) ? TXT_NA : str.tostring(avgRng, "0.00") + "x", text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+            table.cell(dashTable, 3, 7 + t, heldText, text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+
+var table noticeTable = na
+if barstate.islast and not validChart and na(noticeTable)
+    noticeTable := table.new(position.middle_center, 1, 1, bgcolor = DASH_BG, frame_color = DASH_FRAME, frame_width = 1, border_width = 0)
+    table.cell(noticeTable, 0, 0, "Open Types reads intraday charts at a third of the classification window or lower (5 minutes or less by default)", text_color = DASH_TEXT, text_size = size.small)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(odUpEvent, "Open-Drive Up", "Open-drive up on {{ticker}}: price drove higher from the first prints without trading back through the open")
+alertcondition(odDnEvent, "Open-Drive Down", "Open-drive down on {{ticker}}: price drove lower from the first prints without trading back through the open")
+alertcondition(otdUpEvent, "Open-Test-Drive Up", "Open-test-drive up on {{ticker}}: a probe below the open found no business and price drove higher")
+alertcondition(otdDnEvent, "Open-Test-Drive Down", "Open-test-drive down on {{ticker}}: a probe above the open found no business and price drove lower")
+alertcondition(orrUpEvent, "Open-Rejection-Reverse Up", "Open-rejection-reverse on {{ticker}}: the initial move lower was rejected back through the open")
+alertcondition(orrDnEvent, "Open-Rejection-Reverse Down", "Open-rejection-reverse on {{ticker}}: the initial move higher was rejected back through the open")
+alertcondition(oaEvent, "Open-Auction", "Open-auction on {{ticker}}: price rotated around the open with no early conviction")
+alertcondition(voidEvent, "Conviction Open Voided", "Price closed back through the open on {{ticker}}: the drive or test-drive premise is void")
+alertcondition(outsideOpen, "Open Outside Prior Range", "{{ticker}} opened beyond the prior session's range: watch for acceptance or a snap back toward prior value")
+
+//---------------------------------------------------------------------------------------------------------------------}

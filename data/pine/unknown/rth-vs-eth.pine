@@ -1,0 +1,415 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("RTH vs ETH", shorttitle = "RTH vs ETH", overlay = true, max_lines_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+PRESET_FUTURES  = "US Index Futures"
+PRESET_EQUITIES = "US Equities"
+PRESET_CUSTOM   = "Custom"
+US_RTH_SESSION  = "0930-1600"
+US_TIMEZONE     = "America/New_York"
+TZ_EXCHANGE     = "Exchange"
+
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+ETH_COLOR     = #ab47bc // overnight session identity
+RTH_COLOR     = #ffd700 // cash session identity
+ORANGE_COLOR  = #ff9800 // prior RTH close - the gap reference
+NEUTRAL_COLOR = #787b86
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+presetInput = input.string(PRESET_FUTURES, "Market Preset", options = [PRESET_FUTURES, PRESET_EQUITIES, PRESET_CUSTOM], group = "Sessions"
+  , tooltip = "Session convention. Both US presets pin RTH to the 09:30-16:00 America/New_York cash session — the convention index futures align to. ETH is every bar outside RTH: the Globex overnight for futures, pre-market and after-hours for equities (enable extended hours chart data). Select Custom to define your own RTH window and timezone.")
+
+rthSessionInput = input.session(US_RTH_SESSION, "Custom RTH Session", group = "Sessions"
+  , tooltip = "RTH window used when Market Preset is set to Custom, expressed in the Custom Timezone. The window must not cross midnight. All bars outside it are treated as ETH.")
+
+timezoneInput = input.string(TZ_EXCHANGE, "Custom Timezone", group = "Sessions"
+  , options = [TZ_EXCHANGE, "America/New_York", "America/Chicago", "America/Los_Angeles", "UTC", "Europe/London", "Europe/Berlin", "Asia/Tokyo", "Asia/Hong_Kong", "Asia/Kolkata", "Australia/Sydney"]
+  , tooltip = "Timezone the Custom RTH Session is expressed in. Only used when Market Preset is set to Custom; Exchange uses the symbol's own timezone.")
+
+lookbackInput = input.int(20, "Statistics Lookback (Days)", minval = 1, maxval = 250, group = "Sessions"
+  , tooltip = "Number of completed trading days used for the dashboard averages: session ranges, volume participation, extreme attribution, gap size and gap fill rate.")
+
+showEthShadeInput = input.bool(true, "Shade ETH Session", group = "Display"
+  , tooltip = "Highlight the background of every ETH (overnight / extended hours) bar, making the thin-participation regime visible at a glance.")
+
+showRthShadeInput = input.bool(false, "Shade RTH Session", group = "Display"
+  , tooltip = "Highlight the background of every RTH (regular / cash session) bar.")
+
+showEthRangeInput = input.bool(true, "ETH High/Low", group = "Display"
+  , tooltip = "Plot the developing overnight high and low while ETH is active, then project the completed ETH range across the following RTH session — the Globex references the day session frequently tests.")
+
+showPriorCloseInput = input.bool(true, "Prior RTH Close", group = "Display"
+  , tooltip = "Dotted line at the most recent RTH close, carried through the overnight session and the next day session. Where ETH trades relative to it frames the opening gap; price returning to it during RTH fills the gap.")
+
+showDashInput = input.bool(true, "Show Dashboard", group = "Dashboard"
+  , tooltip = "Comparative RTH vs ETH statistics: average range, volume participation, where the day's extremes form, plus today's opening gap and its position relative to the overnight range.")
+
+dashLocationInput = input.string("Top Right", "Location", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left", "Middle Right"], group = "Dashboard"
+  , tooltip = "Dashboard position on the chart.")
+
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = "Dashboard"
+  , tooltip = "Dashboard text size.")
+
+ethColorInput = input.color(ETH_COLOR, "ETH Color", group = "Style"
+  , tooltip = "Color of the ETH session shading, the developing overnight high/low, and the projected ETH range.")
+
+rthColorInput = input.color(RTH_COLOR, "RTH Color", group = "Style"
+  , tooltip = "Color of the RTH session shading and RTH dashboard accents.")
+
+priorCloseColorInput = input.color(ORANGE_COLOR, "Prior RTH Close Color", group = "Style"
+  , tooltip = "Color of the prior RTH close reference line.")
+
+shadeTranspInput = input.int(94, "Shading Transparency", minval = 60, maxval = 100, group = "Style"
+  , tooltip = "Transparency of the session background shading. Higher values are more subtle.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish Color", inline = "bb", group = "Style"
+  , tooltip = "Used for gap up readings and opens above the ETH range.")
+
+bearColorInput = input.color(BEAR_COLOR, "Bearish Color", inline = "bb", group = "Style"
+  , tooltip = "Used for gap down readings and opens below the ETH range.")
+
+// Derived settings
+string rthSession      = presetInput == PRESET_CUSTOM ? rthSessionInput : US_RTH_SESSION
+string sessionTimezone = presetInput != PRESET_CUSTOM ? US_TIMEZONE : timezoneInput == TZ_EXCHANGE ? syminfo.timezone : timezoneInput
+
+dashPosition = switch dashLocationInput
+    "Top Right"    => position.top_right
+    "Top Left"     => position.top_left
+    "Bottom Right" => position.bottom_right
+    "Bottom Left"  => position.bottom_left
+    => position.middle_right
+
+dashTextSize = switch dashSizeInput
+    "Tiny"  => size.tiny
+    "Small" => size.small
+    => size.normal
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Keep a statistics array trimmed to the lookback window
+trimArr(array<float> arr, int maxSize) =>
+    while array.size(arr) > maxSize
+        array.shift(arr)
+
+// Average of an array, na when empty
+avgOf(array<float> arr) =>
+    array.size(arr) > 0 ? array.avg(arr) : na
+
+// Price formatting with na guard
+fmtPrice(float value) =>
+    na(value) ? "—" : str.tostring(value, format.mintick)
+
+// Abbreviated volume formatting with na guard
+fmtVol(float value) =>
+    na(value) ? "—" :
+      value >= 1e12 ? str.tostring(value / 1e12, "#.##") + "T" :
+      value >= 1e9  ? str.tostring(value / 1e9 , "#.##") + "B" :
+      value >= 1e6  ? str.tostring(value / 1e6 , "#.##") + "M" :
+      value >= 1e3  ? str.tostring(value / 1e3 , "#.##") + "K" :
+      str.tostring(value, "#.##")
+
+// Percentage formatting with na guard
+fmtPct(float value) =>
+    na(value) ? "—" : str.tostring(value, "#.#") + "%"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Sessions & Statistics
+//---------------------------------------------------------------------------------------------------------------------{
+// Session detection (timezone aware). ETH is every intraday bar outside the RTH window,
+// so one overnight period spans the post-close, Globex/after-hours and pre-market stretch.
+int  rthTime = time(timeframe.period, rthSession, sessionTimezone)
+int  dayIdx  = dayofmonth(time, sessionTimezone)
+bool newDate = nz(ta.change(dayIdx)) != 0
+
+bool inRTH = timeframe.isintraday and not na(rthTime)
+bool inETH = timeframe.isintraday and not inRTH
+
+int sessFlag = inRTH ? 1 : inETH ? 2 : 0
+int prevFlag = nz(sessFlag[1])
+
+// A date change splits back-to-back RTH sessions (charts without extended hours data)
+bool rthStartBar = sessFlag == 1 and (prevFlag != 1 or newDate)
+bool rthEndBar   = prevFlag == 1 and (sessFlag != 1 or newDate)
+bool ethStartBar = sessFlag == 2 and prevFlag != 2
+
+// Running session trackers
+var float ethHigh  = na
+var float ethLow   = na
+var float ethVol   = na
+var bool  ethFresh = false
+
+var float rthHighTrack  = na
+var float rthLowTrack   = na
+var float rthVolTrack   = na
+var float rthCloseTrack = na
+
+// Completed overnight (ETH) references for the current trading day
+var float onHigh = na
+var float onLow  = na
+
+// Gap state
+var float priorRthClose = na
+var float gapToday      = na
+var float gapPctToday   = na
+var int   openVsEth     = na
+var bool  gapFilled     = false
+var bool  ethHighTested = false
+var bool  ethLowTested  = false
+
+// Statistics arrays (one entry per completed session, trimmed to the lookback)
+var array<float> ethRangeArr = array.new<float>()
+var array<float> ethVolArr   = array.new<float>()
+var array<float> rthRangeArr = array.new<float>()
+var array<float> rthVolArr   = array.new<float>()
+var array<float> highEthArr  = array.new<float>()
+var array<float> lowEthArr   = array.new<float>()
+var array<float> gapAbsArr   = array.new<float>()
+var array<float> gapFillArr  = array.new<float>()
+
+// Reference lines
+var line priorCloseLine = na
+var line ethHiLine      = na
+var line ethLoLine      = na
+
+// Intrabar event flags (latched once per day)
+bool evGapFill     = false
+bool evEthHighTest = false
+bool evEthLowTest  = false
+
+// RTH end — finalize the completed day session
+if rthEndBar
+    if not na(rthCloseTrack)
+        priorRthClose := rthCloseTrack
+        if showPriorCloseInput
+            if not na(priorCloseLine)
+                line.delete(priorCloseLine)
+            priorCloseLine := line.new(math.max(bar_index - 1, 0), priorRthClose, bar_index, priorRthClose, color = priorCloseColorInput, style = line.style_dotted, width = 1)
+    if not na(rthHighTrack) and not na(rthLowTrack)
+        array.push(rthRangeArr, rthHighTrack - rthLowTrack)
+    if not na(rthVolTrack)
+        array.push(rthVolArr, rthVolTrack)
+    // Where did the combined day's extremes form?
+    if not na(onHigh) and not na(onLow) and not na(rthHighTrack) and not na(rthLowTrack)
+        array.push(highEthArr, onHigh > rthHighTrack ? 1.0 : 0.0)
+        array.push(lowEthArr , onLow  < rthLowTrack  ? 1.0 : 0.0)
+    // Gap outcome for the day that just closed
+    if not na(gapToday) and gapToday != 0
+        array.push(gapFillArr, gapFilled ? 1.0 : 0.0)
+    // Overnight projections are only meaningful during the day session
+    if not na(ethHiLine)
+        line.delete(ethHiLine)
+        ethHiLine := na
+    if not na(ethLoLine)
+        line.delete(ethLoLine)
+        ethLoLine := na
+
+// ETH start — a new overnight period begins
+if ethStartBar
+    ethHigh  := high
+    ethLow   := low
+    ethVol   := 0.0
+    ethFresh := true
+
+// ETH update
+if inETH
+    ethHigh := math.max(nz(ethHigh, high), high)
+    ethLow  := math.min(nz(ethLow , low ), low )
+    ethVol  := nz(ethVol) + nz(volume)
+
+// RTH start — lock the overnight range, measure the opening gap
+if rthStartBar
+    onHigh := ethFresh ? ethHigh : na
+    onLow  := ethFresh ? ethLow  : na
+    if ethFresh
+        array.push(ethRangeArr, ethHigh - ethLow)
+        array.push(ethVolArr  , ethVol)
+    ethFresh := false
+    // Opening gap vs the prior RTH close
+    gapToday    := not na(priorRthClose) ? open - priorRthClose : na
+    gapPctToday := not na(priorRthClose) and priorRthClose != 0 ? (open - priorRthClose) / priorRthClose * 100 : na
+    if not na(gapToday)
+        array.push(gapAbsArr, math.abs(gapToday))
+    // RTH open location relative to the overnight range
+    openVsEth := not na(onHigh) and not na(onLow) ? (open > onHigh ? 1 : open < onLow ? -1 : 0) : na
+    // Reset day-session trackers and latches
+    rthHighTrack  := high
+    rthLowTrack   := low
+    rthVolTrack   := 0.0
+    rthCloseTrack := close
+    gapFilled     := false
+    ethHighTested := not na(onHigh) and open > onHigh
+    ethLowTested  := not na(onLow)  and open < onLow
+    // Project the completed overnight range across the day session
+    if showEthRangeInput and not na(onHigh) and not na(onLow)
+        if not na(ethHiLine)
+            line.delete(ethHiLine)
+        if not na(ethLoLine)
+            line.delete(ethLoLine)
+        ethHiLine := line.new(bar_index, onHigh, bar_index, onHigh, color = ethColorInput, style = line.style_dotted, width = 1)
+        ethLoLine := line.new(bar_index, onLow , bar_index, onLow , color = ethColorInput, style = line.style_dotted, width = 1)
+
+// RTH update — trackers, tests of the overnight references, gap fill
+if inRTH
+    rthHighTrack  := math.max(nz(rthHighTrack, high), high)
+    rthLowTrack   := math.min(nz(rthLowTrack , low ), low )
+    rthVolTrack   := nz(rthVolTrack) + nz(volume)
+    rthCloseTrack := close
+    if not gapFilled and not na(gapToday) and gapToday != 0 and not na(priorRthClose) and low <= priorRthClose and high >= priorRthClose
+        gapFilled := true
+        evGapFill := true
+    if not ethHighTested and not na(onHigh) and high >= onHigh
+        ethHighTested := true
+        evEthHighTest := true
+    if not ethLowTested and not na(onLow) and low <= onLow
+        ethLowTested  := true
+        evEthLowTest  := true
+    if not na(ethHiLine)
+        line.set_x2(ethHiLine, bar_index)
+    if not na(ethLoLine)
+        line.set_x2(ethLoLine, bar_index)
+
+// Carry the prior close reference forward
+if not na(priorCloseLine)
+    line.set_x2(priorCloseLine, bar_index)
+
+// Keep statistics inside the lookback window
+trimArr(ethRangeArr, lookbackInput)
+trimArr(ethVolArr  , lookbackInput)
+trimArr(rthRangeArr, lookbackInput)
+trimArr(rthVolArr  , lookbackInput)
+trimArr(highEthArr , lookbackInput)
+trimArr(lowEthArr  , lookbackInput)
+trimArr(gapAbsArr  , lookbackInput)
+trimArr(gapFillArr , lookbackInput)
+
+// Open events (evaluated once per RTH open)
+bool evRthOpen      = rthStartBar
+bool evEthOpen      = ethStartBar
+bool evOpenAboveEth = rthStartBar and not na(onHigh) and open > onHigh
+bool evOpenBelowEth = rthStartBar and not na(onLow)  and open < onLow
+bool evGapUp        = rthStartBar and not na(gapToday) and gapToday > 0
+bool evGapDown      = rthStartBar and not na(gapToday) and gapToday < 0
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visualization
+//---------------------------------------------------------------------------------------------------------------------{
+color shadeColor = inETH and showEthShadeInput ? color.new(ethColorInput, shadeTranspInput) :
+  inRTH and showRthShadeInput ? color.new(rthColorInput, shadeTranspInput) : na
+
+bgcolor(shadeColor, title = "Session Shading")
+
+plot(showEthRangeInput and inETH ? ethHigh : na, "Developing ETH High", ethColorInput, 1, plot.style_linebr)
+plot(showEthRangeInput and inETH ? ethLow  : na, "Developing ETH Low" , ethColorInput, 1, plot.style_linebr)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dashTable = na
+
+if showDashInput and barstate.islast
+    if na(dashTable)
+        dashTable := table.new(dashPosition, 3, 11, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+    if not timeframe.isintraday
+        table.cell(dashTable, 0, 0, "RTH vs ETH", text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_left)
+        table.cell(dashTable, 0, 1, "Intraday timeframe required", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left)
+    else
+        float ethRangeAvg = avgOf(ethRangeArr)
+        float rthRangeAvg = avgOf(rthRangeArr)
+        float ethVolAvg   = avgOf(ethVolArr)
+        float rthVolAvg   = avgOf(rthVolArr)
+        float highEthFrac = avgOf(highEthArr)
+        float lowEthFrac  = avgOf(lowEthArr)
+        float gapAbsAvg   = avgOf(gapAbsArr)
+        float fillFrac    = avgOf(gapFillArr)
+
+        float totVolAvg   = not na(ethVolAvg) and not na(rthVolAvg) ? ethVolAvg + rthVolAvg : na
+        float volShareEth = not na(totVolAvg) and totVolAvg > 0 ? ethVolAvg / totVolAvg * 100 : na
+        float volShareRth = not na(volShareEth) ? 100 - volShareEth : na
+
+        string gapTxt = na(gapToday) ? "—" : (gapToday >= 0 ? "+" : "-") + str.tostring(math.abs(gapToday), format.mintick) + (na(gapPctToday) ? "" : " (" + (gapPctToday >= 0 ? "+" : "-") + str.tostring(math.abs(gapPctToday), "#.##") + "%)")
+        color  gapColor = na(gapToday) or gapToday == 0 ? DASH_TEXT : gapToday > 0 ? bullColorInput : bearColorInput
+
+        string openVsTxt   = na(openVsEth) ? "—" : openVsEth == 1 ? "Above ETH High" : openVsEth == -1 ? "Below ETH Low" : "Inside ETH Range"
+        color  openVsColor = na(openVsEth) ? DASH_TEXT : openVsEth == 1 ? bullColorInput : openVsEth == -1 ? bearColorInput : DASH_TEXT
+
+        string gapStatusTxt = na(gapToday) ? "—" : gapToday == 0 ? "No Gap" : gapFilled ? "Filled" : "Unfilled"
+        string sessNowTxt   = inRTH ? "RTH" : inETH ? "ETH" : "—"
+        color  sessNowColor = inRTH ? rthColorInput : inETH ? ethColorInput : DASH_TEXT
+
+        string gapStatTxt = fmtPrice(gapAbsAvg) + " · " + (na(fillFrac) ? "—" : str.tostring(fillFrac * 100, "#.#") + "% filled")
+
+        color labelColor = DASH_HEADER
+        color valueColor = DASH_TEXT
+
+        table.cell(dashTable, 0, 0, "Session", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+        table.cell(dashTable, 1, 0, "ETH", text_color = ethColorInput, text_size = dashTextSize, tooltip = "Extended / electronic hours: the thin overnight session")
+        table.cell(dashTable, 2, 0, "RTH", text_color = rthColorInput, text_size = dashTextSize, tooltip = "Regular trading hours: the cash session carrying the bulk of institutional volume")
+
+        table.cell(dashTable, 0, 1, "Avg Range", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left, tooltip = "Average session high-low range over the last " + str.tostring(lookbackInput) + " completed sessions")
+        table.cell(dashTable, 1, 1, fmtPrice(ethRangeAvg), text_color = valueColor, text_size = dashTextSize)
+        table.cell(dashTable, 2, 1, fmtPrice(rthRangeAvg), text_color = valueColor, text_size = dashTextSize)
+
+        table.cell(dashTable, 0, 2, "Avg Volume", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left, tooltip = "Average volume traded per session over the lookback")
+        table.cell(dashTable, 1, 2, fmtVol(ethVolAvg), text_color = valueColor, text_size = dashTextSize)
+        table.cell(dashTable, 2, 2, fmtVol(rthVolAvg), text_color = valueColor, text_size = dashTextSize)
+
+        table.cell(dashTable, 0, 3, "Volume Share", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left, tooltip = "Share of the combined 24h volume traded in each session — the participation split")
+        table.cell(dashTable, 1, 3, fmtPct(volShareEth), text_color = valueColor, text_size = dashTextSize)
+        table.cell(dashTable, 2, 3, fmtPct(volShareRth), text_color = valueColor, text_size = dashTextSize)
+
+        table.cell(dashTable, 0, 4, "Day High Set", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left, tooltip = "Share of days whose combined-day high printed during each session")
+        table.cell(dashTable, 1, 4, na(highEthFrac) ? "—" : fmtPct(highEthFrac * 100), text_color = valueColor, text_size = dashTextSize)
+        table.cell(dashTable, 2, 4, na(highEthFrac) ? "—" : fmtPct((1 - highEthFrac) * 100), text_color = valueColor, text_size = dashTextSize)
+
+        table.cell(dashTable, 0, 5, "Day Low Set", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left, tooltip = "Share of days whose combined-day low printed during each session")
+        table.cell(dashTable, 1, 5, na(lowEthFrac) ? "—" : fmtPct(lowEthFrac * 100), text_color = valueColor, text_size = dashTextSize)
+        table.cell(dashTable, 2, 5, na(lowEthFrac) ? "—" : fmtPct((1 - lowEthFrac) * 100), text_color = valueColor, text_size = dashTextSize)
+
+        table.cell(dashTable, 0, 6, "Session Now", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+        table.cell(dashTable, 1, 6, sessNowTxt, text_color = sessNowColor, text_size = dashTextSize)
+        table.cell(dashTable, 2, 6, "", text_size = dashTextSize)
+
+        table.cell(dashTable, 0, 7, "Open Gap", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left, tooltip = "Today's RTH open minus the prior RTH close")
+        table.cell(dashTable, 1, 7, gapTxt, text_color = gapColor, text_size = dashTextSize)
+        table.cell(dashTable, 2, 7, "", text_size = dashTextSize)
+
+        table.cell(dashTable, 0, 8, "Open vs ETH", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left, tooltip = "Where today's RTH open printed relative to the overnight ETH range")
+        table.cell(dashTable, 1, 8, openVsTxt, text_color = openVsColor, text_size = dashTextSize)
+        table.cell(dashTable, 2, 8, "", text_size = dashTextSize)
+
+        table.cell(dashTable, 0, 9, "Gap Status", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left, tooltip = "Whether price has traded back to the prior RTH close during today's day session")
+        table.cell(dashTable, 1, 9, gapStatusTxt, text_color = gapStatusTxt == "Unfilled" ? priorCloseColorInput : valueColor, text_size = dashTextSize)
+        table.cell(dashTable, 2, 9, "", text_size = dashTextSize)
+
+        table.cell(dashTable, 0, 10, "Avg |Gap| · Fill", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left, tooltip = "Average absolute opening gap over the lookback, and the share of gaps that filled back to the prior RTH close intraday")
+        table.cell(dashTable, 1, 10, gapStatTxt, text_color = valueColor, text_size = dashTextSize)
+        table.cell(dashTable, 2, 10, "", text_size = dashTextSize)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(evRthOpen     , "RTH Session Open"        , "{{ticker}}: RTH session opened — overnight ETH range is locked in")
+alertcondition(evEthOpen     , "ETH Session Open"        , "{{ticker}}: ETH (overnight / extended hours) session opened")
+alertcondition(evOpenAboveEth, "RTH Open Above ETH Range", "{{ticker}}: RTH session opened above the overnight ETH high")
+alertcondition(evOpenBelowEth, "RTH Open Below ETH Range", "{{ticker}}: RTH session opened below the overnight ETH low")
+alertcondition(evGapUp       , "RTH Gap Up"              , "{{ticker}}: RTH opened with a gap up vs the prior RTH close")
+alertcondition(evGapDown     , "RTH Gap Down"            , "{{ticker}}: RTH opened with a gap down vs the prior RTH close")
+alertcondition(evEthHighTest , "ETH High Tested"         , "{{ticker}}: day session price reached the overnight ETH high")
+alertcondition(evEthLowTest  , "ETH Low Tested"          , "{{ticker}}: day session price reached the overnight ETH low")
+alertcondition(evGapFill     , "Opening Gap Filled"      , "{{ticker}}: price traded back to the prior RTH close — opening gap filled")
+
+//---------------------------------------------------------------------------------------------------------------------}

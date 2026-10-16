@@ -1,0 +1,524 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Seek & Destroy Profile", shorttitle = "Seek & Destroy Profile", overlay = true, format = format.price, max_boxes_count = 250, max_lines_count = 500, max_labels_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+string GROUP_SESSIONS = "Session Windows"
+string GROUP_LEVELS   = "Reference Levels"
+string GROUP_DETECT   = "Sweeps & Acceptance"
+string GROUP_DASH     = "Dashboard"
+string GROUP_STYLE    = "Style"
+
+string POS_TR = "Top Right"
+string POS_TL = "Top Left"
+string POS_BR = "Bottom Right"
+string POS_BL = "Bottom Left"
+string POS_MR = "Middle Right"
+
+string SIZE_TINY   = "Tiny"
+string SIZE_SMALL  = "Small"
+string SIZE_NORMAL = "Normal"
+
+color COLOR_NONE = #00000000
+
+color NEUTRAL_COLOR = #787b86
+color DASH_BG       = #161616
+color DASH_FRAME    = #2E2E2E
+color DASH_HEADER   = #808080
+color DASH_TEXT     = #DBDBDB
+
+// day profile states
+int STATE_INV   = -1
+int STATE_WATCH = 0
+int STATE_FIRST = 1
+int STATE_DEV   = 2
+int STATE_CONF  = 3
+
+tzInput = input.string("America/New_York", "Timezone"
+  , options = ["America/New_York", "America/Chicago", "America/Los_Angeles", "UTC", "Europe/London", "Europe/Berlin", "Asia/Tokyo", "Asia/Shanghai", "Asia/Kolkata", "Australia/Sydney"]
+  , group   = GROUP_SESSIONS
+  , tooltip = "Timezone the session windows are defined in. New York time is the standard ICT reference. The windows follow this timezone's daylight-saving changes whatever the chart's time zone.")
+
+erSessionInput = input.session("0000-0830", "Early Range"
+  , group   = GROUP_SESSIONS
+  , tooltip = "Window that builds the early reference range - the overnight consolidation into the New York open, midnight to 08:30 ET by default. Its high and low are the primary levels a seek & destroy day runs on both sides. On charts without overnight bars (RTH-only sessions), use an opening-range window such as 0930-1030 instead.")
+
+evalSessionInput = input.session("0830-1600", "Evaluation Window"
+  , group   = GROUP_SESSIONS
+  , tooltip = "Window the profile is judged inside, the New York session 08:30 to 16:00 ET by default. Sweeps and acceptance only count in this window and the day is classified on its final close. Start it earlier (e.g. 0300) to let the London killzone hunt count as well.")
+
+usePdhlInput = input.bool(true, "Prior Day High/Low"
+  , group   = GROUP_LEVELS
+  , tooltip = "Also arm the prior day's high and low as sweep references when they sit outside the early range - runs frequently target them together with the overnight extremes. The levels are drawn from the early-range open either way.")
+
+acceptBarsInput = input.int(2, "Acceptance Closes"
+  , minval  = 1
+  , maxval  = 10
+  , group   = GROUP_DETECT
+  , tooltip = "Consecutive closes beyond a reference level that count as acceptance. Acceptance argues for a genuine breakout instead of a stop run and invalidates the seek & destroy read for the day.")
+
+dispAtrInput = input.float(1.0, "Displacement Multiplier"
+  , minval  = 0
+  , step    = 0.1
+  , group   = GROUP_DETECT
+  , tooltip = "A single close beyond a reference level by more than this many ATRs counts as displacement - immediate follow-through that invalidates the profile without waiting for consecutive closes. 0 disables the displacement test.")
+
+atrLenInput = input.int(14, "ATR Length"
+  , minval  = 1
+  , group   = GROUP_DETECT
+  , tooltip = "Average true range length used by the displacement test.")
+
+midBandInput = input.int(33, "Middle Close Band %"
+  , minval  = 5
+  , maxval  = 100
+  , group   = GROUP_DETECT
+  , tooltip = "Width of the central band of the session range, as a percent of that range, the final close must land in to confirm the profile. 33 demands a middle-third finish after both extremes were taken - the completed seek & destroy signature.")
+
+showDashInput = input.bool(true, "Show Dashboard"
+  , group   = GROUP_DASH
+  , tooltip = "Show a status panel with the live profile state, each side's sweep count, where the close sits in the session range, the early-range width versus its average, the stand-aside read, and the historical base rates of two-sided and confirmed seek & destroy days.")
+
+dashPositionInput = input.string(POS_TR, "Position"
+  , options = [POS_TR, POS_TL, POS_BR, POS_BL, POS_MR]
+  , group   = GROUP_DASH
+  , tooltip = "Corner of the chart the dashboard is anchored to.")
+
+dashSizeInput = input.string(SIZE_SMALL, "Text Size"
+  , options = [SIZE_TINY, SIZE_SMALL, SIZE_NORMAL]
+  , group   = GROUP_DASH
+  , tooltip = "Text size of the dashboard.")
+
+erAvgLenInput = input.int(20, "Early Range Width Average"
+  , minval  = 1
+  , maxval  = 250
+  , group   = GROUP_DASH
+  , tooltip = "Number of prior early ranges averaged to normalize the current early-range width in the dashboard. A clearly narrower-than-average early range is the consolidation backdrop seek & destroy sessions favor.")
+
+showErBoxInput = input.bool(true, "Early Range Box"
+  , group   = GROUP_STYLE
+  , tooltip = "Draw a box around the early range while it forms.")
+
+showLevelLinesInput = input.bool(true, "Reference Level Lines"
+  , group   = GROUP_STYLE
+  , tooltip = "Extend the early-range high and low (dashed) through the evaluation window, and mark the prior day's high and low (dotted, tagged PDH/PDL) across the session.")
+
+showMidInput = input.bool(true, "Session Midpoint"
+  , group   = GROUP_STYLE
+  , tooltip = "Plot the live midpoint of the session range during the evaluation window - the reference a seek & destroy day settles back toward, and the target of traders who fade the extremes after the second sweep.")
+
+showSweepLabelsInput = input.bool(true, "Sweep Labels"
+  , group   = GROUP_STYLE
+  , tooltip = "Label each bar where a reference level is run and price closes back inside without follow-through - buy stops taken above, sell stops taken below.")
+
+showProfileLabelsInput = input.bool(true, "Profile Labels"
+  , group   = GROUP_STYLE
+  , tooltip = "Label the bar where both sides have been swept (profile developing) and tag the completed session when it confirms - or when it ran two-sided but closed away from the middle.")
+
+showBgInput = input.bool(true, "Profile Shading"
+  , group   = GROUP_STYLE
+  , tooltip = "Shade the evaluation window background once seek & destroy becomes the working assumption, keeping the stand-aside state visible at a glance.")
+
+buyColorInput = input.color(#089981, "Buy Side"
+  , inline  = "sideColors"
+  , group   = GROUP_STYLE
+  , tooltip = "Color of the buy-side references (early-range high, prior day high), their sweep labels, and upside-breakout readings.")
+
+sellColorInput = input.color(#f23645, "Sell Side"
+  , inline  = "sideColors"
+  , group   = GROUP_STYLE
+  , tooltip = "Color of the sell-side references (early-range low, prior day low), their sweep labels, and downside-breakout readings.")
+
+erColorInput = input.color(NEUTRAL_COLOR, "Early Range"
+  , inline  = "toneColors"
+  , group   = GROUP_STYLE
+  , tooltip = "Color of the early-range box and the session midpoint plot.")
+
+warnColorInput = input.color(#ff9800, "Seek & Destroy"
+  , inline  = "toneColors"
+  , group   = GROUP_STYLE
+  , tooltip = "Color of the seek & destroy profile labels, dashboard highlights and background shading.")
+
+shadeTranspInput = input.int(90, "Shading Transparency"
+  , minval  = 50
+  , maxval  = 99
+  , group   = GROUP_STYLE
+  , tooltip = "Transparency of the profile background shading. Higher values are more subtle.")
+
+string dashTextSize = switch dashSizeInput
+    SIZE_TINY   => size.tiny
+    SIZE_NORMAL => size.normal
+    =>             size.small
+
+string dashPos = switch dashPositionInput
+    POS_TL => position.top_left
+    POS_BR => position.bottom_right
+    POS_BL => position.bottom_left
+    POS_MR => position.middle_right
+    =>        position.top_right
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types
+//---------------------------------------------------------------------------------------------------------------------{
+// one sweep reference (early-range extreme or prior-day extreme): tracks violations of the level, closes back
+// inside (sweeps) and acceptance beyond it, for one session
+type RefLevel
+    float price        = na
+    bool  active       = false
+    bool  violated     = false
+    int   closesBeyond = 0
+    bool  swept        = false
+    int   sweeps       = 0
+    bool  accepted     = false
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// re-arms a reference level for a new session; a na price keeps it inactive
+method activate(RefLevel this, float levelPrice) =>
+    this.price        := levelPrice
+    this.active       := not na(levelPrice)
+    this.violated     := false
+    this.closesBeyond := 0
+    this.swept        := false
+    this.sweeps       := 0
+    this.accepted     := false
+
+// runs one bar against a reference level. A wick through the level flags a violation; a close back inside converts
+// it into a sweep (stops taken, no follow-through); consecutive closes beyond it - or a single displaced close -
+// convert it into acceptance, the genuine-breakout read. Returns this bar's [sweep, acceptance] events
+method update(RefLevel this, bool isUpper, float dispRoom, int acceptBars) =>
+    bool sweepNow  = false
+    bool acceptNow = false
+    if this.active and not this.accepted
+        if (isUpper ? high > this.price : low < this.price)
+            this.violated := true
+        if this.violated
+            bool beyondClose = isUpper ? close > this.price : close < this.price
+            if beyondClose
+                this.closesBeyond := this.closesBeyond + 1
+                bool displaced = not na(dispRoom) and dispRoom > 0 and (isUpper ? close > this.price + dispRoom : close < this.price - dispRoom)
+                if displaced or this.closesBeyond >= acceptBars
+                    this.accepted := true
+                    acceptNow     := true
+            else
+                this.swept        := true
+                this.sweeps       := this.sweeps + 1
+                this.violated     := false
+                this.closesBeyond := 0
+                sweepNow          := true
+    [sweepNow, acceptNow]
+
+// true when the current bar sits inside the given session window, in the profile timezone
+inWindow(string sess) =>
+    timeframe.isintraday and not na(time(timeframe.period, sess, tzInput))
+
+// dashboard text for one side built from its two references
+sideStatus(RefLevel erLevel, RefLevel pdLevel) =>
+    int  sideSweeps   = erLevel.sweeps + pdLevel.sweeps
+    bool sideAccepted = erLevel.accepted or pdLevel.accepted
+    bool sideActive   = erLevel.active or pdLevel.active
+    bool sideTesting  = erLevel.violated or pdLevel.violated
+    not sideActive ? "—" : sideAccepted ? "Accepted · breakout" : sideSweeps > 0 ? "Swept ×" + str.tostring(sideSweeps) : sideTesting ? "Testing…" : "Held"
+
+// writes one key/value row of the dashboard
+dashRow(table t, int rowIdx, string keyText, string valText, color valCss, string tipText) =>
+    table.cell(t, 0, rowIdx, keyText, text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left, tooltip = tipText)
+    table.cell(t, 1, rowIdx, valText, text_color = valCss, text_size = dashTextSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Sessions & Reference Levels
+//---------------------------------------------------------------------------------------------------------------------{
+bool inEr    = inWindow(erSessionInput)
+bool inEvalW = inWindow(evalSessionInput)
+
+int erState   = inEr ? 1 : 0
+int evalState = inEvalW ? 1 : 0
+
+bool erWasIn   = nz(erState[1], 0) == 1
+bool evalWasIn = nz(evalState[1], 0) == 1
+
+bool erStartBar = inEr and not erWasIn
+bool erEndBar   = erWasIn and not inEr
+bool evalEndBar = evalWasIn and not inEvalW
+
+// prior day high/low, rolled at midnight in the profile timezone
+int  domTz    = dayofmonth(time, tzInput)
+bool newDayTz = barstate.isfirst or (na(domTz[1]) ? false : domTz != domTz[1])
+
+var float dayHiRun = na
+var float dayLoRun = na
+var float pdh      = na
+var float pdl      = na
+
+if newDayTz
+    pdh      := dayHiRun
+    pdl      := dayLoRun
+    dayHiRun := high
+    dayLoRun := low
+else
+    dayHiRun := math.max(nz(dayHiRun, high), high)
+    dayLoRun := math.min(nz(dayLoRun, low), low)
+
+float atrValue = ta.atr(atrLenInput)
+float dispRoom = dispAtrInput * atrValue
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Profile State
+//---------------------------------------------------------------------------------------------------------------------{
+var float erHiVal       = na
+var float erLoVal       = na
+var bool  erDone        = false
+var bool  cycleLive     = false
+var bool  evalDone      = false
+var float sessHi        = na
+var float sessLo        = na
+var int   dayState      = STATE_WATCH
+var int   acceptDir     = 0
+var float finalClosePos = na
+var float erWidthRatio  = na
+var int   totalDays     = 0
+var int   twoSidedDays  = 0
+var int   sdDays        = 0
+
+var RefLevel erHiLevel = RefLevel.new()
+var RefLevel erLoLevel = RefLevel.new()
+var RefLevel pdhLevel  = RefLevel.new()
+var RefLevel pdlLevel  = RefLevel.new()
+
+var array<float> erWidthsArray = array.new<float>()
+
+var box   erBox    = na
+var line  erHiLine = na
+var line  erLoLine = na
+var line  pdhLine  = na
+var line  pdlLine  = na
+var label pdhLabel = na
+var label pdlLabel = na
+
+// per-bar profile events, consumed by the label and alert sections
+bool upSweepEvt     = false
+bool dnSweepEvt     = false
+bool firstFailEvt   = false
+bool developingEvt  = false
+bool confirmedEvt   = false
+bool invalidatedEvt = false
+
+// evaluation window closed: classify the completed session before any new-day reset. Both sides swept plus a
+// finish near the middle of the range is the completed seek & destroy signature; a two-sided day that settles
+// away from the middle stays unconfirmed. Every judged day feeds the base-rate counters
+if evalEndBar and cycleLive
+    if erDone
+        float dayRange = sessHi - sessLo
+        finalClosePos := dayRange > 0 ? (close[1] - sessLo) / dayRange : na
+        if dayState == STATE_DEV and not na(finalClosePos) and math.abs(finalClosePos - 0.5) <= midBandInput / 200.0
+            dayState     := STATE_CONF
+            confirmedEvt := true
+        totalDays += 1
+        if dayState == STATE_DEV or dayState == STATE_CONF
+            twoSidedDays += 1
+        if dayState == STATE_CONF
+            sdDays += 1
+        if showProfileLabelsInput
+            float dayMidFinal = (sessHi + sessLo) / 2
+            if dayState == STATE_CONF
+                label.new(bar_index - 1, dayMidFinal, "Seek & Destroy · Confirmed", color = COLOR_NONE, textcolor = warnColorInput, style = label.style_label_left, size = size.small)
+            else if dayState == STATE_DEV
+                label.new(bar_index - 1, dayMidFinal, "Two-Sided · Unconfirmed", color = COLOR_NONE, textcolor = NEUTRAL_COLOR, style = label.style_label_left, size = size.tiny)
+    evalDone  := true
+    cycleLive := false
+
+// early range opens: reset the session cycle and mark the pre-session references (identify step 1)
+if erStartBar
+    erHiVal       := high
+    erLoVal       := low
+    erDone        := false
+    evalDone      := false
+    cycleLive     := true
+    sessHi        := high
+    sessLo        := low
+    dayState      := STATE_WATCH
+    acceptDir     := 0
+    finalClosePos := na
+    erHiLevel.activate(na)
+    erLoLevel.activate(na)
+    pdhLevel.activate(na)
+    pdlLevel.activate(na)
+    erBox := showErBoxInput ? box.new(bar_index, high, bar_index, low, border_color = color.new(erColorInput, 35), border_width = 1, bgcolor = color.new(erColorInput, 88), text = "Early Range", text_size = size.tiny, text_color = color.new(erColorInput, 25), text_halign = text.align_left, text_valign = text.align_top) : box(na)
+    bool drawPd = showLevelLinesInput and usePdhlInput
+    pdhLine  := drawPd and not na(pdh) ? line.new(bar_index, pdh, bar_index, pdh, color = color.new(buyColorInput, 40), style = line.style_dotted) : line(na)
+    pdlLine  := drawPd and not na(pdl) ? line.new(bar_index, pdl, bar_index, pdl, color = color.new(sellColorInput, 40), style = line.style_dotted) : line(na)
+    pdhLabel := drawPd and not na(pdh) ? label.new(bar_index, pdh, "PDH", color = COLOR_NONE, textcolor = color.new(buyColorInput, 40), style = label.style_label_left, size = size.tiny) : label(na)
+    pdlLabel := drawPd and not na(pdl) ? label.new(bar_index, pdl, "PDL", color = COLOR_NONE, textcolor = color.new(sellColorInput, 40), style = label.style_label_left, size = size.tiny) : label(na)
+else if inEr and cycleLive
+    erHiVal := math.max(erHiVal, high)
+    erLoVal := math.min(erLoVal, low)
+
+// running session range across the early range and the evaluation window - the frame the final close is read in
+if cycleLive and not erStartBar and (inEr or inEvalW)
+    sessHi := math.max(nz(sessHi, high), high)
+    sessLo := math.min(nz(sessLo, low), low)
+
+// early range closes: freeze the reference levels and arm the sweep engine. The prior day extremes only arm
+// when they sit outside the early range - inside it their stops were already traded through overnight
+if erEndBar and cycleLive
+    erDone := true
+    float erWidth  = erHiVal - erLoVal
+    float priorAvg = array.size(erWidthsArray) > 0 ? array.avg(erWidthsArray) : na
+    erWidthRatio := not na(priorAvg) and priorAvg > 0 ? erWidth / priorAvg : na
+    array.push(erWidthsArray, erWidth)
+    if array.size(erWidthsArray) > erAvgLenInput
+        array.shift(erWidthsArray)
+    erHiLevel.activate(erHiVal)
+    erLoLevel.activate(erLoVal)
+    pdhLevel.activate(usePdhlInput and not na(pdh) and pdh >= erHiVal ? pdh : na)
+    pdlLevel.activate(usePdhlInput and not na(pdl) and pdl <= erLoVal ? pdl : na)
+    int edgeBar = math.max(bar_index - 1, 0)
+    erHiLine := showLevelLinesInput ? line.new(edgeBar, erHiVal, bar_index, erHiVal, color = buyColorInput, style = line.style_dashed) : line(na)
+    erLoLine := showLevelLinesInput ? line.new(edgeBar, erLoVal, bar_index, erLoVal, color = sellColorInput, style = line.style_dashed) : line(na)
+
+// evaluation window: run each bar against the armed references. A failed break on one side is the first warning;
+// the rotation through the other side makes seek & destroy the working assumption; acceptance beyond any level
+// reads as a genuine breakout and invalidates the profile for the day
+if inEvalW and erDone and cycleLive and dayState != STATE_INV
+    [erHiSweep, erHiAccept] = erHiLevel.update(true, dispRoom, acceptBarsInput)
+    [erLoSweep, erLoAccept] = erLoLevel.update(false, dispRoom, acceptBarsInput)
+    [pdhSweep, pdhAccept]   = pdhLevel.update(true, dispRoom, acceptBarsInput)
+    [pdlSweep, pdlAccept]   = pdlLevel.update(false, dispRoom, acceptBarsInput)
+    upSweepEvt := erHiSweep or pdhSweep
+    dnSweepEvt := erLoSweep or pdlSweep
+    bool upAccept = erHiAccept or pdhAccept
+    bool dnAccept = erLoAccept or pdlAccept
+    if upAccept or dnAccept
+        acceptDir      := upAccept ? 1 : -1
+        dayState       := STATE_INV
+        invalidatedEvt := true
+    else
+        bool upDone = erHiLevel.swept or pdhLevel.swept
+        bool dnDone = erLoLevel.swept or pdlLevel.swept
+        if upDone and dnDone and dayState < STATE_DEV
+            dayState      := STATE_DEV
+            developingEvt := true
+        else if (upDone or dnDone) and dayState < STATE_FIRST
+            dayState     := STATE_FIRST
+            firstFailEvt := true
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visuals
+//---------------------------------------------------------------------------------------------------------------------{
+if cycleLive and (inEr or inEvalW)
+    if inEr and not na(erBox)
+        box.set_top(erBox, erHiVal)
+        box.set_bottom(erBox, erLoVal)
+        box.set_right(erBox, bar_index)
+    if erDone and not na(erHiLine)
+        line.set_x2(erHiLine, bar_index)
+        line.set_x2(erLoLine, bar_index)
+    if not na(pdhLine)
+        line.set_x2(pdhLine, bar_index)
+        label.set_x(pdhLabel, bar_index)
+    if not na(pdlLine)
+        line.set_x2(pdlLine, bar_index)
+        label.set_x(pdlLabel, bar_index)
+
+if showSweepLabelsInput and upSweepEvt
+    label.new(bar_index, high, "Buy Stops Taken", color = COLOR_NONE, textcolor = buyColorInput, style = label.style_label_down, size = size.tiny)
+
+if showSweepLabelsInput and dnSweepEvt
+    label.new(bar_index, low, "Sell Stops Taken", color = COLOR_NONE, textcolor = sellColorInput, style = label.style_label_up, size = size.tiny)
+
+if showProfileLabelsInput and developingEvt
+    label.new(bar_index, sessHi, "Seek & Destroy · Developing", color = COLOR_NONE, textcolor = warnColorInput, style = label.style_label_down, size = size.small)
+
+plot(showMidInput and cycleLive and erDone and inEvalW ? (sessHi + sessLo) / 2 : na, "Session Midpoint", color.new(erColorInput, 30), 1, plot.style_linebr)
+
+bgcolor(showBgInput and inEvalW and dayState >= STATE_DEV ? color.new(warnColorInput, shadeTranspInput) : na, title = "Seek & Destroy Shading")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dash = showDashInput ? table.new(dashPos, 2, 8, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1) : table(na)
+
+if showDashInput and barstate.islast and not na(dash)
+    bool   intra  = timeframe.isintraday
+    string noData = "—"
+    color  fgCss  = DASH_TEXT
+
+    string stateText = "Watching"
+    color  stateCss  = fgCss
+    if not intra
+        stateText := "intraday only"
+    else if dayState == STATE_FIRST
+        stateText := "One side failed"
+        stateCss  := warnColorInput
+    else if dayState == STATE_DEV
+        stateText := evalDone ? "Two-sided · unconfirmed" : "Seek & Destroy · developing"
+        stateCss  := warnColorInput
+    else if dayState == STATE_CONF
+        stateText := "Seek & Destroy · confirmed"
+        stateCss  := warnColorInput
+    else if dayState == STATE_INV
+        stateText := acceptDir > 0 ? "Upside breakout · not S&D" : "Downside breakout · not S&D"
+        stateCss  := acceptDir > 0 ? buyColorInput : sellColorInput
+    else if inEr
+        stateText := "Early range forming…"
+    else if not erDone
+        stateText := "Waiting for early range"
+
+    string buyText = not intra ? noData : sideStatus(erHiLevel, pdhLevel)
+    color  buyCss  = erHiLevel.accepted or pdhLevel.accepted ? buyColorInput : erHiLevel.sweeps + pdhLevel.sweeps > 0 ? warnColorInput : fgCss
+
+    string sellText = not intra ? noData : sideStatus(erLoLevel, pdlLevel)
+    color  sellCss  = erLoLevel.accepted or pdlLevel.accepted ? sellColorInput : erLoLevel.sweeps + pdlLevel.sweeps > 0 ? warnColorInput : fgCss
+
+    string closeText = noData
+    float  closePos  = na
+    float  rangeNow  = sessHi - sessLo
+    if intra and erDone and not evalDone and not na(rangeNow) and rangeNow > 0
+        closePos  := (close - sessLo) / rangeNow
+        closeText := str.tostring(100 * closePos, "#") + "% · live"
+    else if intra and not na(finalClosePos)
+        closePos  := finalClosePos
+        closeText := str.tostring(100 * closePos, "#") + "% of range"
+    color closeCss = not na(closePos) and math.abs(closePos - 0.5) <= midBandInput / 200.0 ? warnColorInput : fgCss
+
+    string erText = not intra ? noData : inEr ? "forming…" : not erDone ? noData : str.tostring(erHiVal - erLoVal, format.mintick) + (na(erWidthRatio) ? "" : " · " + str.tostring(erWidthRatio, "#.##") + "× avg")
+
+    string readText = "Normal"
+    color  readCss  = fgCss
+    if not intra
+        readText := noData
+    else if dayState == STATE_FIRST
+        readText := "Caution"
+        readCss  := warnColorInput
+    else if dayState == STATE_DEV or dayState == STATE_CONF
+        readText := "Stand aside"
+        readCss  := warnColorInput
+    else if dayState == STATE_INV
+        readText := "Directional day"
+
+    string twoSidedText = totalDays > 0 ? str.tostring(100.0 * twoSidedDays / totalDays, "#.#") + "% (" + str.tostring(twoSidedDays) + "/" + str.tostring(totalDays) + ")" : noData
+    string sdRateText   = totalDays > 0 ? str.tostring(100.0 * sdDays / totalDays, "#.#") + "% (" + str.tostring(sdDays) + "/" + str.tostring(totalDays) + ")" : noData
+
+    dashRow(dash, 0, "State", stateText, stateCss, "The profile firms up in a recognizable order: a failed break on one side, the rotation through the other, and a finish near the middle of the range. Acceptance beyond any reference level argues for a genuine breakout instead.")
+    dashRow(dash, 1, "Buy Side", buyText, buyCss, "Upper references: the early-range high, plus the prior day high when armed. Swept = run and rejected without follow-through.")
+    dashRow(dash, 2, "Sell Side", sellText, sellCss, "Lower references: the early-range low, plus the prior day low when armed. Swept = run and rejected without follow-through.")
+    dashRow(dash, 3, "Close in Range", closeText, closeCss, "Where the close sits inside the session range (50% is the middle). A finish inside the middle band after both extremes were taken confirms the profile.")
+    dashRow(dash, 4, "Early Range", erText, fgCss, "Height of the early range, and how it compares with the average of the prior ranges. A clearly narrower-than-average consolidation raises the prior odds of a seek & destroy session.")
+    dashRow(dash, 5, "Read", readText, readCss, "Once both sides have been run without follow-through, standing aside is the textbook response - the profile punishes persistence. Odds are highest around major data releases (nonfarm payrolls is the classic case) and holiday-thinned tape, so check the calendar.")
+    dashRow(dash, 6, "Two-Sided Days", twoSidedText, fgCss, "Share of judged sessions where both sides of the references were swept without acceptance - your market's base rate for two-sided runs.")
+    dashRow(dash, 7, "Confirmed S&D", sdRateText, fgCss, "Share of judged sessions that completed the full signature: both sides swept and a close near the middle of the range.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(upSweepEvt,     "Buy-Side Sweep",            "Buy stops taken on {{ticker}} - price ran a reference high and closed back inside without follow-through")
+alertcondition(dnSweepEvt,     "Sell-Side Sweep",           "Sell stops taken on {{ticker}} - price ran a reference low and closed back inside without follow-through")
+alertcondition(firstFailEvt,   "First Breakout Failure",    "First breakout attempt failed on {{ticker}} - one side swept without follow-through, first seek & destroy warning")
+alertcondition(developingEvt,  "Seek & Destroy Developing", "Both sides of the range swept without acceptance on {{ticker}} - seek & destroy is the working assumption, treat further intraday signals with skepticism")
+alertcondition(confirmedEvt,   "Seek & Destroy Confirmed",  "Session on {{ticker}} closed near the middle of its range after both extremes were taken - completed seek & destroy signature")
+alertcondition(invalidatedEvt, "Profile Invalidated",       "Price accepted beyond a reference level on {{ticker}} - genuine breakout rather than a stop run, seek & destroy read invalidated for the session")
+
+//---------------------------------------------------------------------------------------------------------------------}

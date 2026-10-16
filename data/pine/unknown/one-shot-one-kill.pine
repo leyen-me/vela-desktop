@@ -1,0 +1,1015 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("One-shot-one-kill", "One-shot-one-kill", overlay = true, format = format.price, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 250, max_bars_back = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+//The weekly campaign's staged sequence: manipulation raid -> displacement MSS arms the OTE -> the single shot
+STAGE_IDLE   = 0
+STAGE_RAIDED = 1
+STAGE_ARMED  = 2
+STAGE_FIRED  = 3
+STAGE_DOWN   = 4
+
+//How a finished campaign ended
+OUTCOME_TARGET  = "Target Hit"
+OUTCOME_STOPPED = "Stopped Out"
+OUTCOME_MISSED  = "Missed - Flat Week"
+
+//Weekly bias modes - the one directional idea framed for the week
+BIAS_AUTO = "Auto (nearest weekly draw)"
+BIAS_BULL = "Bullish (hunt longs)"
+BIAS_BEAR = "Bearish (hunt shorts)"
+
+//Entry zone pricing modes
+REFINE_ON  = "OTE refined by FVG/OB"
+REFINE_OFF = "OTE band only"
+
+//Resting pools tracked as raid candidates, opposite the weekly bias
+KIND_PWH    = "PWH"
+KIND_PWL    = "PWL"
+KIND_ASIA_H = "Asia High"
+KIND_ASIA_L = "Asia Low"
+KIND_LDN_H  = "London High"
+KIND_LDN_L  = "London Low"
+KIND_NY_H   = "NY High"
+KIND_NY_L   = "NY Low"
+
+//Every window is clocked in New York time, daylight-saving aware
+NY_TZ = "America/New_York"
+
+//Memory caps
+MAX_DRAWS     = 12
+MAX_POOLS     = 15
+MAX_STRUCTURE = 40
+
+LABEL_BG = #00000000
+
+//Palette - bull / bear carry the setup, pools and the weekly draw are the one accent, killzones and separators are grey
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+NEUTRAL_COLOR = #787b86
+ACCENT_COLOR  = #ff9800
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+//Visual tuning
+POOL_TRANSPARENCY        = 45
+RAIDED_LINE_TRANSPARENCY = 35
+DRAW_LINE_TRANSPARENCY   = 30
+SHIFT_LINE_TRANSPARENCY  = 20
+STOP_LINE_TRANSPARENCY   = 30
+TARGET_LINE_TRANSPARENCY = 30
+ZONE_BG_TRANSPARENCY     = 88
+ZONE_BORDER_TRANSPARENCY = 60
+ZONE_TEXT_TRANSPARENCY   = 40
+KZ_BG_TRANSPARENCY       = 94
+SEP_TRANSPARENCY         = 85
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+biasModeInput = input.string(BIAS_AUTO, "Weekly Bias", options = [BIAS_AUTO, BIAS_BULL, BIAS_BEAR], group = "Weekly Bias",
+  tooltip = "The one directional idea framed for the week, set when the week opens. 'Auto' anchors the bias to the nearest untaken old weekly high or low relative to the weekly open - a stand-in for the top-down draw read from the weekly and daily charts. The manual settings impose your own read; the model then hunts only that side.")
+
+showDrawInput = input.bool(true, "Show Weekly Draw", group = "Weekly Bias",
+  tooltip = "Draw the week's objective - the old weekly high or low the bias is anchored to - as a dotted level from the weekly open. It is the far side of the projected weekly range and doubles as the target once the setup arms.")
+
+prevWeekPoolInput = input.bool(true, "Prior Week High/Low", group = "Liquidity Pools",
+  tooltip = "Track the prior week's extreme opposite the bias as the primary raid candidate - the prior week's low in a bullish week, its high in a bearish one: the most obvious pool of resting orders the weekly manipulation can run.")
+
+asiaPoolInput = input.bool(true, "Asian Range High/Low", group = "Liquidity Pools",
+  tooltip = "Once each Asian window closes, keep its extreme opposite the bias as a raid candidate - part of the early-week session liquidity where intraday stops build up.")
+
+asiaSessionInput = input.session("2000-0000", "Asia Window", group = "Liquidity Pools",
+  tooltip = "Asian range window on the New York clock, 8:00 pm to midnight ET by default (the ICT convention). The window follows New York daylight-saving changes whatever the chart's time zone.")
+
+londonPoolInput = input.bool(true, "London Session High/Low", group = "Liquidity Pools",
+  tooltip = "Once each London window closes, keep its extreme opposite the bias as a raid candidate - a Monday London low is still a marked pool for Tuesday or Wednesday's run.")
+
+londonSessionInput = input.session("0200-0800", "London Window", group = "Liquidity Pools",
+  tooltip = "London session window on the New York clock, 2:00 am to 8:00 am ET by default. Daylight-saving aware whatever the chart's time zone.")
+
+nyPoolInput = input.bool(true, "New York Session High/Low", group = "Liquidity Pools",
+  tooltip = "Once each New York window closes, keep its extreme opposite the bias as a raid candidate - the previous afternoon's stops are a common early-morning run before the real weekly delivery.")
+
+nySessionInput = input.session("0700-1300", "New York Window", group = "Liquidity Pools",
+  tooltip = "New York session window on the New York clock, 7:00 am to 1:00 pm ET by default (the ICT convention). Daylight-saving aware whatever the chart's time zone.")
+
+holdWindowInput = input.int(3, "Close-Back Window (Bars)", minval = 0, maxval = 20, group = "Liquidity Pools",
+  tooltip = "A run through a pool must close back inside within this many bars to count as the failed raid the model wants - manipulation, not a genuine break. Price accepted beyond the window retires the level without a signal. Zero requires the close-back on the raid bar itself (wick-only sweeps).")
+
+dayMonInput = input.bool(true, "Mon", inline = "days1", group = "Hunt Window")
+dayTueInput = input.bool(true, "Tue", inline = "days1", group = "Hunt Window")
+dayWedInput = input.bool(true, "Wed", inline = "days1", group = "Hunt Window",
+  tooltip = "Days of the week, on the New York clock, on which the raid that sets the weekly extreme may print. The template anticipates the extreme forming Monday through Wednesday. Sunday's opening hours count with Monday.")
+
+dayThuInput = input.bool(false, "Thu", inline = "days2", group = "Hunt Window")
+dayFriInput = input.bool(false, "Fri", inline = "days2", group = "Hunt Window",
+  tooltip = "Allow late-week raids. The classic template leaves these off: a weekly extreme that only arrives Thursday or Friday means a flat week, not a downgraded setup. Saturday, where it trades, counts with Friday.")
+
+kzGateInput = input.bool(true, "Raid & Entry Inside Killzones", group = "Hunt Window",
+  tooltip = "Honor the raid and the entry only inside the London or New York morning windows below - the model expects both the weekly extreme and the single fill to print inside a killzone. Disable to hunt at any hour.")
+
+londonKzInput = input.session("0200-0500", "London Killzone", group = "Hunt Window",
+  tooltip = "London open killzone on the New York clock, 2:00 am to 5:00 am ET by default - the window the weekly extreme is hunted in first.")
+
+nyKzInput = input.session("0700-1000", "New York AM Killzone", group = "Hunt Window",
+  tooltip = "New York morning killzone on the New York clock, 7:00 am to 10:00 am ET by default - spanning the 8:30 news embargo lift and the 9:30 equities open.")
+
+highlightKzInput = input.bool(true, "Highlight Killzones", group = "Hunt Window",
+  tooltip = "Shade the killzone windows in the chart background so the raid, the retracement and the clock are read together.")
+
+structureSwingInput = input.int(5, "Structure Swing Length", minval = 1, group = "Setup Sequence",
+  tooltip = "Bars to the left and right required to confirm the short-term swing used as the structural reference. After a raid of lows the shift is a close back above the most recent such swing high - and the mirror after a raid of highs.")
+
+displacementMultInput = input.float(1.5, "Displacement Body (x ATR)", minval = 0.1, step = 0.25, group = "Setup Sequence",
+  tooltip = "Minimum candle body, as a multiple of the ATR sampled when the raid printed, for the move away from the raid to count as displacement - the fast structure-shifting delivery the model demands before assuming the weekly extreme is in.")
+
+atrLengthInput = input.int(14, "ATR Length", minval = 1, group = "Setup Sequence",
+  tooltip = "Average True Range length used as the volatility yardstick for the displacement test.")
+
+raidExpiryInput = input.int(60, "Raid to MSS Expiry (Bars)", minval = 5, maxval = 200, group = "Setup Sequence",
+  tooltip = "Maximum bars from the raid to the displacement structure shift. A raid that produces no energetic shift inside this window stops being tracked - the weekly-extreme read belongs to the bars right after the run, and a later raid can start a fresh sequence.")
+
+oteShallowInput = input.float(0.62, "OTE Zone From (Retracement)", minval = 0.05, maxval = 0.95, step = 0.01, group = "Optimal Trade Entry",
+  tooltip = "Shallow edge of the optimal trade entry zone as a fraction of the displacement leg, 62% by default. The single entry is honored only inside this band - by construction deeper than 50%, so the fill is priced in discount for longs and premium for shorts.")
+
+oteDeepInput = input.float(0.79, "OTE Zone To (Retracement)", minval = 0.1, maxval = 1, step = 0.01, group = "Optimal Trade Entry",
+  tooltip = "Deep edge of the optimal trade entry zone, 79% by default. Beyond it the retracement is approaching the weekly extreme itself, where the stop - not the entry - belongs.")
+
+refineModeInput = input.string(REFINE_ON, "Entry Zone", options = [REFINE_ON, REFINE_OFF], group = "Optimal Trade Entry",
+  tooltip = "Where inside the OTE the shot is priced. The default narrows the band to its overlap with the entry inventory the displacement leg left behind - the most recent fair value gap, else the order block at the leg's origin - and falls back to the full 62-79% band when the leg left neither inside it.")
+
+showZoneInput = input.bool(true, "Show OTE Entry Zone", group = "Optimal Trade Entry",
+  tooltip = "Draw the entry zone once the setup arms. It re-anchors while the displacement leg keeps extending, then freezes on the bar that tags it - the single entry.")
+
+showStopInput = input.bool(true, "Show Stop Level", group = "Trade Framing",
+  tooltip = "Draw the candidate weekly extreme once the setup arms - the canonical invalidation. The idea is wrong if that level trades again, so the stop belongs just beyond it.")
+
+showTargetInput = input.bool(true, "Show Target Level", group = "Trade Framing",
+  tooltip = "Draw the objective at the far side of the projected weekly range - the nearest untaken old weekly high or low in the trade direction, normally the weekly draw itself.")
+
+showPanelInput = input.bool(true, "Show Discipline Panel", group = "Dashboard",
+  tooltip = "Compact weekly-discipline panel: the week's bias and draw, the stage of the hunt, the state of the single shot, the active entry, stop and target, and the session clock.")
+
+panelLocationInput = input.string("Top Right", "Panel Position", options = ["Top Right", "Bottom Right", "Top Left", "Bottom Left"], group = "Dashboard",
+  tooltip = "Chart corner the discipline panel is anchored to.")
+
+showPoolsInput = input.bool(true, "Show Liquidity Pools", group = "Style",
+  tooltip = "Display the marked raid pools as dotted levels with their kind tags (PWL, Asia Low, London High...). Raided pools keep their level drawn up to the raid, colored by the setup direction they start.")
+
+showStageLabelsInput = input.bool(true, "Stage Labels", group = "Style",
+  tooltip = "Tag the beats of the campaign on the chart: 'Raid' with the pool taken, 'MSS' on the broken swing, 'Entry' at the OTE tag, and the week's outcome (Target Hit, Stopped, Missed).")
+
+showMarkersInput = input.bool(true, "Setup Markers", group = "Style",
+  tooltip = "Mark the armed setup with an 'OSOK' label on the arming bar. Hover it for the full frame: the pool raided, the entry zone, the stop and the target.")
+
+showWeekSepInput = input.bool(true, "Week Separators", group = "Style",
+  tooltip = "Drop a muted vertical line on the first bar of each trading week, framing the one-campaign-per-week cadence.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "colors", group = "Style",
+  tooltip = "Color of bullish weeks: raids of lows, upward shifts, their OTE zones, stops and targets.")
+
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "colors", group = "Style",
+  tooltip = "Color of bearish weeks: raids of highs, downward shifts, their OTE zones, stops and targets.")
+
+poolColorInput = input.color(ACCENT_COLOR, "Pools & Draw", group = "Style",
+  tooltip = "Color of the marked liquidity pools and the weekly draw before the campaign resolves them.")
+
+kzColorInput = input.color(NEUTRAL_COLOR, "Killzone Highlight", group = "Style",
+  tooltip = "Background shade of the killzone windows.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types
+//---------------------------------------------------------------------------------------------------------------------{
+//One monitored resting pool and, while price holds beyond it, the running raid excursion
+type Pool
+    float  price
+    int    startBar
+    string kind
+    int    breachBar
+    float  breachExtreme
+    int    breachExtremeBar
+    line   poolLine
+    label  poolTag
+
+//The week's single staged campaign and its trade frame
+type Setup
+    int    stage = 0
+    float  poolPrice
+    string poolKind
+    int    raidBar
+    float  raidExtreme
+    int    raidExtremeBar
+    float  structurePrice
+    int    structureBar
+    float  baseAtr
+    float  maxBody = 0.0
+    bool   displaced = false
+    float  legFar
+    int    legFarBar
+    int    armBar
+    float  zoneTop
+    float  zoneBottom
+    string zoneKind
+    float  entryPrice
+    int    entryBar
+    float  targetPrice
+    label  raidLabel
+    line   shiftLine
+    label  shiftLabel
+    box    zoneBox
+    line   stopLine
+    label  stopLabel
+    line   targetLine
+    label  targetLabel
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+//Most recent confirmed structural swing at or before a given bar - the opposing point the shift must close through
+latestStructure(array<float> pricesArray, array<int> barsArray, int maxBar) =>
+    float levelPrice = na
+    int   levelBar   = na
+    int i = array.size(pricesArray) - 1
+    while i >= 0 and na(levelPrice)
+        if array.get(barsArray, i) <= maxBar
+            levelPrice := array.get(pricesArray, i)
+            levelBar   := array.get(barsArray, i)
+        i -= 1
+    [levelPrice, levelBar]
+
+//Remember a confirmed structural swing, capping the memory per side
+registerStructure(array<float> pricesArray, array<int> barsArray, float pivotPrice, int pivotBar) =>
+    array.push(pricesArray, pivotPrice)
+    array.push(barsArray, pivotBar)
+    if array.size(pricesArray) > MAX_STRUCTURE
+        array.shift(pricesArray)
+        array.shift(barsArray)
+
+//Delete one pool's drawings and drop it from the watch
+destroyPool(array<Pool> poolsArray, int index) =>
+    Pool pool = array.get(poolsArray, index)
+    if not na(pool.poolLine)
+        line.delete(pool.poolLine)
+    if not na(pool.poolTag)
+        label.delete(pool.poolTag)
+    array.remove(poolsArray, index)
+
+//Create one monitored pool: a dotted level extending right, tagged with its kind
+newPool(array<Pool> poolsArray, float poolPrice, int startBar, string poolKind) =>
+    line poolLine = line.new(startBar, poolPrice, bar_index, poolPrice
+      , extend = extend.right
+      , color  = showPoolsInput ? color.new(poolColorInput, POOL_TRANSPARENCY) : LABEL_BG
+      , style  = line.style_dotted
+      , width  = 1)
+    label poolTag = showPoolsInput
+      ? label.new(startBar, poolPrice, poolKind, style = label.style_label_right, color = LABEL_BG, textcolor = color.new(poolColorInput, 25), size = size.tiny)
+      : label(na)
+    array.push(poolsArray, Pool.new(price = poolPrice, startBar = startBar, kind = poolKind, poolLine = poolLine, poolTag = poolTag))
+    if array.size(poolsArray) > MAX_POOLS
+        destroyPool(poolsArray, 0)
+
+//Old weekly extremes kept as future draws, capped oldest-first
+pushDraw(array<float> pricesArray, float levelPrice) =>
+    array.push(pricesArray, levelPrice)
+    if array.size(pricesArray) > MAX_DRAWS
+        array.shift(pricesArray)
+
+//Levels the tape has traded through are no longer draws
+pruneDraws(array<float> pricesArray, bool isUpper) =>
+    int i = 0
+    while i < array.size(pricesArray)
+        float levelPrice = array.get(pricesArray, i)
+        if isUpper ? high > levelPrice : low < levelPrice
+            array.remove(pricesArray, i)
+        else
+            i += 1
+
+//Nearest untaken draw beyond a reference price - the far side of the projected weekly range
+nearestDraw(array<float> pricesArray, bool above, float fromPrice) =>
+    float best = na
+    int i = 0
+    while i < array.size(pricesArray)
+        float levelPrice = array.get(pricesArray, i)
+        bool valid = above ? levelPrice > fromPrice : levelPrice < fromPrice
+        if valid and (na(best) or (above ? levelPrice < best : levelPrice > best))
+            best := levelPrice
+        i += 1
+    best
+
+//Raid watch opposite the bias: a run through a pool that closes back inside is the failed raid the model wants;
+//price accepted beyond the close-back window is a genuine break that retires the level without a signal
+processPools(array<Pool> poolsArray, bool isUpper, color dirColor) =>
+    bool   sweptNow        = false
+    float  sweptPrice      = na
+    string sweptKind       = na
+    float  sweptExtreme    = na
+    int    sweptExtremeBar = na
+    int i = 0
+    while i < array.size(poolsArray)
+        Pool pool = array.get(poolsArray, i)
+        bool removePool = false
+        bool sweepHere  = false
+        bool beyond     = isUpper ? high > pool.price : low < pool.price
+        bool closedBack = isUpper ? close <= pool.price : close >= pool.price
+        if na(pool.breachBar)
+            if beyond
+                pool.breachExtreme    := isUpper ? high : low
+                pool.breachExtremeBar := bar_index
+                if closedBack
+                    //A poke beyond the level that closes back inside the same bar - the wick-only raid
+                    sweepHere := true
+                else if holdWindowInput == 0
+                    removePool := true
+                else
+                    pool.breachBar := bar_index
+        else
+            //Track the raid extreme while price holds beyond the pool
+            float runExtreme = isUpper ? math.max(pool.breachExtreme, high) : math.min(pool.breachExtreme, low)
+            if runExtreme != pool.breachExtreme
+                pool.breachExtreme    := runExtreme
+                pool.breachExtremeBar := bar_index
+            if closedBack
+                sweepHere := true
+            else if bar_index - pool.breachBar >= holdWindowInput
+                removePool := true
+        if sweepHere
+            //When stacked pools resolve on the same bar, the outermost level anchors the campaign
+            bool better = na(sweptPrice) or (isUpper ? pool.price > sweptPrice : pool.price < sweptPrice)
+            if better
+                sweptPrice      := pool.price
+                sweptKind       := pool.kind
+                sweptExtreme    := pool.breachExtreme
+                sweptExtremeBar := pool.breachExtremeBar
+            sweptNow := true
+            if not na(pool.poolLine)
+                line.set_x2(pool.poolLine, bar_index)
+                line.set_extend(pool.poolLine, extend.none)
+                line.set_style(pool.poolLine, line.style_solid)
+                line.set_color(pool.poolLine, color.new(dirColor, RAIDED_LINE_TRANSPARENCY))
+            array.remove(poolsArray, i)
+        else if removePool
+            if not na(pool.poolLine)
+                line.set_x2(pool.poolLine, na(pool.breachBar) ? bar_index : pool.breachBar)
+                line.set_extend(pool.poolLine, extend.none)
+            array.remove(poolsArray, i)
+        else
+            i += 1
+    [sweptNow, sweptPrice, sweptKind, sweptExtreme, sweptExtremeBar]
+
+//Far point of the displacement leg measured from the raid extreme - the anchor the OTE retraces from
+legExtreme(bool isBull, int extremeBar) =>
+    float farPrice = isBull ? high : low
+    int   farBar   = bar_index
+    int span = math.min(bar_index - extremeBar, 490)
+    int j = 1
+    while j <= span
+        float candidate = isBull ? high[j] : low[j]
+        if not na(candidate) and (isBull ? candidate > farPrice : candidate < farPrice)
+            farPrice := candidate
+            farBar   := bar_index - j
+        j += 1
+    [farPrice, farBar]
+
+//The 62-79% retracement band of the displacement leg
+oteBand(bool isBull, float extremePrice, float legFarPrice) =>
+    float legSpan      = math.abs(legFarPrice - extremePrice)
+    float shallowLevel = isBull ? legFarPrice - oteShallowInput * legSpan : legFarPrice + oteShallowInput * legSpan
+    float deepLevel    = isBull ? legFarPrice - oteDeepInput * legSpan : legFarPrice + oteDeepInput * legSpan
+    [math.max(shallowLevel, deepLevel), math.min(shallowLevel, deepLevel)]
+
+//Price the shot inside the OTE: overlap with the leg's most recent fair value gap, else with the order block
+//at the leg's origin, else the raw band
+refineZone(bool isBull, int extremeBar, float bandTop, float bandBottom) =>
+    float  zoneTopPrice    = bandTop
+    float  zoneBottomPrice = bandBottom
+    string zoneKindText    = "OTE"
+    if refineModeInput == REFINE_ON
+        bool found = false
+        //Most recent three-candle imbalance whose middle candle belongs to the leg and overlaps the band
+        int maxOffset = math.min(bar_index - extremeBar - 1, 480)
+        int j = 0
+        while j <= maxOffset and not found
+            if isBull
+                if not na(high[j + 2]) and high[j + 2] < low[j]
+                    float interTop    = math.min(low[j], bandTop)
+                    float interBottom = math.max(high[j + 2], bandBottom)
+                    if interTop > interBottom
+                        zoneTopPrice    := interTop
+                        zoneBottomPrice := interBottom
+                        zoneKindText    := "OTE + FVG"
+                        found           := true
+            else
+                if not na(low[j + 2]) and low[j + 2] > high[j]
+                    float interTop    = math.min(low[j + 2], bandTop)
+                    float interBottom = math.max(high[j], bandBottom)
+                    if interTop > interBottom
+                        zoneTopPrice    := interTop
+                        zoneBottomPrice := interBottom
+                        zoneKindText    := "OTE + FVG"
+                        found           := true
+            j += 1
+        if not found
+            //Body of the last opposite-direction candle at the origin of the leg
+            int originOffset = math.max(bar_index - extremeBar, 0)
+            int maxOrigin    = math.min(originOffset + 5, 480)
+            int k = originOffset
+            while k <= maxOrigin and not found
+                if not na(close[k])
+                    if isBull
+                        if close[k] < open[k]
+                            float interTop    = math.min(open[k], bandTop)
+                            float interBottom = math.max(close[k], bandBottom)
+                            if interTop > interBottom
+                                zoneTopPrice    := interTop
+                                zoneBottomPrice := interBottom
+                                zoneKindText    := "OTE + OB"
+                                found           := true
+                    else
+                        if close[k] > open[k]
+                            float interTop    = math.min(close[k], bandTop)
+                            float interBottom = math.max(open[k], bandBottom)
+                            if interTop > interBottom
+                                zoneTopPrice    := interTop
+                                zoneBottomPrice := interBottom
+                                zoneKindText    := "OTE + OB"
+                                found           := true
+                k += 1
+    [zoneTopPrice, zoneBottomPrice, zoneKindText]
+
+//End a campaign where it stands and release its extending objects (the drawings stay as history)
+freezeSetup(Setup setup) =>
+    if not na(setup.stopLine)
+        line.set_x2(setup.stopLine, bar_index)
+    if not na(setup.stopLabel)
+        label.set_x(setup.stopLabel, bar_index)
+    if not na(setup.targetLine)
+        line.set_x2(setup.targetLine, bar_index)
+    if not na(setup.targetLabel)
+        label.set_x(setup.targetLabel, bar_index)
+    if not na(setup.zoneBox) and setup.stage < STAGE_FIRED
+        box.set_right(setup.zoneBox, bar_index)
+    setup.stopLine    := line(na)
+    setup.stopLabel   := label(na)
+    setup.targetLine  := line(na)
+    setup.targetLabel := label(na)
+    setup.zoneBox     := box(na)
+    setup.shiftLine   := line(na)
+    setup.shiftLabel  := label(na)
+    setup.raidLabel   := label(na)
+
+//The week's state machine: raid (1) -> displacement MSS arms the OTE (2) -> the single entry (3),
+//stop beyond the weekly extreme, target at the weekly draw, one shot per week
+advanceSetup(Setup setup, bool isBull, bool sweptNow, float sweptPrice, string sweptKind, float sweptExtreme, int sweptExtremeBar, bool canStart, bool entryWindowOk, float armAtr, array<float> structPricesArray, array<int> structBarsArray, array<float> targetDrawsArray) =>
+    bool   raidFired    = false
+    bool   armFired     = false
+    bool   entryFired   = false
+    bool   targetFired  = false
+    bool   invalidFired = false
+    bool   missedFired  = false
+    string outcomeText  = na
+    color dirColor = isBull ? bullColorInput : bearColorInput
+    //Canonical invalidation first: once the OTE is armed, the candidate weekly extreme trading again voids the
+    //idea - after the shot it is the stop being hit and the week is done
+    if setup.stage == STAGE_ARMED or setup.stage == STAGE_FIRED
+        bool beyondExtreme = isBull ? low < setup.raidExtreme : high > setup.raidExtreme
+        if beyondExtreme
+            invalidFired := true
+            bool wasFired = setup.stage == STAGE_FIRED
+            if wasFired and showStageLabelsInput
+                label.new(bar_index, setup.raidExtreme, "Stopped"
+                  , style     = isBull ? label.style_label_up : label.style_label_down
+                  , color     = LABEL_BG
+                  , textcolor = dirColor
+                  , size      = size.tiny)
+            freezeSetup(setup)
+            if wasFired
+                outcomeText := OUTCOME_STOPPED
+                setup.stage := STAGE_DOWN
+            else
+                setup.stage := STAGE_IDLE
+    //A raid that never displaces into the shift stops being tracked; a later raid can start fresh
+    if setup.stage == STAGE_RAIDED and bar_index - setup.raidBar > raidExpiryInput
+        freezeSetup(setup)
+        setup.stage := STAGE_IDLE
+    //Stage 1 - the weekly manipulation: a marked pool is run and fails to hold, inside the hunt window
+    if sweptNow and canStart and (setup.stage == STAGE_IDLE or setup.stage == STAGE_RAIDED)
+        bool fresh = setup.stage == STAGE_IDLE
+        if fresh
+            setup.poolPrice      := sweptPrice
+            setup.poolKind       := sweptKind
+            setup.raidExtreme    := sweptExtreme
+            setup.raidExtremeBar := sweptExtremeBar
+            setup.baseAtr        := armAtr
+            setup.maxBody        := 0.0
+            setup.displaced      := false
+            setup.structurePrice := na
+            setup.structureBar   := na
+            if showStageLabelsInput
+                setup.raidLabel := label.new(sweptExtremeBar, sweptExtreme, "Raid " + sweptKind
+                  , style     = isBull ? label.style_label_up : label.style_label_down
+                  , color     = LABEL_BG
+                  , textcolor = dirColor
+                  , size      = size.tiny)
+        else
+            //A further pool taken while the raid runs keeps the sequence and honors the outermost level
+            bool deeperPool = isBull ? sweptPrice < setup.poolPrice : sweptPrice > setup.poolPrice
+            if deeperPool
+                setup.poolPrice := sweptPrice
+                setup.poolKind  := sweptKind
+                if not na(setup.raidLabel)
+                    label.set_text(setup.raidLabel, "Raid " + sweptKind)
+            bool deeperExtreme = isBull ? sweptExtreme < setup.raidExtreme : sweptExtreme > setup.raidExtreme
+            if deeperExtreme
+                setup.raidExtreme    := sweptExtreme
+                setup.raidExtremeBar := sweptExtremeBar
+        setup.stage   := STAGE_RAIDED
+        setup.raidBar := bar_index
+        raidFired := true
+    //While the raid runs: the excursion extreme is the candidate weekly low or high (the future stop), the
+    //opposing structure is the shift reference, and displacement is measured against the raid-time ATR
+    if setup.stage == STAGE_RAIDED
+        float runExtreme = isBull ? math.min(setup.raidExtreme, low) : math.max(setup.raidExtreme, high)
+        if runExtreme != setup.raidExtreme
+            setup.raidExtreme    := runExtreme
+            setup.raidExtremeBar := bar_index
+        if not na(setup.raidLabel)
+            label.set_xy(setup.raidLabel, setup.raidExtremeBar, setup.raidExtreme)
+        [levelPrice, levelBar] = latestStructure(structPricesArray, structBarsArray, setup.raidBar)
+        setup.structurePrice := levelPrice
+        setup.structureBar   := levelBar
+        float directionalBody = isBull ? (close > open ? close - open : 0.0) : (close < open ? open - close : 0.0)
+        setup.maxBody := math.max(setup.maxBody, directionalBody)
+        float atrBasis = na(setup.baseAtr) ? armAtr : setup.baseAtr
+        setup.displaced := not na(atrBasis) and atrBasis > 0 and setup.maxBody >= displacementMultInput * atrBasis
+    //Stage 2 - displacement MSS: an energetic close through the opposing swing confirms the extreme is likely in
+    //and anchors the OTE of the displacement leg; stop and target frame the shot from here
+    if setup.stage == STAGE_RAIDED and setup.displaced and not na(setup.structurePrice)
+        bool structureBroken = isBull ? close > setup.structurePrice : close < setup.structurePrice
+        if structureBroken
+            setup.stage  := STAGE_ARMED
+            setup.armBar := bar_index
+            armFired := true
+            [legFarPrice, legFarBar] = legExtreme(isBull, setup.raidExtremeBar)
+            setup.legFar    := legFarPrice
+            setup.legFarBar := legFarBar
+            [bandTop, bandBottom] = oteBand(isBull, setup.raidExtreme, legFarPrice)
+            [zoneTopPrice, zoneBottomPrice, zoneKindText] = refineZone(isBull, setup.raidExtremeBar, bandTop, bandBottom)
+            setup.zoneTop     := zoneTopPrice
+            setup.zoneBottom  := zoneBottomPrice
+            setup.zoneKind    := zoneKindText
+            setup.targetPrice := nearestDraw(targetDrawsArray, isBull, close)
+            setup.shiftLine := line.new(setup.structureBar, setup.structurePrice, bar_index, setup.structurePrice
+              , color = color.new(dirColor, SHIFT_LINE_TRANSPARENCY)
+              , width = 1)
+            if showStageLabelsInput
+                setup.shiftLabel := label.new(math.round(math.avg(setup.structureBar, bar_index)), setup.structurePrice, "MSS"
+                  , style     = isBull ? label.style_label_up : label.style_label_down
+                  , color     = LABEL_BG
+                  , textcolor = dirColor
+                  , size      = size.tiny)
+            if showZoneInput
+                setup.zoneBox := box.new(bar_index, zoneTopPrice, bar_index, zoneBottomPrice
+                  , border_color = color.new(dirColor, ZONE_BORDER_TRANSPARENCY)
+                  , border_width = 1
+                  , bgcolor      = color.new(dirColor, ZONE_BG_TRANSPARENCY)
+                  , text         = zoneKindText
+                  , text_size    = size.tiny
+                  , text_color   = color.new(dirColor, ZONE_TEXT_TRANSPARENCY)
+                  , text_halign  = text.align_right)
+            if showStopInput
+                setup.stopLine := line.new(setup.raidExtremeBar, setup.raidExtreme, bar_index, setup.raidExtreme
+                  , color = color.new(dirColor, STOP_LINE_TRANSPARENCY)
+                  , style = line.style_dashed
+                  , width = 1)
+                setup.stopLabel := label.new(bar_index, setup.raidExtreme, "Stop"
+                  , style     = label.style_label_left
+                  , color     = LABEL_BG
+                  , textcolor = dirColor
+                  , size      = size.tiny)
+            if showTargetInput and not na(setup.targetPrice)
+                setup.targetLine := line.new(bar_index, setup.targetPrice, bar_index, setup.targetPrice
+                  , color = color.new(dirColor, TARGET_LINE_TRANSPARENCY)
+                  , style = line.style_dotted
+                  , width = 1)
+                setup.targetLabel := label.new(bar_index, setup.targetPrice, "Target"
+                  , style     = label.style_label_left
+                  , color     = LABEL_BG
+                  , textcolor = dirColor
+                  , size      = size.tiny)
+            if showMarkersInput
+                string markerTip = "One shot one kill " + (isBull ? "long" : "short") + " armed"
+                  + "\nRaid: " + setup.poolKind + " at " + str.tostring(setup.poolPrice, format.mintick)
+                  + "\nEntry (" + zoneKindText + "): " + str.tostring(zoneBottomPrice, format.mintick) + " - " + str.tostring(zoneTopPrice, format.mintick)
+                  + "\nStop: beyond " + str.tostring(setup.raidExtreme, format.mintick)
+                  + (na(setup.targetPrice) ? "" : "\nTarget: weekly draw at " + str.tostring(setup.targetPrice, format.mintick))
+                label.new(bar_index, isBull ? low : high, "OSOK"
+                  , style     = isBull ? label.style_label_up : label.style_label_down
+                  , color     = dirColor
+                  , textcolor = chart.bg_color
+                  , size      = size.small
+                  , tooltip   = markerTip)
+    //Armed: the OTE re-anchors while the displacement leg extends; the single shot fires on the first tag of the
+    //zone inside the session window; the leg reaching the draw first is the missed shot - a flat week, no chase
+    if setup.stage == STAGE_ARMED and bar_index > setup.armBar
+        bool extended = isBull ? high > setup.legFar : low < setup.legFar
+        if extended
+            setup.legFar    := isBull ? high : low
+            setup.legFarBar := bar_index
+            [bandTop, bandBottom] = oteBand(isBull, setup.raidExtreme, setup.legFar)
+            [zoneTopPrice, zoneBottomPrice, zoneKindText] = refineZone(isBull, setup.raidExtremeBar, bandTop, bandBottom)
+            setup.zoneTop    := zoneTopPrice
+            setup.zoneBottom := zoneBottomPrice
+            setup.zoneKind   := zoneKindText
+            if not na(setup.zoneBox)
+                box.set_top(setup.zoneBox, zoneTopPrice)
+                box.set_bottom(setup.zoneBox, zoneBottomPrice)
+                box.set_text(setup.zoneBox, zoneKindText)
+        bool zoneTagged = isBull ? low <= setup.zoneTop : high >= setup.zoneBottom
+        bool ranToDraw  = not na(setup.targetPrice) and (isBull ? high >= setup.targetPrice : low <= setup.targetPrice)
+        if zoneTagged and entryWindowOk
+            setup.stage      := STAGE_FIRED
+            setup.entryBar   := bar_index
+            setup.entryPrice := isBull ? math.min(open, setup.zoneTop) : math.max(open, setup.zoneBottom)
+            entryFired := true
+            if not na(setup.zoneBox)
+                box.set_right(setup.zoneBox, bar_index)
+            if showStageLabelsInput
+                label.new(bar_index, isBull ? setup.zoneTop : setup.zoneBottom, "Entry"
+                  , style     = isBull ? label.style_label_up : label.style_label_down
+                  , color     = LABEL_BG
+                  , textcolor = dirColor
+                  , size      = size.tiny)
+        else if ranToDraw
+            missedFired := true
+            outcomeText := OUTCOME_MISSED
+            if showStageLabelsInput
+                label.new(bar_index, setup.targetPrice, "Missed"
+                  , style     = isBull ? label.style_label_down : label.style_label_up
+                  , color     = LABEL_BG
+                  , textcolor = NEUTRAL_COLOR
+                  , size      = size.tiny)
+            freezeSetup(setup)
+            setup.stage := STAGE_DOWN
+    //The kill: the shot reaches the far side of the projected weekly range and the campaign stands down
+    if setup.stage == STAGE_FIRED and not na(setup.targetPrice)
+        bool targetHit = isBull ? high >= setup.targetPrice : low <= setup.targetPrice
+        if targetHit
+            targetFired := true
+            outcomeText := OUTCOME_TARGET
+            if showStageLabelsInput
+                label.new(bar_index, setup.targetPrice, "Target Hit"
+                  , style     = isBull ? label.style_label_down : label.style_label_up
+                  , color     = LABEL_BG
+                  , textcolor = dirColor
+                  , size      = size.tiny)
+            freezeSetup(setup)
+            setup.stage := STAGE_DOWN
+    //Keep the live frame extending with the tape
+    if setup.stage == STAGE_ARMED or setup.stage == STAGE_FIRED
+        if not na(setup.stopLine)
+            line.set_x2(setup.stopLine, bar_index)
+        if not na(setup.stopLabel)
+            label.set_x(setup.stopLabel, bar_index)
+        if not na(setup.targetLine)
+            line.set_x2(setup.targetLine, bar_index)
+        if not na(setup.targetLabel)
+            label.set_x(setup.targetLabel, bar_index)
+        if not na(setup.zoneBox) and setup.stage == STAGE_ARMED
+            box.set_right(setup.zoneBox, bar_index)
+    [raidFired, armFired, entryFired, targetFired, invalidFired, missedFired, outcomeText]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+//Volatility yardstick, sampled one bar back at raid time so a raid never inflates its own threshold
+atrValue    = ta.atr(atrLengthInput)
+baselineAtr = nz(atrValue[1], atrValue)
+
+//Confirmed swing points (known swingLength bars after the fact)
+structPivotHighPrice = ta.pivothigh(structureSwingInput, structureSwingInput)
+structPivotLowPrice  = ta.pivotlow(structureSwingInput, structureSwingInput)
+
+//Session clocks - New York time, daylight-saving aware whatever the chart's time zone
+bool asiaIn     = not na(time(timeframe.period, asiaSessionInput, NY_TZ))
+bool londonIn   = not na(time(timeframe.period, londonSessionInput, NY_TZ))
+bool nyIn       = not na(time(timeframe.period, nySessionInput, NY_TZ))
+bool londonKzIn = not na(time(timeframe.period, londonKzInput, NY_TZ))
+bool nyKzIn     = not na(time(timeframe.period, nyKzInput, NY_TZ))
+bool inKillzone = londonKzIn or nyKzIn
+
+//A New York calendar-day change splits blocks that only weekend or holiday data gaps made contiguous
+int  nyDay        = dayofmonth(time, NY_TZ)
+bool nyDayChanged = nz(nyDay - nyDay[1], 0) != 0
+
+int  asiaState   = asiaIn ? 1 : 0
+int  londonState = londonIn ? 1 : 0
+int  nyState     = nyIn ? 1 : 0
+bool asiaWasIn   = nz(asiaState[1], 0) == 1
+bool londonWasIn = nz(londonState[1], 0) == 1
+bool nyWasIn     = nz(nyState[1], 0) == 1
+bool asiaStart   = asiaIn and (not asiaWasIn or nyDayChanged)
+bool asiaEnd     = asiaWasIn and (not asiaIn or nyDayChanged)
+bool londonStart = londonIn and (not londonWasIn or nyDayChanged)
+bool londonEnd   = londonWasIn and (not londonIn or nyDayChanged)
+bool nyStart     = nyIn and (not nyWasIn or nyDayChanged)
+bool nyEnd       = nyWasIn and (not nyIn or nyDayChanged)
+
+//Hunt days on the New York clock; Sunday's opening hours count with Monday, Saturday's with Friday
+int nyDow = dayofweek(time, NY_TZ)
+bool huntDayOk = switch
+    nyDow == dayofweek.sunday or nyDow == dayofweek.monday => dayMonInput
+    nyDow == dayofweek.tuesday   => dayTueInput
+    nyDow == dayofweek.wednesday => dayWedInput
+    nyDow == dayofweek.thursday  => dayThuInput
+    => dayFriInput
+
+string nyDayName = switch
+    nyDow == dayofweek.sunday    => "Sun"
+    nyDow == dayofweek.monday    => "Mon"
+    nyDow == dayofweek.tuesday   => "Tue"
+    nyDow == dayofweek.wednesday => "Wed"
+    nyDow == dayofweek.thursday  => "Thu"
+    nyDow == dayofweek.friday    => "Fri"
+    => "Sat"
+
+//The weekly campaign clock
+bool newWeek = timeframe.change("1W")
+
+//Running weekly and session extremes
+var float weekHigh      = na
+var float weekLow       = na
+var float prevWeekHigh  = na
+var float prevWeekLow   = na
+var float weekOpenPrice = na
+var float asiaHigh      = na
+var float asiaLow       = na
+var float londonHigh    = na
+var float londonLow     = na
+var float nyHigh        = na
+var float nyLow         = na
+
+//The week's frame: bias, draw and discipline flags
+var int    weekBias      = 0
+var float  weekDrawPrice = na
+var bool   weekDrawTaken = false
+var line   weekDrawLine  = na
+var label  weekDrawTag   = na
+var bool   shotFired     = false
+var string weekOutcome   = na
+
+//Old weekly extremes kept as draws, and the raid pools opposite the bias
+var array<float> drawHighPricesArray = array.new<float>()
+var array<float> drawLowPricesArray  = array.new<float>()
+var array<Pool>  poolsArray          = array.new<Pool>()
+
+//Structural swing memory per side
+var array<float> structureHighPricesArray = array.new<float>()
+var array<int>   structureHighBarsArray   = array.new<int>()
+var array<float> structureLowPricesArray  = array.new<float>()
+var array<int>   structureLowBarsArray    = array.new<int>()
+
+//The single weekly campaign
+var Setup setup = Setup.new()
+
+bool bullRaidEvent    = false
+bool bearRaidEvent    = false
+bool bullArmEvent     = false
+bool bearArmEvent     = false
+bool bullEntryEvent   = false
+bool bearEntryEvent   = false
+bool bullTargetEvent  = false
+bool bearTargetEvent  = false
+bool bullInvalidEvent = false
+bool bearInvalidEvent = false
+bool missedShotEvent  = false
+bool newBullWeekEvent = false
+bool newBearWeekEvent = false
+
+if barstate.isconfirmed
+    //Weekly rollover: the finished week leaves its extremes as future draws, the campaign closes with its week,
+    //and the new week frames one directional idea from the nearest draw
+    if newWeek
+        if not na(weekHigh)
+            pushDraw(drawHighPricesArray, weekHigh)
+            pushDraw(drawLowPricesArray, weekLow)
+        prevWeekHigh  := weekHigh
+        prevWeekLow   := weekLow
+        weekOpenPrice := open
+        weekHigh      := high
+        weekLow       := low
+        freezeSetup(setup)
+        setup.stage := STAGE_IDLE
+        shotFired   := false
+        weekOutcome := na
+        //Unraided pools do not carry into the new week
+        while array.size(poolsArray) > 0
+            destroyPool(poolsArray, 0)
+        if not na(weekDrawLine)
+            line.set_x2(weekDrawLine, bar_index)
+            line.set_extend(weekDrawLine, extend.none)
+            weekDrawLine := line(na)
+        weekDrawTag := label(na)
+        //Resolve the bias: the nearest untaken old weekly extreme is the draw, or the manual read decides
+        float nearestAbove = nearestDraw(drawHighPricesArray, true, weekOpenPrice)
+        float nearestBelow = nearestDraw(drawLowPricesArray, false, weekOpenPrice)
+        if biasModeInput == BIAS_BULL
+            weekBias      := 1
+            weekDrawPrice := nearestAbove
+        else if biasModeInput == BIAS_BEAR
+            weekBias      := -1
+            weekDrawPrice := nearestBelow
+        else if na(nearestAbove) and na(nearestBelow)
+            weekBias      := 0
+            weekDrawPrice := na
+        else if na(nearestBelow) or (not na(nearestAbove) and nearestAbove - weekOpenPrice <= weekOpenPrice - nearestBelow)
+            weekBias      := 1
+            weekDrawPrice := nearestAbove
+        else
+            weekBias      := -1
+            weekDrawPrice := nearestBelow
+        weekDrawTaken := false
+        //Mark the primary resting liquidity opposite the bias: the prior week's extreme
+        if weekBias != 0 and prevWeekPoolInput
+            if weekBias == 1 and not na(prevWeekLow)
+                newPool(poolsArray, prevWeekLow, bar_index, KIND_PWL)
+            if weekBias == -1 and not na(prevWeekHigh)
+                newPool(poolsArray, prevWeekHigh, bar_index, KIND_PWH)
+        if showDrawInput and not na(weekDrawPrice)
+            weekDrawLine := line.new(bar_index, weekDrawPrice, bar_index, weekDrawPrice
+              , extend = extend.right
+              , color  = color.new(poolColorInput, DRAW_LINE_TRANSPARENCY)
+              , style  = line.style_dotted
+              , width  = 1)
+            weekDrawTag := label.new(bar_index, weekDrawPrice, "Draw"
+              , style     = label.style_label_right
+              , color     = LABEL_BG
+              , textcolor = color.new(poolColorInput, 25)
+              , size      = size.tiny)
+        if showWeekSepInput
+            line.new(bar_index, low, bar_index, high
+              , extend = extend.both
+              , color  = color.new(NEUTRAL_COLOR, SEP_TRANSPARENCY)
+              , style  = line.style_dotted
+              , width  = 1)
+        newBullWeekEvent := weekBias == 1
+        newBearWeekEvent := weekBias == -1
+    else
+        weekHigh := math.max(nz(weekHigh, high), high)
+        weekLow  := math.min(nz(weekLow, low), low)
+    //Session ranges: each completed window leaves its extreme opposite the bias as early-week raid liquidity
+    if asiaEnd and asiaPoolInput and weekBias != 0 and not na(asiaHigh)
+        newPool(poolsArray, weekBias == 1 ? asiaLow : asiaHigh, bar_index - 1, weekBias == 1 ? KIND_ASIA_L : KIND_ASIA_H)
+    if asiaStart
+        asiaHigh := high
+        asiaLow  := low
+    else if asiaIn
+        asiaHigh := math.max(nz(asiaHigh, high), high)
+        asiaLow  := math.min(nz(asiaLow, low), low)
+    if londonEnd and londonPoolInput and weekBias != 0 and not na(londonHigh)
+        newPool(poolsArray, weekBias == 1 ? londonLow : londonHigh, bar_index - 1, weekBias == 1 ? KIND_LDN_L : KIND_LDN_H)
+    if londonStart
+        londonHigh := high
+        londonLow  := low
+    else if londonIn
+        londonHigh := math.max(nz(londonHigh, high), high)
+        londonLow  := math.min(nz(londonLow, low), low)
+    if nyEnd and nyPoolInput and weekBias != 0 and not na(nyHigh)
+        newPool(poolsArray, weekBias == 1 ? nyLow : nyHigh, bar_index - 1, weekBias == 1 ? KIND_NY_L : KIND_NY_H)
+    if nyStart
+        nyHigh := high
+        nyLow  := low
+    else if nyIn
+        nyHigh := math.max(nz(nyHigh, high), high)
+        nyLow  := math.min(nz(nyLow, low), low)
+    //Structural swing memory, so a swing confirming on this bar is available as a shift reference
+    if not na(structPivotHighPrice)
+        registerStructure(structureHighPricesArray, structureHighBarsArray, structPivotHighPrice, bar_index - structureSwingInput)
+    if not na(structPivotLowPrice)
+        registerStructure(structureLowPricesArray, structureLowBarsArray, structPivotLowPrice, bar_index - structureSwingInput)
+    //Draw bookkeeping: levels the tape has traded through stop being draws, and a reached weekly draw freezes
+    pruneDraws(drawHighPricesArray, true)
+    pruneDraws(drawLowPricesArray, false)
+    if not weekDrawTaken and not na(weekDrawPrice) and weekBias != 0
+        bool drawHit = weekBias == 1 ? high >= weekDrawPrice : low <= weekDrawPrice
+        if drawHit
+            weekDrawTaken := true
+            if not na(weekDrawLine)
+                line.set_x2(weekDrawLine, bar_index)
+                line.set_extend(weekDrawLine, extend.none)
+    //Raid watch opposite the bias
+    bool weekIsBull = weekBias == 1
+    [sweptNow, sweptPrice, sweptKind, sweptExtreme, sweptExtremeBar] = processPools(poolsArray, weekBias == -1, weekIsBull ? bullColorInput : bearColorInput)
+    //Timing gates: the raid needs the hunt day and (when gated) a killzone; the entry needs the killzone only
+    bool windowOk = not kzGateInput or inKillzone
+    bool canStart = weekBias != 0 and huntDayOk and windowOk
+    //Advance the week's campaign through raid -> MSS/OTE armed -> the single shot
+    array<float> structPricesArray = structureLowPricesArray
+    array<int>   structBarsArray   = structureLowBarsArray
+    array<float> targetDrawsArray  = drawLowPricesArray
+    if weekIsBull
+        structPricesArray := structureHighPricesArray
+        structBarsArray   := structureHighBarsArray
+        targetDrawsArray  := drawHighPricesArray
+    [raidFired, armFired, entryFired, targetFired, invalidFired, missedFired, outcomeText] = advanceSetup(setup, weekIsBull, sweptNow, sweptPrice, sweptKind, sweptExtreme, sweptExtremeBar, canStart, windowOk, baselineAtr, structPricesArray, structBarsArray, targetDrawsArray)
+    if entryFired
+        shotFired := true
+    if not na(outcomeText)
+        weekOutcome := outcomeText
+    bullRaidEvent    := raidFired and weekIsBull
+    bearRaidEvent    := raidFired and not weekIsBull
+    bullArmEvent     := armFired and weekIsBull
+    bearArmEvent     := armFired and not weekIsBull
+    bullEntryEvent   := entryFired and weekIsBull
+    bearEntryEvent   := entryFired and not weekIsBull
+    bullTargetEvent  := targetFired and weekIsBull
+    bearTargetEvent  := targetFired and not weekIsBull
+    bullInvalidEvent := invalidFired and weekIsBull
+    bearInvalidEvent := invalidFired and not weekIsBull
+    missedShotEvent  := missedFired
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visuals
+//---------------------------------------------------------------------------------------------------------------------{
+//Killzone shading - the tradable hours the raid and the entry are hunted in
+bgcolor(highlightKzInput and inKillzone ? color.new(kzColorInput, KZ_BG_TRANSPARENCY) : na, title = "Killzones")
+
+//The session pools, killzones and hunt days cannot be resolved on daily and higher charts
+if (timeframe.isdwm or timeframe.in_seconds() > 3600) and barstate.islast
+    var table warnTable = table.new(position.bottom_right, 1, 1, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+    table.cell(warnTable, 0, 0, "One shot one kill requires an intraday chart (60 min or lower)", text_color = BEAR_COLOR, text_size = size.small)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+panelPosition = switch panelLocationInput
+    "Top Right"    => position.top_right
+    "Bottom Right" => position.bottom_right
+    "Top Left"     => position.top_left
+    => position.bottom_left
+
+var table panelTable = showPanelInput
+  ? table.new(panelPosition, 2, 8
+      , bgcolor      = DASH_BG
+      , border_width = 0
+      , frame_color  = DASH_FRAME
+      , frame_width  = 1)
+  : table(na)
+
+if barstate.islast and not na(panelTable)
+    color headerColor = DASH_HEADER
+    color mutedColor  = NEUTRAL_COLOR
+    color valueColor  = DASH_TEXT
+    color biasColor   = weekBias == 1 ? bullColorInput : weekBias == -1 ? bearColorInput : mutedColor
+    string biasText   = weekBias == 1 ? "Bullish" : weekBias == -1 ? "Bearish" : "No Draw"
+    string drawText   = na(weekDrawPrice) ? "-" : (weekBias == 1 ? "High " : "Low ") + str.tostring(weekDrawPrice, format.mintick) + (weekDrawTaken ? " (hit)" : "")
+    string stageStr   = setup.stage == STAGE_RAIDED ? "1/3 Raided" : setup.stage == STAGE_ARMED ? "2/3 OTE Armed" : setup.stage == STAGE_FIRED ? "3/3 Shot Fired" : setup.stage == STAGE_DOWN ? (na(weekOutcome) ? "Stand Down" : weekOutcome) : weekBias == 0 ? "Stand By" : "Hunting"
+    string shotText   = shotFired ? "Fired " + str.tostring(setup.entryPrice, format.mintick) : setup.stage == STAGE_DOWN ? "Stand Down" : "1 Available"
+    string entryText  = setup.stage == STAGE_ARMED ? str.tostring(setup.zoneBottom, format.mintick) + " - " + str.tostring(setup.zoneTop, format.mintick) : setup.stage == STAGE_FIRED ? str.tostring(setup.entryPrice, format.mintick) : "-"
+    string stopText   = setup.stage == STAGE_ARMED or setup.stage == STAGE_FIRED ? str.tostring(setup.raidExtreme, format.mintick) : "-"
+    string targetText = (setup.stage == STAGE_ARMED or setup.stage == STAGE_FIRED) and not na(setup.targetPrice) ? str.tostring(setup.targetPrice, format.mintick) : "-"
+    string kzText     = londonKzIn ? "London KZ" : nyKzIn ? "NY AM KZ" : "Off Hours"
+    bool   windowLive = huntDayOk and (not kzGateInput or inKillzone)
+    table.cell(panelTable, 0, 0, "Weekly Bias", text_color = headerColor, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(panelTable, 1, 0, biasText, text_color = biasColor, text_size = size.small)
+    table.cell(panelTable, 0, 1, "Draw", text_color = headerColor, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(panelTable, 1, 1, drawText, text_color = valueColor, text_size = size.small)
+    table.cell(panelTable, 0, 2, "Stage", text_color = headerColor, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(panelTable, 1, 2, stageStr, text_color = setup.stage == STAGE_IDLE or setup.stage == STAGE_DOWN ? mutedColor : biasColor, text_size = size.small)
+    table.cell(panelTable, 0, 3, "Shot", text_color = headerColor, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(panelTable, 1, 3, shotText, text_color = shotFired ? biasColor : mutedColor, text_size = size.small)
+    table.cell(panelTable, 0, 4, "Entry", text_color = headerColor, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(panelTable, 1, 4, entryText, text_color = valueColor, text_size = size.small)
+    table.cell(panelTable, 0, 5, "Stop", text_color = headerColor, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(panelTable, 1, 5, stopText, text_color = valueColor, text_size = size.small)
+    table.cell(panelTable, 0, 6, "Target", text_color = headerColor, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(panelTable, 1, 6, targetText, text_color = valueColor, text_size = size.small)
+    table.cell(panelTable, 0, 7, "Window", text_color = headerColor, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(panelTable, 1, 7, nyDayName + " - " + kzText, text_color = windowLive ? DASH_TEXT : mutedColor, text_size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(newBullWeekEvent, "New Week - Bullish Bias", "One shot one kill: new week opened with a bullish bias - the draw is the nearest old weekly high; hunting a raid of the prior week's low or early-week session lows, Monday to Wednesday, London especially")
+alertcondition(newBearWeekEvent, "New Week - Bearish Bias", "One shot one kill: new week opened with a bearish bias - the draw is the nearest old weekly low; hunting a raid of the prior week's high or early-week session highs, Monday to Wednesday, London especially")
+alertcondition(bullRaidEvent, "Bullish Weekly Raid (Stage 1)", "One shot one kill: sell-side raid - price ran the prior week's low or an early-week session low and failed to hold; candidate weekly low in, demanding displacement before the entry")
+alertcondition(bearRaidEvent, "Bearish Weekly Raid (Stage 1)", "One shot one kill: buy-side raid - price ran the prior week's high or an early-week session high and failed to hold; candidate weekly high in, demanding displacement before the entry")
+alertcondition(bullArmEvent, "Bullish MSS - OTE Armed (Stage 2)", "One shot one kill long armed: displacement shifted structure up off the candidate weekly low - single entry at the 62-79% OTE retracement of the leg, stop beyond the weekly low, target at the weekly draw")
+alertcondition(bearArmEvent, "Bearish MSS - OTE Armed (Stage 2)", "One shot one kill short armed: displacement shifted structure down off the candidate weekly high - single entry at the 62-79% OTE retracement of the leg, stop beyond the weekly high, target at the weekly draw")
+alertcondition(bullArmEvent or bearArmEvent, "Any OTE Armed (Stage 2)", "One shot one kill setup armed: weekly raid and displacement structure shift in place - the single entry waits at the OTE retracement of the displacement leg")
+alertcondition(bullEntryEvent, "Bullish OTE Entry (Shot Fired)", "One shot one kill: price retraced into the bullish OTE zone inside the session window - the week's single long is live; stop beyond the weekly low, target at the weekly draw, hold through intraday pullbacks")
+alertcondition(bearEntryEvent, "Bearish OTE Entry (Shot Fired)", "One shot one kill: price retraced into the bearish OTE zone inside the session window - the week's single short is live; stop beyond the weekly high, target at the weekly draw, hold through intraday pullbacks")
+alertcondition(bullTargetEvent, "Bullish Target Reached", "One shot one kill: the long reached the far side of the projected weekly range - objective met, stand down until next week")
+alertcondition(bearTargetEvent, "Bearish Target Reached", "One shot one kill: the short reached the far side of the projected weekly range - objective met, stand down until next week")
+alertcondition(bullInvalidEvent, "Bullish Setup Invalidated", "One shot one kill: the candidate weekly low traded again - the long idea is wrong; before the entry the read is void, after it the stop is hit")
+alertcondition(bearInvalidEvent, "Bearish Setup Invalidated", "One shot one kill: the candidate weekly high traded again - the short idea is wrong; before the entry the read is void, after it the stop is hit")
+alertcondition(missedShotEvent, "Missed Shot - Flat Week", "One shot one kill: the leg reached the weekly draw without filling the OTE - by the model's discipline that is a flat week, not a chase; stand down and wait for next week")
+
+//---------------------------------------------------------------------------------------------------------------------}

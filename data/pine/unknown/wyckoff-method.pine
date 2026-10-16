@@ -1,0 +1,369 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Wyckoff Method", shorttitle = "Wyckoff Method", overlay = true, precision = 0, max_boxes_count = 500, max_labels_count = 500, max_lines_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+// Four-stage campaign cycle: accumulation -> markup -> distribution -> markdown
+int STAGE_NONE = 0
+int STAGE_ACC  = 1
+int STAGE_MKUP = 2
+int STAGE_DIST = 3
+int STAGE_MKDN = 4
+
+color NEUTRAL_COLOR = #787b86
+color ABSORB_COLOR  = #ff9800 // effort exceeding result - absorption / exhaustion warning
+color EASE_COLOR    = #089981 // result exceeding effort - ease of movement, effort paying efficiently
+color HIDDEN_COLOR  = #00000000
+
+// stage identity hues - accumulation and distribution are the two causes, markup and markdown the two effects
+color ACC_COLOR  = #ab47bc
+color MKUP_COLOR = #089981
+color DIST_COLOR = #ff9800
+color MKDN_COLOR = #f23645
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+int BG_TRANSP     = 94 // stage background tint
+int BOX_TRANSP    = 88 // range box fill
+int BORDER_TRANSP = 35 // range box border
+int CELL_TRANSP   = 85 // dashboard stage cell - the one accent cell
+
+GRP_CYCLE = "Cycle Detection"
+GRP_LAWS  = "Three Laws"
+GRP_DASH  = "Dashboard"
+GRP_STYLE = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+stopBarsInput = input.int(10, "Stopping Bars", minval = 2, group = GRP_CYCLE
+  , tooltip = "Bars without a new trend extreme before the trend counts as stopped. Together with the reaction strength this detects the stopping action - a climax extreme followed by a sharp counter-move - that opens a trading range.")
+
+reactionMultInput = input.float(2.0, "Reaction Strength (ATR)", minval = 0.5, step = 0.25, group = GRP_CYCLE
+  , tooltip = "Minimum size of the counter-move off the trend extreme, in ATR multiples, for a range to open. This is the automatic rally after a selling climax (or the automatic reaction after a buying climax); its extreme sets the opposite boundary of the range.")
+
+shakeoutMultInput = input.float(1.0, "Shakeout Allowance (ATR)", minval = 0.0, step = 0.25, group = GRP_CYCLE
+  , tooltip = "How far price may close beyond the shakeout-prone boundary of a range, in ATR multiples, before the range fails and the prior trend resumes: below support in accumulation, above resistance in distribution. Gives springs and upthrusts room to snap back into the range; 0 treats any close beyond a boundary as a resolution.")
+
+atrLenInput = input.int(14, "ATR Length", minval = 1, group = GRP_CYCLE
+  , tooltip = "Average True Range length used to scale the reaction strength, the shakeout allowance and the spread half of the breakout effort check.")
+
+biasTfInput = input.timeframe("", "Bias Timeframe", group = GRP_CYCLE
+  , tooltip = "Optional higher timeframe for directional bias, per multi-timeframe practice: the campaign stage is computed there with the same settings and shown in the dashboard, while entries are refined on the chart timeframe. Leave empty to disable.")
+
+lawLenInput = input.int(20, "Law Lookback", minval = 2, group = GRP_LAWS
+  , tooltip = "Window for the live law readings: volume on advancing bars versus declining bars for supply & demand, and total volume (effort) versus net price progress (result) for effort vs result. Also the baseline length for the breakout volume check.")
+
+rankLenInput = input.int(100, "Ranking History", minval = 10, group = GRP_LAWS
+  , tooltip = "History used to percentile-rank the current effort and result against their own past, making the two comparable so the third law reads consistently across symbols and timeframes.")
+
+balanceBandInput = input.float(5.0, "Balance Band %", minval = 0.0, maxval = 49.0, step = 1.0, group = GRP_LAWS
+  , tooltip = "Neutral band around a 50/50 volume split. Demand must take more than half of the two-sided volume by this margin before it is reported in control; the mirror holds for supply. Note that spot forex volume is a tick-count proxy, which weakens the volume-based readings.")
+
+gapInput = input.float(25.0, "Divergence Gap", minval = 0.0, maxval = 100.0, step = 5.0, group = GRP_LAWS
+  , tooltip = "Minimum percentile-rank gap between effort and result before the third law reports a divergence: effort above result warns of absorption or exhaustion, result above effort flags ease of movement.")
+
+showDashInput = input.bool(true, "Show Dashboard", group = GRP_DASH
+  , tooltip = "Summary panel with the campaign stage and a live reading of the three Wyckoff laws - supply & demand, cause & effect, effort vs result - plus the Composite Man narrative they imply.")
+
+dashPosInput = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], inline = "dash", group = GRP_DASH
+  , tooltip = "Dashboard corner on the chart.")
+
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], inline = "dash", group = GRP_DASH
+  , tooltip = "Dashboard text size.")
+
+accColorInput = input.color(ACC_COLOR, "Accumulation", inline = "ph1", group = GRP_STYLE
+  , tooltip = "Accumulation stage color: range box, background tint, transition label and dashboard accents.")
+
+markupColorInput = input.color(MKUP_COLOR, "Markup", inline = "ph1", group = GRP_STYLE
+  , tooltip = "Markup stage color: background tint, transition label, objective line and dashboard accents.")
+
+distColorInput = input.color(DIST_COLOR, "Distribution", inline = "ph2", group = GRP_STYLE
+  , tooltip = "Distribution stage color: range box, background tint, transition label and dashboard accents.")
+
+markdownColorInput = input.color(MKDN_COLOR, "Markdown", inline = "ph2", group = GRP_STYLE
+  , tooltip = "Markdown stage color: background tint, transition label, objective line and dashboard accents.")
+
+showBoxesInput = input.bool(true, "Range Boxes", group = GRP_STYLE
+  , tooltip = "Draw each trading range as a box between the climax extreme and the automatic rally/reaction extreme - the support and resistance of the developing cause. Dashed while the range is active, solid once it resolves.")
+
+showBgInput = input.bool(true, "Stage Background", group = GRP_STYLE
+  , tooltip = "Tint the chart background with the current campaign stage.")
+
+showLabelsInput = input.bool(true, "Stage Labels", group = GRP_STYLE
+  , tooltip = "Label each stage transition: range openings after a stopping action, and range resolutions into markup or markdown. Resolution labels carry the effort read of the break in their tooltip.")
+
+showObjectiveInput = input.bool(true, "Cause & Effect Objective", group = GRP_STYLE
+  , tooltip = "Project the cause & effect objective once a range resolves: one range-height beyond the broken boundary, a simple stand-in for the classical point-and-figure count across the cause. An estimate, not a promise.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+stageName(int stageId) =>
+    stageId == STAGE_ACC ? "Accumulation" : stageId == STAGE_MKUP ? "Markup" : stageId == STAGE_DIST ? "Distribution" : stageId == STAGE_MKDN ? "Markdown" : "—"
+
+stageColor(int stageId) =>
+    stageId == STAGE_ACC ? accColorInput : stageId == STAGE_MKUP ? markupColorInput : stageId == STAGE_DIST ? distColorInput : stageId == STAGE_MKDN ? markdownColorInput : NEUTRAL_COLOR
+
+// Four-stage cycle state machine. A trend runs until a stopping action - no new extreme for a while plus a sharp
+// counter-move - opens a trading range whose boundaries are the climax extreme and the automatic rally/reaction.
+// The range holds until a decisive close resolves it, with an ATR allowance on the shakeout-prone boundary so
+// springs and upthrusts can probe beyond it and snap back without flipping the stage.
+cycleState(float atrScale) =>
+    var int   stage            = STAGE_NONE
+    var float trendExtreme     = na
+    var int   trendExtremeBar  = na
+    var float reactionExtreme  = na
+    var int   barsSinceExtreme = 0
+    var float rangeTop         = na
+    var float rangeBot         = na
+    var int   rangeStartBar    = na
+    var float objectiveLevel   = na
+    var float objectiveBase    = na
+    var bool  objectiveHit     = false
+
+    bool accStart      = false
+    bool distStart     = false
+    bool markupStart   = false
+    bool markdownStart = false
+
+    if not na(atrScale)
+        if stage == STAGE_NONE
+            stage            := close >= nz(close[stopBarsInput], close) ? STAGE_MKUP : STAGE_MKDN
+            trendExtreme     := stage == STAGE_MKUP ? high : low
+            trendExtremeBar  := bar_index
+            reactionExtreme  := stage == STAGE_MKUP ? low : high
+            barsSinceExtreme := 0
+        else if stage == STAGE_MKUP or stage == STAGE_MKDN
+            bool trendingUp = stage == STAGE_MKUP
+            if (trendingUp ? high > trendExtreme : low < trendExtreme)
+                trendExtreme     := trendingUp ? high : low
+                trendExtremeBar  := bar_index
+                reactionExtreme  := trendingUp ? low : high
+                barsSinceExtreme := 0
+            else
+                reactionExtreme  := trendingUp ? math.min(reactionExtreme, low) : math.max(reactionExtreme, high)
+                barsSinceExtreme += 1
+            float reactionSize = math.abs(trendExtreme - reactionExtreme)
+            if barsSinceExtreme >= stopBarsInput and reactionSize >= reactionMultInput * atrScale
+                rangeTop       := trendingUp ? trendExtreme : reactionExtreme
+                rangeBot       := trendingUp ? reactionExtreme : trendExtreme
+                rangeStartBar  := trendExtremeBar
+                objectiveLevel := na
+                objectiveBase  := na
+                distStart      := trendingUp
+                accStart       := not trendingUp
+                stage          := trendingUp ? STAGE_DIST : STAGE_ACC
+        else
+            float shakeoutRoom = shakeoutMultInput * atrScale
+            float causeHeight  = rangeTop - rangeBot
+            bool  upResolve    = close > rangeTop + (stage == STAGE_ACC ? 0 : shakeoutRoom)
+            bool  dnResolve    = close < rangeBot - (stage == STAGE_DIST ? 0 : shakeoutRoom)
+            if upResolve or dnResolve
+                stage            := upResolve ? STAGE_MKUP : STAGE_MKDN
+                markupStart      := upResolve
+                markdownStart    := dnResolve
+                objectiveBase    := upResolve ? rangeTop : rangeBot
+                objectiveLevel   := upResolve ? rangeTop + causeHeight : rangeBot - causeHeight
+                objectiveHit     := false
+                trendExtreme     := upResolve ? high : low
+                trendExtremeBar  := bar_index
+                reactionExtreme  := upResolve ? low : high
+                barsSinceExtreme := 0
+
+    bool objectiveReached = false
+    if not na(objectiveLevel) and not objectiveHit
+        if stage == STAGE_MKUP and high >= objectiveLevel
+            objectiveHit     := true
+            objectiveReached := true
+        else if stage == STAGE_MKDN and low <= objectiveLevel
+            objectiveHit     := true
+            objectiveReached := true
+
+    [stage, accStart, distStart, markupStart, markdownStart, rangeTop, rangeBot, rangeStartBar, objectiveLevel, objectiveBase, objectiveHit, objectiveReached, trendExtreme]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Three Laws - Live Readings
+//---------------------------------------------------------------------------------------------------------------------{
+float barVolume   = nz(volume)
+float volBaseline = ta.sma(barVolume, lawLenInput)
+
+var float cumVolume = 0.0
+cumVolume += barVolume
+bool hasVolume = cumVolume > 0
+
+// First law - supply & demand: share of volume on advancing bars vs declining bars
+bool  upBar        = close > nz(close[1], close)
+bool  dnBar        = close < nz(close[1], close)
+float demandVolume = math.sum(upBar ? barVolume : 0, lawLenInput)
+float supplyVolume = math.sum(dnBar ? barVolume : 0, lawLenInput)
+float volumeTotal  = demandVolume + supplyVolume
+float demandPct    = volumeTotal > 0 ? demandVolume / volumeTotal * 100 : 50
+int   sdState      = not hasVolume or na(volumeTotal) ? 0 : demandPct >= 50 + balanceBandInput ? 1 : demandPct <= 50 - balanceBandInput ? -1 : 0
+
+// Third law - effort vs result: windowed volume vs net progress, each ranked against its own history
+float effortSum  = math.sum(barVolume, lawLenInput)
+float resultNet  = math.abs(close - nz(close[lawLenInput], close))
+float effortRank = ta.percentrank(effortSum, rankLenInput)
+float resultRank = ta.percentrank(resultNet, rankLenInput)
+float lawGap     = effortRank - resultRank
+bool  erReady    = hasVolume and not na(lawGap)
+int   erState    = erReady ? (lawGap >= gapInput ? 1 : lawGap <= -gapInput ? -1 : 0) : 0
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Cycle State
+//---------------------------------------------------------------------------------------------------------------------{
+float atrValue = ta.atr(atrLenInput)
+
+[cycleStage, accStart, distStart, markupStart, markdownStart, rangeTop, rangeBot, rangeStartBar, objectiveLevel, objectiveBase, objectiveHit, objectiveReached, trendExtreme] = cycleState(atrValue)
+
+bool stageChanged = cycleStage != nz(cycleStage[1], STAGE_NONE)
+
+var int stageStartBar = na
+if stageChanged
+    stageStartBar := bar_index
+int barsInStage = na(stageStartBar) ? 0 : bar_index - stageStartBar
+
+// Second law - cause & effect: progress of the trend toward the objective projected from the last cause
+float objectiveProgress = na
+if (cycleStage == STAGE_MKUP or cycleStage == STAGE_MKDN) and not na(objectiveLevel) and not na(objectiveBase) and objectiveLevel != objectiveBase
+    objectiveProgress := math.min(100, math.max(0, (close - objectiveBase) / (objectiveLevel - objectiveBase) * 100))
+
+// Breakout filtering: a genuine sign of strength/weakness leaves the range on widening spread and expanding volume
+float barSpread     = high - low
+bool  breakEffortOk = (not hasVolume or na(volBaseline) or barVolume > volBaseline) and barSpread > atrValue
+bool  suspectBreak  = (markupStart or markdownStart) and not breakEffortOk
+
+// Higher-timeframe bias: the same campaign read mapped on a larger degree
+bool htfEnabled = biasTfInput != ""
+bool htfValid   = htfEnabled and timeframe.in_seconds(htfEnabled ? biasTfInput : timeframe.period) >= timeframe.in_seconds(timeframe.period)
+
+[htfStage, htfAccStart, htfDistStart, htfMarkupStart, htfMarkdownStart, htfRangeTop, htfRangeBot, htfRangeStartBar, htfObjectiveLevel, htfObjectiveBase, htfObjectiveHit, htfObjectiveReached, htfTrendExtreme] = request.security(syminfo.tickerid, htfValid ? biasTfInput : timeframe.period, cycleState(ta.atr(atrLenInput)))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visuals
+//---------------------------------------------------------------------------------------------------------------------{
+color stageCss = stageColor(cycleStage)
+
+// Trading-range boxes: support and resistance of the developing cause
+var box rangeBox = na
+if accStart or distStart
+    if showBoxesInput
+        rangeBox := box.new(rangeStartBar, rangeTop, bar_index, rangeBot, border_color = color.new(stageCss, BORDER_TRANSP), border_width = 1, border_style = line.style_dashed, bgcolor = color.new(stageCss, BOX_TRANSP))
+else if (cycleStage == STAGE_ACC or cycleStage == STAGE_DIST) and not na(rangeBox)
+    box.set_right(rangeBox, bar_index)
+else if not na(rangeBox)
+    box.set_border_style(rangeBox, line.style_solid)
+    box.set_right(rangeBox, bar_index)
+    rangeBox := na
+
+// Cause & effect objective projected from the resolved range
+var line objectiveLine = na
+if (markupStart or markdownStart) and not na(objectiveLevel)
+    if showObjectiveInput
+        objectiveLine := line.new(bar_index, objectiveLevel, bar_index, objectiveLevel, color = stageCss, width = 1, style = line.style_dotted)
+else if (cycleStage == STAGE_MKUP or cycleStage == STAGE_MKDN) and not na(objectiveLine)
+    line.set_x2(objectiveLine, bar_index)
+else if not na(objectiveLine)
+    objectiveLine := na
+
+// Stage transition labels
+string breakTip = breakEffortOk ? "Resolved on expanding spread and volume - effort confirms the move"
+  : "Resolved without expanding spread and volume - fails the effort vs result check; potential trap until effort confirms"
+
+if showLabelsInput
+    if accStart
+        label.new(bar_index, low, "Accumulation", color = HIDDEN_COLOR, textcolor = accColorInput, style = label.style_label_up, size = size.small
+          , tooltip = "Stopping action after markdown - support set by the climax low, resistance by the automatic rally")
+    if distStart
+        label.new(bar_index, high, "Distribution", color = HIDDEN_COLOR, textcolor = distColorInput, style = label.style_label_down, size = size.small
+          , tooltip = "Stopping action after markup - resistance set by the buying-climax high, support by the automatic reaction")
+    if markupStart
+        label.new(bar_index, low, "Markup", color = HIDDEN_COLOR, textcolor = markupColorInput, style = label.style_label_up, size = size.small, tooltip = breakTip)
+    if markdownStart
+        label.new(bar_index, high, "Markdown", color = HIDDEN_COLOR, textcolor = markdownColorInput, style = label.style_label_down, size = size.small, tooltip = breakTip)
+
+bgcolor(showBgInput and cycleStage != STAGE_NONE ? color.new(stageCss, BG_TRANSP) : na, title = "Stage Background")
+
+plot(cycleStage, "Cycle Stage (1 Acc, 2 Markup, 3 Dist, 4 Markdown)", editable = false, display = display.data_window)
+plot(demandPct, "Demand Share %", editable = false, display = display.data_window)
+plot(lawGap, "Effort-Result Rank Gap", editable = false, display = display.data_window)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+string dashLocation = dashPosInput == "Top Right" ? position.top_right : dashPosInput == "Top Left" ? position.top_left : dashPosInput == "Bottom Right" ? position.bottom_right : position.bottom_left
+string dashTextSize = dashSizeInput == "Tiny" ? size.tiny : dashSizeInput == "Small" ? size.small : size.normal
+
+var table dash = na
+
+if showDashInput and barstate.islast
+    if na(dash)
+        dash := table.new(dashLocation, 2, 5, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+    bool inRange = cycleStage == STAGE_ACC or cycleStage == STAGE_DIST
+
+    // the higher-timeframe bias is folded into the stage row so the table never carries an empty row
+    string htfTxt = htfEnabled ? " · " + biasTfInput + " " + (htfValid ? stageName(htfStage) : "—") : ""
+    string htfTip = htfEnabled ? (htfValid ? "\nBias " + biasTfInput + ": campaign stage on the bias timeframe with the same settings - map the campaign there, refine entries here" : "\nBias timeframe must be at or above the chart timeframe") : ""
+
+    string stageTxt = stageName(cycleStage) + (cycleStage != STAGE_NONE ? " · " + str.tostring(barsInStage) + " bars" : "") + htfTxt
+    string stageTip = (inRange ? "Support " + str.tostring(rangeBot, format.mintick) + " · Resistance " + str.tostring(rangeTop, format.mintick) + " - set by the climax extreme and the automatic rally/reaction"
+      : cycleStage != STAGE_NONE ? "Trend extreme " + str.tostring(trendExtreme, format.mintick) + " - a stopping action (no new extreme plus a sharp reaction) opens the next range"
+      : "Waiting for enough data to classify the campaign") + htfTip
+
+    string sdTxt = not hasVolume ? "No volume" : na(volumeTotal) ? "—" : sdState == 1 ? "Demand " + str.tostring(math.round(demandPct)) + "%"
+      : sdState == -1 ? "Supply " + str.tostring(math.round(100 - demandPct)) + "%" : "In balance"
+    color sdCss = sdState == 1 ? markupColorInput : sdState == -1 ? markdownColorInput : NEUTRAL_COLOR
+
+    string ceTxt = inRange ? "Cause " + str.tostring(bar_index - rangeStartBar) + " bars × " + str.tostring(rangeTop - rangeBot, format.mintick)
+      : not na(objectiveLevel) ? "Objective " + str.tostring(objectiveLevel, format.mintick) + (objectiveHit ? " · reached" : " · " + str.tostring(math.round(nz(objectiveProgress))) + "%")
+      : "No measured cause yet"
+    color ceCss = inRange or not na(objectiveLevel) ? stageCss : NEUTRAL_COLOR
+
+    string erTxt = not erReady ? (hasVolume ? "—" : "No volume") : erState == 1 ? "Effort > result" : erState == -1 ? "Result > effort" : "In harmony"
+    color erCss = not erReady ? NEUTRAL_COLOR : erState == 1 ? ABSORB_COLOR : erState == -1 ? EASE_COLOR : NEUTRAL_COLOR
+
+    string cmTxt = cycleStage == STAGE_ACC ? (erState == 1 ? "Absorbing supply into the range" : sdState == 1 ? "Accumulating - demand taking control" : "Building a cause - range under test")
+      : cycleStage == STAGE_MKUP ? (erState == 1 ? "Marking up into supply - effort not paying" : erState == -1 ? "Marking up on ease of movement" : "Marking the campaign up")
+      : cycleStage == STAGE_DIST ? (erState == 1 ? "Distributing into strength" : sdState == -1 ? "Distributing - supply taking control" : "Building a cause - range under test")
+      : cycleStage == STAGE_MKDN ? (erState == 1 ? "Marking down into demand - stopping action watch" : erState == -1 ? "Marking down on ease of movement" : "Marking the campaign down")
+      : "Reading the tape"
+
+    table.cell(dash, 0, 0, "Stage", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dash, 1, 0, stageTxt, text_color = stageCss, text_size = dashTextSize, text_halign = text.align_right, bgcolor = cycleStage != STAGE_NONE ? color.new(stageCss, CELL_TRANSP) : DASH_BG, tooltip = stageTip)
+
+    table.cell(dash, 0, 1, "Supply & Demand", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dash, 1, 1, sdTxt, text_color = sdCss, text_size = dashTextSize, text_halign = text.align_right
+      , tooltip = "First law - price rises when demand overwhelms supply and falls when the reverse is true. Share of volume on advancing versus declining bars over the law lookback.")
+
+    table.cell(dash, 0, 2, "Cause & Effect", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dash, 1, 2, ceTxt, text_color = ceCss, text_size = dashTextSize, text_halign = text.align_right
+      , tooltip = "Second law - a range builds a cause proportional to the move that follows. Shows the developing cause (duration and height) inside a range, then the projected range-height objective and its progress once the range resolves.")
+
+    table.cell(dash, 0, 3, "Effort vs Result", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dash, 1, 3, erTxt, text_color = erCss, text_size = dashTextSize, text_halign = text.align_right
+      , tooltip = "Third law - volume is effort, price movement is result. Windowed volume and net progress are percentile-ranked against their own history; effort far above result warns of absorption or exhaustion, the reverse flags ease of movement.")
+
+    table.cell(dash, 0, 4, "Composite Man", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dash, 1, 4, cmTxt, text_color = stageCss, text_size = dashTextSize, text_halign = text.align_right
+      , tooltip = "Composite Man heuristic - the chart read as one deliberate operator's campaign, combining the stage with the live law readings.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(accStart, "Accumulation Range Started", "Wyckoff Method: stopping action after markdown on {{ticker}} {{interval}} - accumulation range forming (support at the climax low, resistance at the automatic-rally high)")
+alertcondition(distStart, "Distribution Range Started", "Wyckoff Method: stopping action after markup on {{ticker}} {{interval}} - distribution range forming (resistance at the buying-climax high, support at the automatic-reaction low)")
+alertcondition(markupStart, "Markup Started", "Wyckoff Method: range resolved upward into markup on {{ticker}} {{interval}} - objective one range-height above resistance")
+alertcondition(markdownStart, "Markdown Started", "Wyckoff Method: range resolved downward into markdown on {{ticker}} {{interval}} - objective one range-height below support")
+alertcondition(accStart or distStart or markupStart or markdownStart, "Stage Transition", "Wyckoff Method: campaign stage changed on {{ticker}} {{interval}} - check the cycle position and law readings before acting")
+alertcondition(suspectBreak, "Low-Effort Range Break", "Wyckoff Method: range on {{ticker}} {{interval}} broke without expanding spread and volume - fails the effort vs result check, treat as a potential trap until effort confirms")
+alertcondition(objectiveReached, "Cause & Effect Objective Reached", "Wyckoff Method: {{ticker}} {{interval}} reached the range-height objective projected from the last cause")
+
+//---------------------------------------------------------------------------------------------------------------------}

@@ -1,0 +1,247 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Distribution Moments", shorttitle = "Distribution Moments", overlay = false, format = format.price, precision = 4)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+NORMAL_KURTOSIS = 3.0
+
+BULL_COLOR    = #089981 // favorable read - right tail, positive mean
+BEAR_COLOR    = #f23645 // unfavorable read - left tail, fat tails, negative mean
+NEUTRAL_COLOR = #787b86 // readings between the thresholds, and the reference level
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+ZONE_TRANSP = 91 // transparency of the soft threshold-zone shading
+
+MOMENT_MEAN  = "Mean"
+MOMENT_VAR   = "Variance"
+MOMENT_STDEV = "Standard Deviation"
+MOMENT_SKEW  = "Skewness"
+MOMENT_KURT  = "Kurtosis"
+
+CONVENTION_RAW    = "Raw (Normal = 3)"
+CONVENTION_EXCESS = "Excess (Normal = 0)"
+
+GROUP_SETTINGS   = "Settings"
+GROUP_THRESHOLDS = "Thresholds"
+GROUP_DASHBOARD  = "Dashboard"
+GROUP_STYLE      = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+srcInput = input.source(close, "Source", group = GROUP_SETTINGS, tooltip = "Price series the rolling return sample is built from.")
+
+returnTypeInput = input.string("Log", "Return Type", options = ["Log", "Simple"], group = GROUP_SETTINGS, tooltip = "Return definition feeding every moment. Log returns (natural log of price over previous price) are the standard choice for distribution work; Simple returns (percentage change) are available for comparison.")
+
+lengthInput = input.int(252, "Window Length", minval = 2, group = GROUP_SETTINGS, tooltip = "Number of returns in the rolling sample. Skewness and kurtosis are powered by rare observations raised to the 3rd and 4th power, so stable readings typically want hundreds of observations - short windows swing wildly when a single outlier enters or exits the sample.")
+
+momentInput = input.string(MOMENT_SKEW, "Plotted Moment", options = [MOMENT_MEAN, MOMENT_VAR, MOMENT_STDEV, MOMENT_SKEW, MOMENT_KURT], group = GROUP_SETTINGS, tooltip = "Moment displayed in the pane: Mean (1st moment), Variance (2nd central moment), Standard Deviation (its square root), Skewness (3rd standardized moment), or Kurtosis (4th standardized moment). The dashboard reports all of them at once.")
+
+kurtosisConventionInput = input.string(CONVENTION_RAW, "Kurtosis Convention", options = [CONVENTION_RAW, CONVENTION_EXCESS], group = GROUP_SETTINGS, tooltip = "Raw kurtosis benchmarks a normal distribution at 3; Excess kurtosis subtracts that 3 so 0 means normal-like tails. The two conventions differ by exactly 3 - check which one other platforms report before comparing readings.")
+
+skewThresholdInput = input.float(0.5, "Skewness Alert Threshold", minval = 0, step = 0.1, group = GROUP_THRESHOLDS, tooltip = "Absolute skewness level used by the alerts and the dashboard read. Crossing below the negative threshold flags a dominant left (downside) tail, crossing above the positive threshold a right tail. Values of 0.5 to 1 are common markers of moderate to high asymmetry.")
+
+kurtosisThresholdInput = input.float(3.0, "Kurtosis Alert Threshold", minval = 0, step = 0.1, group = GROUP_THRESHOLDS, tooltip = "Raw kurtosis level marking fat tails. A normal distribution sits at exactly 3, so readings above it mean extreme moves occur more often than sigma-based expectations imply. Always compared against raw kurtosis, whatever the display convention.")
+
+showDashboardInput = input.bool(true, "Show Dashboard", group = GROUP_DASHBOARD, tooltip = "Displays a summary of all four moments over the current window, with tail reads for skewness and kurtosis.")
+
+dashboardLocationInput = input.string("Top Right", "Location", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = GROUP_DASHBOARD, inline = "dash", tooltip = "Dashboard position on the pane.")
+
+dashboardSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = GROUP_DASHBOARD, inline = "dash", tooltip = "Dashboard text size.")
+
+mainColorInput = input.color(NEUTRAL_COLOR, "Main Color", group = GROUP_STYLE, tooltip = "Neutral color of the plotted moment line and its gradient fill while the reading carries no tail read - between the skewness thresholds, below the fat-tail threshold, or for variance and standard deviation. Beyond a threshold the line takes the matching read color.")
+
+referenceColorInput = input.color(NEUTRAL_COLOR, "Reference Color", group = GROUP_STYLE, tooltip = "Color of the dotted reference level: 0 for mean, variance, standard deviation, skewness and excess kurtosis, or 3 for raw kurtosis (the normal distribution benchmark).")
+
+downReadColorInput = input.color(BEAR_COLOR, "Left Tail / Fat Tails Read", group = GROUP_STYLE, tooltip = "Read color flagging downside-tail skewness, fat-tail kurtosis and a negative mean - used by the dashboard, the plotted line and the zone shading.")
+
+upReadColorInput = input.color(BULL_COLOR, "Right Tail Read", group = GROUP_STYLE, tooltip = "Read color flagging upside-tail skewness and a positive mean - used by the dashboard, the plotted line and the zone shading.")
+
+showFillInput = input.bool(true, "Gradient Fill", group = GROUP_STYLE, tooltip = "Fills the area between the plotted moment and its reference level, fading out toward the reference.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+//Format a return-scale value as a percentage for the dashboard
+formatPercent(float value) =>
+    na(value) ? "n/a" : str.tostring(value * 100, "#.####") + "%"
+
+//Format a unitless moment with the supplied pattern
+formatMoment(float value, string pattern) =>
+    na(value) ? "n/a" : str.tostring(value, pattern)
+
+//Map the location text to a table position
+getPosition(string location) =>
+    switch location
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        => position.bottom_left
+
+//Map the size text to a table text size
+getTextSize(string sizeText) =>
+    switch sizeText
+        "Tiny"  => size.tiny
+        "Small" => size.small
+        => size.normal
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Rolling Moments
+//---------------------------------------------------------------------------------------------------------------------{
+//Return series
+validPair = not na(srcInput) and not na(srcInput[1]) and srcInput[1] != 0
+logValid  = validPair and srcInput > 0 and srcInput[1] > 0
+
+returns = returnTypeInput == "Log" ? (logValid ? math.log(srcInput / srcInput[1]) : na) : (validPair ? srcInput / srcInput[1] - 1 : na)
+
+//Raw moments of the rolling window
+returnsSquared = returns * returns
+returnsCubed   = returnsSquared * returns
+returnsQuartic = returnsSquared * returnsSquared
+
+meanReturn  = ta.sma(returns,        lengthInput)
+meanSquared = ta.sma(returnsSquared, lengthInput)
+meanCubed   = ta.sma(returnsCubed,   lengthInput)
+meanQuartic = ta.sma(returnsQuartic, lengthInput)
+
+//Central moments: 2nd (variance), 3rd and 4th
+muSquared = meanReturn * meanReturn
+
+variance            = math.max(meanSquared - muSquared, 0)
+thirdCentralMoment  = meanCubed - 3 * meanReturn * meanSquared + 2 * muSquared * meanReturn
+fourthCentralMoment = math.max(meanQuartic - 4 * meanReturn * meanCubed + 6 * muSquared * meanSquared - 3 * muSquared * muSquared, 0)
+
+//Standardized moments: each central moment divided by the matching power of standard deviation
+stdevReturn = math.sqrt(variance)
+
+skewness    = variance > 0 ? thirdCentralMoment / (stdevReturn * variance) : na
+kurtosisRaw = variance > 0 ? fourthCentralMoment / (variance * variance) : na
+
+excessKurtosis = kurtosisRaw - NORMAL_KURTOSIS
+
+useRawConvention = kurtosisConventionInput == CONVENTION_RAW
+kurtosisDisplay  = useRawConvention ? kurtosisRaw : excessKurtosis
+
+//Pane series and its reference level
+selectedMoment = switch momentInput
+    MOMENT_MEAN  => meanReturn
+    MOMENT_VAR   => variance
+    MOMENT_STDEV => stdevReturn
+    MOMENT_SKEW  => skewness
+    => kurtosisDisplay
+
+referenceLevel = momentInput == MOMENT_KURT and useRawConvention ? NORMAL_KURTOSIS : 0.0
+
+//Threshold crossings
+skewCrossBelow = ta.crossunder(skewness, -skewThresholdInput)
+skewCrossAbove = ta.crossover(skewness, skewThresholdInput)
+fatTailsCross  = ta.crossover(kurtosisRaw, kurtosisThresholdInput)
+tailsEaseCross = ta.crossunder(kurtosisRaw, kurtosisThresholdInput)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Plots
+//---------------------------------------------------------------------------------------------------------------------{
+//State coloring by the same reads the dashboard reports - left tail / fat tails bearish, right tail / positive mean bullish, neutral otherwise
+momentColor = switch momentInput
+    MOMENT_SKEW => na(skewness) ? mainColorInput : skewness <= -skewThresholdInput ? downReadColorInput : skewness >= skewThresholdInput ? upReadColorInput : mainColorInput
+    MOMENT_KURT => na(kurtosisRaw) ? mainColorInput : kurtosisRaw > kurtosisThresholdInput ? downReadColorInput : mainColorInput
+    MOMENT_MEAN => na(meanReturn) ? mainColorInput : meanReturn > 0 ? upReadColorInput : meanReturn < 0 ? downReadColorInput : mainColorInput
+    => mainColorInput
+
+momentPlot = plot(selectedMoment, "Moment", color = momentColor)
+
+referencePlot = plot(referenceLevel, "Reference Level", color = referenceColorInput, style = plot.style_circles, linewidth = 1)
+
+//Gradient fill, fully transparent at the reference level and 50% at the moment value
+aboveReference = selectedMoment >= referenceLevel
+
+fill(momentPlot, referencePlot
+  , top_value    = math.max(selectedMoment, referenceLevel)
+  , bottom_value = math.min(selectedMoment, referenceLevel)
+  , top_color    = showFillInput ? color.new(momentColor, aboveReference ? 50 : 100) : na
+  , bottom_color = showFillInput ? color.new(momentColor, aboveReference ? 100 : 50) : na
+  , title = "Moment Gradient")
+
+//Soft threshold-zone shading, one threshold deep beyond each alert level, only for the moment the thresholds apply to
+kurtosisZoneOffset = useRawConvention ? 0.0 : NORMAL_KURTOSIS
+upperZoneLevel     = momentInput == MOMENT_SKEW ? skewThresholdInput : momentInput == MOMENT_KURT ? kurtosisThresholdInput - kurtosisZoneOffset : na
+upperZoneDepth     = momentInput == MOMENT_SKEW ? skewThresholdInput : kurtosisThresholdInput
+lowerZoneLevel     = momentInput == MOMENT_SKEW ? -skewThresholdInput : na
+upperZoneColor     = momentInput == MOMENT_SKEW ? upReadColorInput : downReadColorInput
+
+upperZoneId    = plot(upperZoneLevel, "Upper Zone Anchor", color = na, editable = false, display = display.none)
+upperZoneEndId = plot(upperZoneLevel + upperZoneDepth, "Upper Zone End Anchor", color = na, editable = false, display = display.none)
+lowerZoneId    = plot(lowerZoneLevel, "Lower Zone Anchor", color = na, editable = false, display = display.none)
+lowerZoneEndId = plot(lowerZoneLevel - skewThresholdInput, "Lower Zone End Anchor", color = na, editable = false, display = display.none)
+
+fill(upperZoneId, upperZoneEndId, color.new(upperZoneColor, ZONE_TRANSP), title = "Upper Threshold Zone")
+fill(lowerZoneId, lowerZoneEndId, color.new(downReadColorInput, ZONE_TRANSP), title = "Lower Threshold Zone")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dashboardTable = table.new(getPosition(dashboardLocationInput), 3, 7
+  , bgcolor      = DASH_BG
+  , border_width = 0
+  , frame_color  = DASH_FRAME
+  , frame_width  = 1)
+
+if showDashboardInput and barstate.islast
+    textSize     = getTextSize(dashboardSizeInput)
+    valueColor   = DASH_TEXT
+    neutralColor = DASH_HEADER
+
+    skewRead      = na(skewness) ? "n/a" : skewness <= -skewThresholdInput ? "Left Tail" : skewness >= skewThresholdInput ? "Right Tail" : "Symmetric"
+    skewReadColor = na(skewness) ? neutralColor : skewness <= -skewThresholdInput ? downReadColorInput : skewness >= skewThresholdInput ? upReadColorInput : neutralColor
+
+    kurtosisRead      = na(kurtosisRaw) ? "n/a" : kurtosisRaw > kurtosisThresholdInput ? "Fat Tails" : kurtosisRaw < NORMAL_KURTOSIS ? "Thin Tails" : "Normal"
+    kurtosisReadColor = na(kurtosisRaw) ? neutralColor : kurtosisRaw > kurtosisThresholdInput ? downReadColorInput : neutralColor
+
+    table.cell(dashboardTable, 0, 0, "Moment", text_color = DASH_HEADER, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 0, "Value",  text_color = DASH_HEADER, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 2, 0, "Read",   text_color = DASH_HEADER, text_size = textSize, text_halign = text.align_left)
+
+    table.cell(dashboardTable, 0, 1, "Mean", text_color = valueColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 1, formatPercent(meanReturn), text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 2, 1, "", text_color = neutralColor, text_size = textSize)
+
+    table.cell(dashboardTable, 0, 2, "Variance", text_color = valueColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 2, formatMoment(variance, "#.########"), text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 2, 2, "", text_color = neutralColor, text_size = textSize)
+
+    table.cell(dashboardTable, 0, 3, "Std Dev", text_color = valueColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 3, formatPercent(stdevReturn), text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 2, 3, "", text_color = neutralColor, text_size = textSize)
+
+    table.cell(dashboardTable, 0, 4, "Skewness", text_color = valueColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 4, formatMoment(skewness, "#.###"), text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 2, 4, skewRead, text_color = skewReadColor, text_size = textSize, text_halign = text.align_left)
+
+    table.cell(dashboardTable, 0, 5, useRawConvention ? "Kurtosis" : "Excess Kurtosis", text_color = valueColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 5, formatMoment(kurtosisDisplay, "#.###"), text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 2, 5, kurtosisRead, text_color = kurtosisReadColor, text_size = textSize, text_halign = text.align_left)
+
+    table.cell(dashboardTable, 0, 6, "Window", text_color = neutralColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 6, str.tostring(lengthInput) + " bars", text_color = neutralColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 2, 6, returnTypeInput + " returns", text_color = neutralColor, text_size = textSize, text_halign = text.align_left)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(skewCrossBelow, "Skewness Below Negative Threshold", "Distribution Moments: rolling skewness crossed below its negative threshold on {{ticker}} - recent surprises lean downside (left tail).")
+
+alertcondition(skewCrossAbove, "Skewness Above Positive Threshold", "Distribution Moments: rolling skewness crossed above its positive threshold on {{ticker}} - recent surprises lean upside (right tail).")
+
+alertcondition(fatTailsCross, "Fat Tails Threshold Crossed", "Distribution Moments: rolling kurtosis crossed above the fat-tail threshold on {{ticker}} - extreme moves are outrunning sigma-based expectations.")
+
+alertcondition(tailsEaseCross, "Kurtosis Back Below Threshold", "Distribution Moments: rolling kurtosis crossed back below the fat-tail threshold on {{ticker}} - tail weight is receding.")
+
+//---------------------------------------------------------------------------------------------------------------------}

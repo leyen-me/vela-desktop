@@ -1,0 +1,219 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Bitcoin Power Law", "Bitcoin Power Law", max_bars_back = 5000)
+//--------------------------------------------------------------------------------------------------------------------}
+// Symbol/TF Restrictions
+//--------------------------------------------------------------------------------------------------------------------{
+if syminfo.ticker != 'BTCUSD'
+    runtime.error('This indicator is only available for BTCUSD, change your chart ticker')
+
+if timeframe.period != '1D'
+    runtime.error('This indicator is only available for the daily timeframe')
+
+//--------------------------------------------------------------------------------------------------------------------}
+// Input Settings
+//--------------------------------------------------------------------------------------------------------------------{
+trimmDate = input.time(timestamp("July 15 2010 00:00:00"), 'Start Calculation')
+
+useLogLinear = input.bool(false, 'Use Linear Scale for X-Axis', tooltip = 'Converts the x-axis from its default logarithmic scale to a linear scale')
+
+// Regression Line Options
+LINEAR_REGRESSION = 'Linear Regression'
+
+showReg = input.bool(true, 'Show Regression Line', inline = 'reg', group = LINEAR_REGRESSION)
+regCss = input.color(#00ffff, '', inline = 'reg', group = LINEAR_REGRESSION)
+
+// Multipliers for confidence intervals/volatility bands
+showMult1    = input.bool(true, 'Mult 1', inline = 'mult1', group = LINEAR_REGRESSION)
+mult1        = input.int(1, '', inline = 'mult1', group = LINEAR_REGRESSION)
+mult1Css     = input.color(#ff0000, '', inline = 'mult1', group = LINEAR_REGRESSION)
+mult1AreaCss = input.color(color.new(#ff6565, 70), 'Area', inline = 'mult1', group = LINEAR_REGRESSION)
+
+showMult2    = input.bool(true, 'Mult 2', inline = 'mult2', group = LINEAR_REGRESSION)
+mult2        = input.float(0.5, '', inline = 'mult2', group = LINEAR_REGRESSION)
+mult2Css     = input.color(#ff00ff, '', inline = 'mult2', group = LINEAR_REGRESSION)
+mult2AreaCss = input.color(color.new(#f1a57f, 70), 'Area', inline = 'mult2', group = LINEAR_REGRESSION)
+
+showMult3    = input.bool(true, 'Mult 3', inline = 'mult3', group = LINEAR_REGRESSION)
+mult3        = input.float(-0.5, '', inline = 'mult3', group = LINEAR_REGRESSION)
+mult3Css     = input.color(#0000ff, '', inline = 'mult3', group = LINEAR_REGRESSION)
+mult3AreaCss = input.color(color.new(#ffef5c, 70), 'Area', inline = 'mult3', group = LINEAR_REGRESSION)
+
+showMult4    = input.bool(true, 'Mult 4', inline = 'mult4', group = LINEAR_REGRESSION)
+mult4        = input.float(-1.0, '', inline = 'mult4', group = LINEAR_REGRESSION)
+mult4Css     = input.color(#00ff00, '', inline = 'mult4', group = LINEAR_REGRESSION)
+mult4AreaCss = input.color(color.new(#53ff61, 70), 'Area', inline = 'mult4', group = LINEAR_REGRESSION)
+
+// Price Line Style
+btcColor = input.color(#ff5d00, 'Price Line Color', inline = 'btc', group = 'Style')
+autoColor = input.bool(true, 'Auto', inline = 'btc', group = 'Style', tooltip = 'Use the color that provide an optimal contrast with the chart background')
+btcWidth = input.int(2, 'Price Line Width', minval = 1, group = 'Style')
+
+// Halving Lines display
+showHalvings = input.bool(true, 'Show Halvings', inline = 'halvings', group = 'Style')
+halvingsCss  = input.color(color.gray, '', inline = 'halvings', group = 'Style')
+
+// Number of bars for forward model extrapolation
+extrapolate = 4000
+
+//--------------------------------------------------------------------------------------------------------------------}
+// Utility Functions
+//--------------------------------------------------------------------------------------------------------------------{
+// Axis scaling logic: X-axis is log or linear based on user input
+scale(x) => useLogLinear ? x : math.log10(x)
+
+//--------------------------------------------------------------------------------------------------------------------}
+// Stores
+//--------------------------------------------------------------------------------------------------------------------{
+var x          = array.new<float>(0)       // Stores scaled bar indices (x-axis)
+var y          = array.new<float>(0)       // Stores log10(close) prices (y-axis)
+var fullModel  = array.new<float>(0)       // Stores model output (for "full model" line)
+
+var float minPrice = na                    // Tracks minimum close price for y-axis labeling
+var mults      = array.new<float>(0)       // Stores regression multipliers
+var colors     = array.new<color>(0)       // Stores colors for regression lines
+var areaColors = array.new<color>(0)       // Stores fill colors for bands/areas
+var years      = map.new<int, float>()     // Maps year to scaled x position for year labels
+
+// Bitcoin halving dates for reference lines
+var halvings = array.from(timestamp(2012, 11, 28), timestamp(2016, 07, 09), timestamp(2020, 05, 11), timestamp(2024, 4, 19))
+var halvingsN = array.new<float>(0)        // Stores scaled x-positions of halving events
+
+// Offset correcting for GB
+n = bar_index + (useLogLinear ? 0 : 275)
+
+// Record halving positions for drawing
+if halvings.includes(time) and showHalvings
+    halvingsN.push(scale(n))
+
+//--------------------------------------------------------------------------------------------------------------------}
+// Populate Multipliers, Colors, and Areas
+//--------------------------------------------------------------------------------------------------------------------{
+if barstate.isfirst
+    if showMult4
+        mults.push(mult4), colors.push(mult4Css), areaColors.push(color(na))
+    if showMult3
+        mults.push(mult3), colors.push(mult3Css), areaColors.push(mult4AreaCss)
+    if showReg
+        mults.push(0), colors.push(regCss), areaColors.push(mult3AreaCss)
+    if showMult2
+        mults.push(mult2), colors.push(mult2Css), areaColors.push(mult2AreaCss)
+    if showMult1
+        mults.push(mult1), colors.push(mult1Css), areaColors.push(mult1AreaCss)
+
+//--------------------------------------------------------------------------------------------------------------------}
+// Build X/Y Arrays and Track Minimum Price/Year
+//--------------------------------------------------------------------------------------------------------------------{
+if time >= trimmDate
+    x.unshift(scale(n))                   // Prepend new bar index position
+    y.unshift(math.log10(close))          // Prepend new log price
+
+    if year != year[1]
+        years.put(year, scale(n))         // Map each unique year to current bar index
+
+    minPrice := nz(math.min(close, minPrice), close)  // Update minimum price for y-axis
+
+//--------------------------------------------------------------------------------------------------------------------}
+// Draw Chart Elements: Regression, Model, Halvings, Year Labels
+//--------------------------------------------------------------------------------------------------------------------{
+// Remove all previous drawings
+for l in line.all
+    l.delete()
+for lbl in label.all
+    lbl.delete()
+for fill in linefill.all
+    fill.delete()
+
+if barstate.islast
+    // Plotting coordinates
+    points     = array.new<chart.point>(0)
+    max        = scale(n + extrapolate)    // Rightmost x for scaling
+
+    // Regression line anchor variables
+    regX1N = 0
+    regX1Logn = 0.
+    regX2N = 0
+    regX2Logn = 0.
+
+    // Build main points and full model points for chart lines
+    for [index, element] in x
+        xCoord = int(element / max * n)
+        points.push(chart.point.from_index(xCoord, y.get(index)))
+
+        // Extrapolate full model to the right for future bars
+        if index == 0
+            for i = 0 to extrapolate
+                xFullCoord = int(scale(n+i) / max * n)
+
+                if i == 0
+                    regX1N := xFullCoord
+                    regX1Logn := scale(n+i)
+                if i == extrapolate
+                    regX2N := xFullCoord
+                    regX2Logn := scale(n+i)
+
+    // Draw price
+    polyline.delete(polyline.new(points, line_color = autoColor ? chart.fg_color : btcColor, line_width = btcWidth)[1])
+
+    // Linear regression calculation
+    cov = y.covariance(x)
+    xVar = x.variance()
+    a = cov / xVar
+    b = y.avg() - a * x.avg()
+
+    // Get RMSE
+    r2 = math.pow(cov / (y.stdev() * x.stdev()), 2)
+    rss = y.variance() * (1 - r2)
+    dist = math.sqrt(rss)
+
+    // Draw regression lines and fill areas for each multiplier
+    line prevL = na
+    for [index, mult] in mults
+        l = line.new(regX1N,
+          a * regX1Logn + b + dist * mult,
+          regX2N,
+          a * regX2Logn + b + dist * mult,
+          color = colors.get(index),
+          style = line.style_solid,
+          extend = extend.both,
+          width = 2
+          )
+        
+        linefill.new(prevL, l, areaColors.get(index))
+        prevL := l
+
+    // Draw year labels along the x-axis at minPrice
+    logMinPrice = math.log10(minPrice)
+    x1 = int(x.last() / max * n)
+    for yr in years.keys()
+        xLbl = int(years.get(yr) / max * n)
+        
+        // + marker
+        label.new(xLbl, logMinPrice, '+', 
+          color = color(na), 
+          textcolor = chart.fg_color, 
+          style = label.style_label_center, 
+          size = size.small
+          )
+
+        // Year label
+        label.new(xLbl, logMinPrice, str.tostring(yr), 
+          color = color(na), 
+          textcolor = chart.fg_color, 
+          style = label.style_label_up, 
+          size = size.tiny
+          )
+
+        // Draw halving lines as dotted verticals
+    if showHalvings
+        for halving in halvingsN
+            xCoord = int(halving / max * n)
+            line.new(xCoord, logMinPrice, xCoord, logMinPrice + 1, extend = extend.right, color = halvingsCss, style = line.style_dotted)
+
+    // Draw x-axis at log(minPrice)
+    line.new(x1, logMinPrice, n + 20, logMinPrice, color = chart.fg_color)
+    line.new(n + 20, logMinPrice, n + 20, logMinPrice, color = chart.fg_color, extend = extend.left)
+
+//--------------------------------------------------------------------------------------------------------------------}

@@ -1,0 +1,332 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator('Fixed Time Cycles', 'Fixed Time Cycles', overlay = true, format = format.price, precision = 0, max_lines_count = 500, max_labels_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+NEUTRAL_COLOR = #787b86 // cycle lines are structure - the model says when, never which way
+ACCENT_COLOR  = #ff9800 // the turn window - the one "look here"
+DASH_BG       = #161616
+DASH_FRAME    = #2E2E2E
+DASH_HEADER   = #808080
+DASH_TEXT     = #DBDBDB
+
+int MAX_DRAW_LINES    = 480 // headroom under the 500-line cap for one full projection redraw
+int MAX_TURN_LABELS   = 400 // headroom under the 500-label cap for the turn markers
+int MAX_FUTURE_OFFSET = 495 // cycle lines may sit at most this many bars past the newest bar
+int HARD_FUTURE_LIMIT = 499 // absolute platform limit for a drawing's future x-coordinate
+
+GRP_CYCLE  = 'Cycle'
+GRP_SWINGS = 'Swing Turns'
+GRP_DASH   = 'Dashboard'
+GRP_STYLE  = 'Style'
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+anchorTimeInput = input.time(timestamp('01 Jan 2024 00:00 +0000'), 'Anchor Point', group = GRP_CYCLE, confirm = true, tooltip = 'Origin of the count — classically a major swing low, or a prominent high for high-to-high counts. You select it on the chart when the indicator is added; move the anchor by dragging the solid vertical line or editing this field. A time before loaded history falls back to the first chart bar.')
+
+cycleLengthInput = input.int(20, 'Cycle Length (bars)', minval = 2, group = GRP_CYCLE, tooltip = 'The fixed period N, in chart bars. A vertical cycle line is projected at every Nth bar from the anchor and the period never adapts — that is the point of the model, and its weakness. Check the chosen length against the dashboard\'s swing-spacing audit: if historical spacings do not cluster near one value, a fixed period is the wrong tool on this chart.')
+
+windowInput = input.int(2, 'Turn Window (± bars)', minval = 0, maxval = 100, group = GRP_CYCLE, tooltip = 'Half-width of the attention window around each cycle line, in bars. Cycle turns drift early or late, so practitioners watch a window rather than an exact date. 0 keeps just the lines; values at or above half the cycle length merge neighboring windows into a solid band.')
+
+futureCyclesInput = input.int(6, 'Future Cycles', minval = 0, maxval = 50, group = GRP_CYCLE, tooltip = 'How many cycle lines to project beyond the newest bar. Drawings cannot sit more than about 500 bars into the future, so distant projections are clipped on long periods; likewise only the most recent few hundred lines are kept when a short period stretches across deep history.')
+
+snapAnchorInput = input.bool(true, 'Snap Anchor To Swing Turn', group = GRP_CYCLE, tooltip = 'Snaps the selected time to the nearest confirmed swing turn within one cycle length of it, so the count starts exactly on the low or high rather than on the bar you happened to click. Disable to anchor the exact selected bar.')
+
+swingLengthInput = input.int(5, 'Swing Length', minval = 1, maxval = 50, group = GRP_SWINGS, tooltip = 'Pivot strength defining a swing turn: a swing low must be the lowest low for this many bars on both sides, mirrored for swing highs. Turns therefore confirm this many bars after they print. Larger values keep only the significant swings the spacing audit is meant to measure.')
+
+turnTypeInput = input.string('Swing Lows', 'Turn Swings', options = ['Swing Lows', 'Swing Highs', 'Highs & Lows'], group = GRP_SWINGS, tooltip = 'Which confirmed swings count as turns — for anchor snapping, the spacing and window-hit audits, the optional markers and the confirmation alert. Classic fixed-cycle work counts low-to-low from a major bottom; switch when tracking a high-to-high rhythm, or accept either extreme.')
+
+showDashInput = input.bool(true, 'Show Dashboard', group = GRP_DASH, tooltip = 'Fit audit for the fixed-period model: the countdown to the next turn window, the median spacing between historical swing turns against the chosen length, how tightly those spacings cluster, and the share of completed projected windows that actually contained a turn.')
+dashPosInput  = input.string('Top Right', 'Position', inline = 'dash', group = GRP_DASH, options = ['Top Right', 'Top Left', 'Bottom Right', 'Bottom Left'], tooltip = 'Location of the dashboard on the chart.')
+dashSizeInput = input.string('Small', 'Size', inline = 'dash', group = GRP_DASH, options = ['Tiny', 'Small', 'Normal'], tooltip = 'Text size of the dashboard.')
+
+cycleColorInput = input.color(NEUTRAL_COLOR, 'Cycle Lines', inline = 'lines', group = GRP_STYLE, tooltip = 'Color of the anchor line and the projected cycle lines.')
+cycleStyleInput = input.string('Dotted', ' ', inline = 'lines', group = GRP_STYLE, options = ['Solid', 'Dashed', 'Dotted'], tooltip = 'Style of the projected cycle lines. The anchor line itself stays solid so the origin of the count is always visible.')
+
+showWindowsInput = input.bool(true, 'Turn Window Shading', inline = 'window', group = GRP_STYLE, tooltip = 'Shades the ± turn window around every cycle line so the attention zone is visible at a glance. The window nominates when a turn is more likely under the model — never which way.')
+windowColorInput = input.color(color.new(ACCENT_COLOR, 88), ' ', inline = 'window', group = GRP_STYLE, tooltip = 'Shading color of the turn windows; adjust its opacity for stronger or fainter bands.')
+
+showTurnMarkersInput = input.bool(false, 'Mark Turns In Windows', inline = 'marks', group = GRP_STYLE, tooltip = 'Dots each confirmed swing turn that landed inside a cycle window — direct visual evidence of whether turns cluster near the lines. Off by default to keep the chart clean; the audit and the alerts run either way.')
+lowTurnColorInput  = input.color(BULL_COLOR, ' ', inline = 'marks', group = GRP_STYLE, tooltip = 'Marker color for swing lows confirmed inside a turn window.')
+highTurnColorInput = input.color(BEAR_COLOR, ' ', inline = 'marks', group = GRP_STYLE, tooltip = 'Marker color for swing highs confirmed inside a turn window.')
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+f_date(int unixTime) => str.format_time(unixTime, 'dd MMM yy')
+
+//True when a bar sits within ± halfWidth bars of any cycle multiple projected forward from the anchor
+f_inCycleWindow(int candidateBar, int anchorBar, int cycleLength, int halfWidth) =>
+    bool inside = false
+    if not na(anchorBar) and candidateBar >= anchorBar
+        int localPhase = (candidateBar - anchorBar) % cycleLength
+        inside := math.min(localPhase, cycleLength - localPhase) <= halfWidth
+    inside
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Swing Turns & Anchor
+//---------------------------------------------------------------------------------------------------------------------{
+// Confirmed swing turns are stored chronologically. They feed the anchor snap, the spacing audit (the classical way
+// a fixed period is measured: bar counts between successive significant swings), the window-hit audit and the
+// optional markers. Only the swing types selected in 'Turn Swings' are recorded.
+var array<int>   turnBarArray   = array.new<int>()
+var array<int>   turnTimeArray  = array.new<int>()
+var array<float> turnPriceArray = array.new<float>()
+var array<bool>  turnIsLowArray = array.new<bool>()
+
+float pivotLowPrice  = ta.pivotlow(low, swingLengthInput, swingLengthInput)
+float pivotHighPrice = ta.pivothigh(high, swingLengthInput, swingLengthInput)
+int   pivotBar       = bar_index - swingLengthInput
+int   pivotTime      = time[swingLengthInput]
+
+bool lowCounts  = turnTypeInput != 'Swing Highs'
+bool highCounts = turnTypeInput != 'Swing Lows'
+
+bool newLowTurn  = lowCounts and not na(pivotLowPrice)
+bool newHighTurn = highCounts and not na(pivotHighPrice)
+
+if newLowTurn
+    array.push(turnBarArray, pivotBar)
+    array.push(turnTimeArray, pivotTime)
+    array.push(turnPriceArray, pivotLowPrice)
+    array.push(turnIsLowArray, true)
+if newHighTurn
+    array.push(turnBarArray, pivotBar)
+    array.push(turnTimeArray, pivotTime)
+    array.push(turnPriceArray, pivotHighPrice)
+    array.push(turnIsLowArray, false)
+
+//The anchor resolves on the first bar at or after the selected time
+var int anchorRawBar  = na
+var int anchorRawTime = na
+bool anchorLocated = false
+if na(anchorRawBar) and time >= anchorTimeInput
+    anchorRawBar  := bar_index
+    anchorRawTime := time
+    anchorLocated := true
+
+//Optional snap: the closest confirmed swing turn within one cycle length of the selected time. Swings confirming
+//shortly after the click are adopted as they confirm, so the snapped anchor can refine once within the first cycle.
+var int snapBar  = na
+var int snapTime = na
+var int snapDist = na
+int snapRadius = cycleLengthInput
+
+if snapAnchorInput and not na(anchorRawBar)
+    if anchorLocated and array.size(turnBarArray) > 0
+        for i = 0 to array.size(turnBarArray) - 1
+            int candidateDist = math.abs(array.get(turnBarArray, i) - anchorRawBar)
+            if candidateDist <= snapRadius and (na(snapDist) or candidateDist < snapDist)
+                snapBar  := array.get(turnBarArray, i)
+                snapTime := array.get(turnTimeArray, i)
+                snapDist := candidateDist
+    if newLowTurn or newHighTurn
+        int pivotDist = math.abs(pivotBar - anchorRawBar)
+        if pivotDist <= snapRadius and (na(snapDist) or pivotDist < snapDist)
+            snapBar  := pivotBar
+            snapTime := pivotTime
+            snapDist := pivotDist
+
+bool anchorSnapped = snapAnchorInput and not na(snapBar)
+int  effAnchorBar  = anchorSnapped ? snapBar : anchorRawBar
+int  effAnchorTime = anchorSnapped ? snapTime : anchorRawTime
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Cycle Phase
+//---------------------------------------------------------------------------------------------------------------------{
+// Position of the current bar inside the fixed rhythm. The effective anchor is never ahead of the current bar,
+// so the phase arithmetic only runs on non-negative bar counts.
+int barsFromAnchor = na(effAnchorBar) ? na : bar_index - effAnchorBar
+int cyclePhase     = na(barsFromAnchor) ? na : barsFromAnchor % cycleLengthInput
+int distToCycleLine    = na(cyclePhase) ? na : math.min(cyclePhase, cycleLengthInput - cyclePhase)
+int barsUntilCycleLine = na(cyclePhase) ? na : (cycleLengthInput - cyclePhase) % cycleLengthInput
+
+bool inTurnWindow = not na(distToCycleLine) and distToCycleLine <= windowInput
+
+int  distToCycleLinePrev = distToCycleLine[1]
+bool windowOpenedEvent   = inTurnWindow and (na(distToCycleLinePrev) or distToCycleLinePrev > windowInput)
+bool cycleLineEvent      = not na(cyclePhase) and cyclePhase == 0 and barsFromAnchor > 0
+bool turnInWindowEvent   = (newLowTurn or newHighTurn) and f_inCycleWindow(pivotBar, effAnchorBar, cycleLengthInput, windowInput)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Cycle Projection
+//---------------------------------------------------------------------------------------------------------------------{
+// The full projection is redrawn from the effective anchor: a solid vertical at the anchor, a line at every Nth bar
+// after it — past and future — and an optional shaded ± window on each. Everything is rebuilt when the bar or the
+// effective anchor changes, so a refined snap always leaves a consistent picture.
+var array<line>     cycleLineArray  = array.new<line>()
+var array<linefill> windowFillArray = array.new<linefill>()
+var array<label>    turnLabelArray  = array.new<label>()
+
+var int lastDrawnBar    = na
+var int lastDrawnAnchor = na
+
+string cycleLineStyle = switch cycleStyleInput
+    'Solid'  => line.style_solid
+    'Dashed' => line.style_dashed
+    => line.style_dotted
+
+bool redrawNeeded = barstate.islast and (nz(lastDrawnBar, -1) != bar_index or nz(lastDrawnAnchor, -1) != nz(effAnchorBar, -1))
+
+if redrawNeeded
+    lastDrawnBar    := bar_index
+    lastDrawnAnchor := effAnchorBar
+    if array.size(windowFillArray) > 0
+        for i = 0 to array.size(windowFillArray) - 1
+            linefill.delete(array.get(windowFillArray, i))
+        array.clear(windowFillArray)
+    if array.size(cycleLineArray) > 0
+        for i = 0 to array.size(cycleLineArray) - 1
+            line.delete(array.get(cycleLineArray, i))
+        array.clear(cycleLineArray)
+    if array.size(turnLabelArray) > 0
+        for i = 0 to array.size(turnLabelArray) - 1
+            label.delete(array.get(turnLabelArray, i))
+        array.clear(turnLabelArray)
+    if not na(effAnchorBar)
+        float yBase = close
+        float yTop  = close + syminfo.mintick
+        int kLast = math.floor((bar_index - effAnchorBar) / cycleLengthInput)
+        int kMax  = kLast + futureCyclesInput
+        int maxFutureBar = bar_index + MAX_FUTURE_OFFSET
+        if effAnchorBar + kMax * cycleLengthInput > maxFutureBar
+            kMax := math.floor((maxFutureBar - effAnchorBar) / cycleLengthInput)
+        kMax := math.max(kMax, 0)
+        int linesPerPoint = showWindowsInput and windowInput > 0 ? 3 : 1
+        int kMin = math.max(0, kMax - math.floor(MAX_DRAW_LINES / linesPerPoint) + 1)
+        for k = kMin to kMax
+            int cycleBar = effAnchorBar + k * cycleLengthInput
+            array.push(cycleLineArray, line.new(cycleBar, yBase, cycleBar, yTop
+              , extend = extend.both
+              , color  = cycleColorInput
+              , style  = k == 0 ? line.style_solid : cycleLineStyle
+              , width  = k == 0 ? 2 : 1))
+            if showWindowsInput and windowInput > 0
+                int windowLeft  = math.max(cycleBar - windowInput, 0)
+                int windowRight = math.min(cycleBar + windowInput, bar_index + HARD_FUTURE_LIMIT)
+                line leftEdge  = line.new(windowLeft, yBase, windowLeft, yTop, extend = extend.both, color = color.new(windowColorInput, 100))
+                line rightEdge = line.new(windowRight, yBase, windowRight, yTop, extend = extend.both, color = color.new(windowColorInput, 100))
+                array.push(cycleLineArray, leftEdge)
+                array.push(cycleLineArray, rightEdge)
+                array.push(windowFillArray, linefill.new(leftEdge, rightEdge, windowColorInput))
+        if showTurnMarkersInput and array.size(turnBarArray) > 0
+            array<int> hitIndexArray = array.new<int>()
+            for i = 0 to array.size(turnBarArray) - 1
+                if f_inCycleWindow(array.get(turnBarArray, i), effAnchorBar, cycleLengthInput, windowInput)
+                    array.push(hitIndexArray, i)
+            int hitCount = array.size(hitIndexArray)
+            if hitCount > 0
+                for j = math.max(0, hitCount - MAX_TURN_LABELS) to hitCount - 1
+                    int turnIndex  = array.get(hitIndexArray, j)
+                    bool isLowTurn = array.get(turnIsLowArray, turnIndex)
+                    array.push(turnLabelArray, label.new(array.get(turnBarArray, turnIndex), array.get(turnPriceArray, turnIndex)
+                      , style = label.style_circle
+                      , color = isLowTurn ? lowTurnColorInput : highTurnColorInput
+                      , size  = size.tiny))
+
+plot(barsUntilCycleLine, 'Bars Until Next Cycle Line', NEUTRAL_COLOR, 1, display = display.data_window, editable = false)
+plot(inTurnWindow ? 1 : 0, 'In Turn Window', NEUTRAL_COLOR, 1, display = display.data_window, editable = false)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+// The honest half of fixed-cycle work: measure the spacing between successive significant swings over the loaded
+// sample and see whether it clusters near the chosen length, then count how many completed projected windows
+// actually contained a turn. Scattered spacings or a weak hit rate mean the fixed period is mostly marking noise.
+string dashPosition = switch dashPosInput
+    'Top Right'    => position.top_right
+    'Top Left'     => position.top_left
+    'Bottom Right' => position.bottom_right
+    => position.bottom_left
+
+string dashTextSize = switch dashSizeInput
+    'Tiny'  => size.tiny
+    'Small' => size.small
+    => size.normal
+
+var table dashboardTable = na
+
+if barstate.islast and showDashInput and redrawNeeded
+    if na(dashboardTable)
+        dashboardTable := table.new(dashPosition, 2, 6
+          , bgcolor      = DASH_BG
+          , frame_color  = DASH_FRAME
+          , frame_width  = 1
+          , border_width = 0)
+    bool anchorReady = not na(effAnchorBar)
+    //Spacing audit on the swing type the cycle is counted on (lows unless the rhythm is high-to-high)
+    bool spacingUsesLows = turnTypeInput != 'Swing Highs'
+    array<float> spacingArray = array.new<float>()
+    if array.size(turnBarArray) > 0
+        int previousTurnBar = na
+        for i = 0 to array.size(turnBarArray) - 1
+            if array.get(turnIsLowArray, i) == spacingUsesLows
+                int thisTurnBar = array.get(turnBarArray, i)
+                if not na(previousTurnBar)
+                    array.push(spacingArray, thisTurnBar - previousTurnBar)
+                previousTurnBar := thisTurnBar
+    int   spacingCount  = array.size(spacingArray)
+    float spacingMedian = spacingCount > 0 ? array.median(spacingArray) : na
+    float spacingMean   = spacingCount > 0 ? array.avg(spacingArray) : na
+    float spacingStdev  = spacingCount > 1 ? array.stdev(spacingArray) : na
+    float spacingCv     = not na(spacingStdev) and not na(spacingMean) and spacingMean > 0 ? 100 * spacingStdev / spacingMean : na
+    //Window-hit audit over completed projected windows (the anchor window itself is excluded)
+    int totalWindows = 0
+    int hitWindows   = 0
+    if anchorReady
+        int kLastAudit = math.floor((bar_index - effAnchorBar) / cycleLengthInput)
+        int turnCount  = array.size(turnBarArray)
+        int scanPtr    = 0
+        if kLastAudit >= 1
+            for k = 1 to kLastAudit
+                int windowCenter = effAnchorBar + k * cycleLengthInput
+                if windowCenter + windowInput + swingLengthInput > bar_index
+                    break
+                totalWindows += 1
+                while scanPtr < turnCount and array.get(turnBarArray, scanPtr) < windowCenter - windowInput
+                    scanPtr += 1
+                if scanPtr < turnCount and array.get(turnBarArray, scanPtr) <= windowCenter + windowInput
+                    hitWindows += 1
+    float hitPct = totalWindows > 0 ? 100.0 * hitWindows / totalWindows : na
+    //Countdown to the next window at the newest bar
+    string nextWindowText = '—'
+    if anchorReady
+        if cyclePhase == 0
+            nextWindowText := 'cycle line now'
+        else if inTurnWindow and cyclePhase <= windowInput
+            nextWindowText := 'open · line ' + str.tostring(cyclePhase) + ' ago'
+        else if inTurnWindow
+            nextWindowText := 'open · line in ' + str.tostring(cycleLengthInput - cyclePhase)
+        else
+            nextWindowText := 'opens in ' + str.tostring(cycleLengthInput - cyclePhase - windowInput) + ' bars'
+    color titleCol = DASH_TEXT
+    color labelCol = DASH_HEADER
+    color valueCol = DASH_TEXT
+    color mutedCol = NEUTRAL_COLOR
+    table.cell(dashboardTable, 0, 0, 'Fixed Cycles', text_color = titleCol, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 0, 'N = ' + str.tostring(cycleLengthInput) + ' · ±' + str.tostring(windowInput), text_color = titleCol, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 1, 'Anchor', text_color = labelCol, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 1, anchorReady ? f_date(effAnchorTime) + (anchorSnapped ? ' · snapped' : '') : 'beyond chart', text_color = anchorReady ? valueCol : mutedCol, text_size = dashTextSize, text_halign = text.align_right, tooltip = anchorSnapped ? 'Snapped to the nearest confirmed swing turn within one cycle length of the selected time.' : 'First bar at or after the selected time.')
+    table.cell(dashboardTable, 0, 2, 'Next Window', text_color = labelCol, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 2, nextWindowText, text_color = anchorReady ? (inTurnWindow ? color.new(windowColorInput, 0) : valueCol) : mutedCol, text_size = dashTextSize, text_halign = text.align_right, tooltip = 'The window nominates when a turn is more likely under the fixed-period model. It says nothing about direction or size — require price confirmation inside it, and skip windows where nothing sets up.')
+    table.cell(dashboardTable, 0, 3, spacingUsesLows ? 'Low Spacing' : 'High Spacing', text_color = labelCol, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 3, spacingCount > 0 ? 'med ' + str.tostring(spacingMedian, '#.#') + ' · n=' + str.tostring(spacingCount) : '—', text_color = spacingCount > 0 ? valueCol : mutedCol, text_size = dashTextSize, text_halign = text.align_right, tooltip = 'Median bar count between successive confirmed swings over the loaded sample — the classical way a fixed period is measured. Compare it with the chosen cycle length.')
+    table.cell(dashboardTable, 0, 4, 'Spacing CV', text_color = labelCol, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 4, not na(spacingCv) ? str.tostring(spacingCv, '#.#') + '%' : '—', text_color = not na(spacingCv) ? valueCol : mutedCol, text_size = dashTextSize, text_halign = text.align_right, tooltip = 'Standard deviation of the swing spacings as a share of their mean. A low value means spacings cluster tightly around one rhythm and a fixed period is defensible; a high value means they scatter, and fixed projections will mostly be marking noise.')
+    table.cell(dashboardTable, 0, 5, 'Windows Hit', text_color = labelCol, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 5, totalWindows > 0 ? str.tostring(hitWindows) + '/' + str.tostring(totalWindows) + ' (' + str.tostring(hitPct, '#') + '%)' : '—', text_color = totalWindows > 0 ? valueCol : mutedCol, text_size = dashTextSize, text_halign = text.align_right, tooltip = 'Completed projected windows that contained at least one confirmed swing turn. An honest scorecard of the projection so far — expect it to degrade the further the model extrapolates from the anchor.')
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(windowOpenedEvent, 'Turn Window Opened', 'Fixed Time Cycles: price entered a projected turn window — a turn is due under the fixed-period model, direction unknown; look for price confirmation')
+alertcondition(cycleLineEvent, 'Cycle Line Reached', 'Fixed Time Cycles: the bar count from the anchor reached an exact cycle multiple')
+alertcondition(turnInWindowEvent, 'Turn Confirmed In Window', 'Fixed Time Cycles: a swing turn confirmed inside a cycle turn window — the time window found its price trigger')
+
+//---------------------------------------------------------------------------------------------------------------------}

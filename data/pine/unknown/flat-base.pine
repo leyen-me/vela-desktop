@@ -1,0 +1,273 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Flat Base", "Flat Base", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, max_bars_back = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR = #089981
+FAIL_COLOR = #f23645
+FORM_COLOR = #ff9800   // the one accent: a shelf still forming is the thing to watch
+TEXT_COLOR = #DBDBDB
+
+BOX_BG_TRANSPARENCY     = 88
+BOX_BORDER_TRANSPARENCY = 35
+HIDDEN_COLOR            = #00000000
+
+TRIGGER_CLOSE = 'Close above pivot'
+TRIGGER_HIGH  = 'High above pivot'
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Inputs
+//---------------------------------------------------------------------------------------------------------------------{
+minLengthInput = input.int(5, 'Minimum Base Length', minval = 3, maxval = 200, group = 'Base Detection'
+  , tooltip = 'Fewest bars of sideways trade required before a shelf qualifies as a flat base. The IBD convention is roughly five weeks, read on the weekly chart where flat bases show best.')
+
+maxDepthInput = input.float(15, 'Maximum Base Depth %', minval = 1, maxval = 50, step = 0.5, group = 'Base Detection'
+  , tooltip = 'Largest allowed correction from the range high to the range low. The IBD convention caps a flat base at roughly 15%.')
+
+useAdvanceInput = input.bool(true, 'Require Prior Advance', group = 'Base Detection'
+  , tooltip = 'Only accept shelves that form after a meaningful advance. Flat bases characteristically appear as second-stage structures, after an earlier breakout has already worked.')
+
+advancePctInput = input.float(20, 'Prior Advance %', minval = 0, step = 1, group = 'Base Detection'
+  , tooltip = 'Minimum gain from the pre-base low to the base high, measured over the lookback below (O\'Neil: an advance on the order of 20% or more into the base).')
+
+advanceLookbackInput = input.int(40, 'Prior Advance Lookback', minval = 5, maxval = 300, group = 'Base Detection'
+  , tooltip = 'Number of bars before the base start scanned for the low that the prior advance is measured from.')
+
+triggerInput = input.string(TRIGGER_CLOSE, 'Breakout Trigger', options = [TRIGGER_CLOSE, TRIGGER_HIGH], group = 'Breakout'
+  , tooltip = 'Close above pivot waits for a bar to close through the buy point. High above pivot fires as soon as price trades through it intrabar.')
+
+pivotMarginInput = input.float(0.1, 'Pivot Margin %', minval = 0, step = 0.05, group = 'Breakout'
+  , tooltip = 'The buy point sits a small margin above the range high. Price must clear the range high by this percentage to trigger a breakout.')
+
+volumeMultInput = input.float(1.4, 'Breakout Volume × Average', minval = 1, step = 0.1, group = 'Breakout'
+  , tooltip = 'The move through the pivot should come on volume expansion well above average. Breakout volume at or above this multiple of the average flags the breakout as volume confirmed.')
+
+volumeAvgLengthInput = input.int(10, 'Average Volume Length', minval = 1, maxval = 200, group = 'Breakout'
+  , tooltip = 'Bars used for the average-volume baseline (10 weeks is the common convention on weekly charts). The same window, taken just before the base start, is the reference used to judge volume contraction inside the base.')
+
+tightCloseInput = input.float(2.5, 'Tight Closes: Max Avg Close Change %', minval = 0.1, step = 0.1, group = 'Base Quality'
+  , tooltip = 'Average absolute close-to-close change inside the base at or below this percentage reads as tight closes. Together with contracting volume it grades the base, so wide-and-loose shelves that only meet the letter of the depth rule are downgraded. A convention, not a law — adjust to taste.')
+
+showBoxInput    = input.bool(true, 'Show Base Box', group = 'Style')
+showPivotInput  = input.bool(true, 'Show Pivot Line', group = 'Style')
+showLowInput    = input.bool(true, 'Show Range Low Line (Stop Reference)', group = 'Style')
+showInfoInput   = input.bool(true, 'Show Base Info Label', group = 'Style')
+showMarkerInput = input.bool(true, 'Show Breakout & Failure Markers', group = 'Style')
+
+bullColorInput = input.color(BULL_COLOR, 'Breakout', group = 'Style', inline = 'colors')
+formColorInput = input.color(FORM_COLOR, 'Forming', group = 'Style', inline = 'colors')
+failColorInput = input.color(FAIL_COLOR, 'Invalidated', group = 'Style', inline = 'colors')
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// high-to-low correction of a range, as a percentage of the range high
+depthPercent(hiPrice, loPrice) =>
+    hiPrice > 0 ? (hiPrice - loPrice) / hiPrice * 100 : na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+// rolling series, computed on every bar
+windowHigh     = ta.highest(high, minLengthInput)
+windowLow      = ta.lowest(low, minLengthInput)
+preBaseLow     = ta.lowest(low, advanceLookbackInput)[minLengthInput]
+volumeSma      = ta.sma(nz(volume), volumeAvgLengthInput)
+priorVolumeAvg = volumeSma[1]
+preBaseVolume  = volumeSma[minLengthInput]
+
+// base state
+var bool  inBase        = false
+var int   baseStart     = na
+var float baseHigh      = na
+var float baseLow       = na
+var float basePreVolume = na
+var float baseVolumeSum = 0.0
+var float changeSum     = 0.0
+var int   changeCount   = 0
+var int   baseBars      = 0
+var int   lastBaseEnd   = -1
+
+// drawings of the active base
+var box   baseBox   = na
+var line  pivotLine = na
+var line  lowLine   = na
+var label infoLabel = na
+
+// tight closes / contracting volume assessment of the active base
+qualityState() =>
+    avgChange     = changeCount > 0 ? changeSum / changeCount : na
+    baseVolumeAvg = baseBars > 0 ? baseVolumeSum / baseBars : na
+    tightCloses   = not na(avgChange) and avgChange <= tightCloseInput
+    volumeDryUp   = not na(baseVolumeAvg) and not na(basePreVolume) and basePreVolume > 0 and baseVolumeAvg < basePreVolume
+    gradeText     = tightCloses and volumeDryUp ? 'Tight' : tightCloses or volumeDryUp ? 'Average' : 'Loose'
+    [gradeText, tightCloses, volumeDryUp]
+
+// info label text for the active base - one compact line, the grade breakdown lives in the hover tooltip
+buildInfoText(statusText) =>
+    [gradeText, tightCloses, volumeDryUp] = qualityState()
+    statusText + ' · ' + str.tostring(baseBars) + ' bars · depth ' + str.tostring(depthPercent(baseHigh, baseLow), '#.##') + '% · ' + gradeText
+
+// hover detail behind the grade word
+buildInfoTooltip() =>
+    [gradeText, tightCloses, volumeDryUp] = qualityState()
+    gradeText + ' · closes ' + (tightCloses ? '✓' : '✕') + ' · volume ' + (volumeDryUp ? 'contracting ✓' : 'not contracting ✕')
+
+// per-bar event flags
+newBase        = false
+breakoutStrong = false
+breakoutWeak   = false
+invalidated    = false
+
+// manage the active base first
+if inBase
+    float pivotLevel   = baseHigh * (1 + pivotMarginInput / 100)
+    float triggerPrice = triggerInput == TRIGGER_CLOSE ? close : high
+
+    if triggerPrice > pivotLevel
+        // breakout through the pivot — check for volume expansion well above average
+        bool volumeOk   = not na(priorVolumeAvg) and priorVolumeAvg > 0 and nz(volume) >= volumeMultInput * priorVolumeAvg
+        breakoutStrong := volumeOk
+        breakoutWeak   := not volumeOk
+
+        if not na(baseBox)
+            baseBox.set_right(bar_index)
+            baseBox.set_border_color(color.new(bullColorInput, BOX_BORDER_TRANSPARENCY))
+            baseBox.set_bgcolor(color.new(bullColorInput, BOX_BG_TRANSPARENCY))
+        if not na(pivotLine)
+            pivotLine.set_xy2(bar_index, pivotLevel)
+            pivotLine.set_color(bullColorInput)
+        if not na(lowLine)
+            lowLine.set_xy2(bar_index, baseLow)
+        if not na(infoLabel)
+            infoLabel.set_text(buildInfoText('✓ breakout'))
+            infoLabel.set_tooltip(buildInfoTooltip())
+        if showMarkerInput
+            if volumeOk
+                label.new(bar_index, low, '▲ vol ✓', style = label.style_label_up, color = bullColorInput, textcolor = chart.bg_color, size = size.tiny)
+            else
+                label.new(bar_index, low, '▲ low vol', style = label.style_label_up, color = HIDDEN_COLOR, textcolor = bullColorInput, size = size.tiny)
+
+        inBase      := false
+        lastBaseEnd := bar_index
+        baseBox     := na
+        pivotLine   := na
+        lowLine     := na
+        infoLabel   := na
+    else
+        float nextHigh = math.max(baseHigh, high)
+        float nextLow  = math.min(baseLow, low)
+
+        if depthPercent(nextHigh, nextLow) > maxDepthInput
+            // the correction exceeded the depth cap — this is no longer a flat base
+            invalidated := true
+
+            if not na(baseBox)
+                baseBox.set_right(bar_index)
+                baseBox.set_border_color(color.new(failColorInput, BOX_BORDER_TRANSPARENCY))
+                baseBox.set_bgcolor(color.new(failColorInput, BOX_BG_TRANSPARENCY))
+            if not na(pivotLine)
+                pivotLine.set_xy2(bar_index, pivotLevel)
+                pivotLine.set_color(failColorInput)
+            if not na(lowLine)
+                lowLine.set_xy2(bar_index, baseLow)
+            if not na(infoLabel)
+                infoLabel.set_text(buildInfoText('✕ invalidated'))
+                infoLabel.set_tooltip(buildInfoTooltip())
+            if showMarkerInput
+                label.new(bar_index, high, '✕', style = label.style_label_down, color = HIDDEN_COLOR, textcolor = failColorInput, size = size.tiny)
+
+            inBase      := false
+            lastBaseEnd := bar_index
+            baseBox     := na
+            pivotLine   := na
+            lowLine     := na
+            infoLabel   := na
+        else
+            // the shelf extends — update range, statistics and drawings
+            baseHigh      := nextHigh
+            baseLow       := nextLow
+            baseBars      += 1
+            baseVolumeSum += nz(volume)
+
+            if not na(close[1]) and close[1] != 0 and not na(close)
+                float changeValue = math.abs(close / close[1] - 1) * 100
+                changeSum   += changeValue
+                changeCount += 1
+
+            float newPivotLevel = baseHigh * (1 + pivotMarginInput / 100)
+            if not na(baseBox)
+                baseBox.set_right(bar_index)
+                baseBox.set_top(baseHigh)
+                baseBox.set_bottom(baseLow)
+            if not na(pivotLine)
+                pivotLine.set_xy1(baseStart, newPivotLevel)
+                pivotLine.set_xy2(bar_index, newPivotLevel)
+            if not na(lowLine)
+                lowLine.set_xy1(baseStart, baseLow)
+                lowLine.set_xy2(bar_index, baseLow)
+            if not na(infoLabel)
+                infoLabel.set_x(int(math.avg(baseStart, bar_index)))
+                infoLabel.set_y(newPivotLevel)
+                infoLabel.set_text(buildInfoText('— forming'))
+                infoLabel.set_tooltip(buildInfoTooltip())
+
+// look for a new qualifying shelf
+if not inBase and bar_index >= minLengthInput
+    int  candidateStart = bar_index - minLengthInput + 1
+    bool dataOk         = not na(windowHigh) and not na(windowLow) and windowHigh > 0
+    bool depthOk        = dataOk and depthPercent(windowHigh, windowLow) <= maxDepthInput
+    bool freshOk        = candidateStart > lastBaseEnd
+    bool advanceOk      = not useAdvanceInput or (not na(preBaseLow) and preBaseLow > 0 and windowHigh >= preBaseLow * (1 + advancePctInput / 100))
+
+    if depthOk and freshOk and advanceOk
+        inBase        := true
+        newBase       := true
+        baseStart     := candidateStart
+        baseHigh      := windowHigh
+        baseLow       := windowLow
+        basePreVolume := preBaseVolume
+        baseBars      := minLengthInput
+        baseVolumeSum := 0.0
+        changeSum     := 0.0
+        changeCount   := 0
+
+        // seed statistics over the initial window
+        for i = 0 to minLengthInput - 1
+            baseVolumeSum += nz(volume[i])
+            float previousClose = close[i + 1]
+            if not na(previousClose) and previousClose != 0 and not na(close[i])
+                float changeValue = math.abs(close[i] / previousClose - 1) * 100
+                changeSum   += changeValue
+                changeCount += 1
+
+        float pivotLevel = baseHigh * (1 + pivotMarginInput / 100)
+        if showBoxInput
+            baseBox := box.new(baseStart, baseHigh, bar_index, baseLow, border_color = color.new(formColorInput, BOX_BORDER_TRANSPARENCY), bgcolor = color.new(formColorInput, BOX_BG_TRANSPARENCY), border_width = 1)
+        if showPivotInput
+            pivotLine := line.new(baseStart, pivotLevel, bar_index, pivotLevel, color = formColorInput, style = line.style_dashed)
+        if showLowInput
+            lowLine := line.new(baseStart, baseLow, bar_index, baseLow, color = failColorInput, style = line.style_dotted)
+        if showInfoInput
+            infoLabel := label.new(int(math.avg(baseStart, bar_index)), pivotLevel, buildInfoText('— forming'), style = label.style_label_down, color = HIDDEN_COLOR, textcolor = TEXT_COLOR, size = size.tiny, tooltip = buildInfoTooltip())
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Data Window
+//---------------------------------------------------------------------------------------------------------------------{
+plot(inBase ? baseHigh * (1 + pivotMarginInput / 100) : na, 'Pivot', color = formColorInput, display = display.data_window)
+plot(inBase ? baseLow : na, 'Range Low', color = failColorInput, display = display.data_window)
+plot(inBase ? depthPercent(baseHigh, baseLow) : na, 'Base Depth %', color = formColorInput, display = display.data_window)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(newBase, 'New Flat Base', 'A qualifying flat base has formed: minimum length of sideways trade within the maximum depth, shelving after a prior advance.')
+alertcondition(breakoutStrong, 'Flat Base Breakout (Volume Confirmed)', 'Price cleared the flat base pivot on volume well above average.')
+alertcondition(breakoutWeak, 'Flat Base Breakout (Weak Volume)', 'Price cleared the flat base pivot without volume confirmation — treat with caution.')
+alertcondition(invalidated, 'Flat Base Invalidated', 'The range exceeded the maximum depth and no longer qualifies as a flat base.')
+
+//---------------------------------------------------------------------------------------------------------------------}

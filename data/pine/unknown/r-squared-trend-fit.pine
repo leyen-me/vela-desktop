@@ -1,0 +1,299 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("R-squared Trend Fit"
+  , shorttitle = "R-squared Trend Fit"
+  , overlay    = false
+  , format     = format.price
+  , precision  = 3)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+int MAX_LOOKBACK = 500
+
+int FULL_TRANSP = 100
+int HALF_TRANSP = 50
+int BG_TRANSP   = 92
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+string GROUP_FIT   = "Regression Fit"
+string GROUP_GATE  = "Trend Gate"
+string GROUP_DASH  = "Dashboard"
+string GROUP_STYLE = "Style"
+
+string MODE_STATISTICAL = "Statistical"
+string MODE_FIXED       = "Fixed"
+
+string CONF_90 = "90%"
+string CONF_95 = "95%"
+string CONF_99 = "99%"
+
+string LOC_TOP_RIGHT    = "Top Right"
+string LOC_TOP_LEFT     = "Top Left"
+string LOC_BOTTOM_RIGHT = "Bottom Right"
+string LOC_BOTTOM_LEFT  = "Bottom Left"
+
+string SIZE_TINY   = "Tiny"
+string SIZE_SMALL  = "Small"
+string SIZE_NORMAL = "Normal"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+lengthInput = input.int(20, "Length"
+  , minval  = 5
+  , maxval  = MAX_LOOKBACK
+  , group   = GROUP_FIT
+  , tooltip = "Lookback window (n), in bars, of the linear regression of the source against time. Commonly 14 to 21. Short windows produce high R-squared by chance, so they need a higher reading before it means anything.")
+
+sourceInput = input.source(close, "Source"
+  , group   = GROUP_FIT
+  , tooltip = "Series regressed against the bar index, usually the close.")
+
+useLogInput = input.bool(false, "Use Log Price"
+  , group   = GROUP_FIT
+  , tooltip = "Regresses the logarithm of the source instead of its raw value, making fits comparable across large percentage moves. It rarely matters on short windows. Non-positive source values return no reading.")
+
+gateModeInput = input.string(MODE_STATISTICAL, "Threshold Mode"
+  , options = [MODE_STATISTICAL, MODE_FIXED]
+  , group   = GROUP_GATE
+  , tooltip = "Statistical derives the critical R-squared below which the fit is indistinguishable from random data for the chosen window length and confidence level: shorter windows demand higher readings, longer windows clear significance at lower values. Fixed uses the manual level below instead.")
+
+confidenceInput = input.string(CONF_95, "Confidence Level"
+  , options = [CONF_90, CONF_95, CONF_99]
+  , group   = GROUP_GATE
+  , tooltip = "Confidence used by the statistical threshold, from the two-tailed significance test of a correlation with n - 2 degrees of freedom. Higher confidence raises the critical value.")
+
+fixedLevelInput = input.float(0.25, "Fixed Level"
+  , minval  = 0.0
+  , maxval  = 1.0
+  , step    = 0.05
+  , group   = GROUP_GATE
+  , tooltip = "Manual trend/no-trend cutoff used when Threshold Mode is Fixed. On 14-to-20 bar windows, readings below roughly 0.2 to 0.3 are generally indistinguishable from noise.")
+
+maturityTrendInput = input.int(10, "Maturity: Bars In Trend"
+  , minval  = 1
+  , group   = GROUP_GATE
+  , tooltip = "Minimum consecutive bars with a significant fit before falling R-squared readings count as trend maturity.")
+
+maturityFallInput = input.int(3, "Maturity: Falling Bars"
+  , minval  = 1
+  , group   = GROUP_GATE
+  , tooltip = "Consecutive declining R-squared bars that trigger the trend maturity warning while the fit is still significant. A decay symptom, not a reversal signal - chop can persist long after the reading drops.")
+
+showDashboardInput = input.bool(true, "Show Dashboard"
+  , group   = GROUP_DASH
+  , tooltip = "Displays the current R-squared, the active critical value, the regression slope direction, and the resulting regime read.")
+
+dashboardLocationInput = input.string(LOC_TOP_RIGHT, "Location"
+  , options = [LOC_TOP_RIGHT, LOC_TOP_LEFT, LOC_BOTTOM_RIGHT, LOC_BOTTOM_LEFT]
+  , group   = GROUP_DASH
+  , tooltip = "Corner of the pane holding the dashboard.")
+
+dashboardSizeInput = input.string(SIZE_SMALL, "Size"
+  , options = [SIZE_TINY, SIZE_SMALL, SIZE_NORMAL]
+  , group   = GROUP_DASH
+  , tooltip = "Text size of the dashboard.")
+
+regimeBgInput = input.bool(false, "Regime Background"
+  , group   = GROUP_STYLE
+  , tooltip = "Tints the pane background while the fit is significant, green with a rising slope and red with a falling one - the stretches where the trend gate is open.")
+
+gradientFillInput = input.bool(true, "Gradient Fill", group = GROUP_STYLE)
+
+bullColorInput = input.color(#089981, "Bullish Color", group = GROUP_STYLE)
+
+bearColorInput = input.color(#f23645, "Bearish Color", group = GROUP_STYLE)
+
+rangeColorInput = input.color(#787b86, "No-Trend Color", group = GROUP_STYLE)
+
+criticalColorInput = input.color(#ff9800, "Critical Value Color", group = GROUP_STYLE)
+
+levelsColorInput = input.color(#787b86, "Bounds Color", group = GROUP_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// User-Defined Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Upper-tail quantile of the standard normal distribution (Abramowitz & Stegun 26.2.23, |error| < 4.5e-4)
+invNormalUpper(float p) =>
+    float u = math.sqrt(-2.0 * math.log(p))
+    u - (2.515517 + 0.802853 * u + 0.010328 * u * u) / (1.0 + 1.432788 * u + 0.189269 * u * u + 0.001308 * u * u * u)
+
+// Two-tailed Student-t quantile expanded around the normal quantile (Abramowitz & Stegun 26.7.5)
+invStudentT(float alpha, float df) =>
+    float z  = invNormalUpper(alpha / 2.0)
+    float z3 = z * z * z
+    float z5 = z3 * z * z
+    float z7 = z5 * z * z
+    float z9 = z7 * z * z
+    float g1 = (z3 + z) / 4.0
+    float g2 = (5.0 * z5 + 16.0 * z3 + 3.0 * z) / 96.0
+    float g3 = (3.0 * z7 + 19.0 * z5 + 17.0 * z3 - 15.0 * z) / 384.0
+    float g4 = (79.0 * z9 + 776.0 * z7 + 1482.0 * z5 - 1920.0 * z3 - 945.0 * z) / 92160.0
+    z + g1 / df + g2 / math.pow(df, 2) + g3 / math.pow(df, 3) + g4 / math.pow(df, 4)
+
+// Critical R-squared for a regression on time: the t-test cutoff for a correlation with df = n - 2 maps to
+// R2c = t^2 / (t^2 + df), reproducing the published critical-value tables for each window length.
+criticalRSquared(int n, float alpha) =>
+    float df    = n - 2
+    float tCrit = invStudentT(alpha, df)
+    tCrit * tCrit / (tCrit * tCrit + df)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Optional log transform: constant-percentage growth turns linear, keeping fits comparable across large moves
+float regSource = useLogInput ? math.log(sourceInput) : sourceInput
+
+max_bars_back(regSource, MAX_LOOKBACK)
+
+// Simple regression of the source on time over the window. The time axis pairs offset i with t = -i, so it
+// rises toward the current bar in unit steps.
+float sumT  = 0.0 // St  = SUM t_i
+float sumY  = 0.0 // Sy  = SUM y_i
+float sumTT = 0.0 // Stt = SUM t_i^2
+float sumYY = 0.0 // Syy = SUM y_i^2
+float sumTY = 0.0 // Sty = SUM t_i * y_i
+
+for i = 0 to lengthInput - 1
+    float tAxis = -i
+    float yVal  = regSource[i]
+    sumT  += tAxis
+    sumY  += yVal
+    sumTT += tAxis * tAxis
+    sumYY += yVal * yVal
+    sumTY += tAxis * yVal
+
+float covTY = lengthInput * sumTY - sumT * sumY
+float varT  = lengthInput * sumTT - sumT * sumT
+float varY  = lengthInput * sumYY - sumY * sumY
+
+// R-squared is the squared Pearson correlation between source and time, algebraically identical to 1 - SSE/SST
+// for a simple regression on time. A perfectly flat window has no linear drift to explain and is scored 0.
+float rSquared = na
+float slope    = na
+if not na(covTY)
+    rSquared := varY > 0 ? math.min(covTY * covTY / (varT * varY), 1.0) : 0.0
+    slope    := covTY / varT
+
+// Trend/no-trend gate: critical value from the significance test, or the manual level
+float alphaLevel    = confidenceInput == CONF_90 ? 0.10 : confidenceInput == CONF_99 ? 0.01 : 0.05
+float criticalValue = gateModeInput == MODE_STATISTICAL ? criticalRSquared(lengthInput, alphaLevel) : fixedLevelInput
+
+bool significant = not na(rSquared) and rSquared >= criticalValue
+
+// The square discards the line's sign, so direction comes from the regression slope, checked separately
+int direction = na(slope) ? 0 : slope > 0 ? 1 : slope < 0 ? -1 : 0
+int regime    = significant ? direction : 0
+
+int  sigFlag        = significant ? 1 : 0
+bool gateOn         = sigFlag == 1 and nz(sigFlag[1]) == 0
+bool gateOff        = sigFlag == 0 and nz(sigFlag[1]) == 1
+bool bullTrendStart = regime == 1 and nz(regime[1]) != 1
+bool bearTrendStart = regime == -1 and nz(regime[1]) != -1
+
+// Trend maturity: falling R-squared after an extended significant stretch, while the fit is still significant
+var int significantStreak = 0
+var int fallingStreak     = 0
+
+significantStreak := significant ? significantStreak + 1 : 0
+fallingStreak     := not na(rSquared) and not na(rSquared[1]) and rSquared < rSquared[1] ? fallingStreak + 1 : 0
+
+bool maturityWarning = significantStreak >= maturityTrendInput and fallingStreak == maturityFallInput
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+
+color stateColor = regime == 1 ? bullColorInput : regime == -1 ? bearColorInput : rangeColorInput
+
+r2PlotId   = plot(rSquared, "R-squared", stateColor, 1)
+basePlotId = plot(0, "Zero Anchor", editable = false, display = display.none)
+
+fill(basePlotId, r2PlotId
+  , top_value    = rSquared
+  , bottom_value = 0.0
+  , top_color    = gradientFillInput ? color.new(stateColor, HALF_TRANSP) : color(na)
+  , bottom_color = gradientFillInput ? color.new(stateColor, FULL_TRANSP) : color(na)
+  , title        = "Strength Gradient")
+
+hline(1.0, "Perfect Fit", levelsColorInput, hline.style_dotted)
+hline(0.0, "No Fit", levelsColorInput, hline.style_dotted)
+
+// The critical value is derived from inputs, so it renders as a dashed horizontal level
+var line criticalLineId = line.new(0, 0.0, 1, 0.0
+  , extend = extend.both
+  , style  = line.style_dashed
+  , color  = criticalColorInput)
+
+if barstate.islast
+    line.set_xy1(criticalLineId, math.max(bar_index - 1, 0), criticalValue)
+    line.set_xy2(criticalLineId, bar_index, criticalValue)
+
+bgcolor(regimeBgInput and regime != 0 ? color.new(regime == 1 ? bullColorInput : bearColorInput, BG_TRANSP) : color(na)
+  , title = "Trend Gate Background")
+
+plot(criticalValue, "Critical Value", color = color(na), editable = false, display = display.data_window)
+plot(slope, "Regression Slope", color = color(na), editable = false, display = display.data_window)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+
+string dashboardLocation = dashboardLocationInput == LOC_TOP_RIGHT ? position.top_right
+  : dashboardLocationInput == LOC_TOP_LEFT ? position.top_left
+  : dashboardLocationInput == LOC_BOTTOM_RIGHT ? position.bottom_right
+  : position.bottom_left
+
+string dashboardTextSize = dashboardSizeInput == SIZE_TINY ? size.tiny
+  : dashboardSizeInput == SIZE_NORMAL ? size.normal
+  : size.small
+
+var table dashboardTable = table(na)
+
+if showDashboardInput and barstate.isfirst
+    dashboardTable := table.new(dashboardLocation, 2, 4
+      , bgcolor      = DASH_BG
+      , border_width = 0
+      , frame_color  = DASH_FRAME
+      , frame_width  = 1)
+
+if showDashboardInput and barstate.islast
+    string r2Text       = na(rSquared) ? "n/a" : str.tostring(rSquared, "0.000")
+    string gateLabel    = gateModeInput == MODE_STATISTICAL ? "Critical (" + confidenceInput + ")" : "Fixed Level"
+    string criticalText = str.tostring(criticalValue, "0.000")
+    string slopeWord    = direction == 1 ? "Up " : direction == -1 ? "Down " : "Flat "
+    string slopeText    = na(slope) ? "n/a" : slopeWord + "(" + str.tostring(slope, "0.#####") + ")"
+    string regimeText   = regime == 1 ? "Trending Up" : regime == -1 ? "Trending Down" : "No Trend"
+    color  slopeColor   = direction == 1 ? bullColorInput : direction == -1 ? bearColorInput : rangeColorInput
+
+    table.cell(dashboardTable, 0, 0, "R-squared", text_color = DASH_HEADER, text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 0, r2Text, text_color = stateColor, text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 1, gateLabel, text_color = DASH_HEADER, text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 1, criticalText, text_color = criticalColorInput, text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 2, "Slope", text_color = DASH_HEADER, text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 2, slopeText, text_color = slopeColor, text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 3, "Regime", text_color = DASH_HEADER, text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 3, regimeText, text_color = stateColor, text_size = dashboardTextSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(gateOn, "Fit Turned Significant", "R-squared trend fit crossed above its critical value on {{ticker}} ({{interval}}) - trend conditions")
+alertcondition(gateOff, "Fit Lost Significance", "R-squared trend fit fell below its critical value on {{ticker}} ({{interval}}) - range conditions")
+alertcondition(bullTrendStart, "Clean Uptrend Qualified", "Significant R-squared fit with a rising slope on {{ticker}} ({{interval}})")
+alertcondition(bearTrendStart, "Clean Downtrend Qualified", "Significant R-squared fit with a falling slope on {{ticker}} ({{interval}})")
+alertcondition(maturityWarning, "Trend Maturity Warning", "R-squared falling after an extended significant trend on {{ticker}} ({{interval}}) - decay symptom, not a reversal signal")
+
+//---------------------------------------------------------------------------------------------------------------------}

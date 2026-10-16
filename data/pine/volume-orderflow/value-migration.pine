@@ -1,0 +1,472 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Value Migration", shorttitle = "Value Migration", overlay = true, format = format.price, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+color BULL_COLOR    = #089981   // value migrating higher
+color BEAR_COLOR    = #f23645   // value migrating lower
+color NEUTRAL_COLOR = #787b86   // unchanged value (balance) and the prior references - structure
+color OUTSIDE_COLOR = #ab47bc   // engulfing, two-sided value - a category of its own, kept apart from balance
+color LABEL_BG      = #00000000
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+string VA_GROUP    = "Value Area"
+string RULES_GROUP = "Migration Rules"
+string STYLE_GROUP = "Style"
+
+string ANCHOR_DAILY   = "Daily"
+string ANCHOR_WEEKLY  = "Weekly"
+string ANCHOR_MONTHLY = "Monthly"
+
+string WEIGHT_VOLUME = "Volume"
+string WEIGHT_TPO    = "TPO (Time)"
+
+string POS_TOP_RIGHT    = "Top Right"
+string POS_TOP_LEFT     = "Top Left"
+string POS_BOTTOM_RIGHT = "Bottom Right"
+string POS_BOTTOM_LEFT  = "Bottom Left"
+
+string SIZE_TINY   = "Tiny"
+string SIZE_SMALL  = "Small"
+string SIZE_NORMAL = "Normal"
+
+// Overlapping value rule categories
+int CAT_NONE           = 0
+int CAT_HIGHER         = 1
+int CAT_OVERLAP_HIGHER = 2
+int CAT_UNCHANGED      = 3
+int CAT_OVERLAP_LOWER  = 4
+int CAT_LOWER          = 5
+int CAT_OUTSIDE        = 6
+
+// Sessions shown in the dashboard sequence readout
+int SEQUENCE_LENGTH = 8
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+anchorInput = input.string(ANCHOR_DAILY, "Anchor Period", options = [ANCHOR_DAILY, ANCHOR_WEEKLY, ANCHOR_MONTHLY], group = VA_GROUP, tooltip = "Session period whose value areas are compared. 'Daily' reproduces the classic day-over-day migration read. Use a chart timeframe below the anchor so each session holds enough bars to build a profile.")
+
+rowsInput = input.int(25, "Profile Rows", minval = 5, maxval = 100, group = VA_GROUP, tooltip = "Number of price rows each session profile is built on. More rows resolve the value area high, value area low and POC more finely; fewer rows smooth them.")
+
+vaPercentInput = input.float(70, "Value Area %", minval = 10, maxval = 100, step = 1, group = VA_GROUP, tooltip = "Share of the session's business, expanded around the point of control, that defines the value area. 70% is the standard Market Profile convention.")
+
+weightingInput = input.string(WEIGHT_VOLUME, "Profile Weighting", options = [WEIGHT_VOLUME, WEIGHT_TPO], group = VA_GROUP, tooltip = "How each session profile is weighted. 'Volume' distributes each bar's volume across the rows it spans, giving a volume profile value area. 'TPO (Time)' counts one unit per row a bar traded at, giving a TPO-style value area. Sessions without volume data automatically fall back to time weighting.")
+
+toleranceInput = input.float(10, "Unchanged Tolerance %", minval = 0, maxval = 50, step = 1, group = RULES_GROUP, tooltip = "Value is classified as 'unchanged' when the session's value area high and low both land within this percentage of the prior area's width from the prior levels - the 'roughly matching' case of the overlapping value rules.")
+
+streakTargetInput = input.int(3, "Trend-Grade Streak", minval = 2, maxval = 10, group = RULES_GROUP, tooltip = "Number of consecutive sessions migrating in the same direction treated as trend-grade evidence. Feeds the streak alert and the dashboard readout.")
+
+showAreasInput = input.bool(true, "Session Value Areas", group = STYLE_GROUP, tooltip = "Draw each completed session's value area, colored by its overlapping value rule category.")
+
+showPocInput = input.bool(true, "Session POC", group = STYLE_GROUP, tooltip = "Draw each completed session's point of control across its value area.")
+
+showLabelsInput = input.bool(true, "Migration Labels", group = STYLE_GROUP, tooltip = "Label each completed session with its migration category. A warning mark is added when price stretched to a new extreme without value migrating that way.")
+
+showDevelopingInput = input.bool(true, "Developing Value Area", group = STYLE_GROUP, tooltip = "Track the current session's value area as it forms, colored by its live relationship to the prior session's area.")
+
+showPriorInput  = input.bool(true, "Prior Value References", inline = "ref", group = STYLE_GROUP, tooltip = "Extend the prior session's value area high, value area low (dotted) and point of control (dashed) across the developing session.")
+priorColorInput = input.color(NEUTRAL_COLOR, "", inline = "ref", group = STYLE_GROUP)
+
+higherColorInput = input.color(BULL_COLOR, "Higher", inline = "dir", group = STYLE_GROUP)
+lowerColorInput  = input.color(BEAR_COLOR, "Lower", inline = "dir", group = STYLE_GROUP)
+
+unchangedColorInput = input.color(NEUTRAL_COLOR, "Unchanged", inline = "bal", group = STYLE_GROUP)
+outsideColorInput   = input.color(OUTSIDE_COLOR, "Outside", inline = "bal", group = STYLE_GROUP)
+
+showDashboardInput     = input.bool(true, "Dashboard", inline = "dash", group = STYLE_GROUP, tooltip = "Live dashboard: the developing session's relationship to prior value, the POC read, the migration streak and the recent migration sequence.")
+dashboardLocationInput = input.string(POS_TOP_RIGHT, "", options = [POS_TOP_RIGHT, POS_TOP_LEFT, POS_BOTTOM_RIGHT, POS_BOTTOM_LEFT], inline = "dash", group = STYLE_GROUP)
+dashboardSizeInput     = input.string(SIZE_SMALL, "Dashboard Size", options = [SIZE_TINY, SIZE_SMALL, SIZE_NORMAL], group = STYLE_GROUP, tooltip = "Text size of the dashboard.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Table position constant from the style option
+getTablePosition(string positionName) =>
+    switch positionName
+        POS_TOP_LEFT     => position.top_left
+        POS_BOTTOM_RIGHT => position.bottom_right
+        POS_BOTTOM_LEFT  => position.bottom_left
+        => position.top_right
+
+// Table text size constant from the style option
+getTextSize(string sizeName) =>
+    switch sizeName
+        SIZE_TINY   => size.tiny
+        SIZE_NORMAL => size.normal
+        => size.small
+
+// Price text for tooltips
+formatPrice(float priceValue) =>
+    na(priceValue) ? "n/a" : str.tostring(priceValue, format.mintick)
+
+// Value area of a stored session: profile rows around the point of control, expanded two rows at a time
+// (the standard Market Profile procedure) until the requested share of the total weight is contained.
+// Returns [value area high, POC, value area low].
+sessionValueArea(array<float> highArray, array<float> lowArray, array<float> weightArray, int rows, float vaPercent, bool volumeWeighted) =>
+    float vaHigh   = na
+    float pocPrice = na
+    float vaLow    = na
+    int barCount = array.size(highArray)
+    if barCount > 0
+        float profileHigh = array.max(highArray)
+        float profileLow  = array.min(lowArray)
+        if profileHigh <= profileLow
+            // Degenerate flat session: all business at one price
+            vaHigh   := profileHigh
+            pocPrice := profileHigh
+            vaLow    := profileLow
+        else
+            float rowStep = (profileHigh - profileLow) / rows
+            array<float> rowWeightArray = array.new<float>(rows, 0.0)
+            // Volume weighting only when the session actually carries volume, otherwise TPO counts
+            bool useVolume = volumeWeighted and array.sum(weightArray) > 0
+
+            // Distribute each bar over the rows its range covers, volume pro-rata or one TPO count per row touched
+            for i = 0 to barCount - 1
+                float barHigh   = array.get(highArray, i)
+                float barLow    = array.get(lowArray, i)
+                float barWeight = array.get(weightArray, i)
+                int rowLo = math.max(0, math.min(rows - 1, int(math.floor((barLow - profileLow) / rowStep))))
+                int rowHi = math.max(0, math.min(rows - 1, int(math.floor((barHigh - profileLow) / rowStep))))
+                for j = rowLo to rowHi
+                    float addWeight = 1.0
+                    if useVolume
+                        float rowTop    = profileLow + (j + 1) * rowStep
+                        float rowBottom = profileLow + j * rowStep
+                        float overlap   = math.min(barHigh, rowTop) - math.max(barLow, rowBottom)
+                        addWeight := barHigh > barLow ? barWeight * math.max(overlap, 0.0) / (barHigh - barLow) : barWeight
+                    array.set(rowWeightArray, j, array.get(rowWeightArray, j) + addWeight)
+
+            float totalWeight = array.sum(rowWeightArray)
+            if totalWeight > 0
+                // POC row: heaviest row, ties resolved toward the middle of the session range
+                int rowMid = (rows - 1) / 2
+                int pocRow = 0
+                float pocWeight = array.get(rowWeightArray, 0)
+                for j = 1 to rows - 1
+                    float rowWeight = array.get(rowWeightArray, j)
+                    if rowWeight > pocWeight or rowWeight == pocWeight and math.abs(j - rowMid) < math.abs(pocRow - rowMid)
+                        pocWeight := rowWeight
+                        pocRow    := j
+
+                // Expand around the POC, adding the heavier of the two rows above vs the two rows below
+                float targetWeight  = totalWeight * vaPercent / 100
+                float coveredWeight = pocWeight
+                int upRow = pocRow + 1
+                int dnRow = pocRow - 1
+                while coveredWeight < targetWeight and (upRow < rows or dnRow >= 0)
+                    float upWeight = (upRow < rows ? array.get(rowWeightArray, upRow) : 0.0) + (upRow + 1 < rows ? array.get(rowWeightArray, upRow + 1) : 0.0)
+                    float dnWeight = (dnRow >= 0 ? array.get(rowWeightArray, dnRow) : 0.0) + (dnRow - 1 >= 0 ? array.get(rowWeightArray, dnRow - 1) : 0.0)
+                    if upRow >= rows or dnRow >= 0 and dnWeight > upWeight
+                        coveredWeight += dnWeight
+                        dnRow -= 2
+                    else
+                        coveredWeight += upWeight
+                        upRow += 2
+
+                vaHigh   := profileLow + (math.min(upRow - 1, rows - 1) + 1) * rowStep
+                vaLow    := profileLow + math.max(dnRow + 1, 0) * rowStep
+                pocPrice := profileLow + (pocRow + 0.5) * rowStep
+    [vaHigh, pocPrice, vaLow]
+
+// Overlapping value rules: classify a value area against the prior session's. The clean non-overlapping
+// cases and the engulfing case are checked first; an area holding inside the prior one reads as balance.
+classifyMigration(float vaHigh, float vaLow, float priorVaHigh, float priorVaLow, float tolerancePercent) =>
+    int migrationCategory = CAT_NONE
+    if not (na(vaHigh) or na(vaLow) or na(priorVaHigh) or na(priorVaLow))
+        float tolerance = math.max((priorVaHigh - priorVaLow) * tolerancePercent / 100, syminfo.mintick)
+        if vaLow > priorVaHigh
+            migrationCategory := CAT_HIGHER
+        else if vaHigh < priorVaLow
+            migrationCategory := CAT_LOWER
+        else if math.abs(vaHigh - priorVaHigh) <= tolerance and math.abs(vaLow - priorVaLow) <= tolerance
+            migrationCategory := CAT_UNCHANGED
+        else if vaHigh >= priorVaHigh and vaLow <= priorVaLow
+            migrationCategory := CAT_OUTSIDE
+        else if vaHigh > priorVaHigh
+            migrationCategory := CAT_OVERLAP_HIGHER
+        else if vaLow < priorVaLow
+            migrationCategory := CAT_OVERLAP_LOWER
+        else
+            // Value building inside the prior area: same prices accepted, balance
+            migrationCategory := CAT_UNCHANGED
+    migrationCategory
+
+// Directional lean of a category: +1 migrating higher, -1 migrating lower, 0 balance
+categoryDirection(int migrationCategory) =>
+    migrationCategory == CAT_HIGHER or migrationCategory == CAT_OVERLAP_HIGHER ? 1 : migrationCategory == CAT_LOWER or migrationCategory == CAT_OVERLAP_LOWER ? -1 : 0
+
+// Category color from the style inputs
+categoryColor(int migrationCategory) =>
+    switch migrationCategory
+        CAT_HIGHER         => higherColorInput
+        CAT_OVERLAP_HIGHER => higherColorInput
+        CAT_LOWER          => lowerColorInput
+        CAT_OVERLAP_LOWER  => lowerColorInput
+        CAT_OUTSIDE        => outsideColorInput
+        => unchangedColorInput
+
+// Short category text for labels and the dashboard
+categoryText(int migrationCategory) =>
+    switch migrationCategory
+        CAT_HIGHER         => "Higher ▲"
+        CAT_OVERLAP_HIGHER => "Overlap △"
+        CAT_UNCHANGED      => "Unchanged •"
+        CAT_OVERLAP_LOWER  => "Overlap ▽"
+        CAT_LOWER          => "Lower ▼"
+        CAT_OUTSIDE        => "Outside ◆"
+        => "—"
+
+// One-character marker for the dashboard sequence readout
+categoryChar(int migrationCategory) =>
+    switch migrationCategory
+        CAT_HIGHER         => "▲"
+        CAT_OVERLAP_HIGHER => "△"
+        CAT_UNCHANGED      => "•"
+        CAT_OVERLAP_LOWER  => "▽"
+        CAT_LOWER          => "▼"
+        CAT_OUTSIDE        => "◆"
+        => "·"
+
+// Long category description for tooltips
+categoryPhrase(int migrationCategory) =>
+    switch migrationCategory
+        CAT_HIGHER         => "higher - built entirely above the prior session's area"
+        CAT_OVERLAP_HIGHER => "overlapping to higher - shifted up but still overlapping"
+        CAT_UNCHANGED      => "unchanged - roughly the same business at the same prices (balance)"
+        CAT_OVERLAP_LOWER  => "overlapping to lower - shifted down but still overlapping"
+        CAT_LOWER          => "lower - built entirely below the prior session's area"
+        CAT_OUTSIDE        => "outside - engulfing the prior session's area"
+        => "unclassified"
+
+// POC weighting of the read: a POC migrating with the value area strengthens it, a POC still anchored
+// inside the prior area argues the migration is tentative
+pocReadText(int direction, float pocPrice, float priorPoc, float priorVaHigh, float priorVaLow) =>
+    string pocText = "Balanced"
+    if na(pocPrice) or na(priorPoc) or na(priorVaHigh) or na(priorVaLow)
+        pocText := "n/a"
+    else if direction != 0
+        bool anchored   = pocPrice <= priorVaHigh and pocPrice >= priorVaLow
+        bool confirming = direction > 0 ? pocPrice > priorPoc : pocPrice < priorPoc
+        pocText := anchored ? "Anchored in prior value" : confirming ? "Migrating with value" : "Against migration"
+    pocText
+
+// Streak wording shared by tooltips and the dashboard
+streakPhrase(int streakValue) =>
+    streakValue > 0 ? str.tostring(streakValue) + " higher" : streakValue < 0 ? str.tostring(-streakValue) + " lower" : "None"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Session Tracking & Migration Classification
+//---------------------------------------------------------------------------------------------------------------------{
+
+string anchorTimeframe = switch anchorInput
+    ANCHOR_WEEKLY  => "W"
+    ANCHOR_MONTHLY => "M"
+    => "D"
+
+int anchorSeconds = switch anchorInput
+    ANCHOR_WEEKLY  => 604800
+    ANCHOR_MONTHLY => 2628000
+    => 86400
+
+bool timeframeOk    = timeframe.in_seconds(timeframe.period) < anchorSeconds
+bool volumeWeighted = weightingInput == WEIGHT_VOLUME
+bool newSession     = timeframeOk and timeframe.change(anchorTimeframe)
+
+// Bars of the running session, stored to build its profile
+var array<float> sessionHighArray   = array.new<float>()
+var array<float> sessionLowArray    = array.new<float>()
+var array<float> sessionWeightArray = array.new<float>()
+
+// Recent migration categories for the dashboard sequence readout
+var array<int> historyArray = array.new<int>()
+
+var int sessionStartBar = 0
+
+// Prior completed session references
+var float priorVaHigh      = na
+var float priorPoc         = na
+var float priorVaLow       = na
+var float priorSessionHigh = na
+var float priorSessionLow  = na
+
+// Signed run of consecutive same-direction migrations
+var int migrationStreak = 0
+
+// Per-bar events feeding the alerts
+int  barCategory         = CAT_NONE
+bool trendGradeEvent     = false
+bool extremeWarningEvent = false
+
+if newSession
+    if array.size(sessionHighArray) > 0
+        // The session that just completed: build its value area and classify it against the prior one
+        [vaHighNew, pocNew, vaLowNew] = sessionValueArea(sessionHighArray, sessionLowArray, sessionWeightArray, rowsInput, vaPercentInput, volumeWeighted)
+        float sessionHigh = array.max(sessionHighArray)
+        float sessionLow  = array.min(sessionLowArray)
+
+        int migrationCategory = classifyMigration(vaHighNew, vaLowNew, priorVaHigh, priorVaLow, toleranceInput)
+        int direction         = categoryDirection(migrationCategory)
+        string pocRead        = pocReadText(direction, pocNew, priorPoc, priorVaHigh, priorVaLow)
+
+        if migrationCategory != CAT_NONE
+            // Sequence matters more than one comparison: track the run of same-direction migrations
+            migrationStreak := direction == 0 ? 0 : migrationStreak * direction > 0 ? migrationStreak + direction : direction
+            trendGradeEvent := direction != 0 and math.abs(migrationStreak) >= streakTargetInput
+
+            // Divergence warning: a new price extreme while value did not migrate that way
+            bool newHighNoAcceptance = not na(priorSessionHigh) and sessionHigh > priorSessionHigh and direction <= 0
+            bool newLowNoAcceptance  = not na(priorSessionLow) and sessionLow < priorSessionLow and direction >= 0
+            extremeWarningEvent := newHighNoAcceptance or newLowNoAcceptance
+
+            barCategory := migrationCategory
+
+            array.push(historyArray, migrationCategory)
+            if array.size(historyArray) > SEQUENCE_LENGTH
+                array.shift(historyArray)
+
+        // Draw the completed session's value area, POC and category label
+        if not na(vaHighNew)
+            color sessionColor  = categoryColor(migrationCategory)
+            bool strongCategory = migrationCategory == CAT_HIGHER or migrationCategory == CAT_LOWER or migrationCategory == CAT_OUTSIDE
+            int lastSessionBar  = math.max(bar_index - 1, sessionStartBar)
+            if showAreasInput
+                box.new(sessionStartBar, vaHighNew, lastSessionBar, vaLowNew, border_color = color.new(sessionColor, strongCategory ? 45 : 60), border_width = 1, bgcolor = color.new(sessionColor, strongCategory ? 85 : 92))
+            if showPocInput
+                line.new(sessionStartBar, pocNew, lastSessionBar, pocNew, color = color.new(sessionColor, 20), width = 1)
+            if showLabelsInput and migrationCategory != CAT_NONE
+                string labelTooltip = "Value " + categoryPhrase(migrationCategory) + "\nVAH " + formatPrice(vaHighNew) + " · POC " + formatPrice(pocNew) + " · VAL " + formatPrice(vaLowNew) + "\nPOC read: " + pocRead + "\nStreak: " + streakPhrase(migrationStreak) + (extremeWarningEvent ? "\n⚠ New extreme without value acceptance" : "")
+                label.new((sessionStartBar + lastSessionBar) / 2, vaHighNew, categoryText(migrationCategory) + (extremeWarningEvent ? " ⚠" : ""), style = label.style_label_down, color = LABEL_BG, textcolor = sessionColor, size = size.tiny, tooltip = labelTooltip)
+
+        // The completed session becomes the prior references for the next one
+        priorVaHigh      := vaHighNew
+        priorPoc         := pocNew
+        priorVaLow       := vaLowNew
+        priorSessionHigh := sessionHigh
+        priorSessionLow  := sessionLow
+
+    array.clear(sessionHighArray)
+    array.clear(sessionLowArray)
+    array.clear(sessionWeightArray)
+    sessionStartBar := bar_index
+
+// Store the bar into the running session profile
+if timeframeOk and not na(high) and not na(low)
+    array.push(sessionHighArray, high)
+    array.push(sessionLowArray, low)
+    array.push(sessionWeightArray, nz(volume))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Developing Session, Prior References & Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+
+var box  developingBox     = na
+var line developingPocLine = na
+var line priorVaHighLine   = na
+var line priorVaLowLine    = na
+var line priorPocLine      = na
+
+var table dashboardTable = table.new(getTablePosition(dashboardLocationInput), 2, 4, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+if barstate.islast
+    // Redraw the live objects from scratch on the last bar
+    if not na(developingBox)
+        box.delete(developingBox)
+        developingBox := na
+    if not na(developingPocLine)
+        line.delete(developingPocLine)
+        developingPocLine := na
+    if not na(priorVaHighLine)
+        line.delete(priorVaHighLine)
+        priorVaHighLine := na
+    if not na(priorVaLowLine)
+        line.delete(priorVaLowLine)
+        priorVaLowLine := na
+    if not na(priorPocLine)
+        line.delete(priorPocLine)
+        priorPocLine := na
+
+    if not timeframeOk
+        table.cell(dashboardTable, 0, 0, "value migration needs a chart timeframe below the " + anchorInput + " anchor period", text_color = DASH_TEXT, text_size = size.small, bgcolor = color.new(BEAR_COLOR, 80))
+    else
+        // Where the new value area is forming relative to the prior session's references
+        [devVaHigh, devPoc, devVaLow] = sessionValueArea(sessionHighArray, sessionLowArray, sessionWeightArray, rowsInput, vaPercentInput, volumeWeighted)
+        int devCategory  = classifyMigration(devVaHigh, devVaLow, priorVaHigh, priorVaLow, toleranceInput)
+        int devDirection = categoryDirection(devCategory)
+        color devColor   = categoryColor(devCategory)
+
+        if showDevelopingInput and not na(devVaHigh)
+            developingBox     := box.new(sessionStartBar, devVaHigh, bar_index, devVaLow, border_color = color.new(devColor, 40), border_width = 1, border_style = line.style_dotted, bgcolor = color.new(devColor, 88))
+            developingPocLine := line.new(sessionStartBar, devPoc, bar_index, devPoc, color = color.new(devColor, 30), style = line.style_dotted, width = 1)
+
+        if showPriorInput and not na(priorVaHigh)
+            priorVaHighLine := line.new(sessionStartBar, priorVaHigh, bar_index, priorVaHigh, color = color.new(priorColorInput, 20), style = line.style_dotted, width = 1)
+            priorVaLowLine  := line.new(sessionStartBar, priorVaLow, bar_index, priorVaLow, color = color.new(priorColorInput, 20), style = line.style_dotted, width = 1)
+            priorPocLine    := line.new(sessionStartBar, priorPoc, bar_index, priorPoc, color = color.new(priorColorInput, 20), style = line.style_dashed, width = 1)
+
+        if showDashboardInput
+            // Live divergence check: a new extreme while the developing value has not migrated that way
+            float devHigh = array.size(sessionHighArray) > 0 ? array.max(sessionHighArray) : na
+            float devLow  = array.size(sessionLowArray) > 0 ? array.min(sessionLowArray) : na
+            bool devWarnHigh = not na(priorSessionHigh) and not na(devHigh) and devHigh > priorSessionHigh and devDirection <= 0
+            bool devWarnLow  = not na(priorSessionLow) and not na(devLow) and devLow < priorSessionLow and devDirection >= 0
+            bool devWarn     = devCategory != CAT_NONE and (devWarnHigh or devWarnLow)
+
+            string devText = devCategory == CAT_NONE ? "Awaiting prior session" : categoryText(devCategory)
+            string pocText = devCategory == CAT_NONE ? "n/a" : pocReadText(devDirection, devPoc, priorPoc, priorVaHigh, priorVaLow)
+
+            string streakDisplay = streakPhrase(migrationStreak)
+            if math.abs(migrationStreak) >= streakTargetInput
+                streakDisplay += " · trend-grade"
+
+            string sequenceText = "—"
+            int histSize = array.size(historyArray)
+            if histSize > 0
+                sequenceText := ""
+                for i = 0 to histSize - 1
+                    sequenceText += categoryChar(array.get(historyArray, i)) + (i < histSize - 1 ? " " : "")
+
+            string dashTextSize = getTextSize(dashboardSizeInput)
+            color devCellColor    = devCategory == CAT_NONE ? DASH_TEXT : devColor
+            color streakCellColor = migrationStreak > 0 ? higherColorInput : migrationStreak < 0 ? lowerColorInput : DASH_TEXT
+
+            table.cell(dashboardTable, 0, 0, "Developing value", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left)
+            table.cell(dashboardTable, 1, 0, devText + (devWarn ? " ⚠" : ""), text_color = devCellColor, text_size = dashTextSize, text_halign = text.align_right)
+            table.cell(dashboardTable, 0, 1, "POC", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left)
+            table.cell(dashboardTable, 1, 1, pocText, text_color = pocText == "Migrating with value" ? devCellColor : DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+            table.cell(dashboardTable, 0, 2, "Streak", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left)
+            table.cell(dashboardTable, 1, 2, streakDisplay, text_color = streakCellColor, text_size = dashTextSize, text_halign = text.align_right)
+            table.cell(dashboardTable, 0, 3, "Sequence", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left)
+            table.cell(dashboardTable, 1, 3, sequenceText, text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+
+// Data window readout of the prior session references and the streak
+plot(priorVaHigh, "Prior VAH", priorColorInput, display = display.data_window)
+plot(priorPoc, "Prior POC", priorColorInput, display = display.data_window)
+plot(priorVaLow, "Prior VAL", priorColorInput, display = display.data_window)
+plot(migrationStreak, "Migration Streak", NEUTRAL_COLOR, display = display.data_window)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(barCategory == CAT_HIGHER, "Value Higher", "Value migration on {{ticker}} {{interval}}: the completed session built its value area entirely above the prior session's - strong upward migration")
+alertcondition(barCategory == CAT_OVERLAP_HIGHER, "Value Overlapping Higher", "Value migration on {{ticker}} {{interval}}: the completed session's value area overlaps the prior one but is shifted higher - tentative upward migration")
+alertcondition(barCategory == CAT_UNCHANGED, "Value Unchanged", "Value migration on {{ticker}} {{interval}}: the completed session's value area roughly matches the prior one - balance, expect rotation until value migrates")
+alertcondition(barCategory == CAT_OVERLAP_LOWER, "Value Overlapping Lower", "Value migration on {{ticker}} {{interval}}: the completed session's value area overlaps the prior one but is shifted lower - tentative downward migration")
+alertcondition(barCategory == CAT_LOWER, "Value Lower", "Value migration on {{ticker}} {{interval}}: the completed session built its value area entirely below the prior session's - strong downward migration")
+alertcondition(barCategory == CAT_OUTSIDE, "Value Outside", "Value migration on {{ticker}} {{interval}}: the completed session's value area engulfs the prior session's - a wider two-sided auction")
+alertcondition(trendGradeEvent, "Trend-Grade Migration Streak", "Value migration on {{ticker}} {{interval}}: value has migrated in the same direction for the configured number of consecutive sessions - trend-grade acceptance")
+alertcondition(extremeWarningEvent, "Extreme Without Acceptance", "Value migration on {{ticker}} {{interval}}: price stretched beyond the prior session's extreme but value did not migrate that way - excursion without acceptance")
+
+//---------------------------------------------------------------------------------------------------------------------}

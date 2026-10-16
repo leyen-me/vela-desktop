@@ -1,0 +1,192 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Chebyshev Filters", shorttitle = "Chebyshev Filters", overlay = true, format = format.price)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+MAX_ORDER         = 8     // cascade cap: 8 poles = 4 biquad sections
+TYPE_ONE          = "Type I (passband ripple)"
+TYPE_TWO          = "Type II (stopband ripple)"
+BULL_COLOR        = #089981
+BEAR_COLOR        = #f23645
+NEUTRAL_COLOR     = #787b86
+FILL_PRICE_TRANSP = 60    // gradient transparency at the price end of the fill
+FILL_FILT_TRANSP  = 100   // gradient transparency at the filter end of the fill
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+srcInput    = input.source(close, "Source", group = "Settings",
+     tooltip = "Price series the filter smooths. Feeding another indicator's output here covers the preprocessing use — cleaning a series before crossovers or divergence reads are computed on it.")
+
+typeInput   = input.string(TYPE_ONE, "Filter Type", options = [TYPE_ONE, TYPE_TWO], group = "Settings",
+     tooltip = "Where the design's ripple lives. Type I allows a small ripple in the passband — the trend it keeps — in exchange for the steepest roll-off available from an all-pole filter of its order. Type II (the inverse Chebyshev) keeps the passband flat and pushes the ripple into the stopband it rejects, rendering the kept trend more faithfully. At the same cutoff Type II is also smoother and slower, since its cutoff marks where full rejection is reached rather than where the passband ends.")
+
+periodInput = input.int(20, "Cutoff Period", minval = 4, group = "Settings",
+     tooltip = "Trend/noise boundary in bars: price cycles slower than this period are kept, faster ones are attenuated. Type I reads it as the passband edge (ripple is allowed up to it), Type II as the stopband edge (at least the configured attenuation beyond it). Match it to the shortest swing you trade.")
+
+orderInput  = input.int(3, "Order", minval = 2, maxval = MAX_ORDER, group = "Settings",
+     tooltip = "How sharply the trend/noise boundary is enforced. Each added order separates trend from noise more decisively but adds lag and strengthens the overshoot and ringing around fast reversals. Orders 2 to 4 cover most charting uses — start low and raise the order only if noise still leaks through.")
+
+rippleInput = input.float(0.5, "Passband Ripple (dB)", minval = 0.05, maxval = 6, step = 0.05, group = "Settings",
+     tooltip = "Type I only. Ripple allowance in the passband, in decibels — how unevenly the kept trend cycles may be passed. A larger allowance buys a steeper roll-off at the cutoff, at the cost of slightly exaggerating or muting some swing sizes. Small values (0.1 to 1 dB) are typical on charts.")
+
+attenInput  = input.float(40, "Stopband Attenuation (dB)", minval = 10, maxval = 80, step = 1, group = "Settings",
+     tooltip = "Type II only. Minimum rejection, in decibels, applied to cycles faster than the cutoff. Higher values silence noise harder for the given order; the ripple stays confined to the rejected band, so the kept trend is passed undistorted.")
+
+trendColorInput   = input.bool(true, "Slope Trend Coloring", group = "Style",
+     tooltip = "Colors the Chebyshev filter by its slope — bullish while the filter is rising, bearish while it is falling. Disable to draw the line in the neutral color.")
+
+bullColorInput    = input.color(BULL_COLOR, "Bullish", inline = "direction", group = "Style",
+     tooltip = "Bullish color, used while the filter slope is rising and for bullish crossings/fill.")
+
+bearColorInput    = input.color(BEAR_COLOR, "Bearish", inline = "direction", group = "Style",
+     tooltip = "Bearish color, used while the filter slope is falling and for bearish crossings/fill.")
+
+neutralColorInput = input.color(NEUTRAL_COLOR, "Neutral", group = "Style",
+     tooltip = "Line color used when slope trend coloring is disabled, or when the slope is flat.")
+
+showFillInput     = input.bool(true, "Price / Filter Gradient Fill", group = "Style",
+     tooltip = "Fills the area between the source and the filter with a vertical gradient — bullish while price holds above the Chebyshev filter, bearish while below — fading to fully transparent at the filter line.")
+
+showSignalsInput  = input.bool(false, "Price Crossing Markers", group = "Style",
+     tooltip = "Displays small triangle markers when the source crosses over or under the Chebyshev filter. Off by default to keep the chart clean — the crossing alerts work regardless.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Pine has no hyperbolic built-ins — standard exponential/logarithmic identities
+sinh(float x) =>
+    (math.exp(x) - math.exp(-x)) / 2
+
+cosh(float x) =>
+    (math.exp(x) + math.exp(-x)) / 2
+
+asinh(float x) =>
+    math.log(x + math.sqrt(x * x + 1))
+
+// Chebyshev low-pass design — the standard signal-processing recipe, realized as cascaded biquad sections:
+//   ripple factor  Type I : eps = sqrt(10^(Rp/10) - 1)        (Rp = allowed passband ripple, dB)
+//                  Type II: eps = 1 / sqrt(10^(Rs/10) - 1)    (Rs = required stopband attenuation, dB)
+//   mu = asinh(1/eps) / N, prototype poles s_k = -sinh(mu)*sin(theta_k) + i*cosh(mu)*cos(theta_k) with
+//   theta_k = pi*(2k - 1)/(2N) — poles on an ellipse shaped by Chebyshev polynomials. Type II (the inverse
+//   design) takes the reciprocals of the prototype poles and adds stopband zeros at i/cos(theta_k).
+//   Poles/zeros are scaled by the prewarped cutoff Omega = tan(pi/P) and mapped to the z-plane through the
+//   bilinear transform z = (1 + s)/(1 - s). Each conjugate pole pair forms one biquad section; odd orders add
+//   one first-order section. Every section is normalized to unity gain at DC so the cascade sits on price.
+// Returns the [b0, b1, b2, a1, a2] coefficients of one section (identity pass-through for unused stages).
+chebySection(bool isTypeTwo, int order, float rippleDb, float attenDb, int period, int stage) =>
+    pairCount    = order / 2                      // conjugate pole pairs (integer division)
+    hasReal      = order % 2 == 1                 // odd orders carry one real pole
+    sectionCount = pairCount + (hasReal ? 1 : 0)
+    float b0 = 1.0
+    float b1 = 0.0
+    float b2 = 0.0
+    float a1 = 0.0
+    float a2 = 0.0
+    if stage <= sectionCount
+        eps    = isTypeTwo ? 1 / math.sqrt(math.pow(10, attenDb / 10) - 1) : math.sqrt(math.pow(10, rippleDb / 10) - 1)
+        mu     = asinh(1 / eps) / order
+        sh     = sinh(mu)
+        ch     = cosh(mu)
+        omegaC = math.tan(math.pi / period)
+        if hasReal and stage == sectionCount
+            // first-order section from the real prototype pole (-sinh(mu), inverted for Type II)
+            sigma = isTypeTwo ? -omegaC / sh : -omegaC * sh
+            a1 := -(1 + sigma) / (1 - sigma)
+            g = (1 + a1) / 2
+            b0 := g
+            b1 := g
+        else
+            theta = math.pi * (2 * stage - 1) / (2 * order)
+            [sigma, omega] = if isTypeTwo
+                // Type II pole = Omega / s_k — reciprocal of the prototype pole, then scaled
+                s1r = -sh * math.sin(theta)
+                s1i = ch * math.cos(theta)
+                mag = s1r * s1r + s1i * s1i
+                [omegaC * s1r / mag, omegaC * s1i / mag]
+            else
+                // Type I pole = Omega * s_k
+                [-omegaC * sh * math.sin(theta), omegaC * ch * math.cos(theta)]
+            den = (1 - sigma) * (1 - sigma) + omega * omega
+            a1 := -2 * (1 - sigma * sigma - omega * omega) / den
+            a2 := ((1 + sigma) * (1 + sigma) + omega * omega) / den
+            if isTypeTwo
+                // finite stopband zero at i*Omega/cos(theta) lands on the unit circle after the bilinear map
+                beta = omegaC / math.cos(theta)
+                zre  = (1 - beta * beta) / (1 + beta * beta)
+                g    = (1 + a1 + a2) / (2 - 2 * zre)
+                b0 := g
+                b1 := -2 * zre * g
+                b2 := g
+            else
+                // Type I is all-pole: both bilinear zeros sit at z = -1 (Nyquist)
+                g = (1 + a1 + a2) / 4
+                b0 := g
+                b1 := 2 * g
+                b2 := g
+    [b0, b1, b2, a1, a2]
+
+// One recursive biquad stage, na-seeded with its own input — because every section has unity DC gain,
+// seeding the histories with the current input starts the cascade exactly on price with no transient
+chebyStage(float x, float b0, float b1, float b2, float a1, float a2) =>
+    float y = na
+    y := b0 * x + b1 * nz(x[1], x) + b2 * nz(x[2], x) - a1 * nz(y[1], x) - a2 * nz(y[2], x)
+    y
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+isTypeTwo = typeInput == TYPE_TWO
+
+[b0s1, b1s1, b2s1, a1s1, a2s1] = chebySection(isTypeTwo, orderInput, rippleInput, attenInput, periodInput, 1)
+[b0s2, b1s2, b2s2, a1s2, a2s2] = chebySection(isTypeTwo, orderInput, rippleInput, attenInput, periodInput, 2)
+[b0s3, b1s3, b2s3, a1s3, a2s3] = chebySection(isTypeTwo, orderInput, rippleInput, attenInput, periodInput, 3)
+[b0s4, b1s4, b2s4, a1s4, a2s4] = chebySection(isTypeTwo, orderInput, rippleInput, attenInput, periodInput, 4)
+
+// All four stages run on every bar so their recursive histories stay consistent;
+// stages beyond the selected order hold identity coefficients and pass the signal through unchanged
+stage1 = chebyStage(srcInput, b0s1, b1s1, b2s1, a1s1, a2s1)
+stage2 = chebyStage(stage1, b0s2, b1s2, b2s2, a1s2, a2s2)
+stage3 = chebyStage(stage2, b0s3, b1s3, b2s3, a1s3, a2s3)
+cheby  = chebyStage(stage3, b0s4, b1s4, b2s4, a1s4, a2s4)
+
+// Slope of the filter — the trend-baseline read of the smoother
+slope = cheby - nz(cheby[1], cheby)
+
+// Slope reversals of the filter
+slopeTurnUp   = slope > 0 and nz(slope[1]) <= 0
+slopeTurnDown = slope < 0 and nz(slope[1]) >= 0
+
+// Price crossings — read exactly like a moving average baseline
+crossUp   = ta.crossover(srcInput, cheby)
+crossDown = ta.crossunder(srcInput, cheby)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+chebyColor = trendColorInput ? (slope > 0 ? bullColorInput : slope < 0 ? bearColorInput : neutralColorInput) : neutralColorInput
+
+priceAbove      = srcInput > cheby
+fillTopColor    = showFillInput ? (priceAbove ? color.new(bullColorInput, FILL_PRICE_TRANSP) : color.new(bearColorInput, FILL_FILT_TRANSP)) : na
+fillBottomColor = showFillInput ? (priceAbove ? color.new(bullColorInput, FILL_FILT_TRANSP) : color.new(bearColorInput, FILL_PRICE_TRANSP)) : na
+
+srcPlotId   = plot(srcInput, "Source", color = na, editable = false, display = display.none)
+chebyPlotId = plot(cheby, "Chebyshev Filter", color = chebyColor, linewidth = 2)
+
+fill(srcPlotId, chebyPlotId, top_value = math.max(srcInput, cheby), bottom_value = math.min(srcInput, cheby), top_color = fillTopColor, bottom_color = fillBottomColor, title = "Price / Filter Gradient Fill")
+
+plotshape(showSignalsInput and crossUp, "Bullish Cross", shape.triangleup, location.belowbar, color = bullColorInput, size = size.tiny)
+plotshape(showSignalsInput and crossDown, "Bearish Cross", shape.triangledown, location.abovebar, color = bearColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(crossUp, "Bullish Price Cross", "Price crossed above the Chebyshev filter on {{ticker}} ({{interval}})")
+alertcondition(crossDown, "Bearish Price Cross", "Price crossed below the Chebyshev filter on {{ticker}} ({{interval}})")
+alertcondition(slopeTurnUp, "Chebyshev Filter Slope Up", "Chebyshev filter slope turned upward on {{ticker}} ({{interval}})")
+alertcondition(slopeTurnDown, "Chebyshev Filter Slope Down", "Chebyshev filter slope turned downward on {{ticker}} ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

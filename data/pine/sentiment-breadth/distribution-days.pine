@@ -1,0 +1,232 @@
+// This work is licensed under Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Distribution Day Count", shorttitle = "Distribution Day Count", overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+color DIST_COLOR    = #f23645
+color STALL_COLOR   = #ff9800
+color CALM_COLOR    = #089981
+color NEUTRAL_COLOR = #787b86
+color HIDDEN_COLOR  = #00000000
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+int EXPIRED_TRANSP = 55
+int ZONE_TRANSP    = 90
+int CELL_TRANSP    = 80
+
+string GRP_RULES  = 'Distribution Rules'
+string GRP_STALL  = 'Stalling Days'
+string GRP_STATUS = 'Market Status'
+string GRP_DASH   = 'Dashboard'
+string GRP_STYLE  = 'Style'
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+declineInput = input.float(0.2, 'Minimum Decline %', minval = 0.01, maxval = 5, step = 0.05, group = GRP_RULES, tooltip = 'A distribution day closes down at least this much from the prior close. IBD\'s threshold is 0.2% and it is not rounded: a 0.19% loss does not qualify. Apply the tool to a major index or an index ETF on daily bars, the way the rule is defined.')
+
+windowInput = input.int(25, 'Count Window (sessions)', minval = 5, maxval = 100, group = GRP_RULES, tooltip = 'A distribution day stays in the count for this many sessions, its own session included (IBD: 25).')
+
+rallyInput = input.float(5.0, 'Rally Removal %', minval = 0, maxval = 20, step = 0.5, group = GRP_RULES, tooltip = 'A distribution day drops out of the count early once the index rallies this far above its close on that day: a market able to climb that far has absorbed the selling (IBD: 5%). Set to 0 to disable early removal.')
+
+rallyBasisInput = input.string('Close', 'Rally Measured On', options = ['Close', 'High'], group = GRP_RULES, tooltip = 'Test the rally removal against later closes (the usual statement of the rule) or against intraday highs, which some counters use and which removes distribution days sooner.')
+
+stallInput = input.bool(false, 'Count Stalling Days', group = GRP_STALL, tooltip = 'O\'Neil also counted stalling days: heavy volume with little or no upward progress after an advance, the index-level version of churn. Because "slightly higher" is a judgment call, IBD applies them less consistently than the 0.2% rule, so they are off by default. When on they are marked S and added to the count.')
+
+stallMaxInput = input.float(0.3, 'Stalling: Maximum Gain %', minval = 0, maxval = 2, step = 0.05, group = GRP_STALL, tooltip = 'A stalling day closes between the distribution threshold and this small gain, on higher volume than the prior session.')
+
+stallNearInput = input.float(3.0, 'Stalling: Within % of High', minval = 0.5, maxval = 20, step = 0.5, group = GRP_STALL, tooltip = 'Stalling only counts after an advance: the close must sit within this distance of the highest close of the count window, and in the lower half of the day\'s range.')
+
+pressureInput = input.int(5, 'Under Pressure At', minval = 2, maxval = 20, group = GRP_STATUS, tooltip = 'Active distribution days at which the uptrend is read as under pressure. O\'Neil described four or five within roughly four or five weeks as usually enough to turn an advancing market down; counts at that level have also come and gone without a correction, so this is a risk dial, not a sell signal. Two below this level the count reads as building.')
+
+showDashInput = input.bool(true, 'Show Dashboard', group = GRP_DASH)
+dashPosInput  = input.string('Top Right', 'Position', options = ['Top Right', 'Top Left', 'Bottom Right', 'Bottom Left'], inline = 'dash', group = GRP_DASH)
+dashSizeInput = input.string('Small', 'Size', options = ['Tiny', 'Small', 'Normal'], inline = 'dash', group = GRP_DASH)
+
+showExpiredInput = input.bool(true, 'Keep Expired Markers', group = GRP_STYLE, tooltip = 'Expired distribution days stay on the chart, dimmed, with the reason they left the count in their tooltip. Off deletes them.')
+showZoneInput    = input.bool(true, 'Shade Pressure Clusters', group = GRP_STYLE, tooltip = 'Box the cluster of distribution days that pushed the count to the pressure level, from the oldest active day until the count drops back below it.')
+distColorInput   = input.color(DIST_COLOR, 'Distribution', inline = 'c', group = GRP_STYLE)
+stallColorInput  = input.color(STALL_COLOR, 'Stalling', inline = 'c', group = GRP_STYLE)
+calmColorInput   = input.color(CALM_COLOR, 'Light Count', inline = 'c', group = GRP_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types
+//---------------------------------------------------------------------------------------------------------------------{
+
+type DistDay
+    int    bar
+    float  close
+    bool   stall
+    label  mark
+    string tip
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+
+var array<DistDay> active = array.new<DistDay>()
+var bool volumeSeen = false
+if nz(volume) > 0
+    volumeSeen := true
+
+float chgPct    = close[1] > 0 ? (close / close[1] - 1) * 100 : na
+bool  volUp     = nz(volume) > nz(volume[1]) and nz(volume[1]) > 0
+float volRatio  = nz(volume[1]) > 0 ? nz(volume) / volume[1] : na
+float windowMax = ta.highest(close, windowInput)
+bool  lowerHalf = high > low and (close - low) / (high - low) < 0.5
+
+bool isDist  = barstate.isconfirmed and not na(chgPct) and chgPct <= -declineInput and volUp
+bool isStall = barstate.isconfirmed and stallInput and not isDist and not na(chgPct) and chgPct > -declineInput and chgPct <= stallMaxInput and volUp and lowerHalf and close >= windowMax * (1 - stallNearInput / 100)
+
+int  newCount    = 0
+bool distEvent   = false
+bool stallEvent  = false
+int  removedNow  = 0
+
+if barstate.isconfirmed
+    // expire first: the window and the rally rule
+    float rallyRef = rallyBasisInput == 'High' ? high : close
+    int i = array.size(active) - 1
+    while i >= 0
+        DistDay d = array.get(active, i)
+        bool aged    = bar_index - d.bar >= windowInput
+        bool rallied = rallyInput > 0 and bar_index > d.bar and rallyRef >= d.close * (1 + rallyInput / 100)
+        if aged or rallied
+            if showExpiredInput
+                label.set_textcolor(d.mark, color.new(d.stall ? stallColorInput : distColorInput, EXPIRED_TRANSP))
+                label.set_tooltip(d.mark, d.tip + (aged ? '\nLeft the count after ' + str.tostring(windowInput) + ' sessions' : '\nRemoved: the index ' + (rallyBasisInput == 'High' ? 'traded ' : 'closed ') + str.tostring(rallyInput, '#.#') + '% above this close'))
+            else
+                label.delete(d.mark)
+            array.remove(active, i)
+            removedNow += 1
+        i -= 1
+
+    if isDist or isStall
+        string kind = isDist ? 'Distribution day' : 'Stalling day'
+        string tip  = kind + ': ' + (chgPct >= 0 ? '+' : '') + str.tostring(chgPct, '#.##') + '% on volume ' + str.tostring(volRatio, '#.##') + 'x the prior session'
+        int    n    = array.size(active) + 1
+        label  m    = label.new(bar_index, high, (isDist ? 'D' : 'S') + str.tostring(n), style = label.style_label_down, color = HIDDEN_COLOR, textcolor = isDist ? distColorInput : stallColorInput, size = size.small, tooltip = tip + '\nCount after this session: ' + str.tostring(n))
+        array.push(active, DistDay.new(bar_index, close, isStall, m, tip))
+        distEvent  := isDist
+        stallEvent := isStall
+
+int count = array.size(active)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Status & Pressure Clusters
+//---------------------------------------------------------------------------------------------------------------------{
+
+int buildAt = math.max(1, pressureInput - 2)
+
+statusText(int n) =>
+    n >= pressureInput ? 'Uptrend under pressure' : n >= buildAt ? 'Distribution building' : 'Light distribution'
+
+statusColor(int n) =>
+    n >= pressureInput ? distColorInput : n >= buildAt ? stallColorInput : calmColorInput
+
+var box   zone      = na
+var label zoneLabel = na
+var int   zoneStart = na
+var float zoneTop   = na
+var float zoneBot   = na
+var int   peakCount = 0
+
+bool pressureOn  = barstate.isconfirmed and count >= pressureInput and nz(count[1]) < pressureInput
+bool pressureOff = barstate.isconfirmed and count < pressureInput and nz(count[1]) >= pressureInput
+
+if pressureOn
+    DistDay oldest = array.get(active, 0)
+    zoneStart := oldest.bar
+    zoneTop   := high
+    zoneBot   := low
+    for k = 1 to bar_index - zoneStart
+        zoneTop := math.max(zoneTop, high[k])
+        zoneBot := math.min(zoneBot, low[k])
+    peakCount := count
+    if showZoneInput
+        zone := box.new(zoneStart, zoneTop, bar_index, zoneBot, border_color = color.new(distColorInput, 60), bgcolor = color.new(distColorInput, ZONE_TRANSP), text = str.tostring(count) + ' distribution days in ' + str.tostring(bar_index - zoneStart + 1) + ' sessions', text_size = size.small, text_color = distColorInput, text_halign = text.align_left, text_valign = text.align_bottom)
+    label.new(bar_index, zoneTop, 'Under pressure', style = label.style_label_down, color = distColorInput, textcolor = color.white, size = size.small, tooltip = str.tostring(count) + ' active distribution days within the last ' + str.tostring(windowInput) + ' sessions')
+else if count >= pressureInput and not na(zone)
+    zoneTop   := math.max(zoneTop, high)
+    zoneBot   := math.min(zoneBot, low)
+    peakCount := math.max(peakCount, count)
+    box.set_right(zone, bar_index)
+    box.set_top(zone, zoneTop)
+    box.set_bottom(zone, zoneBot)
+    box.set_text(zone, 'Count peaked at ' + str.tostring(peakCount) + ' distribution days')
+
+if pressureOff
+    zone := na
+    label.new(bar_index, high, 'Pressure eases', style = label.style_label_down, color = HIDDEN_COLOR, textcolor = calmColorInput, size = size.small, tooltip = 'The count fell back to ' + str.tostring(count) + ', below the pressure level of ' + str.tostring(pressureInput) + (removedNow > 0 ? ' as older distribution days expired or were removed by the rally' : ''))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+
+plot(count, 'Active Distribution Days', color = na, display = display.data_window)
+
+var table dash = na
+
+if showDashInput and barstate.islast
+    string pos = switch dashPosInput
+        'Top Right'   => position.top_right
+        'Top Left'    => position.top_left
+        'Bottom Right' => position.bottom_right
+        => position.bottom_left
+
+    string sz = switch dashSizeInput
+        'Tiny'   => size.tiny
+        'Normal' => size.normal
+        => size.small
+
+    if na(dash)
+        dash := table.new(pos, 2, 6, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+        table.merge_cells(dash, 0, 0, 1, 0)
+
+    int   stalls   = 0
+    int   nextOut  = na
+    float rallyLvl = na
+    int   lastBar  = na
+    for j = 0 to math.max(0, array.size(active) - 1)
+        if array.size(active) == 0
+            break
+        DistDay d = array.get(active, j)
+        stalls   += d.stall ? 1 : 0
+        int left  = windowInput - (bar_index - d.bar)
+        nextOut  := na(nextOut) ? left : math.min(nextOut, left)
+        rallyLvl := na(rallyLvl) ? d.close : math.min(rallyLvl, d.close)
+        lastBar  := na(lastBar) ? d.bar : math.max(lastBar, d.bar)
+
+    color sc = statusColor(count)
+    table.cell(dash, 0, 0, 'Distribution Day Count', text_color = DASH_TEXT, text_size = sz)
+    table.cell(dash, 0, 1, 'Status', text_color = DASH_HEADER, text_size = sz, text_halign = text.align_left)
+    table.cell(dash, 1, 1, volumeSeen ? statusText(count) : 'No volume data', text_color = volumeSeen ? sc : DASH_HEADER, bgcolor = volumeSeen ? color.new(sc, CELL_TRANSP) : DASH_BG, text_size = sz)
+    table.cell(dash, 0, 2, 'Active count', text_color = DASH_HEADER, text_size = sz, text_halign = text.align_left)
+    table.cell(dash, 1, 2, str.tostring(count) + ' in ' + str.tostring(windowInput) + ' sessions' + (stallInput ? ' (' + str.tostring(stalls) + ' stalling)' : ''), text_color = DASH_TEXT, text_size = sz)
+    table.cell(dash, 0, 3, 'Next to expire', text_color = DASH_HEADER, text_size = sz, text_halign = text.align_left)
+    table.cell(dash, 1, 3, na(nextOut) ? '-' : 'in ' + str.tostring(nextOut) + (nextOut == 1 ? ' session' : ' sessions'), text_color = DASH_TEXT, text_size = sz)
+    table.cell(dash, 0, 4, 'Rally removal at', text_color = DASH_HEADER, text_size = sz, text_halign = text.align_left)
+    table.cell(dash, 1, 4, na(rallyLvl) or rallyInput == 0 ? '-' : str.tostring(rallyLvl * (1 + rallyInput / 100), format.mintick), text_color = DASH_TEXT, text_size = sz)
+    table.cell(dash, 0, 5, 'Last distribution', text_color = DASH_HEADER, text_size = sz, text_halign = text.align_left)
+    table.cell(dash, 1, 5, na(lastBar) ? '-' : bar_index == lastBar ? 'this session' : bar_index - lastBar == 1 ? '1 session ago' : str.tostring(bar_index - lastBar) + ' sessions ago', text_color = DASH_TEXT, text_size = sz)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(distEvent, 'Distribution Day', 'Distribution day count: {{ticker}} closed down at least the threshold on higher volume than the prior session.')
+alertcondition(stallEvent, 'Stalling Day', 'Distribution day count: {{ticker}} stalled near its highs on higher volume.')
+alertcondition(pressureOn, 'Uptrend Under Pressure', 'Distribution day count: {{ticker}} reached the pressure level of active distribution days.')
+alertcondition(pressureOff, 'Pressure Eases', 'Distribution day count: {{ticker}} count dropped back below the pressure level.')
+
+//---------------------------------------------------------------------------------------------------------------------}

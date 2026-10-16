@@ -1,0 +1,321 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Ascending Base", "Ascending Base", overlay = true, max_lines_count = 500, max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+int MAX_SWINGS = 20
+
+color BULL_COLOR        = #089981
+color BEAR_COLOR        = #f23645
+color TRANSPARENT_COLOR = #00000000
+
+string DETECTION_GROUP    = 'Detection'
+string CONFIRMATION_GROUP = 'Confirmation'
+string MARKET_GROUP       = 'Market Backdrop'
+string RISK_GROUP         = 'Risk'
+string STYLE_GROUP        = 'Style'
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+swingLengthInput = input.int(5, 'Swing Detection Length', minval = 2, maxval = 50, group = DETECTION_GROUP, tooltip = 'Bars required on each side of a pivot before a swing high or swing low is confirmed. Larger values return wider, cleaner swings but confirm them later.')
+
+minDepthInput = input.float(10.0, 'Pullback Depth (%)', minval = 0.1, step = 0.5, inline = 'depth', group = DETECTION_GROUP, tooltip = 'Minimum retracement each of the three pullbacks must make from its local swing high; shallower dips do not count as pullbacks.')
+maxDepthInput = input.float(20.0, '', minval = 0.1, step = 0.5, inline = 'depth', group = DETECTION_GROUP, tooltip = 'Depth band each of the three pullbacks must respect, measured down from its local swing high. The specification looks for moderate pullbacks of roughly 10 to 20 percent; much deeper corrections point to a different pattern.')
+
+minDurationInput = input.int(40, 'Base Duration (bars)', minval = 5, inline = 'duration', group = DETECTION_GROUP, tooltip = 'Minimum number of bars between the first swing high and the third pullback low; faster structures are too compressed to qualify.')
+maxDurationInput = input.int(85, '', minval = 5, inline = 'duration', group = DETECTION_GROUP, tooltip = 'Allowed number of bars between the first swing high and the third pullback low. The complete structure commonly takes on the order of 9 to 16 weeks (about 45-80 daily bars); adjust these bounds on other timeframes.')
+
+trendFilterInput = input.bool(true, 'Prior Uptrend Filter', inline = 'trend', group = DETECTION_GROUP, tooltip = 'Require the base to start within an established uptrend, as the pattern appears mid-advance in leading stocks.')
+trendLengthInput = input.int(50, '', minval = 2, inline = 'trend', group = DETECTION_GROUP, tooltip = 'Only validate bases whose first swing high forms above a simple moving average of this length, keeping detections within an established uptrend.')
+
+volConfirmInput  = input.bool(true, 'Breakout Volume Confirmation', group = CONFIRMATION_GROUP, tooltip = 'Require the breakout close above the buy level to occur on volume meaningfully above average. Disable on symbols without volume data.')
+volLengthInput   = input.int(50, 'Volume Average Length', minval = 1, group = CONFIRMATION_GROUP, tooltip = 'Length of the simple moving average of volume used as the reference for breakout volume expansion and pullback volume contraction.')
+volMultInput     = input.float(1.4, 'Breakout Volume Multiplier', minval = 1.0, step = 0.1, group = CONFIRMATION_GROUP, tooltip = 'The breakout bar volume must exceed the volume average multiplied by this factor, consistent with the guideline of volume at least 40 percent above average on a valid breakout.')
+contractionInput = input.bool(false, 'Pullback Volume Contraction', group = CONFIRMATION_GROUP, tooltip = 'Additionally require each pullback leg to average below the reference volume average. Wide, loose structures with no volume contraction are noise, not an ascending base.')
+
+marketFilterInput = input.bool(false, 'Weak Market Filter', inline = 'market', group = MARKET_GROUP, tooltip = 'Check the market backdrop: the pattern is most convincing when the pullbacks coincide with general market weakness the stock keeps shrugging off.')
+benchSymbolInput  = input.symbol('SP:SPX', '', inline = 'market', group = MARKET_GROUP, tooltip = 'Only validate bases formed against a weak general market: the benchmark must stand lower at the third pullback low than at the base start, evidencing the resilience the stock keeps shrugging off.')
+
+stopEnableInput  = input.bool(true, 'Fixed Stop After Breakout', inline = 'risk', group = RISK_GROUP, tooltip = 'Track a fixed percentage stop below the buy point once the breakout confirms, defining the exit in advance.')
+stopPercentInput = input.float(7.0, '', minval = 0.5, step = 0.5, inline = 'risk', group = RISK_GROUP, tooltip = 'After a confirmed breakout, place a fixed percentage stop this far below the buy level, per the practice of capping losses a set percentage under the buy point.')
+
+bullColorInput   = input.color(BULL_COLOR, 'Pattern', inline = 'colors', group = STYLE_GROUP)
+bearColorInput   = input.color(BEAR_COLOR, 'Invalidation', inline = 'colors', group = STYLE_GROUP)
+showOutlineInput = input.bool(true, 'Show Pattern Structure', group = STYLE_GROUP)
+showDepthInput   = input.bool(true, 'Show Pullback Depths', group = STYLE_GROUP)
+showLevelsInput  = input.bool(true, 'Show Buy & Invalidation Levels', group = STYLE_GROUP)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Variables
+//---------------------------------------------------------------------------------------------------------------------{
+
+var array<bool>  swingIsHighArray = array.new_bool()
+var array<float> swingPriceArray  = array.new_float()
+var array<int>   swingBarArray    = array.new_int()
+var array<float> swingCumVolArray = array.new_float()
+var array<float> swingVolAvgArray = array.new_float()
+var array<float> swingBenchArray  = array.new_float()
+var array<bool>  swingTrendArray  = array.new_bool()
+
+var array<line>  patternLineArray  = array.new_line()
+var array<label> patternLabelArray = array.new_label()
+
+var bool  patternActive = false
+var float buyLevel      = na
+var float stopLevel     = na
+var int   patternH3Bar  = na
+var int   resolvedH3Bar = na
+
+var bool  riskActive = false
+var float riskLevel  = na
+
+var line  buyLineId   = na
+var line  stopLineId  = na
+var line  riskLineId  = na
+var label buyLabelId  = na
+var label stopLabelId = na
+var label riskLabelId = na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Appends a confirmed swing to the alternating swing series, or extends the last swing when two same-direction
+// pivots occur in a row (the more extreme one is kept). Returns true when the stored swings changed.
+addSwing(bool isHigh, float price, int barIdx, float cumVol, float volAvg, float benchValue, bool trendFlag) =>
+    int  swingCount = array.size(swingPriceArray)
+    bool changed    = false
+
+    if swingCount > 0 and array.get(swingIsHighArray, swingCount - 1) == isHigh
+        float lastPrice = array.get(swingPriceArray, swingCount - 1)
+
+        if (isHigh and price >= lastPrice) or (not isHigh and price <= lastPrice)
+            array.set(swingPriceArray, swingCount - 1, price)
+            array.set(swingBarArray, swingCount - 1, barIdx)
+            array.set(swingCumVolArray, swingCount - 1, cumVol)
+            array.set(swingVolAvgArray, swingCount - 1, volAvg)
+            array.set(swingBenchArray, swingCount - 1, benchValue)
+            array.set(swingTrendArray, swingCount - 1, trendFlag)
+            changed := true
+    else
+        array.push(swingIsHighArray, isHigh)
+        array.push(swingPriceArray, price)
+        array.push(swingBarArray, barIdx)
+        array.push(swingCumVolArray, cumVol)
+        array.push(swingVolAvgArray, volAvg)
+        array.push(swingBenchArray, benchValue)
+        array.push(swingTrendArray, trendFlag)
+        changed := true
+
+        if array.size(swingPriceArray) > MAX_SWINGS
+            array.shift(swingIsHighArray)
+            array.shift(swingPriceArray)
+            array.shift(swingBarArray)
+            array.shift(swingCumVolArray)
+            array.shift(swingVolAvgArray)
+            array.shift(swingBenchArray)
+            array.shift(swingTrendArray)
+
+    changed
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Swing Detection
+//---------------------------------------------------------------------------------------------------------------------{
+
+float trendSma = ta.sma(close, trendLengthInput)
+float volSma   = ta.sma(nz(volume), volLengthInput)
+
+float pivotHighPrice = ta.pivothigh(high, swingLengthInput, swingLengthInput)
+float pivotLowPrice  = ta.pivotlow(low, swingLengthInput, swingLengthInput)
+
+var float cumVolume = 0.0
+cumVolume += nz(volume)
+
+float benchClose = request.security(benchSymbolInput, timeframe.period, close)
+
+var float benchHeld = na
+benchHeld := na(benchClose) ? benchHeld : benchClose
+
+int   pivotBar    = bar_index - swingLengthInput
+float pivotCumVol = cumVolume[swingLengthInput]
+float pivotVolAvg = volSma[swingLengthInput]
+float pivotBench  = benchHeld[swingLengthInput]
+bool  pivotTrend  = close[swingLengthInput] > trendSma[swingLengthInput]
+
+bool lowSwingEvent = false
+
+if not na(pivotHighPrice)
+    bool highChanged = addSwing(true, pivotHighPrice, pivotBar, pivotCumVol, pivotVolAvg, pivotBench, pivotTrend)
+
+if not na(pivotLowPrice)
+    lowSwingEvent := addSwing(false, pivotLowPrice, pivotBar, pivotCumVol, pivotVolAvg, pivotBench, pivotTrend)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Pattern Detection
+//---------------------------------------------------------------------------------------------------------------------{
+
+bool detectedEvent    = false
+bool breakoutEvent    = false
+bool invalidatedEvent = false
+bool stopHitEvent     = false
+
+if lowSwingEvent and array.size(swingPriceArray) >= 6
+    int n = array.size(swingPriceArray)
+
+    // The window must alternate high, low, high, low, high, low (guaranteed by construction, checked for safety)
+    bool typesOk = array.get(swingIsHighArray, n - 6) and not array.get(swingIsHighArray, n - 5) and array.get(swingIsHighArray, n - 4) and not array.get(swingIsHighArray, n - 3) and array.get(swingIsHighArray, n - 2) and not array.get(swingIsHighArray, n - 1)
+
+    if typesOk
+        float h1 = array.get(swingPriceArray, n - 6)
+        float l1 = array.get(swingPriceArray, n - 5)
+        float h2 = array.get(swingPriceArray, n - 4)
+        float l2 = array.get(swingPriceArray, n - 3)
+        float h3 = array.get(swingPriceArray, n - 2)
+        float l3 = array.get(swingPriceArray, n - 1)
+
+        int h1Bar = array.get(swingBarArray, n - 6)
+        int l1Bar = array.get(swingBarArray, n - 5)
+        int h2Bar = array.get(swingBarArray, n - 4)
+        int l2Bar = array.get(swingBarArray, n - 3)
+        int h3Bar = array.get(swingBarArray, n - 2)
+        int l3Bar = array.get(swingBarArray, n - 1)
+
+        float depth1 = h1 > 0 ? 100 * (h1 - l1) / h1 : na
+        float depth2 = h2 > 0 ? 100 * (h2 - l2) / h2 : na
+        float depth3 = h3 > 0 ? 100 * (h3 - l3) / h3 : na
+
+        // Staircase: each pullback low above the prior low, each recovery high above the prior high
+        bool staircaseOk = h2 > h1 and h3 > h2 and l2 > l1 and l3 > l2
+
+        // Each of the three pullbacks retraces a moderate amount from its local high
+        bool depthsOk = depth1 >= minDepthInput and depth1 <= maxDepthInput and depth2 >= minDepthInput and depth2 <= maxDepthInput and depth3 >= minDepthInput and depth3 <= maxDepthInput
+
+        bool durationOk = l3Bar - h1Bar >= minDurationInput and l3Bar - h1Bar <= maxDurationInput
+
+        bool trendOk = not trendFilterInput or array.get(swingTrendArray, n - 6)
+
+        // Optional: pullback legs must trade below-average volume (volume contraction)
+        bool contractionOk = true
+        if contractionInput
+            float leg1Volume = (array.get(swingCumVolArray, n - 5) - array.get(swingCumVolArray, n - 6)) / math.max(1, l1Bar - h1Bar)
+            float leg2Volume = (array.get(swingCumVolArray, n - 3) - array.get(swingCumVolArray, n - 4)) / math.max(1, l2Bar - h2Bar)
+            float leg3Volume = (array.get(swingCumVolArray, n - 1) - array.get(swingCumVolArray, n - 2)) / math.max(1, l3Bar - h3Bar)
+            float refAvg1 = array.get(swingVolAvgArray, n - 5)
+            float refAvg2 = array.get(swingVolAvgArray, n - 3)
+            float refAvg3 = array.get(swingVolAvgArray, n - 1)
+            contractionOk := not na(refAvg1) and not na(refAvg2) and not na(refAvg3) and leg1Volume < refAvg1 and leg2Volume < refAvg2 and leg3Volume < refAvg3
+
+        // Optional: the general market must be lower at the third pullback low than at the base start
+        bool marketOk = true
+        if marketFilterInput
+            float benchStart = array.get(swingBenchArray, n - 6)
+            float benchEnd   = array.get(swingBenchArray, n - 1)
+            marketOk := not na(benchStart) and not na(benchEnd) and benchEnd < benchStart
+
+        // Do not resurrect a pattern that already broke out or failed on the same third high
+        bool freshOk = na(resolvedH3Bar) or h3Bar != resolvedH3Bar
+
+        if staircaseOk and depthsOk and durationOk and trendOk and contractionOk and marketOk and freshOk and close >= l3
+            // A newer valid structure replaces an unresolved active one
+            if patternActive
+                while array.size(patternLineArray) > 0
+                    line.delete(array.pop(patternLineArray))
+                while array.size(patternLabelArray) > 0
+                    label.delete(array.pop(patternLabelArray))
+
+            detectedEvent := not patternActive or patternH3Bar != h3Bar
+            patternActive := true
+            buyLevel      := h3
+            stopLevel     := l3
+            patternH3Bar  := h3Bar
+
+            buyLineId   := na
+            stopLineId  := na
+            buyLabelId  := na
+            stopLabelId := na
+
+            if showOutlineInput
+                array.push(patternLineArray, line.new(h1Bar, h1, l1Bar, l1, color = bullColorInput))
+                array.push(patternLineArray, line.new(l1Bar, l1, h2Bar, h2, color = bullColorInput))
+                array.push(patternLineArray, line.new(h2Bar, h2, l2Bar, l2, color = bullColorInput))
+                array.push(patternLineArray, line.new(l2Bar, l2, h3Bar, h3, color = bullColorInput))
+                array.push(patternLineArray, line.new(h3Bar, h3, l3Bar, l3, color = bullColorInput))
+                array.push(patternLabelArray, label.new(h3Bar, h3, 'Ascending Base', style = label.style_label_down, color = TRANSPARENT_COLOR, textcolor = bullColorInput, size = size.small))
+
+            if showDepthInput
+                array.push(patternLabelArray, label.new(l1Bar, l1, '#1 -' + str.tostring(depth1, '#.#') + '%', style = label.style_label_up, color = TRANSPARENT_COLOR, textcolor = chart.fg_color, size = size.tiny))
+                array.push(patternLabelArray, label.new(l2Bar, l2, '#2 -' + str.tostring(depth2, '#.#') + '%', style = label.style_label_up, color = TRANSPARENT_COLOR, textcolor = chart.fg_color, size = size.tiny))
+                array.push(patternLabelArray, label.new(l3Bar, l3, '#3 -' + str.tostring(depth3, '#.#') + '%', style = label.style_label_up, color = TRANSPARENT_COLOR, textcolor = chart.fg_color, size = size.tiny))
+
+            if showLevelsInput
+                buyLineId   := line.new(h3Bar, h3, bar_index, h3, color = bullColorInput, style = line.style_dashed)
+                stopLineId  := line.new(l3Bar, l3, bar_index, l3, color = bearColorInput, style = line.style_dotted)
+                buyLabelId  := label.new(bar_index, h3, 'Buy ' + str.tostring(h3, format.mintick), style = label.style_label_left, color = TRANSPARENT_COLOR, textcolor = bullColorInput, size = size.small)
+                stopLabelId := label.new(bar_index, l3, 'Invalidation ' + str.tostring(l3, format.mintick), style = label.style_label_left, color = TRANSPARENT_COLOR, textcolor = bearColorInput, size = size.small)
+                array.push(patternLineArray, buyLineId)
+                array.push(patternLineArray, stopLineId)
+                array.push(patternLabelArray, buyLabelId)
+                array.push(patternLabelArray, stopLabelId)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Pattern Management
+//---------------------------------------------------------------------------------------------------------------------{
+
+if patternActive
+    if not na(buyLineId)
+        line.set_x2(buyLineId, bar_index)
+        label.set_x(buyLabelId, bar_index)
+
+    if not na(stopLineId)
+        line.set_x2(stopLineId, bar_index)
+        label.set_x(stopLabelId, bar_index)
+
+    bool volumeOk = not volConfirmInput or nz(volume) > volMultInput * volSma
+
+    if close > buyLevel and volumeOk
+        breakoutEvent := true
+    else if close < stopLevel
+        invalidatedEvent := true
+
+    if breakoutEvent or invalidatedEvent
+        patternActive := false
+        resolvedH3Bar := patternH3Bar
+
+        // Release references so the resolved pattern's drawings persist as history
+        array.clear(patternLineArray)
+        array.clear(patternLabelArray)
+
+        label.new(bar_index, breakoutEvent ? low : high, breakoutEvent ? 'Breakout' : 'Invalidated', style = breakoutEvent ? label.style_label_up : label.style_label_down, color = breakoutEvent ? bullColorInput : bearColorInput, textcolor = chart.bg_color, size = size.small)
+
+    if breakoutEvent and stopEnableInput
+        riskActive  := true
+        riskLevel   := buyLevel * (1 - stopPercentInput / 100)
+        riskLineId  := line.new(bar_index, riskLevel, bar_index, riskLevel, color = bearColorInput, style = line.style_dotted)
+        riskLabelId := label.new(bar_index, riskLevel, 'Stop ' + str.tostring(riskLevel, format.mintick), style = label.style_label_left, color = TRANSPARENT_COLOR, textcolor = bearColorInput, size = size.small)
+
+if riskActive
+    line.set_x2(riskLineId, bar_index)
+    label.set_x(riskLabelId, bar_index)
+
+    if close < riskLevel
+        stopHitEvent := true
+        riskActive   := false
+        label.new(bar_index, high, 'Stop Hit', style = label.style_label_down, color = bearColorInput, textcolor = chart.bg_color, size = size.small)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(detectedEvent, 'Ascending Base Detected', 'Ascending base completed: three pullbacks of moderate depth with higher highs and higher lows. Buy level set at the third-pullback high.')
+alertcondition(breakoutEvent, 'Ascending Base Breakout', 'Price closed above the ascending base buy level on qualifying volume.')
+alertcondition(invalidatedEvent, 'Ascending Base Invalidated', 'Price closed below the third-pullback low, invalidating the ascending base.')
+alertcondition(stopHitEvent, 'Ascending Base Stop Hit', 'Price closed below the fixed percentage stop placed under the ascending base buy level.')
+
+//---------------------------------------------------------------------------------------------------------------------}

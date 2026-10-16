@@ -1,0 +1,509 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Corrective Leg", "Corrective Leg", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+//Classification of a completed counter-leg
+CLASS_NONE       = 0
+CLASS_CORRECTIVE = 1
+
+//Live correction episode against the latest completed leg
+EP_NONE        = 0
+EP_ACTIVE      = 1
+EP_RESUMED     = 2
+EP_INVALIDATED = 3
+
+//Storage caps
+MAX_STORED_BARS = 90000
+MAX_SWINGS      = 500
+
+//Visual tuning
+ZONE_FILL_TRANSPARENCY   = 88
+ZONE_BORDER_TRANSPARENCY = 60
+FRAMEWORK_TRANSPARENCY   = 75
+
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+NEUTRAL_COLOR = #787b86 // swing framework and muted dashboard readings
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+swingLengthInput = input.int(10, "Swing Length", minval = 2, group = "Swing Detection",
+  tooltip = "Bars to the left and right required to confirm a swing high or swing low. The zigzag built from these confirmed swings gives every leg a defined origin and end; larger values read larger structure but confirm later, and a leg's label only firms up once the swing at its end has formed.")
+
+minDepthInput = input.float(0, "Min Retracement %", minval = 0, maxval = 100, step = 0.1, group = "Corrective Criteria",
+  tooltip = "Smallest share of the retraced leg the counter-move must give back to classify as corrective. 0 accepts any partial retrace; raise it (23.6 and 38.2 are common floors) to skip shallow stalls.")
+
+maxDepthInput = input.float(100, "Max Retracement %", minval = 10, maxval = 100, step = 0.1, group = "Corrective Criteria",
+  tooltip = "Largest share of the retraced leg the counter-move may give back. A corrective leg stays inside the prior leg's territory - at 100 it may test but never take out that leg's origin. Beyond the origin the move is no longer corrective and is reclassified.")
+
+maxSpeedInput = input.float(1.0, "Max Speed Ratio", minval = 0, step = 0.05, group = "Corrective Criteria",
+  tooltip = "The leg's distance per bar may be at most this multiple of the retraced leg's. Corrections cover less ground in more time than the impulse they retrace - 1 means no faster than it.")
+
+minOverlapInput = input.float(50, "Min Bar Overlap %", minval = 0, maxval = 100, group = "Corrective Criteria",
+  tooltip = "Minimum average overlap between consecutive candle ranges inside the leg, as a percentage of each bar's range. Heavy bar-to-bar overlap is the corrective signature; impulsive travel shows little.")
+
+maxBodyRatioInput = input.float(1.0, "Max Body Size Ratio", minval = 0, step = 0.05, group = "Corrective Criteria",
+  tooltip = "The leg's average candle body, as a share of each bar's range, may be at most this multiple of the retraced leg's. Corrective candles carry smaller bodies - 1 means no larger than the leg being retraced.")
+
+maxEfficiencyInput = input.float(50, "Max Travel Efficiency %", minval = 0, maxval = 100, group = "Corrective Criteria",
+  tooltip = "Maximum net close-to-close travel as a percentage of the summed bar-to-bar close travel inside the leg. One-way travel scores near 100; the drifting, back-and-forth shape of a correction scores low.")
+
+shallowPctInput = input.float(38.2, "Shallow Below %", minval = 0, maxval = 100, step = 0.1, group = "Correction Tracking",
+  tooltip = "Retracement depth below this reads Shallow. Shallow, brief corrections that give back little of the leg suggest a strong trend. 38.2 is the classic Fibonacci boundary.")
+
+deepPctInput = input.float(61.8, "Deep Above %", minval = 0, maxval = 100, step = 0.1, group = "Correction Tracking",
+  tooltip = "Retracement depth above this reads Deep. Deep, long-lived corrections that consume most of the leg warn that trend sponsorship is fading; the active correction crossing it fires the Deep Correction alert. 61.8 is the classic Fibonacci boundary.")
+
+closeBreakInput = input.bool(false, "Events Require Close Beyond Level", group = "Correction Tracking",
+  tooltip = "When enabled, trend resumption needs a close beyond the retraced leg's extreme and invalidation needs a close beyond its origin; otherwise trading through the level intrabar is enough.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", group = "Style", inline = "colors",
+  tooltip = "Color of corrections within bullish structure - counter-moves retracing an up-leg - and of their zone, levels and labels.")
+
+bearColorInput = input.color(BEAR_COLOR, "Bearish", group = "Style", inline = "colors",
+  tooltip = "Color of corrections within bearish structure - counter-moves retracing a down-leg - and of their zone, levels and labels.")
+
+legWidthInput = input.int(2, "Corrective Line Width", minval = 1, maxval = 5, group = "Style",
+  tooltip = "Width of confirmed corrective leg lines.")
+
+showLabelsInput = input.bool(true, "Leg Labels", group = "Style",
+  tooltip = "Label classified corrective legs near their midpoint with their depth health. Hover a label for the leg's measured statistics against each criterion.")
+
+showZoneInput = input.bool(true, "Active Correction Zone", group = "Style",
+  tooltip = "Shade the territory claimed by the correction currently developing against the latest completed leg - the live entry window - from that leg's extreme to the deepest point reached, tagged with the running retracement depth and its health reading.")
+
+showInvalidationInput = input.bool(true, "Invalidation Level", group = "Style",
+  tooltip = "Dotted level at the origin of the leg the active correction retraces. A healthy correction terminates before this level; price taking it out stands continuation setups down and reclassifies the leg.")
+
+showFrameworkInput = input.bool(false, "Show Swing Framework", group = "Style",
+  tooltip = "Faint dotted zigzag connecting every confirmed swing point, so classified corrective legs can be read against the legs they retrace.")
+
+showDashInput = input.bool(true, "Show Dashboard", group = "Dashboard",
+  tooltip = "Compact readout of the active correction - status, depth and health - plus how the latest completed counter-leg measured against each corrective criterion.")
+
+dashPositionInput = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = "Dashboard",
+  tooltip = "Corner of the chart holding the dashboard.")
+
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = "Dashboard",
+  tooltip = "Dashboard text size.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// State
+//---------------------------------------------------------------------------------------------------------------------{
+//Per-bar OHLC storage so a completed leg can be measured bar by bar (index = bar_index - oldestStoredBar)
+var array<float> openArray  = array.new<float>()
+var array<float> highArray  = array.new<float>()
+var array<float> lowArray   = array.new<float>()
+var array<float> closeArray = array.new<float>()
+var int oldestStoredBar = 0
+
+//Zigzag swing points, oldest first; the last two swings bound the leg most recently completed
+var array<int>   swingBarArray   = array.new<int>()
+var array<float> swingPriceArray = array.new<float>()
+var int lastSwingDir = 0
+
+//Current (most recently completed, still extendable) counter-leg
+var bool  correctiveAlerted = false
+var line  currentLegLine    = na
+var label currentLegLabel   = na
+var line  currentFrameLine  = na
+
+//Live correction episode: the developing counter-move retracing the latest completed leg
+var int   epStatus      = EP_NONE
+var bool  epUp          = true
+var int   epOriginBar   = na
+var float epOriginPrice = na
+var int   epEndBar      = na
+var float epEndPrice    = na
+var float epExtreme     = na
+var bool  epDeepFired   = false
+
+//Active correction drawings
+var box   zoneBox  = na
+var line  invLine  = na
+var label invTag   = na
+var label depthTag = na
+
+//Dashboard snapshot of the latest completed counter-leg
+var int   dashDir        = 0
+var int   dashClass      = -1
+var float dashDepth      = na
+var float dashSpeed      = na
+var float dashOverlap    = na
+var float dashBody       = na
+var float dashEfficiency = na
+var int   dashBars       = 0
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+formatRatio(float value) =>
+    na(value) ? "—" : str.tostring(value, "#.##") + "×"
+
+formatPercent(float value) =>
+    na(value) ? "—" : str.tostring(value, "#.#") + "%"
+
+healthWord(float depthPct) =>
+    na(depthPct) ? "—" : depthPct < shallowPctInput ? "Shallow" : depthPct > deepPctInput ? "Deep" : "Typical"
+
+//Measure a leg bar by bar from the stored series.
+//Returns [measured, bars, priceRange, perBarSpeed, overlapPct, bodyPct, efficiencyPct]
+measureLeg(int startBar, int endBar, float startPrice, float endPrice) =>
+    int   legBars    = endBar - startBar
+    float legRange   = math.abs(endPrice - startPrice)
+    int   startIndex = startBar - oldestStoredBar
+    int   endIndex   = endBar - oldestStoredBar
+    float overlapSum  = 0.
+    float bodySum     = 0.
+    float grossTravel = 0.
+    bool  canMeasure  = legBars >= 1 and startIndex >= 0 and endIndex < array.size(closeArray)
+    if canMeasure
+        for idx = startIndex + 1 to endIndex
+            float o = array.get(openArray, idx)
+            float h = array.get(highArray, idx)
+            float l = array.get(lowArray, idx)
+            float c = array.get(closeArray, idx)
+            float hPrev = array.get(highArray, idx - 1)
+            float lPrev = array.get(lowArray, idx - 1)
+            float cPrev = array.get(closeArray, idx - 1)
+            //Bar-to-bar overlap as a share of the current bar's range
+            float barRange = h - l
+            float overlap  = math.max(0., math.min(h, hPrev) - math.max(l, lPrev))
+            overlapSum += barRange > 0 ? overlap / barRange : 1.
+            //Candle body as a share of the bar's range
+            bodySum += barRange > 0 ? math.abs(c - o) / barRange : 0.
+            //Gross close-to-close travel for the efficiency reading
+            grossTravel += math.abs(c - cPrev)
+    bool  measured      = canMeasure and legRange > 0
+    float perBarSpeed   = measured ? legRange / legBars : na
+    float overlapPct    = measured ? 100. * overlapSum / legBars : na
+    float bodyPct       = measured ? 100. * bodySum / legBars : na
+    float netTravel     = measured ? math.abs(array.get(closeArray, endIndex) - array.get(closeArray, startIndex)) : na
+    float efficiencyPct = measured ? (grossTravel > 0 ? 100. * netTravel / grossTravel : 0.) : na
+    [measured, legBars, legRange, perBarSpeed, overlapPct, bodyPct, efficiencyPct]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Swing Detection
+//---------------------------------------------------------------------------------------------------------------------{
+array.push(openArray, open)
+array.push(highArray, high)
+array.push(lowArray, low)
+array.push(closeArray, close)
+
+if array.size(openArray) > MAX_STORED_BARS
+    array.shift(openArray)
+    array.shift(highArray)
+    array.shift(lowArray)
+    array.shift(closeArray)
+    oldestStoredBar += 1
+
+//Confirmed swing points (known swingLength bars after the fact)
+float pivotHighPrice = ta.pivothigh(swingLengthInput, swingLengthInput)
+float pivotLowPrice  = ta.pivotlow(swingLengthInput, swingLengthInput)
+int   pivotBar       = bar_index - swingLengthInput
+
+bool legEvent = false
+
+//Same-direction pivots extend the current leg; opposite pivots lock it and start the next one.
+//On an outside bar both confirm at once - handle the extension side first to keep alternation clean.
+bool highFirst = lastSwingDir == 1
+
+if barstate.isconfirmed
+    for passIndex = 0 to 1
+        bool  isHighPass = highFirst ? passIndex == 0 : passIndex == 1
+        float passPrice  = isHighPass ? pivotHighPrice : pivotLowPrice
+        int   passDir    = isHighPass ? 1 : -1
+        if not na(passPrice)
+            int swingCount = array.size(swingBarArray)
+            if lastSwingDir == passDir and swingCount > 0
+                //Same direction: the leg extends only if this swing is more extreme
+                float lastPrice = array.get(swingPriceArray, swingCount - 1)
+                if (passDir == 1 ? passPrice > lastPrice : passPrice < lastPrice)
+                    array.set(swingBarArray, swingCount - 1, pivotBar)
+                    array.set(swingPriceArray, swingCount - 1, passPrice)
+                    legEvent := true
+            else
+                //Opposite direction: the current leg locks and a new counter-leg begins; locked drawings stay on the chart
+                correctiveAlerted := false
+                currentLegLine    := na
+                currentLegLabel   := na
+                currentFrameLine  := na
+                array.push(swingBarArray, pivotBar)
+                array.push(swingPriceArray, passPrice)
+                if array.size(swingBarArray) > MAX_SWINGS
+                    array.shift(swingBarArray)
+                    array.shift(swingPriceArray)
+                lastSwingDir := passDir
+                legEvent     := true
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Leg Classification
+//---------------------------------------------------------------------------------------------------------------------{
+bool bullCorrectiveAlert = false
+bool bearCorrectiveAlert = false
+
+int swingTotal = array.size(swingBarArray)
+
+if legEvent and swingTotal >= 3
+    //Leg being classified: the latest completed counter-move
+    int   originBar   = array.get(swingBarArray, swingTotal - 2)
+    float originPrice = array.get(swingPriceArray, swingTotal - 2)
+    int   endBar      = array.get(swingBarArray, swingTotal - 1)
+    float endPrice    = array.get(swingPriceArray, swingTotal - 1)
+    //The leg it retraces - the preceding leg, whose end is this leg's origin
+    int   refBar   = array.get(swingBarArray, swingTotal - 3)
+    float refPrice = array.get(swingPriceArray, swingTotal - 3)
+    [legMeasured, legBars, legRange, legSpeed, legOverlap, legBody, legEfficiency] = measureLeg(originBar, endBar, originPrice, endPrice)
+    [refMeasured, refBars, refRange, refSpeed, refOverlap, refBody, refEfficiency] = measureLeg(refBar, originBar, refPrice, originPrice)
+    //Everything is judged relative to the leg being retraced: shallower, slower, choppier
+    float depthPct   = legMeasured and refMeasured and refRange > 0 ? 100. * legRange / refRange : na
+    float speedRatio = legMeasured and refMeasured and not na(refSpeed) and refSpeed > 0 ? legSpeed / refSpeed : na
+    float bodyRatio  = legMeasured and refMeasured and not na(refBody) and refBody > 0 ? legBody / refBody : na
+    bool isCorrective = legMeasured and refMeasured
+      and not na(depthPct)      and depthPct      >= minDepthInput and depthPct <= maxDepthInput
+      and not na(speedRatio)    and speedRatio    <= maxSpeedInput
+      and not na(legOverlap)    and legOverlap    >= minOverlapInput
+      and not na(bodyRatio)     and bodyRatio     <= maxBodyRatioInput
+      and not na(legEfficiency) and legEfficiency <= maxEfficiencyInput
+    bool  refUp      = originPrice > refPrice
+    bool  legUp      = endPrice > originPrice
+    color trendColor = refUp ? bullColorInput : bearColorInput
+    //Faint zigzag context connecting every swing
+    if showFrameworkInput
+        if na(currentFrameLine)
+            currentFrameLine := line.new(originBar, originPrice, endBar, endPrice, color = color.new(NEUTRAL_COLOR, FRAMEWORK_TRANSPARENCY), style = line.style_dotted)
+        else
+            line.set_xy2(currentFrameLine, endBar, endPrice)
+    //Labels are provisional while the leg can still extend - redraw the current leg on every evaluation
+    if not na(currentLegLine)
+        line.delete(currentLegLine)
+        currentLegLine := na
+    if not na(currentLegLabel)
+        label.delete(currentLegLabel)
+        currentLegLabel := na
+    if isCorrective
+        currentLegLine := line.new(originBar, originPrice, endBar, endPrice, color = trendColor, style = line.style_solid, width = legWidthInput)
+        if showLabelsInput
+            string legTip = "Retraces the prior " + (refUp ? "up-leg" : "down-leg") + " by " + formatPercent(depthPct) + " (" + healthWord(depthPct) + ")"
+              + "\nBars: " + str.tostring(legBars)
+              + "\nSpeed vs retraced leg: " + formatRatio(speedRatio)
+              + "\nBar overlap: " + formatPercent(legOverlap)
+              + "\nBody size vs retraced leg: " + formatRatio(bodyRatio)
+              + "\nTravel efficiency: " + formatPercent(legEfficiency)
+            currentLegLabel := label.new(math.floor((originBar + endBar) / 2), (originPrice + endPrice) / 2, "Corrective · " + healthWord(depthPct)
+              , style     = legUp ? label.style_label_up : label.style_label_down
+              , color     = #00000000
+              , textcolor = trendColor
+              , size      = size.small
+              , tooltip   = legTip)
+    //Fire the classification once per leg, on the bar its end swing confirms or upgrades
+    if isCorrective and not correctiveAlerted
+        correctiveAlerted   := true
+        bullCorrectiveAlert := refUp
+        bearCorrectiveAlert := not refUp
+    //Dashboard snapshot of the latest completed counter-leg
+    dashDir        := refUp ? 1 : -1
+    dashClass      := isCorrective ? CLASS_CORRECTIVE : CLASS_NONE
+    dashDepth      := depthPct
+    dashSpeed      := speedRatio
+    dashOverlap    := legOverlap
+    dashBody       := bodyRatio
+    dashEfficiency := legEfficiency
+    dashBars       := legBars
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Active Correction Tracking
+//---------------------------------------------------------------------------------------------------------------------{
+bool deepAlert         = false
+bool invalidationAlert = false
+bool bullResumeAlert   = false
+bool bearResumeAlert   = false
+
+if barstate.isconfirmed
+    //Re-anchor on legs that are not corrective: a completed corrective leg does not become the reference,
+    //it is part of the ongoing correction of the prior trend leg - so complex, multi-swing corrections keep
+    //being measured against the leg they retrace until its extreme is retaken or its origin gives way
+    bool rearmEpisode = legEvent and swingTotal >= 2 and dashClass != CLASS_CORRECTIVE
+    if rearmEpisode
+        //The last two swings frame the leg now being retraced by the developing counter-move
+        epOriginBar   := array.get(swingBarArray, swingTotal - 2)
+        epOriginPrice := array.get(swingPriceArray, swingTotal - 2)
+        epEndBar      := array.get(swingBarArray, swingTotal - 1)
+        epEndPrice    := array.get(swingPriceArray, swingTotal - 1)
+        epUp          := epEndPrice > epOriginPrice
+        epStatus      := math.abs(epEndPrice - epOriginPrice) > 0 ? EP_ACTIVE : EP_NONE
+        epDeepFired   := false
+        //Seed the against-extreme from the bars that confirmed the swing - the correction is already that old
+        epExtreme := epEndPrice
+        int firstIndex = epEndBar + 1 - oldestStoredBar
+        int lastIndex  = array.size(lowArray) - 1
+        if firstIndex >= 0 and firstIndex <= lastIndex
+            for idx = firstIndex to lastIndex
+                epExtreme := epUp ? math.min(epExtreme, array.get(lowArray, idx)) : math.max(epExtreme, array.get(highArray, idx))
+    else if epStatus == EP_ACTIVE
+        epExtreme := epUp ? math.min(epExtreme, low) : math.max(epExtreme, high)
+    //Episode events: invalidation at the retraced leg's origin, resumption at its extreme, depth warning between
+    if epStatus == EP_ACTIVE
+        float breachPrice = closeBreakInput ? close : epUp ? low : high
+        float resumePrice = closeBreakInput ? close : epUp ? high : low
+        bool  invalidated = epUp ? breachPrice < epOriginPrice : breachPrice > epOriginPrice
+        bool  resumed     = epUp ? resumePrice > epEndPrice : resumePrice < epEndPrice
+        if invalidated
+            epStatus          := EP_INVALIDATED
+            invalidationAlert := true
+        else if resumed
+            epStatus        := EP_RESUMED
+            bullResumeAlert := epUp
+            bearResumeAlert := not epUp
+        else
+            float epRange   = math.abs(epEndPrice - epOriginPrice)
+            float liveDepth = epRange > 0 ? 100. * (epUp ? epEndPrice - epExtreme : epExtreme - epEndPrice) / epRange : na
+            if not epDeepFired and not na(liveDepth) and liveDepth >= deepPctInput
+                epDeepFired := true
+                deepAlert   := true
+
+//Running depth of the tracked correction for the zone tag and dashboard
+float epRangeNow   = epStatus != EP_NONE ? math.abs(epEndPrice - epOriginPrice) : na
+float liveDepthPct = not na(epRangeNow) and epRangeNow > 0 and not na(epExtreme) ? 100. * (epUp ? epEndPrice - epExtreme : epExtreme - epEndPrice) / epRangeNow : na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Correction Zone & Invalidation Level
+//---------------------------------------------------------------------------------------------------------------------{
+bool  episodeVisible = epStatus == EP_ACTIVE
+color episodeColor   = epUp ? bullColorInput : bearColorInput
+
+if episodeVisible and showZoneInput
+    //Territory the correction has claimed so far: from the retraced leg's extreme to the deepest point reached
+    float zoneTop    = epUp ? epEndPrice : epExtreme
+    float zoneBottom = epUp ? epExtreme : epEndPrice
+    if na(zoneBox)
+        zoneBox := box.new(epEndBar, zoneTop, bar_index, zoneBottom
+          , border_color = color.new(episodeColor, ZONE_BORDER_TRANSPARENCY)
+          , border_width = 1
+          , border_style = line.style_dotted
+          , bgcolor      = color.new(episodeColor, ZONE_FILL_TRANSPARENCY))
+    else
+        box.set_lefttop(zoneBox, epEndBar, zoneTop)
+        box.set_rightbottom(zoneBox, bar_index, zoneBottom)
+        box.set_border_color(zoneBox, color.new(episodeColor, ZONE_BORDER_TRANSPARENCY))
+        box.set_bgcolor(zoneBox, color.new(episodeColor, ZONE_FILL_TRANSPARENCY))
+    if barstate.islast
+        string depthText = formatPercent(liveDepthPct) + " · " + healthWord(liveDepthPct)
+        string depthTip  = "Running retracement depth of the active correction - how much of the leg it retraces has been given back. Shallow corrections (below " + str.tostring(shallowPctInput, "#.#") + "%) read as trend strength; deep ones (above " + str.tostring(deepPctInput, "#.#") + "%) warn that sponsorship is fading."
+        if na(depthTag)
+            depthTag := label.new(bar_index + 1, epExtreme, depthText
+              , style     = label.style_label_left
+              , color     = #00000000
+              , textcolor = episodeColor
+              , size      = size.small
+              , tooltip   = depthTip)
+        else
+            label.set_xy(depthTag, bar_index + 1, epExtreme)
+            label.set_text(depthTag, depthText)
+            label.set_textcolor(depthTag, episodeColor)
+            label.set_tooltip(depthTag, depthTip)
+else
+    if not na(zoneBox)
+        box.delete(zoneBox)
+        zoneBox := na
+    if not na(depthTag)
+        label.delete(depthTag)
+        depthTag := na
+
+if episodeVisible and showInvalidationInput
+    if na(invLine)
+        invLine := line.new(epOriginBar, epOriginPrice, epOriginBar + 1, epOriginPrice, extend = extend.right, color = episodeColor, style = line.style_dotted)
+    else
+        line.set_xy1(invLine, epOriginBar, epOriginPrice)
+        line.set_xy2(invLine, epOriginBar + 1, epOriginPrice)
+        line.set_color(invLine, episodeColor)
+    if barstate.islast
+        if na(invTag)
+            invTag := label.new(bar_index + 1, epOriginPrice, "Invalidation"
+              , style     = label.style_label_left
+              , color     = #00000000
+              , textcolor = episodeColor
+              , size      = size.tiny
+              , tooltip   = "Origin of the leg the active correction retraces. A healthy correction terminates before this level - if it gives way, continuation setups are stood down and the leg is reclassified.")
+        else
+            label.set_xy(invTag, bar_index + 1, epOriginPrice)
+            label.set_textcolor(invTag, episodeColor)
+else
+    if not na(invLine)
+        line.delete(invLine)
+        invLine := na
+    if not na(invTag)
+        label.delete(invTag)
+        invTag := na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+string tablePosition = switch dashPositionInput
+    "Top Right"    => position.top_right
+    "Top Left"     => position.top_left
+    "Bottom Right" => position.bottom_right
+    => position.bottom_left
+
+string tableTextSize = switch dashSizeInput
+    "Tiny"  => size.tiny
+    "Small" => size.small
+    => size.normal
+
+var table dashboardTable = showDashInput ? table.new(tablePosition, 2, 7, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1) : na
+
+if showDashInput and barstate.islast
+    color titleColor = DASH_TEXT
+    color labelColor = DASH_HEADER
+    color valueColor = DASH_TEXT
+    color mutedColor = NEUTRAL_COLOR
+    color epDirColor = epUp ? bullColorInput : bearColorInput
+    string statusText = epStatus == EP_ACTIVE ? "Correcting" : epStatus == EP_RESUMED ? "Resumed" : epStatus == EP_INVALIDATED ? "Invalidated" : "Waiting"
+    if epStatus != EP_NONE
+        statusText := (epUp ? "Bullish · " : "Bearish · ") + statusText
+    color statusColor = epStatus == EP_ACTIVE or epStatus == EP_RESUMED ? epDirColor : mutedColor
+    color legDirColor = dashDir == 1 ? bullColorInput : dashDir == -1 ? bearColorInput : mutedColor
+    table.cell(dashboardTable, 0, 0, "Correction", text_color = titleColor, text_size = tableTextSize, text_halign = text.align_left,
+      tooltip = "The counter-move developing against the latest completed leg: Correcting while it holds inside that leg's territory, Resumed once the leg's extreme is retaken, Invalidated once the leg's origin gives way.")
+    table.cell(dashboardTable, 1, 0, statusText, text_color = statusColor, text_size = tableTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 1, "Depth", text_color = labelColor, text_size = tableTextSize, text_halign = text.align_left,
+      tooltip = "Share of the retraced leg given back so far. Shallow below " + str.tostring(shallowPctInput, "#.#") + "%, Deep above " + str.tostring(deepPctInput, "#.#") + "% - shallow corrections signal trend strength, deep ones fading sponsorship.")
+    table.cell(dashboardTable, 1, 1, na(liveDepthPct) ? "—" : formatPercent(liveDepthPct) + " · " + healthWord(liveDepthPct), text_color = valueColor, text_size = tableTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 2, "Latest Leg", text_color = labelColor, text_size = tableTextSize, text_halign = text.align_left,
+      tooltip = "Classification of the latest completed counter-leg over " + str.tostring(dashBars) + " bars, retracing " + formatPercent(dashDepth) + " of the leg before it.")
+    table.cell(dashboardTable, 1, 2, dashClass == CLASS_CORRECTIVE ? "Corrective" : dashClass == CLASS_NONE ? "Not corrective" : "—", text_color = dashClass == CLASS_CORRECTIVE ? legDirColor : mutedColor, text_size = tableTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 3, "Speed", text_color = labelColor, text_size = tableTextSize, text_halign = text.align_left,
+      tooltip = "Latest leg's per-bar travel vs the leg it retraces. Maximum allowed: " + str.tostring(maxSpeedInput, "#.##") + "×")
+    table.cell(dashboardTable, 1, 3, formatRatio(dashSpeed), text_color = valueColor, text_size = tableTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 4, "Overlap", text_color = labelColor, text_size = tableTextSize, text_halign = text.align_left,
+      tooltip = "Average overlap between consecutive candle ranges inside the latest leg. Minimum required: " + str.tostring(minOverlapInput, "#.#") + "%")
+    table.cell(dashboardTable, 1, 4, formatPercent(dashOverlap), text_color = valueColor, text_size = tableTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 5, "Bodies", text_color = labelColor, text_size = tableTextSize, text_halign = text.align_left,
+      tooltip = "Latest leg's average candle body vs the leg it retraces. Maximum allowed: " + str.tostring(maxBodyRatioInput, "#.##") + "×")
+    table.cell(dashboardTable, 1, 5, formatRatio(dashBody), text_color = valueColor, text_size = tableTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 6, "Efficiency", text_color = labelColor, text_size = tableTextSize, text_halign = text.align_left,
+      tooltip = "Latest leg's net close travel vs its summed bar-to-bar travel - one-way moves score high, drifting corrections low. Maximum allowed: " + str.tostring(maxEfficiencyInput, "#.#") + "%")
+    table.cell(dashboardTable, 1, 6, formatPercent(dashEfficiency), text_color = valueColor, text_size = tableTextSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(bullCorrectiveAlert, "Bullish Corrective Leg", "Corrective leg confirmed - slow, overlapping counter-move retracing part of the prior up-leg while holding above its origin: the pullback entry window within bullish structure")
+alertcondition(bearCorrectiveAlert, "Bearish Corrective Leg", "Corrective leg confirmed - slow, overlapping counter-move retracing part of the prior down-leg while holding below its origin: the pullback entry window within bearish structure")
+alertcondition(bullCorrectiveAlert or bearCorrectiveAlert, "Any Corrective Leg", "Corrective leg confirmed - slower, overlapping counter-move staying inside the territory of the leg it retraces")
+alertcondition(deepAlert, "Deep Correction", "Active correction has consumed most of the leg it retraces - a deep, long-lived correction warns that trend sponsorship is fading")
+alertcondition(invalidationAlert, "Correction Invalidated", "The correction traded through the origin of the leg it retraces - continuation setups are stood down and the leg is reclassified")
+alertcondition(bullResumeAlert, "Bullish Trend Resumption", "Price retook the extreme of the retraced up-leg - the correction has terminated and bullish trend travel has resumed")
+alertcondition(bearResumeAlert, "Bearish Trend Resumption", "Price broke the extreme of the retraced down-leg - the correction has terminated and bearish trend travel has resumed")
+
+//---------------------------------------------------------------------------------------------------------------------}

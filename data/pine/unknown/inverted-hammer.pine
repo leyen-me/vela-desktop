@@ -1,0 +1,276 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Inverted Hammer", shorttitle = "Inverted Hammer", overlay = true, format = format.price, max_labels_count = 500, max_lines_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+NEUTRAL_COLOR = #787b86
+LABEL_BG      = #00000000
+
+TREND_SMA     = "Price Below SMA"
+TREND_DECLINE = "Net Price Decline"
+TREND_BOTH    = "Both"
+
+VOL_OFF       = "Off"
+VOL_HIGHLIGHT = "Highlight"
+VOL_REQUIRE   = "Require"
+
+TAG_PLAIN    = "IH"
+TAG_ELEVATED = "IH+"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+upperShadowRatioInput = input.float(2, "Minimum Upper Shadow / Body Ratio", minval = 1, maxval = 10, step = 0.1, group = "Pattern Proportions",
+  tooltip = "Minimum upper shadow length as a multiple of the real body. The classical proportion asks for a shadow at least twice the body's height — the long probe higher, and its failure into the close, is the whole story of the candle. Raise the ratio for rarer, cleaner instances.")
+
+maxLowerShadowInput = input.float(10, "Maximum Lower Shadow (%)", minval = 0, maxval = 50, step = 0.5, group = "Pattern Proportions",
+  tooltip = "Largest lower shadow allowed, as a percentage of the candle's high-low range. The textbook form shows little or no shadow below the body; a small allowance keeps realistic prints on liquid markets. Set to 0 to demand a fully shaved low.")
+
+minBodyInput = input.float(5, "Minimum Real Body (%)", minval = 0, maxval = 40, step = 0.5, group = "Pattern Proportions",
+  tooltip = "Smallest real body accepted, as a percentage of the candle's range. The inverted hammer keeps a small but real body — a bar with essentially no body is a gravestone-style doji, a related but separate formation, and is excluded by default. The shadow rules already force the body to the lower end of the range, so no upper cap is needed.")
+
+bullBodyOnlyInput = input.bool(false, "Bullish Body Only", group = "Pattern Proportions",
+  tooltip = "Keep only instances that closed bullish. Classical references accept either body color and treat a bullish close as only marginally preferred, so the restriction is off by default.")
+
+trendMethodInput = input.string(TREND_SMA, "Decline Detection", options = [TREND_SMA, TREND_DECLINE, TREND_BOTH], group = "Decline Context",
+  tooltip = "How the decline into the candle is established — the pattern only exists after selling, and the identical shape printed after an advance is a shooting star, not an inverted hammer. 'Price Below SMA' asks the prior close to sit under a simple moving average; 'Net Price Decline' asks the prior close to sit below the close a set number of bars earlier; 'Both' demands the two agree. Context is measured one bar back so the pattern candle does not shape its own baseline.")
+
+smaLengthInput = input.int(50, "SMA Length", minval = 2, maxval = 500, group = "Decline Context",
+  tooltip = "Length of the simple moving average used by the 'Price Below SMA' context test.")
+
+declineLengthInput = input.int(5, "Decline Lookback", minval = 1, maxval = 200, group = "Decline Context",
+  tooltip = "Bars used by the 'Net Price Decline' test: the close one bar before the pattern must be below the close this many bars earlier, establishing a multi-bar slide into the candle.")
+
+confirmWindowInput = input.int(3, "Confirmation Window", minval = 1, maxval = 50, group = "Confirmation",
+  tooltip = "Bars allowed for confirmation before the pattern is set aside as noise — the candle closes weak by construction, so unconfirmed instances are treated as candidates only. Classical references look to the very next candle; set 1 for that strict reading, or widen the window to also catch a delayed trade above the pattern high. The gap and bullish-close checks always apply to the next candle only.")
+
+confirmBullCloseInput = input.bool(true, "Bullish Close on Next Candle", group = "Confirmation",
+  tooltip = "Confirm when the candle immediately after the pattern closes bullish, showing buyers followed through on the probe.")
+
+confirmGapUpInput = input.bool(true, "Gap Up on Next Candle", group = "Confirmation",
+  tooltip = "Confirm when the next candle opens above the inverted hammer's real body — the classical gap-higher verification for the session after the pattern.")
+
+confirmBreakHighInput = input.bool(true, "Trade Above Pattern High", group = "Confirmation",
+  tooltip = "Confirm when price trades above the pattern high within the confirmation window. Many traders act only once this trigger prints, since it means the failed rally has been retraced in the buyers' favor.")
+
+volumeModeInput = input.string(VOL_HIGHLIGHT, "Volume Grading", options = [VOL_OFF, VOL_HIGHLIGHT, VOL_REQUIRE], group = "Volume Grading",
+  tooltip = "Grading by participation. 'Highlight' tags instances printed on elevated volume with a plus sign; 'Require' keeps only those instances; 'Off' ignores volume. Some practitioners weight high-volume inverted hammers more heavily, reading the failed rally as active two-way interest rather than drift. Automatically bypassed when the symbol reports no volume data.")
+
+volumeLengthInput = input.int(20, "Volume Average Length", minval = 1, maxval = 500, group = "Volume Grading",
+  tooltip = "Number of bars in the trailing volume average used as the yardstick, taken one bar back so the pattern candle does not inflate its own baseline.")
+
+volumeMultInput = input.float(1.5, "Elevated Volume Multiple", minval = 0.1, maxval = 10, step = 0.1, group = "Volume Grading",
+  tooltip = "Volume must exceed its trailing average times this factor to count as elevated.")
+
+labelsInput = input.bool(true, "Show Pattern Labels", group = "Style",
+  tooltip = "Tag each detection with a compact IH label below the bar — IH+ when printed on elevated volume. The tag starts in the tentative color and turns to the bullish color if the pattern confirms. Hovering reports the candle's anatomy plus the trigger and stop prices.")
+
+levelsInput = input.bool(true, "Show Trigger & Stop Levels", group = "Style",
+  tooltip = "Draw the pattern's actionable levels while it awaits resolution: a dashed trigger line at the pattern high, the classical entry, and a dashed stop line at the pattern low, the defined invalidation. Both lines stop extending once the pattern confirms, invalidates or expires.")
+
+markersInput = input.bool(true, "Show Resolution Markers", group = "Style",
+  tooltip = "Mark the bar that resolves a pending pattern: a small triangle when it confirms, a cross when price trades below the pattern low first. Hovering the marker reports which confirmation rule fired.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "colors", group = "Style",
+  tooltip = "Color for confirmed pattern tags, confirmation markers and the trigger level.")
+
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "colors", group = "Style",
+  tooltip = "Color for invalidation markers and the stop level.")
+
+neutralColorInput = input.color(NEUTRAL_COLOR, "Tentative", inline = "colors", group = "Style",
+  tooltip = "Color for freshly printed, still unconfirmed pattern tags. The candle closes weak by construction, so it stays a candidate until follow-through appears.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types
+//---------------------------------------------------------------------------------------------------------------------{
+type PendingPattern
+    int   startBar
+    float patternHigh
+    float patternLow
+    float patternBodyTop
+    label patternLabel
+    line  triggerLine
+    line  stopLine
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Detection
+//---------------------------------------------------------------------------------------------------------------------{
+//Candle anatomy
+candleRange = high - low
+bodyTop     = math.max(open, close)
+bodyBottom  = math.min(open, close)
+candleBody  = bodyTop - bodyBottom
+upperShadow = high - bodyTop
+lowerShadow = bodyBottom - low
+
+//Context series, computed unconditionally on every bar
+trendSma      = ta.sma(close, smaLengthInput)
+volumeAverage = ta.sma(volume, volumeLengthInput)
+
+//Baselines taken one bar back so the pattern candle does not shape its own yardstick
+trendSmaPrev      = trendSma[1]
+volumeAveragePrev = volumeAverage[1]
+pastClose         = close[1 + declineLengthInput]
+
+//Decline into the candle: without prior selling there is nothing to reverse, and the identical
+//shape after an advance is a shooting star, which this script deliberately does not detect
+belowSma   = not na(trendSmaPrev) and close[1] < trendSmaPrev
+netDecline = not na(pastClose) and close[1] < pastClose
+
+inDecline = switch trendMethodInput
+    TREND_SMA     => belowSma
+    TREND_DECLINE => netDecline
+    => belowSma and netDecline
+
+//Volume grading, bypassed when the symbol reports no volume data
+hasVolumeData  = not na(volume) and not na(volumeAveragePrev) and volumeAveragePrev > 0
+elevatedVolume = hasVolumeData and volume > volumeMultInput * volumeAveragePrev
+volumeOk       = volumeModeInput != VOL_REQUIRE or not hasVolumeData or elevatedVolume
+
+//Proportions: a small real body at the lower end of the range, an upper shadow at least the set
+//multiple of the body, and little or no lower shadow
+shapeOk = candleRange > 0
+  and upperShadow >= upperShadowRatioInput * candleBody
+  and lowerShadow <= maxLowerShadowInput / 100 * candleRange
+  and candleBody >= minBodyInput / 100 * candleRange
+
+colorOk = not bullBodyOnlyInput or close > open
+
+//Pattern validity, evaluated on confirmed bars only
+invertedHammer = barstate.isconfirmed and shapeOk and colorOk and inDecline and volumeOk
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Pattern Tracking
+//---------------------------------------------------------------------------------------------------------------------{
+var pendingArray = array.new<PendingPattern>()
+
+confirmedNow      = false
+invalidatedNow    = false
+gapConfirmedNow   = false
+closeConfirmedNow = false
+breakConfirmedNow = false
+confirmReason     = ""
+
+//Resolve pending patterns: confirmation, invalidation at the stop, or expiry after the window
+if array.size(pendingArray) > 0
+    keepArray = array.new<PendingPattern>()
+
+    for i = 0 to array.size(pendingArray) - 1
+        p = array.get(pendingArray, i)
+
+        //Extend the trigger and stop levels to the current bar while the pattern is pending
+        if not na(p.triggerLine)
+            line.set_x2(p.triggerLine, bar_index)
+        if not na(p.stopLine)
+            line.set_x2(p.stopLine, bar_index)
+
+        resolved = false
+
+        if barstate.isconfirmed
+            barsSince = bar_index - p.startBar
+            isNextBar = barsSince == 1
+
+            //A gap is set at the open, before price can trade down through the stop intrabar,
+            //so it outranks same-bar invalidation; every other same-bar tie breaks conservatively
+            //in favor of the stop
+            gapConfirm   = confirmGapUpInput and isNextBar and open > p.patternBodyTop
+            stopHit      = low < p.patternLow
+            breakConfirm = confirmBreakHighInput and high > p.patternHigh
+            closeConfirm = confirmBullCloseInput and isNextBar and close > open
+
+            if gapConfirm
+                resolved        := true
+                confirmedNow    := true
+                gapConfirmedNow := true
+                confirmReason   := "the next candle opened above the pattern's real body"
+
+                if not na(p.patternLabel)
+                    label.set_textcolor(p.patternLabel, bullColorInput)
+            else if stopHit
+                resolved       := true
+                invalidatedNow := true
+            else if breakConfirm or closeConfirm
+                resolved     := true
+                confirmedNow := true
+
+                if breakConfirm
+                    breakConfirmedNow := true
+                    confirmReason     := "price traded above the pattern high"
+                else
+                    closeConfirmedNow := true
+                    confirmReason     := "the next candle closed bullish"
+
+                if not na(p.patternLabel)
+                    label.set_textcolor(p.patternLabel, bullColorInput)
+            else if barsSince >= confirmWindowInput
+                //No follow-through inside the window: the weak close never got its verification,
+                //so the candle is set aside as noise
+                resolved := true
+
+        if not resolved
+            array.push(keepArray, p)
+
+    pendingArray := keepArray
+
+//Register a new pattern on the bar it completes
+if invertedHammer
+    tagText = volumeModeInput != VOL_OFF and elevatedVolume ? TAG_ELEVATED : TAG_PLAIN
+
+    ratioText  = candleBody > 0 ? "\nUpper shadow " + str.tostring(upperShadow / candleBody, "#.#") + "x the real body" : ""
+    volumeText = hasVolumeData ? "\nVolume " + str.tostring(volume / volumeAveragePrev, "#.##") + "x its " + str.tostring(volumeLengthInput) + "-bar average" : ""
+
+    patternTooltip = "Inverted Hammer — tentative bullish reversal candidate, awaiting confirmation" + ratioText
+      + "\nBody " + str.tostring(candleBody / candleRange * 100, "#.#") + "% of range, lower shadow " + str.tostring(lowerShadow / candleRange * 100, "#.#") + "%"
+      + volumeText
+      + "\nTrigger above " + str.tostring(high, format.mintick) + ", stop below " + str.tostring(low, format.mintick)
+
+    newLabel = labelsInput ? label.new(bar_index, na, tagText
+      , yloc      = yloc.belowbar
+      , style     = label.style_label_up
+      , color     = LABEL_BG
+      , textcolor = neutralColorInput
+      , size      = size.tiny
+      , tooltip   = patternTooltip) : label(na)
+
+    newTrigger = levelsInput ? line.new(bar_index, high, bar_index, high, color = bullColorInput, style = line.style_dashed) : line(na)
+    newStop    = levelsInput ? line.new(bar_index, low, bar_index, low, color = bearColorInput, style = line.style_dashed) : line(na)
+
+    array.push(pendingArray, PendingPattern.new(bar_index, high, low, bodyTop, newLabel, newTrigger, newStop))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visuals
+//---------------------------------------------------------------------------------------------------------------------{
+//Resolution markers on the bar that settles a pending pattern
+if markersInput and confirmedNow
+    label.new(bar_index, na, ""
+      , yloc    = yloc.belowbar
+      , style   = label.style_triangleup
+      , color   = bullColorInput
+      , size    = size.tiny
+      , tooltip = "Inverted Hammer confirmed — " + confirmReason)
+
+if markersInput and invalidatedNow
+    label.new(bar_index, na, ""
+      , yloc    = yloc.belowbar
+      , style   = label.style_xcross
+      , color   = bearColorInput
+      , size    = size.tiny
+      , tooltip = "Inverted Hammer invalidated — price traded below the pattern low before confirmation")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(invertedHammer, "Inverted Hammer Detected", "Inverted Hammer on {{ticker}} ({{interval}}) — small body at the low with a long upper shadow after a decline; tentative bullish candidate awaiting confirmation")
+alertcondition(invertedHammer and elevatedVolume, "Inverted Hammer on Elevated Volume", "Inverted Hammer on elevated volume on {{ticker}} ({{interval}}) — the failed intrabar rally printed on active participation, a grade some practitioners weight more heavily")
+alertcondition(confirmedNow, "Inverted Hammer Confirmed", "Inverted Hammer confirmed on {{ticker}} ({{interval}}) — follow-through appeared within the confirmation window; the stop belongs below the pattern low")
+alertcondition(gapConfirmedNow, "Inverted Hammer Confirmed (Gap Up)", "Inverted Hammer confirmed by a gap up on {{ticker}} ({{interval}}) — the next candle opened above the pattern's real body")
+alertcondition(closeConfirmedNow, "Inverted Hammer Confirmed (Bullish Close)", "Inverted Hammer confirmed by a bullish close on {{ticker}} ({{interval}}) — the next candle closed in the buyers' favor")
+alertcondition(breakConfirmedNow, "Inverted Hammer Confirmed (Trade Above High)", "Inverted Hammer confirmed on {{ticker}} ({{interval}}) — price traded above the pattern high, the classical entry trigger")
+alertcondition(invalidatedNow, "Inverted Hammer Invalidated", "Inverted Hammer invalidated on {{ticker}} ({{interval}}) — price traded below the pattern low before confirmation")
+
+//---------------------------------------------------------------------------------------------------------------------}

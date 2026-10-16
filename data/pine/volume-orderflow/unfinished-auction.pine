@@ -1,0 +1,338 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Unfinished Auction", "Unfinished Auction", overlay = true, max_lines_count = 500, max_labels_count = 500, precision = 0)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+color HIGH_COLOR = #f23645
+color LOW_COLOR  = #089981
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+int MIN_SESSION_BARS = 5
+int TABLE_MAX_ROWS   = 8
+int REPAIRED_TRANSP  = 70
+int SHORT_STREAK     = 3
+
+string REPAIR_TOUCH   = "Touch"
+string REPAIR_THROUGH = "Trade Through"
+
+string STYLE_SOLID  = "Solid"
+string STYLE_DASHED = "Dashed"
+string STYLE_DOTTED = "Dotted"
+
+string DETECTION_GROUP = "Auction Detection"
+string LEVELS_GROUP    = "Unfinished References"
+string DASH_GROUP      = "Dashboard"
+string STYLE_GROUP     = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+sessionTfInput = input.timeframe("D", "Auction Session", group = DETECTION_GROUP, tooltip = "Timeframe of the auction whose extremes are audited, one auction per period. Use a chart timeframe well below it so each session holds enough bars to read the structure of its extremes.")
+
+rowsInput = input.int(24, "Profile Rows", minval = 8, maxval = 100, group = DETECTION_GROUP, tooltip = "Number of TPO-style price rows the completed session range is divided into when inspecting an extreme for a single-print tail or stacked TPOs.")
+
+minTailInput = input.int(2, "Minimum Excess Tail", minval = 1, maxval = 20, group = DETECTION_GROUP, tooltip = "Consecutive single-print rows required at an extreme for the auction to count as finished (excess). Extremes with a shorter tail are missing the completion signature.")
+
+stackedInput = input.int(2, "Minimum Stacked TPOs", minval = 2, maxval = 50, group = DETECTION_GROUP, tooltip = "Bars that must trade in the extreme row for the high or low to count as flat, heavily traded poor structure.")
+
+closeCutInput = input.bool(true, "Flag Closing-Bell Extremes", inline = "cut", group = DETECTION_GROUP, tooltip = "Treat an extreme first printed at the end of the session as unfinished by default: the clock, not the auction, ended the move. Extremes that still printed a full excess tail are exempt.")
+closeCutBarsInput = input.int(1, "Bars", minval = 1, maxval = 20, inline = "cut", group = DETECTION_GROUP, tooltip = "Number of final session bars regarded as the closing window.")
+
+volFilterInput = input.bool(true, "Volume Corroboration", inline = "vol", group = DETECTION_GROUP, tooltip = "Require heavy trade at the extreme before a stacked high or low is flagged, corroborating that two-sided business was still being done when the move stopped. Ignored when the symbol reports no volume.")
+volMultInput = input.float(1.0, "Ratio", minval = 0.1, maxval = 10, step = 0.1, inline = "vol", group = DETECTION_GROUP, tooltip = "Minimum average volume of the bars trading in the extreme row, as a multiple of the session mean bar volume. Closing-bell extremes bypass this filter.")
+
+repairModeInput = input.string(REPAIR_THROUGH, "Repair On", options = [REPAIR_TOUCH, REPAIR_THROUGH], group = LEVELS_GROUP, tooltip = "A reference is repaired when price returns and trades at (Touch) or through (Trade Through) the old extreme, finally completing the auction there.")
+
+showRepairedInput = input.bool(true, "Show Repaired Levels", group = LEVELS_GROUP, tooltip = "Keep repaired references on the chart as dimmed dotted lines ending at the repair bar instead of removing them.")
+
+maxLevelsInput = input.int(50, "Maximum References", minval = 1, maxval = 250, group = LEVELS_GROUP, tooltip = "Most recent references kept on the chart, repaired ones included. Older drawings are removed beyond this count.")
+
+showTableInput = input.bool(true, "Show Dashboard", group = DASH_GROUP, tooltip = "Running list of open unfinished references ranked by distance from the current price, the destination map profile traders keep for session preparation.")
+statsLenInput = input.int(20, "Auction Quality Lookback", minval = 4, maxval = 200, group = DASH_GROUP, tooltip = "Recently audited session extremes (two per session) used for the dashboard's unfinished share. A market repeatedly leaving unfinished structure is storing up return trips, while clean excess-marked auctioning leaves few.")
+tablePosInput = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left", "Middle Right"], group = DASH_GROUP, tooltip = "Dashboard position on the chart.")
+tableSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = DASH_GROUP, tooltip = "Dashboard text size.")
+
+highColorInput = input.color(HIGH_COLOR, "Unfinished High", group = STYLE_GROUP)
+lowColorInput = input.color(LOW_COLOR, "Unfinished Low", group = STYLE_GROUP)
+lineStyleInput = input.string(STYLE_SOLID, "Line Style", options = [STYLE_SOLID, STYLE_DASHED, STYLE_DOTTED], group = STYLE_GROUP, tooltip = "Style of open reference level lines. Repaired references always dim to dotted.")
+widthInput = input.int(1, "Line Width", minval = 1, maxval = 4, group = STYLE_GROUP, tooltip = "Width of the reference level lines.")
+showLabelsInput = input.bool(true, "Show Labels", group = STYLE_GROUP)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types & Variables
+//---------------------------------------------------------------------------------------------------------------------{
+type AuctionLevel
+    float price
+    int   side
+    int   bornSession
+    bool  repaired
+    line  levelLine
+    label levelLabel
+
+var array<float> sessHighArray = array.new<float>()
+var array<float> sessLowArray  = array.new<float>()
+var array<float> sessVolArray  = array.new<float>()
+
+var array<AuctionLevel> levelsArray = array.new<AuctionLevel>()
+var array<int>          resultArray = array.new<int>()
+
+var table dashTable = na
+
+var int sessStartBar       = 0
+var int sessionCount       = 0
+var int shortSessionStreak = 0
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Audits one side of a completed session in mirrored coordinates (dir = 1 for the high, dir = -1 for the low).
+// Returns the TPO count of the extreme row, the single-print tail length in rows, whether the extreme first
+// printed inside the closing window, the extreme-row volume ratio, and the bar offset of the extreme's first print.
+evalSide(array<float> highsArray, array<float> lowsArray, array<float> volsArray, float extremePrice, float oppositePrice, float rowSize, int dir) =>
+    int   n    = array.size(highsArray)
+    float tick = syminfo.mintick
+    float uExt = dir * extremePrice
+    float uOpp = dir * oppositePrice
+    int   topCount  = 0
+    float topVolume = 0.0
+    float allVolume = 0.0
+    int   firstIdx  = -1
+    for i = 0 to n - 1
+        float uHigh = dir > 0 ? array.get(highsArray, i) : -array.get(lowsArray, i)
+        float uLow  = dir > 0 ? array.get(lowsArray, i)  : -array.get(highsArray, i)
+        allVolume += array.get(volsArray, i)
+        if uHigh > uExt - rowSize and uLow < uExt + tick
+            topCount  += 1
+            topVolume += array.get(volsArray, i)
+        if firstIdx == -1 and uHigh >= uExt - tick * 0.05
+            firstIdx := i
+    int tailRows = 0
+    if topCount <= 1
+        tailRows := 1
+        for k = 1 to rowsInput - 1
+            float bandHi = uExt - k * rowSize
+            float bandLo = bandHi - rowSize
+            if bandHi <= uOpp
+                break
+            int bandCount = 0
+            for i = 0 to n - 1
+                float uHigh = dir > 0 ? array.get(highsArray, i) : -array.get(lowsArray, i)
+                float uLow  = dir > 0 ? array.get(lowsArray, i)  : -array.get(highsArray, i)
+                if uHigh > bandLo and uLow < bandHi
+                    bandCount += 1
+            if bandCount <= 1
+                tailRows += 1
+            else
+                break
+    float sessionAvgVolume = n > 0 ? allVolume / n : 0.0
+    float topAvgVolume     = topCount > 0 ? topVolume / topCount : 0.0
+    float volumeRatio      = sessionAvgVolume > 0 ? topAvgVolume / sessionAvgVolume : na
+    bool  isCloseCut       = firstIdx >= 0 and n - 1 - firstIdx < closeCutBarsInput
+    [topCount, tailRows, isCloseCut, volumeRatio, firstIdx]
+
+// Logs a new unfinished reference: draws its level line and label, stores it, and trims the oldest beyond the cap.
+createLevel(float levelPrice, int levelSide, int anchorBar, int topCount, int tailRows, bool isCloseCut, float volumeRatio) =>
+    color levelColor = levelSide > 0 ? highColorInput : lowColorInput
+    line levelLine = line.new(anchorBar, levelPrice, bar_index, levelPrice, color = levelColor, style = lineStyleInput == STYLE_DASHED ? line.style_dashed : lineStyleInput == STYLE_DOTTED ? line.style_dotted : line.style_solid, width = widthInput)
+    label levelLabel = na
+    if showLabelsInput
+        string diagText = "TPOs at extreme: " + str.tostring(topCount)
+        diagText += "\nSingle-print tail: " + str.tostring(tailRows) + (tailRows == 1 ? " row" : " rows")
+        diagText += "\nClosing-bell extreme: " + (isCloseCut ? "yes" : "no")
+        diagText += "\nExtreme volume: " + (na(volumeRatio) ? "n/a" : str.tostring(volumeRatio, "#.##") + "x session average")
+        levelLabel := label.new(bar_index, levelPrice, levelSide > 0 ? "Unfinished High" : "Unfinished Low", style = label.style_label_left, color = #00000000, textcolor = levelColor, size = size.small, tooltip = diagText)
+    array.push(levelsArray, AuctionLevel.new(price = levelPrice, side = levelSide, bornSession = sessionCount, repaired = false, levelLine = levelLine, levelLabel = levelLabel))
+    while array.size(levelsArray) > maxLevelsInput
+        AuctionLevel oldLevel = array.shift(levelsArray)
+        if not na(oldLevel.levelLine)
+            line.delete(oldLevel.levelLine)
+        if not na(oldLevel.levelLabel)
+            label.delete(oldLevel.levelLabel)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Auction Detection
+//---------------------------------------------------------------------------------------------------------------------{
+bool newSession = timeframe.change(sessionTfInput)
+
+bool newUnfinishedHigh = false
+bool newUnfinishedLow  = false
+bool repairedHighEvent = false
+bool repairedLowEvent  = false
+
+if newSession
+    sessionCount += 1
+    int completedBars = array.size(sessHighArray)
+    if completedBars > 0
+        shortSessionStreak := completedBars < MIN_SESSION_BARS ? shortSessionStreak + 1 : 0
+    if completedBars >= MIN_SESSION_BARS
+        float sessionHigh  = array.max(sessHighArray)
+        float sessionLow   = array.min(sessLowArray)
+        float sessionRange = sessionHigh - sessionLow
+        if sessionRange > 0
+            float rowSize = math.max(sessionRange / rowsInput, syminfo.mintick)
+            [topCountH, tailRowsH, closeCutH, volumeRatioH, firstIdxH] = evalSide(sessHighArray, sessLowArray, sessVolArray, sessionHigh, sessionLow, rowSize, 1)
+            [topCountL, tailRowsL, closeCutL, volumeRatioL, firstIdxL] = evalSide(sessHighArray, sessLowArray, sessVolArray, sessionLow, sessionHigh, rowSize, -1)
+            bool volumeOkH = not volFilterInput or na(volumeRatioH) or volumeRatioH >= volMultInput
+            bool volumeOkL = not volFilterInput or na(volumeRatioL) or volumeRatioL >= volMultInput
+            bool stackedH  = topCountH >= stackedInput and volumeOkH
+            bool stackedL  = topCountL >= stackedInput and volumeOkL
+            bool clockCutH = closeCutInput and closeCutH
+            bool clockCutL = closeCutInput and closeCutL
+            bool unfinishedHigh = tailRowsH < minTailInput and (stackedH or clockCutH)
+            bool unfinishedLow  = tailRowsL < minTailInput and (stackedL or clockCutL)
+            array.push(resultArray, unfinishedHigh ? 1 : 0)
+            array.push(resultArray, unfinishedLow ? 1 : 0)
+            while array.size(resultArray) > statsLenInput
+                array.shift(resultArray)
+            if unfinishedHigh
+                createLevel(sessionHigh, 1, sessStartBar + firstIdxH, topCountH, tailRowsH, closeCutH, volumeRatioH)
+                newUnfinishedHigh := true
+            if unfinishedLow
+                createLevel(sessionLow, -1, sessStartBar + firstIdxL, topCountL, tailRowsL, closeCutL, volumeRatioL)
+                newUnfinishedLow := true
+    array.clear(sessHighArray)
+    array.clear(sessLowArray)
+    array.clear(sessVolArray)
+    sessStartBar := bar_index
+
+array.push(sessHighArray, high)
+array.push(sessLowArray, low)
+array.push(sessVolArray, nz(volume))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Reference Levels
+//---------------------------------------------------------------------------------------------------------------------{
+bool repairOnTouch = repairModeInput == REPAIR_TOUCH
+
+int levelIdx = 0
+while levelIdx < array.size(levelsArray)
+    AuctionLevel refLevel = array.get(levelsArray, levelIdx)
+    bool removed = false
+    if not refLevel.repaired
+        line.set_x2(refLevel.levelLine, bar_index)
+        if not na(refLevel.levelLabel)
+            label.set_x(refLevel.levelLabel, bar_index)
+        bool hit = refLevel.side > 0 ? (repairOnTouch ? high >= refLevel.price : high > refLevel.price) : (repairOnTouch ? low <= refLevel.price : low < refLevel.price)
+        if hit
+            refLevel.repaired := true
+            if refLevel.side > 0
+                repairedHighEvent := true
+            else
+                repairedLowEvent := true
+            if showRepairedInput
+                color dimColor = color.new(refLevel.side > 0 ? highColorInput : lowColorInput, REPAIRED_TRANSP)
+                line.set_color(refLevel.levelLine, dimColor)
+                line.set_style(refLevel.levelLine, line.style_dotted)
+                if not na(refLevel.levelLabel)
+                    label.set_textcolor(refLevel.levelLabel, dimColor)
+            else
+                line.delete(refLevel.levelLine)
+                if not na(refLevel.levelLabel)
+                    label.delete(refLevel.levelLabel)
+                array.remove(levelsArray, levelIdx)
+                removed := true
+    if not removed
+        levelIdx += 1
+
+int openHighCount = 0
+int openLowCount  = 0
+if array.size(levelsArray) > 0
+    for i = 0 to array.size(levelsArray) - 1
+        AuctionLevel countLevel = array.get(levelsArray, i)
+        if not countLevel.repaired
+            if countLevel.side > 0
+                openHighCount += 1
+            else
+                openLowCount += 1
+
+plot(openHighCount, "Open Unfinished Highs", highColorInput, display = display.data_window)
+plot(openLowCount, "Open Unfinished Lows", lowColorInput, display = display.data_window)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+tablePosition = switch tablePosInput
+    "Top Right"    => position.top_right
+    "Top Left"     => position.top_left
+    "Bottom Right" => position.bottom_right
+    "Bottom Left"  => position.bottom_left
+    => position.middle_right
+
+tableTextSize = switch tableSizeInput
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    => size.small
+
+if barstate.islast
+    if not na(dashTable)
+        table.delete(dashTable)
+        dashTable := na
+    if showTableInput
+        array<int>   openIdxArray  = array.new<int>()
+        array<float> openDistArray = array.new<float>()
+        int levelCount = array.size(levelsArray)
+        if levelCount > 0
+            for i = 0 to levelCount - 1
+                AuctionLevel refLevel = array.get(levelsArray, i)
+                if not refLevel.repaired
+                    array.push(openIdxArray, i)
+                    array.push(openDistArray, math.abs(refLevel.price - close))
+        int openCount = array.size(openIdxArray)
+        int entryRows = math.min(openCount, TABLE_MAX_ROWS)
+        bool shortWarn = shortSessionStreak >= SHORT_STREAK
+        int totalRows = 1 + math.max(entryRows, 1) + 1 + (shortWarn ? 1 : 0)
+        dashTable := table.new(tablePosition, 4, totalRows, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+        table.cell(dashTable, 0, 0, "Side", text_color = DASH_HEADER, text_size = tableTextSize)
+        table.cell(dashTable, 1, 0, "Price", text_color = DASH_HEADER, text_size = tableTextSize)
+        table.cell(dashTable, 2, 0, "Dist", text_color = DASH_HEADER, text_size = tableTextSize, tooltip = "Signed distance from the current price")
+        table.cell(dashTable, 3, 0, "Age", text_color = DASH_HEADER, text_size = tableTextSize, tooltip = "Completed sessions since the reference formed")
+        if openCount == 0
+            table.cell(dashTable, 0, 1, "No open references", text_color = DASH_HEADER, text_size = tableTextSize)
+        else
+            for r = 0 to entryRows - 1
+                int bestIdx = r
+                if r + 1 <= openCount - 1
+                    for j = r + 1 to openCount - 1
+                        if array.get(openDistArray, j) < array.get(openDistArray, bestIdx)
+                            bestIdx := j
+                if bestIdx != r
+                    float tmpDist = array.get(openDistArray, r)
+                    array.set(openDistArray, r, array.get(openDistArray, bestIdx))
+                    array.set(openDistArray, bestIdx, tmpDist)
+                    int tmpIdx = array.get(openIdxArray, r)
+                    array.set(openIdxArray, r, array.get(openIdxArray, bestIdx))
+                    array.set(openIdxArray, bestIdx, tmpIdx)
+                AuctionLevel refLevel = array.get(levelsArray, array.get(openIdxArray, r))
+                bool isHigh = refLevel.side > 0
+                float distPct = close != 0 ? (refLevel.price - close) / close * 100 : 0.0
+                string distText = (distPct >= 0 ? "+" : "") + str.tostring(distPct, "#.##") + "%"
+                table.cell(dashTable, 0, r + 1, isHigh ? "High" : "Low", text_color = isHigh ? highColorInput : lowColorInput, text_size = tableTextSize)
+                table.cell(dashTable, 1, r + 1, str.tostring(refLevel.price, format.mintick), text_color = DASH_TEXT, text_size = tableTextSize)
+                table.cell(dashTable, 2, r + 1, distText, text_color = DASH_TEXT, text_size = tableTextSize)
+                table.cell(dashTable, 3, r + 1, str.tostring(sessionCount - refLevel.bornSession), text_color = DASH_TEXT, text_size = tableTextSize)
+        int statRow = 1 + math.max(entryRows, 1)
+        table.merge_cells(dashTable, 0, statRow, 3, statRow)
+        int sampleCount = array.size(resultArray)
+        int unfinishedTotal = math.round(array.sum(resultArray))
+        string statText = sampleCount > 0 ? "Unfinished: " + str.tostring(unfinishedTotal) + "/" + str.tostring(sampleCount) + " extremes (" + str.tostring(unfinishedTotal * 100.0 / sampleCount, "#") + "%)" : "Unfinished: no audited sessions yet"
+        table.cell(dashTable, 0, statRow, statText, text_color = DASH_TEXT, text_size = tableTextSize, tooltip = "Share of recently audited session extremes left without the completion signature. A trend repeatedly leaving unfinished structure is storing up return trips; excess-marked extremes mark clean auctioning.")
+        if shortWarn
+            table.cell(dashTable, 0, totalRows - 1, "Sessions too short - use a lower chart timeframe", text_color = highColorInput, text_size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(newUnfinishedHigh, "New Unfinished High", "unfinished auction: session high on {{ticker}} completed without excess - new unfinished reference above")
+alertcondition(newUnfinishedLow, "New Unfinished Low", "unfinished auction: session low on {{ticker}} completed without excess - new unfinished reference below")
+alertcondition(repairedHighEvent, "Unfinished High Repaired", "unfinished auction: price returned to an unfinished high on {{ticker}} and repaired it")
+alertcondition(repairedLowEvent, "Unfinished Low Repaired", "unfinished auction: price returned to an unfinished low on {{ticker}} and repaired it")
+
+//---------------------------------------------------------------------------------------------------------------------}

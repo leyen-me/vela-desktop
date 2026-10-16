@@ -1,0 +1,527 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Gaussian Mixture Models", shorttitle = "Gaussian Mixture Models", overlay = false, format = format.percent, precision = 1, calc_bars_count = 4000)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+// Feature-set and volatility-measure options
+FEAT_RV = "Returns + Volatility"
+FEAT_R  = "Returns Only"
+FEAT_V  = "Volatility Only"
+VOL_SD  = "Stdev of Returns"
+VOL_ATR = "ATR %"
+
+// Fitting schedule options
+MODE_WARM = "Incremental (Warm Start)"
+MODE_FULL = "Full Refit Each Bar"
+
+// Dashboard options
+TOP_RIGHT    = "Top Right"
+TOP_LEFT     = "Top Left"
+BOTTOM_RIGHT = "Bottom Right"
+BOTTOM_LEFT  = "Bottom Left"
+TINY_SIZE    = "Tiny"
+SMALL_SIZE   = "Small"
+NORMAL_SIZE  = "Normal"
+
+// Regime palette - components are ordered by variance, calm first
+CALM_COLOR       = #089981
+TRANSITION_COLOR = #ff9800
+STRESS_COLOR     = #f23645
+ANOMALY_COLOR    = #fbc02d
+GUIDE_COLOR      = #787b86
+DASH_BG          = #161616
+DASH_FRAME       = #2E2E2E
+DASH_HEADER      = #808080
+DASH_TEXT        = #DBDBDB
+
+// Expectation-maximization guards
+MIN_TRAIN      = 30       // observations required before the first fit
+EM_TOL         = 1.0e-6   // relative log-likelihood improvement treated as converged
+VAR_FLOOR_FRAC = 1.0e-4   // variance floor as a fraction of each feature's window variance
+WEIGHT_FLOOR   = 1.0e-4   // mixture weight given to a degenerate (emptied) component
+LOG_FLOOR      = 1.0e-12  // smallest weight passed to math.log
+NEG_INFINITY   = -1.0e308
+
+// Gradient/opacity levels
+FILL_VALUE_TRANSP = 55    // gradient transparency at the dominant probability
+FILL_BASE_TRANSP  = 100   // gradient transparency at zero
+BAR_MAX_TRANSP    = 85.0  // candle transparency at minimum confidence (probability 1/K)
+
+// Input groups
+G_MODEL = "Gaussian Mixture"
+G_EM    = "Expectation-Maximization"
+G_DASH  = "Dashboard"
+G_STYLE = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+componentsInput = input.int(2, "Components", options = [2, 3]
+  , group   = G_MODEL
+  , tooltip = "Number of Gaussian components in the mixture. Two - the common starting point - reads as calm and stressed regimes; three adds a middle transition tier. Adding components never worsens the in-sample fit but the extra flexibility often models noise, so sanity-check any count against stretches of the chart it was not fitted on.")
+
+featureModeInput = input.string(FEAT_RV, "Features", options = [FEAT_RV, FEAT_R, FEAT_V]
+  , group   = G_MODEL
+  , tooltip = "Observation vector the mixture is fitted to. Returns + Volatility - the most common pairing - fits a two-dimensional mixture with a diagonal covariance (each component has its own mean and variance per feature); the single-feature modes fit a one-dimensional mixture. Components are only as meaningful as the features chosen.")
+
+srcInput = input.source(close, "Return Source"
+  , group   = G_MODEL
+  , tooltip = "Series whose one-bar log returns (in percent) feed the return feature and the Stdev of Returns volatility measure.")
+
+volMeasureInput = input.string(VOL_SD, "Volatility Measure", options = [VOL_SD, VOL_ATR]
+  , group   = G_MODEL
+  , tooltip = "Volatility feature definition. Stdev of Returns is the standard deviation of the percent log returns over the volatility length; ATR % is the average true range divided by price, in percent - both keep the feature scale-free so fits compare across symbols.")
+
+volLengthInput = input.int(14, "Volatility Length", minval = 2, maxval = 200
+  , group   = G_MODEL
+  , tooltip = "Lookback of the volatility measure feeding the volatility feature.")
+
+trainLengthInput = input.int(200, "Training Window", minval = 50, maxval = 500, step = 10
+  , group   = G_MODEL
+  , tooltip = "Rolling number of observations the mixture is fitted to. Each bar the newest observation replaces the oldest, so the fit always describes the most recent window - fits go stale as markets drift, and rolling the window accepts that component parameters (and therefore past labels) change as it moves. The first fit waits for 30 observations while the window fills.")
+
+maxStepsInput = input.int(10, "Max EM Steps per Bar", minval = 1, maxval = 30
+  , group   = G_EM
+  , tooltip = "Cap on expectation-maximization parameter updates per bar. Each step computes every observation's component responsibilities (expectation) then re-estimates each component's weight, mean and variance from them (maximization); stepping stops early once the log-likelihood improvement falls below 1e-6. Warm-started fits usually settle in one or two steps - the dashboard reports the count and whether the last fit converged or hit this cap. EM only guarantees a local optimum of the likelihood.")
+
+updateModeInput = input.string(MODE_WARM, "Update Mode", options = [MODE_WARM, MODE_FULL]
+  , group   = G_EM
+  , tooltip = "Incremental (Warm Start) begins each bar's fit from the previous bar's parameters - the online-style rolling update, cheap and label-stable. Full Refit Each Bar re-initializes from a variance-sorted quantile split of the window before iterating: heavier and more willing to relabel, but independent of the fit path taken so far.")
+
+smoothingInput = input.int(3, "Probability Smoothing", minval = 1, maxval = 50
+  , group   = G_EM
+  , tooltip = "EMA length applied to the component probabilities before the dominant regime is read. 1 = raw responsibilities. A plain mixture scores every bar independently - it has no memory of which regime came last - so raw labels can flicker bar to bar in transitional stretches; smoothing steadies the read at the cost of a little lag.")
+
+anomalyPctInput = input.float(5, "Anomaly Percentile", minval = 0.5, maxval = 25, step = 0.5
+  , group   = G_EM
+  , tooltip = "A bar is flagged anomalous when its likelihood under the whole mixture falls below this percentile of the training window's likelihoods - an observation with low likelihood under every component is unlike anything in the window, a warning that current conditions may not match the fitted regimes.")
+
+closedBarsInput = input.bool(true, "Fit on Closed Bars"
+  , group   = G_EM
+  , tooltip = "Update the training window and refit on confirmed bars only, so probabilities never change inside the forming bar and live readings match a replay of closed bars. Disable to refit on every tick of the developing bar at the cost of repaint risk.")
+
+showDashboardInput = input.bool(true, "Show Dashboard"
+  , group   = G_DASH
+  , tooltip = "Panel with each fitted component's mixture weight, per-feature mean and standard deviation, and current probability, plus the EM status (steps used, converged or capped), the window's average log-likelihood and the anomaly state.")
+
+dashboardPositionInput = input.string(TOP_RIGHT, "Position", options = [TOP_RIGHT, TOP_LEFT, BOTTOM_RIGHT, BOTTOM_LEFT], inline = "dash"
+  , group   = G_DASH
+  , tooltip = "Corner of the pane the dashboard is anchored to.")
+
+dashboardSizeInput = input.string(SMALL_SIZE, "Size", options = [TINY_SIZE, SMALL_SIZE, NORMAL_SIZE], inline = "dash"
+  , group   = G_DASH
+  , tooltip = "Dashboard text size.")
+
+calmColorInput = input.color(CALM_COLOR, "Calm", inline = "colors"
+  , group   = G_STYLE
+  , tooltip = "Color of the lowest-variance component - the quiet regime.")
+
+transitionColorInput = input.color(TRANSITION_COLOR, "Transition", inline = "colors"
+  , group   = G_STYLE
+  , tooltip = "Color of the middle component when three components are fitted.")
+
+stressColorInput = input.color(STRESS_COLOR, "Stressed", inline = "colors"
+  , group   = G_STYLE
+  , tooltip = "Color of the highest-variance component - the stressed regime.")
+
+anomalyColorInput = input.color(ANOMALY_COLOR, "Anomaly"
+  , group   = G_STYLE
+  , tooltip = "Color of the low-likelihood anomaly markers and dashboard flag.")
+
+lineWidthInput = input.int(1, "Line Width", minval = 1, maxval = 4
+  , group   = G_STYLE
+  , tooltip = "Width of the component probability lines.")
+
+gradientFillInput = input.bool(true, "Dominant Gradient"
+  , group   = G_STYLE
+  , tooltip = "Vertical gradient under the dominant component's probability, in that regime's color - transparent at zero, strongest at the value.")
+
+barColorInput = input.bool(true, "Color Chart Bars"
+  , group   = G_STYLE
+  , tooltip = "Paint main-chart candles with the dominant regime's color, opacity scaling with the probability - the soft-assignment read: confident bars are solid, bars sitting between regimes fade out.")
+
+showAnomalyInput = input.bool(false, "Anomaly Markers"
+  , group   = G_STYLE
+  , tooltip = "Draws a small diamond at the top of the pane on low-likelihood bars. Off by default - alerts and the dashboard carry the event; enable when a visual record is preferred.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+getLocation(string positionText) =>
+    switch positionText
+        TOP_RIGHT    => position.top_right
+        TOP_LEFT     => position.top_left
+        BOTTOM_RIGHT => position.bottom_right
+        => position.bottom_left
+
+getSize(string sizeText) =>
+    sizeText == TINY_SIZE ? size.tiny : sizeText == SMALL_SIZE ? size.small : size.normal
+
+formatPercent(float value) =>
+    na(value) ? "—" : str.tostring(100.0 * value, "0.0") + "%"
+
+formatValue(float value) =>
+    na(value) ? "—" : str.tostring(value, "0.000")
+
+// Components are kept ordered by variance, so index 0 is always the calm regime
+regimeName(int componentIndex) =>
+    componentIndex == 0 ? "Calm" : componentIndex == componentsInput - 1 ? "Stressed" : "Transition"
+
+regimeColor(int componentIndex) =>
+    componentIndex == 0 ? calmColorInput : componentIndex == componentsInput - 1 ? stressColorInput : transitionColorInput
+
+// Log of the normal density - all mixture math runs in log space for numerical stability
+logNormalPdf(float value, float meanValue, float varianceValue) =>
+    -0.5 * math.log(2.0 * math.pi * varianceValue) - 0.5 * (value - meanValue) * (value - meanValue) / varianceValue
+
+// ln( weight_k · N(x | mu_k, sigma_k²) ) over the active feature dimensions (diagonal covariance)
+componentLogDensity(float value0, float value1, int dimensionCount, int componentIndex, array<float> weights, array<float> means, array<float> variances) =>
+    float logDensity = math.log(math.max(array.get(weights, componentIndex), LOG_FLOOR)) + logNormalPdf(value0, array.get(means, componentIndex * 2), array.get(variances, componentIndex * 2))
+    if dimensionCount == 2
+        logDensity += logNormalPdf(value1, array.get(means, componentIndex * 2 + 1), array.get(variances, componentIndex * 2 + 1))
+    logDensity
+
+// One observation under the mixture: log-likelihood via log-sum-exp, plus each component's responsibility
+evaluatePoint(float value0, float value1, int dimensionCount, int componentCount, array<float> weights, array<float> means, array<float> variances) =>
+    float logDensity0   = componentLogDensity(value0, value1, dimensionCount, 0, weights, means, variances)
+    float logDensity1   = componentLogDensity(value0, value1, dimensionCount, 1, weights, means, variances)
+    float logDensity2   = componentCount == 3 ? componentLogDensity(value0, value1, dimensionCount, 2, weights, means, variances) : NEG_INFINITY
+    float maxLogDensity = math.max(logDensity0, logDensity1, logDensity2)
+    float expSum        = math.exp(logDensity0 - maxLogDensity) + math.exp(logDensity1 - maxLogDensity) + (componentCount == 3 ? math.exp(logDensity2 - maxLogDensity) : 0.0)
+    float pointLogLik   = maxLogDensity + math.log(expSum)
+    [pointLogLik, math.exp(logDensity0 - pointLogLik), math.exp(logDensity1 - pointLogLik), componentCount == 3 ? math.exp(logDensity2 - pointLogLik) : 0.0]
+
+// EMA that seeds on the first value and holds through gaps, so probabilities persist over non-fitting bars
+smoothProbability(float probabilityValue, simple int smoothingLength) =>
+    var float smoothedValue = na
+    float smoothingAlpha = 2.0 / (smoothingLength + 1.0)
+    if not na(probabilityValue)
+        smoothedValue := na(smoothedValue) ? probabilityValue : smoothedValue + smoothingAlpha * (probabilityValue - smoothedValue)
+    smoothedValue
+
+// Dashboard is created once, with its title and status rows pre-merged
+createDashboardTable(int columnCount, int rowCount) =>
+    tableId = table.new(getLocation(dashboardPositionInput), columnCount, rowCount, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+    table.merge_cells(tableId, 0, 0, columnCount - 1, 0)
+    table.merge_cells(tableId, 0, rowCount - 1, columnCount - 1, rowCount - 1)
+    tableId
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Features & Rolling Training Window
+//---------------------------------------------------------------------------------------------------------------------{
+// Scale-free features in percent units: one-bar log return, and a volatility measure of choice
+float returnFeature = srcInput > 0 and srcInput[1] > 0 ? 100.0 * math.log(srcInput / srcInput[1]) : na
+float stdevOfReturn = ta.stdev(returnFeature, volLengthInput)
+float atrRaw        = ta.atr(volLengthInput)
+float atrPercent    = close > 0 ? 100.0 * atrRaw / close : na
+float volFeature    = volMeasureInput == VOL_SD ? stdevOfReturn : atrPercent
+
+int   dims     = featureModeInput == FEAT_RV ? 2 : 1
+float feature0 = featureModeInput == FEAT_V ? volFeature : returnFeature
+float feature1 = volFeature
+
+// Observations enter the window on confirmed updates only (unless intrabar fitting is enabled)
+bool allowUpdate      = not closedBarsInput or barstate.isconfirmed
+bool observationValid = allowUpdate and not na(feature0) and (dims == 1 or not na(feature1))
+
+var feature0Array = array.new_float()
+var feature1Array = array.new_float()
+
+if observationValid
+    array.push(feature0Array, feature0)
+    array.push(feature1Array, dims == 2 ? feature1 : 0.0)
+    if array.size(feature0Array) > trainLengthInput
+        array.shift(feature0Array)
+        array.shift(feature1Array)
+
+int windowSize = array.size(feature0Array)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// EM Fit (bounded steps, variance-ordered components)
+//---------------------------------------------------------------------------------------------------------------------{
+// Mixture parameters, flattened as [component * 2 + dimension] - persisted for warm-started updates
+var weightArray   = array.new_float(3, 0.0)
+var meanArray     = array.new_float(6, 0.0)
+var varianceArray = array.new_float(6, 1.0)
+
+var bool  mixtureFitted        = false
+var bool  lastConverged        = false
+var int   lastSteps            = 0
+var float avgLogLikelihood     = na
+var float currentLogLikelihood = na
+var float anomalyThreshold     = na
+
+// Current-bar responsibilities (na whenever no fit ran on this bar; the smoother holds through gaps)
+float prob0Raw = na
+float prob1Raw = na
+float prob2Raw = na
+
+if observationValid and windowSize >= MIN_TRAIN
+    // window moments per feature - variance floors keep components from collapsing onto single points
+    float windowMean0 = 0.0
+    float windowMean1 = 0.0
+    for i = 0 to windowSize - 1
+        windowMean0 += array.get(feature0Array, i)
+        windowMean1 += array.get(feature1Array, i)
+    windowMean0 /= windowSize
+    windowMean1 /= windowSize
+    float windowVariance0 = 0.0
+    float windowVariance1 = 0.0
+    for i = 0 to windowSize - 1
+        float deviation0 = array.get(feature0Array, i) - windowMean0
+        float deviation1 = array.get(feature1Array, i) - windowMean1
+        windowVariance0 += deviation0 * deviation0
+        windowVariance1 += deviation1 * deviation1
+    windowVariance0 /= windowSize
+    windowVariance1 /= windowSize
+    float varianceFloor0 = math.max(1.0e-10, windowVariance0 * VAR_FLOOR_FRAC)
+    float varianceFloor1 = math.max(1.0e-10, windowVariance1 * VAR_FLOOR_FRAC)
+
+    // deterministic initialization: sort observations by a severity key and split into equal-count
+    // groups, seeding each component with its group's moments and a uniform weight
+    if (not mixtureFitted) or updateModeInput == MODE_FULL
+        keyArray = array.new_float(windowSize, 0.0)
+        for i = 0 to windowSize - 1
+            float severityValue = dims == 2 ? array.get(feature1Array, i) : featureModeInput == FEAT_V ? array.get(feature0Array, i) : math.abs(array.get(feature0Array, i) - windowMean0)
+            array.set(keyArray, i, severityValue)
+        sortedIndexArray = array.sort_indices(keyArray, order.ascending)
+        for k = 0 to componentsInput - 1
+            int startIndex = math.floor(k * windowSize / componentsInput)
+            int endIndex   = math.floor((k + 1) * windowSize / componentsInput) - 1
+            int groupCount = endIndex - startIndex + 1
+            float groupMean0 = 0.0
+            float groupMean1 = 0.0
+            for j = startIndex to endIndex
+                int obsIndex = array.get(sortedIndexArray, j)
+                groupMean0 += array.get(feature0Array, obsIndex)
+                groupMean1 += array.get(feature1Array, obsIndex)
+            groupMean0 /= groupCount
+            groupMean1 /= groupCount
+            float groupVariance0 = 0.0
+            float groupVariance1 = 0.0
+            for j = startIndex to endIndex
+                int spreadIndex = array.get(sortedIndexArray, j)
+                float groupDev0 = array.get(feature0Array, spreadIndex) - groupMean0
+                float groupDev1 = array.get(feature1Array, spreadIndex) - groupMean1
+                groupVariance0 += groupDev0 * groupDev0
+                groupVariance1 += groupDev1 * groupDev1
+            array.set(weightArray, k, 1.0 / componentsInput)
+            array.set(meanArray, k * 2, groupMean0)
+            array.set(meanArray, k * 2 + 1, groupMean1)
+            array.set(varianceArray, k * 2, math.max(groupVariance0 / groupCount, varianceFloor0))
+            array.set(varianceArray, k * 2 + 1, math.max(groupVariance1 / groupCount, varianceFloor1))
+
+    // bounded EM: expectation (responsibilities + log-likelihood), convergence test, maximization
+    responsibilityArray = array.new_float(windowSize * componentsInput, 0.0)
+    float previousLogLikelihood = na
+    bool  emConverged = false
+    int   emSteps     = 0
+    for iteration = 1 to maxStepsInput
+        float totalLogLikelihood = 0.0
+        for i = 0 to windowSize - 1
+            [pointLl, resp0, resp1, resp2] = evaluatePoint(array.get(feature0Array, i), array.get(feature1Array, i), dims, componentsInput, weightArray, meanArray, varianceArray)
+            totalLogLikelihood += pointLl
+            array.set(responsibilityArray, i * componentsInput, resp0)
+            array.set(responsibilityArray, i * componentsInput + 1, resp1)
+            if componentsInput == 3
+                array.set(responsibilityArray, i * componentsInput + 2, resp2)
+        if not na(previousLogLikelihood) and math.abs(totalLogLikelihood - previousLogLikelihood) <= EM_TOL * math.max(1.0, math.abs(totalLogLikelihood))
+            emConverged := true
+            break
+        previousLogLikelihood := totalLogLikelihood
+        for k = 0 to componentsInput - 1
+            float responsibilitySum = 0.0
+            float weightedSum0      = 0.0
+            float weightedSum1      = 0.0
+            for i = 0 to windowSize - 1
+                float responsibility = array.get(responsibilityArray, i * componentsInput + k)
+                responsibilitySum += responsibility
+                weightedSum0      += responsibility * array.get(feature0Array, i)
+                weightedSum1      += responsibility * array.get(feature1Array, i)
+            if responsibilitySum > 1.0e-8
+                float newMean0 = weightedSum0 / responsibilitySum
+                float newMean1 = weightedSum1 / responsibilitySum
+                float weightedVariance0 = 0.0
+                float weightedVariance1 = 0.0
+                for i = 0 to windowSize - 1
+                    float memberWeight = array.get(responsibilityArray, i * componentsInput + k)
+                    float newDev0 = array.get(feature0Array, i) - newMean0
+                    float newDev1 = array.get(feature1Array, i) - newMean1
+                    weightedVariance0 += memberWeight * newDev0 * newDev0
+                    weightedVariance1 += memberWeight * newDev1 * newDev1
+                array.set(weightArray, k, responsibilitySum / windowSize)
+                array.set(meanArray, k * 2, newMean0)
+                array.set(meanArray, k * 2 + 1, newMean1)
+                array.set(varianceArray, k * 2, math.max(weightedVariance0 / responsibilitySum, varianceFloor0))
+                array.set(varianceArray, k * 2 + 1, math.max(weightedVariance1 / responsibilitySum, varianceFloor1))
+            else
+                // a component lost all its observations - keep its shape, shrink its weight
+                array.set(weightArray, k, WEIGHT_FLOOR)
+        float weightSum = 0.0
+        for k = 0 to componentsInput - 1
+            weightSum += array.get(weightArray, k)
+        for k = 0 to componentsInput - 1
+            array.set(weightArray, k, array.get(weightArray, k) / weightSum)
+        emSteps := iteration
+
+    // fix component identities by ordering on variance (total over active features, ascending),
+    // so component 0 is always the calm regime and labels cannot swap between refits
+    for passIndex = 0 to componentsInput - 2
+        for swapIndex = 0 to componentsInput - 2 - passIndex
+            float totalVarianceA = array.get(varianceArray, swapIndex * 2) + (dims == 2 ? array.get(varianceArray, swapIndex * 2 + 1) : 0.0)
+            float totalVarianceB = array.get(varianceArray, (swapIndex + 1) * 2) + (dims == 2 ? array.get(varianceArray, (swapIndex + 1) * 2 + 1) : 0.0)
+            if totalVarianceA > totalVarianceB
+                float swapWeight = array.get(weightArray, swapIndex)
+                array.set(weightArray, swapIndex, array.get(weightArray, swapIndex + 1))
+                array.set(weightArray, swapIndex + 1, swapWeight)
+                for dimensionIndex = 0 to 1
+                    float swapMean = array.get(meanArray, swapIndex * 2 + dimensionIndex)
+                    array.set(meanArray, swapIndex * 2 + dimensionIndex, array.get(meanArray, (swapIndex + 1) * 2 + dimensionIndex))
+                    array.set(meanArray, (swapIndex + 1) * 2 + dimensionIndex, swapMean)
+                    float swapVariance = array.get(varianceArray, swapIndex * 2 + dimensionIndex)
+                    array.set(varianceArray, swapIndex * 2 + dimensionIndex, array.get(varianceArray, (swapIndex + 1) * 2 + dimensionIndex))
+                    array.set(varianceArray, (swapIndex + 1) * 2 + dimensionIndex, swapVariance)
+
+    // scoring pass under the final ordered parameters: per-observation likelihoods for the anomaly
+    // percentile, the window's average log-likelihood, and the current bar's responsibilities
+    likelihoodArray = array.new_float(windowSize, 0.0)
+    float logLikelihoodSum = 0.0
+    for i = 0 to windowSize - 1
+        [scoreLl, scoreResp0, scoreResp1, scoreResp2] = evaluatePoint(array.get(feature0Array, i), array.get(feature1Array, i), dims, componentsInput, weightArray, meanArray, varianceArray)
+        array.set(likelihoodArray, i, scoreLl)
+        logLikelihoodSum += scoreLl
+        if i == windowSize - 1
+            prob0Raw := scoreResp0
+            prob1Raw := scoreResp1
+            prob2Raw := componentsInput == 3 ? scoreResp2 : na
+            currentLogLikelihood := scoreLl
+    avgLogLikelihood := logLikelihoodSum / windowSize
+    anomalyThreshold := array.percentile_linear_interpolation(likelihoodArray, anomalyPctInput)
+    lastSteps        := emSteps
+    lastConverged    := emConverged
+    mixtureFitted    := true
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Regime Read & Anomaly Flag
+//---------------------------------------------------------------------------------------------------------------------{
+float prob0Smooth = smoothProbability(prob0Raw, smoothingInput)
+float prob1Smooth = smoothProbability(prob1Raw, smoothingInput)
+float prob2Smooth = smoothProbability(prob2Raw, smoothingInput)
+
+int   dominantIndex       = na
+float dominantProbability = na
+if not na(prob0Smooth) and not na(prob1Smooth)
+    dominantIndex       := prob0Smooth >= prob1Smooth ? 0 : 1
+    dominantProbability := math.max(prob0Smooth, prob1Smooth)
+    if componentsInput == 3 and not na(prob2Smooth) and prob2Smooth > dominantProbability
+        dominantIndex       := 2
+        dominantProbability := prob2Smooth
+
+color dominantColor = na(dominantIndex) ? na : regimeColor(dominantIndex)
+
+// confidence rescaled from [1/K, 1] to [0, 1] - drives the soft-assignment candle opacity
+float confidence01 = na(dominantProbability) ? na : math.max(0.0, math.min(1.0, (dominantProbability - 1.0 / componentsInput) / (1.0 - 1.0 / componentsInput)))
+color barPaintColor = na(dominantColor) or na(confidence01) ? na : color.new(dominantColor, int(math.round(BAR_MAX_TRANSP * (1.0 - confidence01))))
+
+// low likelihood under every component - the observation is unlike anything in the training window
+bool anomalyBar      = mixtureFitted and not na(currentLogLikelihood) and not na(anomalyThreshold) and currentLogLikelihood < anomalyThreshold
+bool previousAnomaly = na(anomalyBar[1]) ? false : anomalyBar[1]
+bool anomalyNew      = anomalyBar and not previousAnomaly
+
+int  previousDominant = dominantIndex[1]
+bool dominantChanged  = not na(dominantIndex) and not na(previousDominant) and dominantIndex != previousDominant
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Plots
+//---------------------------------------------------------------------------------------------------------------------{
+hline(100, "Upper Bound", color = color.new(GUIDE_COLOR, 70))
+hline(50, "Majority Level", color = color.new(GUIDE_COLOR, 50), linestyle = hline.style_dashed)
+hline(0, "Lower Bound", color = color.new(GUIDE_COLOR, 70))
+
+plot(100.0 * prob0Smooth, "Component 1 Probability (lowest variance)", color = regimeColor(0), linewidth = lineWidthInput, style = plot.style_linebr)
+plot(100.0 * prob1Smooth, "Component 2 Probability", color = regimeColor(1), linewidth = lineWidthInput, style = plot.style_linebr)
+plot(100.0 * prob2Smooth, "Component 3 Probability (highest variance)", color = regimeColor(2), linewidth = lineWidthInput, style = plot.style_linebr)
+
+dominantPlotId = plot(100.0 * dominantProbability, "Dominant Probability", color = na, editable = false)
+baselinePlotId = plot(0, "Gradient Baseline", color = na, editable = false, display = display.none)
+
+fillTopColor    = gradientFillInput ? color.new(dominantColor, FILL_VALUE_TRANSP) : na
+fillBottomColor = gradientFillInput ? color.new(dominantColor, FILL_BASE_TRANSP) : na
+fill(dominantPlotId, baselinePlotId, top_value = 100.0 * dominantProbability, bottom_value = 0.0, top_color = fillTopColor, bottom_color = fillBottomColor, title = "Dominant Regime Gradient")
+
+plotshape(showAnomalyInput and anomalyBar, "Anomaly Marker", style = shape.diamond, location = location.top, color = color.new(anomalyColorInput, 0), size = size.tiny)
+
+barcolor(barColorInput ? barPaintColor : na, title = "Regime Bar Coloring")
+
+// diagnostics - data window only
+plot(avgLogLikelihood, "Avg Log-Likelihood (window)", color = color.new(GUIDE_COLOR, 0), editable = false, display = display.data_window)
+plot(currentLogLikelihood, "Bar Log-Likelihood", color = color.new(GUIDE_COLOR, 0), editable = false, display = display.data_window)
+plot(anomalyThreshold, "Anomaly Threshold (log-lik)", color = color.new(GUIDE_COLOR, 0), editable = false, display = display.data_window)
+plot(lastSteps, "EM Steps (last fit)", color = color.new(GUIDE_COLOR, 0), editable = false, display = display.data_window)
+plot(lastConverged ? 1 : 0, "EM Converged (1 = yes)", color = color.new(GUIDE_COLOR, 0), editable = false, display = display.data_window)
+plot(windowSize, "Training Observations", color = color.new(GUIDE_COLOR, 0), editable = false, display = display.data_window)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dashboardTable = showDashboardInput ? createDashboardTable(3 + 2 * dims, componentsInput + 3) : na
+
+if showDashboardInput and barstate.islast
+    string textSizeValue = getSize(dashboardSizeInput)
+    color  dimColor      = DASH_HEADER
+    color  highlightBg   = DASH_BG
+    string volLabel      = volMeasureInput == VOL_SD ? "Vol%" : "ATR%"
+    string dim0Label     = featureModeInput == FEAT_V ? volLabel : "Ret%"
+
+    string headerText = mixtureFitted
+         ? "Gaussian Mixture • " + str.tostring(componentsInput) + " components • " + str.tostring(windowSize) + " obs"
+         : "Gaussian Mixture • training " + str.tostring(windowSize) + "/" + str.tostring(MIN_TRAIN) + " obs"
+    table.cell(dashboardTable, 0, 0, headerText, text_color = dimColor, text_size = textSizeValue, text_halign = text.align_left,
+         tooltip = "Rolling fit: each bar the newest observation replaces the oldest and the mixture is re-estimated, so parameters - and how past bars would be labeled - drift with the window. Component identities are pinned by ordering on variance, calm first.")
+
+    table.cell(dashboardTable, 0, 1, "Regime", text_color = dimColor, text_size = textSizeValue, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 1, "Weight", text_color = dimColor, text_size = textSizeValue, text_halign = text.align_right,
+         tooltip = "Mixture weight - the share of the training window the component accounts for.")
+    for dimensionIndex = 0 to dims - 1
+        string dimensionLabel = dimensionIndex == 0 ? dim0Label : volLabel
+        table.cell(dashboardTable, 2 + dimensionIndex * 2, 1, "μ " + dimensionLabel, text_color = dimColor, text_size = textSizeValue, text_halign = text.align_right,
+             tooltip = "Fitted component mean of this feature, in percent per bar.")
+        table.cell(dashboardTable, 3 + dimensionIndex * 2, 1, "σ " + dimensionLabel, text_color = dimColor, text_size = textSizeValue, text_halign = text.align_right,
+             tooltip = "Fitted component standard deviation of this feature - the variance axis the regimes separate on.")
+    table.cell(dashboardTable, 2 + dims * 2, 1, "P(bar)", text_color = dimColor, text_size = textSizeValue, text_halign = text.align_right,
+         tooltip = "Smoothed probability that the current bar belongs to the component - the soft assignment. Values near 1 mean confident membership; middling values mean the bar sits between regimes and labels may flip.")
+
+    for componentIndex = 0 to componentsInput - 1
+        int  rowIndex   = componentIndex + 2
+        bool isDominant = not na(dominantIndex) and dominantIndex == componentIndex
+        color rowBg     = isDominant ? highlightBg : na
+        float probValue = componentIndex == 0 ? prob0Smooth : componentIndex == 1 ? prob1Smooth : prob2Smooth
+        table.cell(dashboardTable, 0, rowIndex, "● " + regimeName(componentIndex), text_color = regimeColor(componentIndex), text_size = textSizeValue, text_halign = text.align_left, bgcolor = rowBg)
+        table.cell(dashboardTable, 1, rowIndex, formatPercent(mixtureFitted ? array.get(weightArray, componentIndex) : na), text_color = DASH_TEXT, text_size = textSizeValue, text_halign = text.align_right, bgcolor = rowBg)
+        for dimensionIndex = 0 to dims - 1
+            float meanValue  = mixtureFitted ? array.get(meanArray, componentIndex * 2 + dimensionIndex) : na
+            float sigmaValue = mixtureFitted ? math.sqrt(array.get(varianceArray, componentIndex * 2 + dimensionIndex)) : na
+            table.cell(dashboardTable, 2 + dimensionIndex * 2, rowIndex, formatValue(meanValue), text_color = DASH_TEXT, text_size = textSizeValue, text_halign = text.align_right, bgcolor = rowBg)
+            table.cell(dashboardTable, 3 + dimensionIndex * 2, rowIndex, formatValue(sigmaValue), text_color = DASH_TEXT, text_size = textSizeValue, text_halign = text.align_right, bgcolor = rowBg)
+        table.cell(dashboardTable, 2 + dims * 2, rowIndex, formatPercent(probValue), text_color = isDominant ? regimeColor(componentIndex) : DASH_TEXT, text_size = textSizeValue, text_halign = text.align_right, bgcolor = rowBg)
+
+    string statusText = mixtureFitted
+         ? "EM: " + str.tostring(lastSteps) + (lastSteps == 1 ? " update • " : " updates • ") + (lastConverged ? "converged" : "step cap hit") + " | avg log-lik " + str.tostring(avgLogLikelihood, "0.00") + " | anomaly: " + (anomalyBar ? "YES" : "no")
+         : "Collecting observations — first EM fit pending"
+    table.cell(dashboardTable, 0, componentsInput + 2, statusText, text_color = anomalyBar ? anomalyColorInput : dimColor, text_size = textSizeValue, text_halign = text.align_left,
+         tooltip = "Honest-fit notes: EM improves the likelihood until it stalls, sometimes at a local optimum, and stepping is capped per bar - 'step cap hit' means the last fit was still moving when stopped. Probabilities describe the recent window only; they contain no directional forecast. Anomaly flags bars whose mixture likelihood sits below the chosen percentile of the window.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(dominantChanged, "Dominant Regime Change", "Gaussian Mixture Models: the dominant mixture component changed ({{ticker}}, {{interval}})")
+alertcondition(dominantChanged and dominantIndex == 0, "Calm Regime Dominant", "Gaussian Mixture Models: the calm (lowest-variance) component is now dominant ({{ticker}}, {{interval}})")
+alertcondition(dominantChanged and componentsInput == 3 and dominantIndex == 1, "Transition Regime Dominant", "Gaussian Mixture Models: the middle transition component is now dominant ({{ticker}}, {{interval}})")
+alertcondition(dominantChanged and dominantIndex == componentsInput - 1, "Stressed Regime Dominant", "Gaussian Mixture Models: the stressed (highest-variance) component is now dominant ({{ticker}}, {{interval}})")
+alertcondition(anomalyNew, "Low-Likelihood Anomaly", "Gaussian Mixture Models: bar likelihood fell below the anomaly percentile - conditions unlike the training window ({{ticker}}, {{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

@@ -1,0 +1,500 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Low-resistance vs High-resistance Liquidity Runs"
+  , shorttitle       = "Low-resistance vs High-resistance Liquidity Runs"
+  , overlay          = true
+  , format           = format.price
+  , max_lines_count  = 500
+  , max_labels_count = 500
+  , max_boxes_count  = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+//Corridor classification codes
+int CLASS_LOW   = 1
+int CLASS_MIXED = 2
+int CLASS_HIGH  = 3
+
+//Inventory caps and drawing limits
+int MAX_MAJOR_SWINGS  = 100
+int MAX_MINOR_SWINGS  = 200
+int MAX_GAPS          = 150
+int CORRIDOR_EXTEND   = 8
+int ATR_LENGTH        = 200
+int MAX_DRAW_LOOKBACK = 4500
+
+//Default palette: green for a cleared path, red for intact opposition, gray for mixed / cleared context
+color LOW_COLOR     = #089981
+color HIGH_COLOR    = #f23645
+color NEUTRAL_COLOR = #787b86
+color TRANSP_COLOR  = #00000000
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+int CORRIDOR_TRANSP = 85
+int GAP_TRANSP      = 85
+int SWEPT_TRANSP    = 50
+int HISTORY_TRANSP  = 35
+
+string GROUP_CORRIDOR = "Liquidity Corridor"
+string GROUP_GAPS     = "Imbalances"
+string GROUP_DELIVERY = "Delivery"
+string GROUP_DASH     = "Dashboard"
+string GROUP_STYLE    = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types
+//---------------------------------------------------------------------------------------------------------------------{
+
+//A confirmed swing point, kept in the corridor inventory until it scrolls out of the capped history.
+//Unswept swings are intact resistance to a run; swept ones mark cleared territory
+type Swing
+    float price
+    int   barIdx
+    bool  isHigh
+    bool  swept = false
+
+//An unfilled fair value gap, removed from the inventory once price fully trades back through it
+type Imbalance
+    float top
+    float bottom
+    bool  bullish
+    int   barIdx
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+targetLengthInput = input.int(30, "Target Pool Swing Length"
+  , minval  = 2
+  , group   = GROUP_CORRIDOR
+  , tooltip = "Pivot length of the major swings whose unswept highs and lows serve as target liquidity pools. The nearest unswept major swing high above price is the buy-side pool; the nearest unswept major swing low below price is the sell-side pool. Larger values target older, more obvious pools.")
+
+structureLengthInput = input.int(10, "Intervening Swing Length"
+  , minval  = 1
+  , group   = GROUP_CORRIDOR
+  , tooltip = "Pivot length of the minor swings inventoried inside the corridor between price and each target pool. Unswept minor swings are fresh, intact resistance to the run; swept ones mark already-cleared territory. Keep it below the target pool length.")
+
+lowMaxInput = input.int(0, "Low-Resistance Threshold"
+  , minval  = 0
+  , group   = GROUP_CORRIDOR
+  , tooltip = "A corridor classifies as a low-resistance run while its intact units (fresh swings plus opposing gaps) are at or below this count. With 0, the only untouched feature ahead must be the target pool itself.")
+
+highMinInput = input.int(3, "High-Resistance Threshold"
+  , minval  = 1
+  , group   = GROUP_CORRIDOR
+  , tooltip = "A corridor classifies as a high-resistance run once its intact units reach or exceed this count - a stack of untested swings and opposing levels. Counts between the two thresholds read as Mixed.")
+
+useFvgInput = input.bool(true, "Include Fair Value Gaps"
+  , group   = GROUP_GAPS
+  , tooltip = "Counts unfilled fair value gaps overlapping the corridor in the inventory: gaps opposing the direction of travel add intact resistance, aligned gaps mark cleared, low-resistance territory.")
+
+fvgFilterInput = input.float(0, "Minimum Gap Width (xATR)"
+  , minval  = 0
+  , step    = 0.05
+  , group   = GROUP_GAPS
+  , tooltip = "Ignores fair value gaps narrower than this multiple of the 200-period ATR, filtering noise gaps on small timeframes. 0 keeps every gap.")
+
+deliveryLengthInput = input.int(10, "Delivery Window"
+  , minval  = 2
+  , maxval  = 200
+  , group   = GROUP_DELIVERY
+  , tooltip = "Bars used to judge delivery once a move is under way, via the efficiency ratio: net progress divided by the total bar-to-bar travel over the window. Direct travel scores near 1, overlapping candles near 0.")
+
+displaceThInput = input.float(0.5, "Displacing Threshold"
+  , minval  = 0
+  , maxval  = 1
+  , step    = 0.05
+  , group   = GROUP_DELIVERY
+  , tooltip = "Efficiency ratio at or above which delivery reads as displacement with shallow pullbacks - behavior consistent with a low-resistance run.")
+
+grindThInput = input.float(0.25, "Grinding Threshold"
+  , minval  = 0
+  , maxval  = 1
+  , step    = 0.05
+  , group   = GROUP_DELIVERY
+  , tooltip = "Efficiency ratio at or below which delivery reads as slow, overlapping candles with deep retracements - the market is meeting resistance. Values above the displacing threshold are clamped to it.")
+
+showDashInput = input.bool(true, "Show Dashboard"
+  , group   = GROUP_DASH
+  , tooltip = "Summarizes both corridors - target pool, intact versus cleared structure, classification - plus the current delivery reading.")
+
+dashLocInput = input.string("Top Right", "Location"
+  , options = ["Top Right", "Bottom Right", "Bottom Left", "Top Left"]
+  , group   = GROUP_DASH
+  , tooltip = "Dashboard position on the chart.")
+
+dashSizeInput = input.string("Small", "Size"
+  , options = ["Tiny", "Small", "Normal"]
+  , group   = GROUP_DASH
+  , tooltip = "Dashboard text size.")
+
+showCorridorInput = input.bool(true, "Corridor Boxes"
+  , group   = GROUP_STYLE
+  , tooltip = "Shades the corridor between price and each target pool with its current classification and inventory counts.")
+
+showTargetInput = input.bool(true, "Target Pool Lines"
+  , group   = GROUP_STYLE
+  , tooltip = "Draws the buy-side and sell-side target pool levels from their origin swing, colored by the corridor classification.")
+
+showHistoryInput = input.bool(true, "Plot Pool History"
+  , group   = GROUP_STYLE
+  , tooltip = "Plots where both target pools sat on past bars, colored by the classification the corridor carried at the time.")
+
+showStructInput = input.bool(true, "Intervening Swings"
+  , group   = GROUP_STYLE
+  , tooltip = "Draws the minor swings inside each corridor - dashed for fresh, intact levels and dotted for already-swept ones.")
+
+showFvgInput = input.bool(true, "Corridor Imbalances"
+  , group   = GROUP_STYLE
+  , tooltip = "Draws unfilled fair value gaps inside the corridors, colored by whether they align with or oppose the run toward the pool.")
+
+barColorInput = input.bool(false, "Color Bars By Delivery State"
+  , group   = GROUP_STYLE
+  , tooltip = "Colors candles by delivery quality: displacing (efficient, one-sided travel) or grinding (overlapping, deeply retracing delivery).")
+
+lowColorInput = input.color(LOW_COLOR, "Low Resistance", inline = "classColors", group = GROUP_STYLE)
+
+highColorInput = input.color(HIGH_COLOR, "High Resistance", inline = "classColors", group = GROUP_STYLE)
+
+neutralColorInput = input.color(NEUTRAL_COLOR, "Mixed / Cleared", inline = "classColors", group = GROUP_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+//Classification color from a class code (0 / na reads neutral)
+classColor(int classId) =>
+    classId == CLASS_LOW ? lowColorInput : classId == CLASS_HIGH ? highColorInput : neutralColorInput
+
+//Classification text from a class code
+classText(int classId) =>
+    classId == CLASS_LOW ? "Low-resistance" : classId == CLASS_HIGH ? "High-resistance" : classId == CLASS_MIXED ? "Mixed" : "-"
+
+//Classifies one corridor from its count of intact opposing units. No target pool means no run to classify
+classifyCorridor(int resistanceUnits, bool hasTarget) =>
+    int classId = na
+    if hasTarget
+        int highMin = math.max(highMinInput, lowMaxInput + 1)
+        classId := resistanceUnits <= lowMaxInput ? CLASS_LOW : resistanceUnits >= highMin ? CLASS_HIGH : CLASS_MIXED
+    classId
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Swings & Sweeps
+//---------------------------------------------------------------------------------------------------------------------{
+
+var array<Swing> majorSwingsArray = array.new<Swing>()
+var array<Swing> minorSwingsArray = array.new<Swing>()
+
+//Major swings supply the target pools, minor swings supply the intervening structure inventoried
+//inside the corridor - two tiers, so the corridor to a pool can still contain smaller intact levels
+float majorHighPrice = ta.pivothigh(targetLengthInput, targetLengthInput)
+float majorLowPrice  = ta.pivotlow(targetLengthInput, targetLengthInput)
+float minorHighPrice = ta.pivothigh(structureLengthInput, structureLengthInput)
+float minorLowPrice  = ta.pivotlow(structureLengthInput, structureLengthInput)
+
+if not na(majorHighPrice)
+    array.push(majorSwingsArray, Swing.new(majorHighPrice, bar_index - targetLengthInput, true))
+if not na(majorLowPrice)
+    array.push(majorSwingsArray, Swing.new(majorLowPrice, bar_index - targetLengthInput, false))
+if not na(minorHighPrice)
+    array.push(minorSwingsArray, Swing.new(minorHighPrice, bar_index - structureLengthInput, true))
+if not na(minorLowPrice)
+    array.push(minorSwingsArray, Swing.new(minorLowPrice, bar_index - structureLengthInput, false))
+
+if array.size(majorSwingsArray) > MAX_MAJOR_SWINGS
+    array.shift(majorSwingsArray)
+if array.size(minorSwingsArray) > MAX_MINOR_SWINGS
+    array.shift(minorSwingsArray)
+
+//Each sweep converts remaining resistance into cleared territory: a swing is swept once price
+//trades through it, and it stays in the inventory as a cleared level
+int majorCount = array.size(majorSwingsArray)
+if majorCount > 0
+    for i = 0 to majorCount - 1
+        Swing majorSwing = array.get(majorSwingsArray, i)
+        if not majorSwing.swept and (majorSwing.isHigh ? high > majorSwing.price : low < majorSwing.price)
+            majorSwing.swept := true
+
+int minorCount = array.size(minorSwingsArray)
+if minorCount > 0
+    for i = 0 to minorCount - 1
+        Swing minorSwing = array.get(minorSwingsArray, i)
+        if not minorSwing.swept and (minorSwing.isHigh ? high > minorSwing.price : low < minorSwing.price)
+            minorSwing.swept := true
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Fair Value Gaps
+//---------------------------------------------------------------------------------------------------------------------{
+
+var array<Imbalance> gapsArray = array.new<Imbalance>()
+
+float atrValue    = ta.atr(ATR_LENGTH)
+float minGapWidth = fvgFilterInput * nz(atrValue)
+
+//Three-candle imbalances: a bullish gap opens between the first candle's high and the third's low
+bool bullishGap = not na(high[2]) and low > high[2] and low - high[2] >= minGapWidth
+bool bearishGap = not na(low[2]) and high < low[2] and low[2] - high >= minGapWidth
+
+if bullishGap
+    array.push(gapsArray, Imbalance.new(low, high[2], true, bar_index - 1))
+if bearishGap
+    array.push(gapsArray, Imbalance.new(low[2], high, false, bar_index - 1))
+
+//A gap leaves the inventory once price has traded back through its far side - it no longer
+//marks one-sided territory in either direction
+int gapIndex = 0
+while gapIndex < array.size(gapsArray)
+    Imbalance gap = array.get(gapsArray, gapIndex)
+    if gap.bullish ? low <= gap.bottom : high >= gap.top
+        array.remove(gapsArray, gapIndex)
+    else
+        gapIndex += 1
+
+if array.size(gapsArray) > MAX_GAPS
+    array.shift(gapsArray)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Target Pools & Corridor Inventory
+//---------------------------------------------------------------------------------------------------------------------{
+
+//Step 1 - define the target: the nearest unswept major swing in each direction is the pool the run
+//would draw toward (buy-side above, sell-side below). No unswept major swing means no pool that way
+float upTargetPrice   = na
+int   upTargetBar     = na
+float downTargetPrice = na
+int   downTargetBar   = na
+
+if majorCount > 0
+    for i = 0 to majorCount - 1
+        Swing majorSwing = array.get(majorSwingsArray, i)
+        if not majorSwing.swept
+            if majorSwing.isHigh and majorSwing.price > close and (na(upTargetPrice) or majorSwing.price < upTargetPrice)
+                upTargetPrice := majorSwing.price
+                upTargetBar   := majorSwing.barIdx
+            else if not majorSwing.isHigh and majorSwing.price < close and (na(downTargetPrice) or majorSwing.price > downTargetPrice)
+                downTargetPrice := majorSwing.price
+                downTargetBar   := majorSwing.barIdx
+
+//Steps 2 and 3 - inventory each corridor: unswept minor swings between price and the pool are fresh,
+//intact resistance; swept ones are cleared territory. Swings sitting exactly at the pool price belong
+//to the pool itself and are excluded
+int freshUpCount     = 0
+int clearedUpCount   = 0
+int freshDownCount   = 0
+int clearedDownCount = 0
+
+if minorCount > 0
+    for i = 0 to minorCount - 1
+        Swing minorSwing = array.get(minorSwingsArray, i)
+        if not na(upTargetPrice) and minorSwing.price > close and minorSwing.price < upTargetPrice
+            if minorSwing.swept
+                clearedUpCount += 1
+            else
+                freshUpCount += 1
+        if not na(downTargetPrice) and minorSwing.price < close and minorSwing.price > downTargetPrice
+            if minorSwing.swept
+                clearedDownCount += 1
+            else
+                freshDownCount += 1
+
+//Unfilled gaps overlapping the corridor: opposing imbalances count as resistance to the run,
+//imbalances aligned with the direction of travel mark low-resistance territory
+int opposingGapUpCount   = 0
+int alignedGapUpCount    = 0
+int opposingGapDownCount = 0
+int alignedGapDownCount  = 0
+
+if useFvgInput
+    int gapCount = array.size(gapsArray)
+    if gapCount > 0
+        for i = 0 to gapCount - 1
+            Imbalance gap = array.get(gapsArray, i)
+            if not na(upTargetPrice) and gap.top > close and gap.bottom < upTargetPrice
+                if gap.bullish
+                    alignedGapUpCount += 1
+                else
+                    opposingGapUpCount += 1
+            if not na(downTargetPrice) and gap.bottom < close and gap.top > downTargetPrice
+                if gap.bullish
+                    opposingGapDownCount += 1
+                else
+                    alignedGapDownCount += 1
+
+int resistanceUpUnits   = freshUpCount + opposingGapUpCount
+int clearedUpUnits      = clearedUpCount + alignedGapUpCount
+int resistanceDownUnits = freshDownCount + opposingGapDownCount
+int clearedDownUnits    = clearedDownCount + alignedGapDownCount
+
+//Step 5 - the classification is recomputed on every bar, so a corridor reclassifies as soon as fresh
+//opposing structure forms, existing structure is swept, or the pool itself changes
+int upClass   = classifyCorridor(resistanceUpUnits, not na(upTargetPrice))
+int downClass = classifyCorridor(resistanceDownUnits, not na(downTargetPrice))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Delivery Quality
+//---------------------------------------------------------------------------------------------------------------------{
+
+//Step 4 - observe delivery once the move starts. The efficiency ratio compares net progress with the
+//total bar-to-bar travel: displacement with shallow pullbacks scores high, overlapping candles with
+//repeated deep retracements score low
+float netMove         = close - close[deliveryLengthInput]
+float travelSum       = math.sum(math.abs(close - close[1]), deliveryLengthInput)
+float efficiencyRatio = na(netMove) or na(travelSum) or travelSum == 0 ? na : math.abs(netMove) / travelSum
+
+bool deliveryUp   = not na(netMove) and netMove > 0
+bool deliveryDown = not na(netMove) and netMove < 0
+bool displacing   = not na(efficiencyRatio) and efficiencyRatio >= displaceThInput
+bool grinding     = not na(efficiencyRatio) and efficiencyRatio <= math.min(grindThInput, displaceThInput)
+
+//Corridor and delivery events for the alert runners
+bool lowUpStart    = nz(upClass) == CLASS_LOW and nz(upClass[1]) != CLASS_LOW
+bool lowDownStart  = nz(downClass) == CLASS_LOW and nz(downClass[1]) != CLASS_LOW
+bool highUpStart   = nz(upClass) == CLASS_HIGH and nz(upClass[1]) != CLASS_HIGH
+bool highDownStart = nz(downClass) == CLASS_HIGH and nz(downClass[1]) != CLASS_HIGH
+
+bool upPoolSwept   = not na(upTargetPrice[1]) and high > upTargetPrice[1]
+bool downPoolSwept = not na(downTargetPrice[1]) and low < downTargetPrice[1]
+
+//Execution honesty check: the move under way points at a low-resistance pool, yet delivery just
+//turned grinding - the low-resistance premise is failing before the target is reached
+bool premiseFailing = grinding and not grinding[1] and ((deliveryUp and nz(upClass) == CLASS_LOW) or (deliveryDown and nz(downClass) == CLASS_LOW))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+
+plot(showHistoryInput ? upTargetPrice : na, "Buy-side pool history", color.new(classColor(nz(upClass)), HISTORY_TRANSP), 1, plot.style_linebr)
+plot(showHistoryInput ? downTargetPrice : na, "Sell-side pool history", color.new(classColor(nz(downClass)), HISTORY_TRANSP), 1, plot.style_linebr)
+
+barcolor(barColorInput ? (displacing ? lowColorInput : grinding ? highColorInput : color(na)) : color(na), title = "Delivery state")
+
+var array<line>  drawnLinesArray  = array.new<line>()
+var array<box>   drawnBoxesArray  = array.new<box>()
+var array<label> drawnLabelsArray = array.new<label>()
+
+if barstate.islast
+    while array.size(drawnLinesArray) > 0
+        line.delete(array.pop(drawnLinesArray))
+    while array.size(drawnBoxesArray) > 0
+        box.delete(array.pop(drawnBoxesArray))
+    while array.size(drawnLabelsArray) > 0
+        label.delete(array.pop(drawnLabelsArray))
+
+    int minDrawBar = math.max(bar_index - MAX_DRAW_LOOKBACK, 0)
+    color upClassColor   = classColor(nz(upClass))
+    color downClassColor = classColor(nz(downClass))
+
+    //Target pools and their corridors, shaded by classification with the live inventory counts
+    if not na(upTargetPrice)
+        if showTargetInput
+            array.push(drawnLinesArray, line.new(math.max(upTargetBar, minDrawBar), upTargetPrice, bar_index + CORRIDOR_EXTEND, upTargetPrice, color = upClassColor, width = 1))
+            array.push(drawnLabelsArray, label.new(bar_index + CORRIDOR_EXTEND, upTargetPrice, "Buy-side pool", style = label.style_label_left, color = TRANSP_COLOR, textcolor = upClassColor, size = size.small))
+        if showCorridorInput
+            string upBoxText = classText(nz(upClass)) + " run ▲\n" + str.tostring(resistanceUpUnits) + " intact · " + str.tostring(clearedUpUnits) + " cleared"
+            array.push(drawnBoxesArray, box.new(bar_index, upTargetPrice, bar_index + CORRIDOR_EXTEND, close, border_color = color(na), bgcolor = color.new(upClassColor, CORRIDOR_TRANSP), text = upBoxText, text_color = upClassColor, text_size = size.tiny))
+
+    if not na(downTargetPrice)
+        if showTargetInput
+            array.push(drawnLinesArray, line.new(math.max(downTargetBar, minDrawBar), downTargetPrice, bar_index + CORRIDOR_EXTEND, downTargetPrice, color = downClassColor, width = 1))
+            array.push(drawnLabelsArray, label.new(bar_index + CORRIDOR_EXTEND, downTargetPrice, "Sell-side pool", style = label.style_label_left, color = TRANSP_COLOR, textcolor = downClassColor, size = size.small))
+        if showCorridorInput
+            string downBoxText = classText(nz(downClass)) + " run ▼\n" + str.tostring(resistanceDownUnits) + " intact · " + str.tostring(clearedDownUnits) + " cleared"
+            array.push(drawnBoxesArray, box.new(bar_index, close, bar_index + CORRIDOR_EXTEND, downTargetPrice, border_color = color(na), bgcolor = color.new(downClassColor, CORRIDOR_TRANSP), text = downBoxText, text_color = downClassColor, text_size = size.tiny))
+
+    //The explicit corridor map: fresh intervening swings dashed (intact resistance), swept ones dotted
+    if showStructInput and minorCount > 0
+        for i = 0 to minorCount - 1
+            Swing minorSwing = array.get(minorSwingsArray, i)
+            bool inUpBand   = not na(upTargetPrice) and minorSwing.price > close and minorSwing.price < upTargetPrice
+            bool inDownBand = not na(downTargetPrice) and minorSwing.price < close and minorSwing.price > downTargetPrice
+            if inUpBand or inDownBand
+                if minorSwing.swept
+                    array.push(drawnLinesArray, line.new(math.max(minorSwing.barIdx, minDrawBar), minorSwing.price, bar_index, minorSwing.price, color = color.new(neutralColorInput, SWEPT_TRANSP), style = line.style_dotted))
+                else
+                    array.push(drawnLinesArray, line.new(math.max(minorSwing.barIdx, minDrawBar), minorSwing.price, bar_index, minorSwing.price, color = highColorInput, style = line.style_dashed))
+
+    //Unfilled gaps inside the corridors, colored by their role relative to the run they sit in
+    if showFvgInput
+        int gapDrawCount = array.size(gapsArray)
+        if gapDrawCount > 0
+            for i = 0 to gapDrawCount - 1
+                Imbalance gap = array.get(gapsArray, i)
+                bool inUpCorridor   = not na(upTargetPrice) and gap.top > close and gap.bottom < upTargetPrice
+                bool inDownCorridor = not na(downTargetPrice) and gap.bottom < close and gap.top > downTargetPrice
+                if inUpCorridor or inDownCorridor
+                    bool upSide     = inUpCorridor and (not inDownCorridor or math.avg(gap.top, gap.bottom) > close)
+                    bool alignedGap = upSide ? gap.bullish : not gap.bullish
+                    color gapColor  = alignedGap ? lowColorInput : highColorInput
+                    array.push(drawnBoxesArray, box.new(math.max(gap.barIdx, minDrawBar), gap.top, bar_index, gap.bottom, border_color = color(na), bgcolor = color.new(gapColor, GAP_TRANSP)))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+
+var table dashboardTable = na
+
+if showDashInput and barstate.islast
+    if na(dashboardTable)
+        string dashPos = dashLocInput == "Top Right" ? position.top_right : dashLocInput == "Bottom Right" ? position.bottom_right : dashLocInput == "Bottom Left" ? position.bottom_left : position.top_left
+        dashboardTable := table.new(dashPos, 5, 4, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+    string dashTextSize = dashSizeInput == "Tiny" ? size.tiny : dashSizeInput == "Small" ? size.small : size.normal
+    color headerColor   = DASH_HEADER
+    color textColor     = DASH_TEXT
+    color upCellColor   = classColor(nz(upClass))
+    color downCellColor = classColor(nz(downClass))
+
+    table.cell(dashboardTable, 0, 0, "Run", text_color = headerColor, text_size = dashTextSize)
+    table.cell(dashboardTable, 1, 0, "Target", text_color = headerColor, text_size = dashTextSize)
+    table.cell(dashboardTable, 2, 0, "Intact", text_color = headerColor, text_size = dashTextSize)
+    table.cell(dashboardTable, 3, 0, "Cleared", text_color = headerColor, text_size = dashTextSize)
+    table.cell(dashboardTable, 4, 0, "Class", text_color = headerColor, text_size = dashTextSize)
+
+    table.cell(dashboardTable, 0, 1, "Buy-side ▲", text_color = headerColor, text_size = dashTextSize)
+    table.cell(dashboardTable, 1, 1, na(upTargetPrice) ? "-" : str.tostring(upTargetPrice, format.mintick), text_color = textColor, text_size = dashTextSize)
+    table.cell(dashboardTable, 2, 1, na(upTargetPrice) ? "-" : str.tostring(resistanceUpUnits), text_color = textColor, text_size = dashTextSize, tooltip = str.tostring(freshUpCount) + " fresh swings, " + str.tostring(opposingGapUpCount) + " opposing gaps")
+    table.cell(dashboardTable, 3, 1, na(upTargetPrice) ? "-" : str.tostring(clearedUpUnits), text_color = textColor, text_size = dashTextSize, tooltip = str.tostring(clearedUpCount) + " swept swings, " + str.tostring(alignedGapUpCount) + " aligned gaps")
+    table.cell(dashboardTable, 4, 1, classText(nz(upClass)), text_color = upCellColor, text_size = dashTextSize)
+
+    table.cell(dashboardTable, 0, 2, "Sell-side ▼", text_color = headerColor, text_size = dashTextSize)
+    table.cell(dashboardTable, 1, 2, na(downTargetPrice) ? "-" : str.tostring(downTargetPrice, format.mintick), text_color = textColor, text_size = dashTextSize)
+    table.cell(dashboardTable, 2, 2, na(downTargetPrice) ? "-" : str.tostring(resistanceDownUnits), text_color = textColor, text_size = dashTextSize, tooltip = str.tostring(freshDownCount) + " fresh swings, " + str.tostring(opposingGapDownCount) + " opposing gaps")
+    table.cell(dashboardTable, 3, 2, na(downTargetPrice) ? "-" : str.tostring(clearedDownUnits), text_color = textColor, text_size = dashTextSize, tooltip = str.tostring(clearedDownCount) + " swept swings, " + str.tostring(alignedGapDownCount) + " aligned gaps")
+    table.cell(dashboardTable, 4, 2, classText(nz(downClass)), text_color = downCellColor, text_size = dashTextSize)
+
+    string deliveryText = na(efficiencyRatio) ? "-" : displacing ? "Displacing" : grinding ? "Grinding" : "Neutral"
+    color deliveryColor = displacing ? lowColorInput : grinding ? highColorInput : neutralColorInput
+
+    table.cell(dashboardTable, 0, 3, "Delivery", text_color = headerColor, text_size = dashTextSize)
+    table.cell(dashboardTable, 1, 3, deliveryUp ? "Up" : deliveryDown ? "Down" : "Flat", text_color = deliveryUp ? lowColorInput : deliveryDown ? highColorInput : textColor, text_size = dashTextSize)
+    table.cell(dashboardTable, 2, 3, na(efficiencyRatio) ? "ER -" : "ER " + str.tostring(efficiencyRatio, "#.##"), text_color = textColor, text_size = dashTextSize, tooltip = "Efficiency ratio over the delivery window: net progress divided by total bar-to-bar travel")
+    table.cell(dashboardTable, 3, 3, "", text_size = dashTextSize)
+    table.cell(dashboardTable, 4, 3, deliveryText, text_color = deliveryColor, text_size = dashTextSize)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(lowUpStart, "Low-Resistance Path To Buy-Side Pool", "The corridor to the buy-side pool on {{ticker}} ({{interval}}) turned low-resistance - the intervening structure is cleared and the main untouched feature ahead is the target pool itself")
+
+alertcondition(lowDownStart, "Low-Resistance Path To Sell-Side Pool", "The corridor to the sell-side pool on {{ticker}} ({{interval}}) turned low-resistance - the intervening structure is cleared and the main untouched feature ahead is the target pool itself")
+
+alertcondition(highUpStart, "High-Resistance Path To Buy-Side Pool", "The corridor to the buy-side pool on {{ticker}} ({{interval}}) turned high-resistance - fresh, unswept swings and opposing imbalances now stack the path")
+
+alertcondition(highDownStart, "High-Resistance Path To Sell-Side Pool", "The corridor to the sell-side pool on {{ticker}} ({{interval}}) turned high-resistance - fresh, unswept swings and opposing imbalances now stack the path")
+
+alertcondition(upPoolSwept, "Buy-Side Target Pool Reached", "Price ran into the buy-side target pool on {{ticker}} ({{interval}}) - the run is complete and fresh opposing structure often begins here, so reclassify from the new corridor")
+
+alertcondition(downPoolSwept, "Sell-Side Target Pool Reached", "Price ran into the sell-side target pool on {{ticker}} ({{interval}}) - the run is complete and fresh opposing structure often begins here, so reclassify from the new corridor")
+
+alertcondition(premiseFailing, "Low-Resistance Premise Failing", "Delivery on {{ticker}} ({{interval}}) turned grinding while the corridor ahead reads low-resistance - slow, overlapping candles say the low-resistance premise is failing")
+
+//---------------------------------------------------------------------------------------------------------------------}

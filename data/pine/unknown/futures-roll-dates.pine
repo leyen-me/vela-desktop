@@ -1,0 +1,361 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Futures Roll Dates", shorttitle = "Futures Roll Dates", overlay = false, format = format.volume)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+color FRONT_COLOR   = #787b86   // the expiring contract is structure - grey
+color NEXT_COLOR    = #ff9800   // the one accent - where the flow is migrating to
+color GRAY_COLOR    = #787b86
+color GAP_COLOR     = #f23645   // splice-artifact warning
+color BULL_COLOR    = #089981   // backwardation - roll yield for longs
+color BEAR_COLOR    = #f23645   // contango - roll cost for longs, OI collapse
+color NEUTRAL_COLOR = #787b86
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+int DAY_MS          = 86400000
+int DAYS_PER_WEEK   = 7
+int EPOCH_DOW_OFFS  = 3        // 1970-01-01 was a Thursday: (dayId + 3) % 7 + 1 maps to ISO weekday, 1 = Monday
+int ISO_FRIDAY      = 5
+int MONTHS_PER_YEAR = 12
+int QUARTER_MONTH   = 3        // equity index cycle months are multiples of three: Mar / Jun / Sep / Dec
+
+// Leadership hysteresis: once volume (or open interest) leadership has passed to the next contract, the state only
+// re-arms after the front out-trades the next by this factor - which happens naturally when the continuous series
+// steps forward and a fresh, dominant front month takes over. Prevents seesaw days from re-firing the trigger.
+float RESET_RATIO = 1.5
+
+int VOL_TRANSP    = 45
+int LEAD_TRANSP   = 10
+int TINT_TRANSP   = 82
+
+string OI_SUFFIX = "_OI"
+string DAILY_TF  = "1D"
+
+string SCHEDULE_QUARTERLY = "Quarterly (equity index)"
+string SCHEDULE_MONTHLY   = "Monthly (commodity / energy)"
+string SCHEDULE_OFF       = "Off"
+
+string POS_TOP_RIGHT    = "Top Right"
+string POS_TOP_LEFT     = "Top Left"
+string POS_BOTTOM_RIGHT = "Bottom Right"
+string POS_BOTTOM_LEFT  = "Bottom Left"
+
+string SIZE_TINY   = "Tiny"
+string SIZE_SMALL  = "Small"
+string SIZE_NORMAL = "Normal"
+
+string SCHEDULE_GROUP = "Roll Schedule"
+string DETECT_GROUP   = "Roll Detection"
+string STYLE_GROUP    = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+scheduleInput = input.string(SCHEDULE_QUARTERLY, "Roll Schedule", options = [SCHEDULE_QUARTERLY, SCHEDULE_MONTHLY, SCHEDULE_OFF], group = SCHEDULE_GROUP, tooltip = "Calendar that anchors the expected roll window. US equity index futures expire on the third Friday of March, June, September and December, with the bulk of roll activity in the week or so before expiration. Most physical commodity and energy contracts roll monthly, with timing shaped by first-notice and last-trading days that cluster around month end - size the window to the contract's specs. Off disables the calendar window and leaves the roll purely data-driven.")
+
+windowDaysInput = input.int(8, "Roll Window Length (Days)", minval = 1, maxval = 45, group = SCHEDULE_GROUP, tooltip = "Calendar days ahead of the quarterly expiration Friday (or ahead of month end in monthly mode) shaded as the expected roll window - the stretch when two contracts share the flow and execution in the old front month starts to deteriorate.")
+
+volumeFloorInput = input.int(100, "Volume Noise Floor (Contracts)", minval = 0, group = DETECT_GROUP, tooltip = "The next contract's session volume must exceed this before the volume-leadership trigger can fire. Filters spurious crossovers in the first minutes of a session on intraday charts, when both contracts have traded almost nothing.")
+
+oiPeakLenInput = input.int(20, "Front OI Peak Lookback (Days)", minval = 5, maxval = 100, group = DETECT_GROUP, tooltip = "Trading days over which the front contract's peak open interest is measured for the collapse check below.")
+
+oiCollapsePctInput = input.float(25, "Front OI Collapse Threshold (%)", minval = 5, maxval = 90, step = 5, group = DETECT_GROUP, tooltip = "Percent drop from its recent peak that flags the front month's open interest as collapsing - the signature of non-delivering holders exiting ahead of first notice or last trading, typical of physical commodity contracts.")
+
+atrLengthInput = input.int(14, "Gap ATR Length", minval = 1, maxval = 100, group = DETECT_GROUP, tooltip = "ATR length used to scale the roll-window gap flag.")
+
+gapMultInput = input.float(1.0, "Gap Flag Threshold (x ATR)", minval = 0.25, step = 0.25, group = DETECT_GROUP, tooltip = "A new-session gap larger than this many ATRs, printed inside the roll context on a continuous (spliced) chart, is flagged as a possible roll artifact. Consecutive contracts trade at different prices, so unadjusted splices print artificial gaps while back-adjusted series shift historical levels - verify the vendor's method before reading such a gap as breakout conviction or capitulation.")
+
+showVolumesInput = input.bool(true, "Contract Volume Columns", group = STYLE_GROUP, tooltip = "Session volume of the front and next contracts, side by side. The day the next contract out-trades the expiring one is the conventional marker that the roll has effectively happened.")
+showOiInput      = input.bool(true, "Open Interest Lines", group = STYLE_GROUP, tooltip = "Open interest of both contracts, confirming the roll: it falls in the expiring month and builds in the new one as positions migrate rather than merely day-trade. Futures open interest updates once per day.")
+showMarkersInput = input.bool(true, "Roll Event Markers", group = STYLE_GROUP, tooltip = "Mark the bar where volume leadership passes to the next contract and the bar where open interest migrates.")
+gapFlagInput     = input.bool(true, "Flag Roll-Window Gaps On Chart", group = STYLE_GROUP, tooltip = "Diamond on the price chart above suspicious new-session gaps inside the roll context on continuous charts - candidates for splice artifacts rather than market moves.")
+shadePaneInput   = input.bool(true, "Shade Roll Window (Pane)", group = STYLE_GROUP)
+shadeChartInput  = input.bool(true, "Shade Roll Window (Price Chart)", group = STYLE_GROUP)
+
+showDashInput     = input.bool(true, "Dashboard", inline = "dash", group = STYLE_GROUP)
+dashPositionInput = input.string(POS_TOP_RIGHT, "", options = [POS_TOP_RIGHT, POS_TOP_LEFT, POS_BOTTOM_RIGHT, POS_BOTTOM_LEFT], inline = "dash", group = STYLE_GROUP)
+dashSizeInput     = input.string(SIZE_SMALL, "Dashboard Size", options = [SIZE_TINY, SIZE_SMALL, SIZE_NORMAL], group = STYLE_GROUP)
+
+frontColorInput  = input.color(FRONT_COLOR, "Front Contract", inline = "cc", group = STYLE_GROUP)
+nextColorInput   = input.color(NEXT_COLOR, "Next Contract", inline = "cc", group = STYLE_GROUP)
+windowColorInput = input.color(color.new(GRAY_COLOR, 85), "Window Shade", inline = "ws", group = STYLE_GROUP)
+gapColorInput    = input.color(GAP_COLOR, "Gap Flag", inline = "ws", group = STYLE_GROUP)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Table position constant from the style option
+getTablePosition(string positionName) =>
+    switch positionName
+        POS_TOP_LEFT     => position.top_left
+        POS_BOTTOM_RIGHT => position.bottom_right
+        POS_BOTTOM_LEFT  => position.bottom_left
+        => position.top_right
+
+// Text size constant from the style option
+getTextSize(string sizeName) =>
+    switch sizeName
+        SIZE_TINY   => size.tiny
+        SIZE_NORMAL => size.normal
+        => size.small
+
+// Days elapsed since 1970-01-01 for a civil calendar date (standard proleptic Gregorian arithmetic)
+civilToDays(int yr, int mo, int dy) =>
+    int yAdj = mo <= 2 ? yr - 1 : yr
+    int era  = yAdj / 400
+    int yoe  = yAdj - era * 400
+    int doy  = (153 * (mo + (mo > 2 ? -3 : 9)) + 2) / 5 + dy - 1
+    int doe  = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    era * 146097 + doe - 719468
+
+// Midnight timestamp of the third Friday of a month, in the exchange time zone - the quarterly expiration date
+thirdFridayTs(int yr, int mo) =>
+    int isoDowFirst   = (civilToDays(yr, mo, 1) + EPOCH_DOW_OFFS) % DAYS_PER_WEEK + 1
+    int firstFridayDy = 1 + (ISO_FRIDAY - isoDowFirst + DAYS_PER_WEEK) % DAYS_PER_WEEK
+    timestamp(syminfo.timezone, yr, mo, firstFridayDy + 2 * DAYS_PER_WEEK, 0, 0)
+
+// Compact month name for date readouts
+monthText(int mo) =>
+    switch mo
+        1  => "Jan"
+        2  => "Feb"
+        3  => "Mar"
+        4  => "Apr"
+        5  => "May"
+        6  => "Jun"
+        7  => "Jul"
+        8  => "Aug"
+        9  => "Sep"
+        10 => "Oct"
+        11 => "Nov"
+        => "Dec"
+
+// "Mmm d" date text in the exchange time zone
+dateText(int ts) =>
+    monthText(month(ts, syminfo.timezone)) + " " + str.tostring(dayofmonth(ts, syminfo.timezone))
+
+// Contract-count text for volume and open interest readouts
+countText(float value) =>
+    na(value) ? "n/a" : str.tostring(value, format.volume)
+
+// Signed percent text
+pctText(float value) =>
+    na(value) ? "n/a" : (value >= 0 ? "+" : "") + str.tostring(value, "#.##") + "%"
+
+// Next-over-front multiple text
+ratioText(float value) =>
+    na(value) ? "n/a" : "x" + str.tostring(value, "#.##")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Contract Data
+//---------------------------------------------------------------------------------------------------------------------{
+
+// The front and next contracts are read from the chart symbol's root, so the script works on a continuous chart,
+// on a dated contract, and on either month during the roll. Futures volume and open interest are daily figures,
+// so intraday charts sample the daily series - the resolution the conventional roll marker is defined on.
+string frontTickerId = syminfo.prefix + ":" + syminfo.root + "1!"
+string nextTickerId  = syminfo.prefix + ":" + syminfo.root + "2!"
+string frontNameText = syminfo.root + "1!"
+string nextNameText  = syminfo.root + "2!"
+string dataTimeframe = timeframe.isintraday ? DAILY_TF : timeframe.period
+
+[frontVolume, frontClose] = request.security(frontTickerId, dataTimeframe, [volume, close], ignore_invalid_symbol = true)
+[nextVolume, nextClose]   = request.security(nextTickerId, dataTimeframe, [volume, close], ignore_invalid_symbol = true)
+
+// Open interest arrives as the companion "_OI" ticker; the front's recent peak is measured in the daily context
+[frontOi, frontOiPeak] = request.security(frontTickerId + OI_SUFFIX, dataTimeframe, [close, ta.highest(close, oiPeakLenInput)], ignore_invalid_symbol = true)
+float nextOi           = request.security(nextTickerId + OI_SUFFIX, dataTimeframe, close, ignore_invalid_symbol = true)
+
+bool dataOk = not na(frontVolume) and not na(nextVolume)
+bool oiOk   = not na(frontOi) and not na(nextOi)
+
+// The calendar spread the roll transacts at: the price paid (contango) or received (backwardation) to step
+// one contract out on the curve - the mechanism that turns curve shape into recurring roll cost or yield
+float rollSpread    = dataOk ? nextClose - frontClose : na
+float rollSpreadPct = dataOk and frontClose != 0 ? rollSpread / frontClose * 100 : na
+float volumeRatio   = dataOk and frontVolume > 0 ? nextVolume / frontVolume : na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Scheduled Roll Window
+//---------------------------------------------------------------------------------------------------------------------{
+
+bool quarterlyMode = scheduleInput == SCHEDULE_QUARTERLY
+bool monthlyMode   = scheduleInput == SCHEDULE_MONTHLY
+
+// Nearest upcoming quarterly expiration: third Friday of Mar / Jun / Sep / Dec, active through the Friday itself
+int nextQuarterlyTs = na
+if quarterlyMode
+    int yearNow = year(time, syminfo.timezone)
+    for yearOffset = 0 to 1
+        for quarterIdx = 1 to 4
+            int candidateTs = thirdFridayTs(yearNow + yearOffset, QUARTER_MONTH * quarterIdx)
+            if na(nextQuarterlyTs) and time < candidateTs + DAY_MS
+                nextQuarterlyTs := candidateTs
+
+// Monthly cycle: anchored on the month boundary, the neighborhood of first-notice / last-trading days
+int monthEndTs = na
+if monthlyMode
+    int yearNow  = year(time, syminfo.timezone)
+    int monthNow = month(time, syminfo.timezone)
+    monthEndTs := timestamp(syminfo.timezone, monthNow == MONTHS_PER_YEAR ? yearNow + 1 : yearNow, monthNow == MONTHS_PER_YEAR ? 1 : monthNow + 1, 1, 0, 0)
+
+int anchorTs      = quarterlyMode ? nextQuarterlyTs : monthlyMode ? monthEndTs : int(na)
+int windowEndTs   = quarterlyMode ? anchorTs + DAY_MS : anchorTs
+int windowStartTs = anchorTs - windowDaysInput * DAY_MS
+
+bool inRollWindow    = not na(anchorTs) and time >= windowStartTs and time < windowEndTs
+bool windowOpenEvent = inRollWindow and not inRollWindow[1]
+
+float daysToAnchor      = na(anchorTs) ? na : math.max((anchorTs - time) / (1.0 * DAY_MS), 0)
+float daysToWindowOpen  = na(anchorTs) ? na : math.max((windowStartTs - time) / (1.0 * DAY_MS), 0)
+float daysToWindowClose = na(anchorTs) ? na : math.max((windowEndTs - time) / (1.0 * DAY_MS), 0)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Roll Detection
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Volume leadership - the day the next contract out-trades the expiring one is the conventional roll marker
+var bool nextLeadsVolume = false
+var int  volumeRollTs    = na
+bool     volumeRollEvent = false
+
+if dataOk
+    if not nextLeadsVolume and nextVolume > frontVolume and nextVolume > volumeFloorInput
+        nextLeadsVolume := true
+        volumeRollTs    := time
+        volumeRollEvent := true
+    else if nextLeadsVolume and frontVolume > nextVolume * RESET_RATIO
+        nextLeadsVolume := false
+
+// Open interest migration - positions rewritten into the new month rather than merely day-traded
+var bool nextLeadsOi = false
+var int  oiRollTs    = na
+bool     oiRollEvent = false
+
+if oiOk
+    if not nextLeadsOi and nextOi > frontOi
+        nextLeadsOi := true
+        oiRollTs    := time
+        oiRollEvent := true
+    else if nextLeadsOi and frontOi > nextOi * RESET_RATIO
+        nextLeadsOi := false
+
+// Front-month open interest collapse - holders exiting ahead of first notice / last trading
+float oiDropPct       = oiOk and not na(frontOiPeak) and frontOiPeak > 0 ? (frontOi / frontOiPeak - 1) * 100 : na
+bool  oiCollapsing    = not na(oiDropPct) and oiDropPct <= -oiCollapsePctInput
+bool  oiCollapseEvent = oiCollapsing and not oiCollapsing[1]
+
+// Suspicious gaps on continuous charts inside the roll context - candidate splice artifacts, not market moves
+float atrValue        = ta.atr(atrLengthInput)
+bool  newSessionBar   = timeframe.isintraday ? timeframe.change(DAILY_TF) : true
+bool  continuousChart = str.contains(syminfo.ticker, "!")
+bool  rollContext     = inRollWindow or nextLeadsVolume
+float gapSize         = math.abs(open - close[1])
+bool  spliceGapEvent  = gapFlagInput and continuousChart and rollContext and newSessionBar and bar_index > 0 and not na(atrValue) and gapSize >= atrValue * gapMultInput
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Volume of both contracts side by side; the next month's columns brighten once it leads the tape
+plot(showVolumesInput ? frontVolume : na, "Front Volume", color.new(frontColorInput, VOL_TRANSP), 1, plot.style_columns)
+plot(showVolumesInput ? nextVolume : na, "Next Volume", color.new(nextColorInput, nextLeadsVolume ? LEAD_TRANSP : VOL_TRANSP), 1, plot.style_columns)
+
+// Open interest crossing from old to new confirms the migration
+plot(showOiInput ? frontOi : na, "Front Open Interest", frontColorInput, 2, plot.style_linebr)
+plot(showOiInput ? nextOi : na, "Next Open Interest", nextColorInput, 2, plot.style_linebr)
+
+// Scheduled roll window shading, in the pane and on the price chart
+color windowShadeColor = inRollWindow ? windowColorInput : na
+bgcolor(shadePaneInput ? windowShadeColor : na, title = "Roll window (pane)")
+bgcolor(shadeChartInput ? windowShadeColor : na, title = "Roll window (price chart)", force_overlay = true)
+
+// Roll events
+plotshape(showMarkersInput and volumeRollEvent, "Volume Roll Trigger", shape.triangledown, location.top, nextColorInput, text = "ROLL", textcolor = nextColorInput, size = size.tiny)
+plotshape(showMarkersInput and oiRollEvent, "OI Migration", shape.circle, location.top, nextColorInput, text = "OI", textcolor = nextColorInput, size = size.tiny)
+plotshape(spliceGapEvent, "Roll-Window Gap", shape.diamond, location.abovebar, gapColorInput, size = size.tiny, force_overlay = true)
+
+// Data window readouts
+plot(volumeRatio, "Next / Front Volume", GRAY_COLOR, display = display.data_window, editable = false)
+plot(rollSpread, "Roll Spread (Next - Front)", GRAY_COLOR, display = display.data_window, editable = false)
+plot(rollSpreadPct, "Roll Spread %", GRAY_COLOR, display = display.data_window, editable = false)
+plot(daysToAnchor, "Days To Roll Anchor", GRAY_COLOR, display = display.data_window, editable = false)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+
+var table dashTable = table.new(getTablePosition(dashPositionInput), 3, 9, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+string dashTextSize = getTextSize(dashSizeInput)
+
+if barstate.islast and showDashInput
+    if not dataOk
+        table.cell(dashTable, 0, 0, "futures roll dates needs a futures chart\nno front / next contract data for " + frontTickerId + " and " + nextTickerId, text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left)
+    else
+        string volumeLeadText  = nextLeadsVolume ? "Next " + ratioText(volumeRatio) : "Front " + ratioText(volumeRatio)
+        string volumeSinceText = nextLeadsVolume and not na(volumeRollTs) ? "since " + dateText(volumeRollTs) : "—"
+        string oiLeadText      = not oiOk ? "n/a" : nextLeadsOi ? "Migrated" : "In front"
+        string oiSinceText     = oiOk and nextLeadsOi and not na(oiRollTs) ? "since " + dateText(oiRollTs) : "—"
+        string curveText       = na(rollSpreadPct) ? "n/a" : rollSpreadPct > 0 ? "Contango" : rollSpreadPct < 0 ? "Backwardation" : "Flat"
+        string curveNoteText   = na(rollSpreadPct) ? "—" : rollSpreadPct > 0 ? "roll cost for longs" : rollSpreadPct < 0 ? "roll yield for longs" : "—"
+        string windowStateText = not (quarterlyMode or monthlyMode) ? "Schedule off" : na(anchorTs) ? "n/a" : inRollWindow ? "OPEN - " + str.tostring(math.ceil(daysToWindowClose)) + "d left" : "opens in " + str.tostring(math.ceil(daysToWindowOpen)) + "d"
+        string anchorText      = na(anchorTs) ? "—" : quarterlyMode ? "3rd Fri " + dateText(anchorTs) : "month end " + dateText(anchorTs - DAY_MS)
+        color  volumeLeadColor = nextLeadsVolume ? nextColorInput : DASH_TEXT
+        color  oiLeadColor     = not oiOk ? DASH_HEADER : nextLeadsOi ? nextColorInput : DASH_TEXT
+        color  curveColor      = na(rollSpreadPct) ? DASH_HEADER : rollSpreadPct > 0 ? BEAR_COLOR : rollSpreadPct < 0 ? BULL_COLOR : DASH_TEXT
+        color  frontCountColor = nextLeadsVolume ? DASH_TEXT : frontColorInput
+        color  nextCountColor  = nextLeadsVolume ? nextColorInput : DASH_TEXT
+        color  frontOiColor    = oiOk and not nextLeadsOi ? frontColorInput : DASH_TEXT
+        color  nextOiColor     = oiOk and nextLeadsOi ? nextColorInput : DASH_TEXT
+
+        table.cell(dashTable, 0, 0, "Contract", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left, tooltip = "Front and next contracts derived from this chart's futures root. During the roll window trading activity migrates from the expiring front month to the next one out on the curve.")
+        table.cell(dashTable, 1, 0, frontNameText, text_color = frontColorInput, text_size = dashTextSize, text_halign = text.align_right)
+        table.cell(dashTable, 2, 0, nextNameText, text_color = nextColorInput, text_size = dashTextSize, text_halign = text.align_right)
+        table.cell(dashTable, 0, 1, "Session volume", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left, tooltip = "Daily volume of each contract. The day the next contract out-trades the expiring one is the conventional marker that the roll has effectively happened.")
+        table.cell(dashTable, 1, 1, countText(frontVolume), text_color = frontCountColor, text_size = dashTextSize, text_halign = text.align_right)
+        table.cell(dashTable, 2, 1, countText(nextVolume), text_color = nextCountColor, text_size = dashTextSize, text_halign = text.align_right, bgcolor = nextLeadsVolume ? color.new(nextColorInput, TINT_TRANSP) : DASH_BG)
+        table.cell(dashTable, 0, 2, "Open interest", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left, tooltip = "Open interest falls in the expiring contract and builds in the new one as positions migrate rather than merely day-trade - the confirmation of the roll. Published once per day.")
+        table.cell(dashTable, 1, 2, countText(frontOi), text_color = frontOiColor, text_size = dashTextSize, text_halign = text.align_right)
+        table.cell(dashTable, 2, 2, countText(nextOi), text_color = nextOiColor, text_size = dashTextSize, text_halign = text.align_right)
+        table.cell(dashTable, 0, 3, "Volume leadership", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left, tooltip = "Which month leads the tape, with the next-over-front volume multiple. Active traders switch their working contract as soon as leadership passes, because execution quality in the abandoned front month deteriorates within days.")
+        table.cell(dashTable, 1, 3, volumeLeadText, text_color = volumeLeadColor, text_size = dashTextSize, text_halign = text.align_right)
+        table.cell(dashTable, 2, 3, volumeSinceText, text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+        table.cell(dashTable, 0, 4, "OI migration", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left, tooltip = "Whether open interest has crossed over into the next contract.")
+        table.cell(dashTable, 1, 4, oiLeadText, text_color = oiLeadColor, text_size = dashTextSize, text_halign = text.align_right)
+        table.cell(dashTable, 2, 4, oiSinceText, text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+        table.cell(dashTable, 0, 5, "Roll spread (next - front)", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left, tooltip = "The calendar spread the roll transacts at: what a position holder pays or receives to step from the front contract to the next. Roll-period spread pricing in index futures reflects funding and dividend expectations.")
+        table.cell(dashTable, 1, 5, na(rollSpread) ? "n/a" : str.tostring(rollSpread, format.mintick), text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+        table.cell(dashTable, 2, 5, pctText(rollSpreadPct), text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+        table.cell(dashTable, 0, 6, "Curve", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left, tooltip = "Front-to-next slope. Persistent contango turns rolling long positions into a recurring cost, backwardation into a recurring yield - a return component separate from the spot price path. Mostly a flow and data event, not a directional signal.")
+        table.cell(dashTable, 1, 6, curveText, text_color = curveColor, text_size = dashTextSize, text_halign = text.align_right)
+        table.cell(dashTable, 2, 6, curveNoteText, text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+        table.cell(dashTable, 0, 7, "Front OI vs peak", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left, tooltip = "Front-month open interest against its recent peak. In physical commodities it typically collapses ahead of first notice as non-delivering holders exit.")
+        table.cell(dashTable, 1, 7, pctText(oiDropPct), text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+        table.cell(dashTable, 2, 7, not oiOk ? "n/a" : oiCollapsing ? "Collapsing" : "Stable", text_color = oiCollapsing ? BEAR_COLOR : DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+        table.cell(dashTable, 0, 8, "Roll window", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left, tooltip = "Scheduled roll window from the calendar mode: the week or so before the third-Friday expiration on the quarterly equity index cycle, or the run-in to month end on the monthly commodity cycle.")
+        table.cell(dashTable, 1, 8, windowStateText, text_color = inRollWindow ? nextColorInput : DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+        table.cell(dashTable, 2, 8, anchorText, text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(volumeRollEvent, "Volume Rolled To Next Contract", "futures roll dates: {{ticker}} - the next contract just out-traded the expiring front month, the conventional marker that the roll has effectively happened. Execution quality in the abandoned front month deteriorates within days - time to switch the working contract.")
+alertcondition(oiRollEvent, "Open Interest Migrated", "futures roll dates: {{ticker}} - open interest in the next contract overtook the front month. Positions are migrating rather than merely day-trading, confirming the roll.")
+alertcondition(windowOpenEvent, "Roll Window Opened", "futures roll dates: {{ticker}} - the scheduled roll window opened. Two contracts share the flow from here: expect volume and open interest to cross from the front month to the next, and annotate gaps and surges accordingly.")
+alertcondition(oiCollapseEvent, "Front-Month OI Collapsing", "futures roll dates: {{ticker}} - front-month open interest is collapsing from its recent peak, the signature of non-delivering holders exiting ahead of first-notice and last-trading days.")
+alertcondition(spliceGapEvent, "Roll-Window Gap On Continuous Chart", "futures roll dates: {{ticker}} - a large new-session gap printed inside the roll window on a continuous chart. Verify the data vendor's roll and adjustment method: a gap on a roll date may be a splice artifact rather than a market move.")
+
+//---------------------------------------------------------------------------------------------------------------------}

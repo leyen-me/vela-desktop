@@ -1,0 +1,194 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Harmonic MA", shorttitle = "Harmonic MA", overlay = true, format = format.price, max_bars_back = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+NEUTRAL_COLOR = #787b86
+SMA_REF_COLOR = #787b86 // the comparison line is structure - grey
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+FILL_PRICE_TRANSP = 70  // gradient transparency at the price end of the fill
+FILL_LINE_TRANSP  = 100 // gradient transparency at the harmonic MA end of the fill
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+srcInput    = input.source(close, "Source", group = "Settings",
+     tooltip = "Series the harmonic mean smooths. The math is defined for strictly positive data only — a zero breaks the reciprocal outright and a value near zero drags the mean toward zero — so feed it raw prices, volumes or ratio-like series (valuation multiples, spread ratios, rates), never returns, z-scores or oscillators that cross zero. Windows holding a non-positive value plot nothing and are flagged on the dashboard.")
+
+lengthInput = input.int(20, "Harmonic Length", minval = 1, maxval = 500, group = "Settings",
+     tooltip = "Number of bars N in the window. Each bar the last N values are inverted, the reciprocals averaged, and the result inverted again — equivalently N divided by the sum of 1/price — the p = -1 member of the power-mean family (arithmetic mean at p = 1, geometric mean as the p = 0 limit). The mean type shifts the line's level toward the window's lows; it is not a lag-reduction technique — turns arrive on the same schedule as an SMA of the same length.")
+
+showSmaInput = input.bool(true, "SMA — Same Length", group = "Comparison",
+     tooltip = "Overlays the arithmetic SMA of the same length — same window, same lag, different mean. In a quiet range the two lines should be nearly indistinguishable, the standard check that the implementation is sound; once a sharp selloff enters the window the harmonic line sags visibly below the SMA, because reciprocal averaging lets the low prints dominate. For positive data the harmonic mean sits at or below the SMA on every bar, so the pair measures stress in the window rather than crossing.")
+
+showDashboardInput     = input.bool(true, "Show Dashboard", group = "Dashboard",
+     tooltip = "Displays a compact panel with the window length, the harmonic line's gap to the same-length SMA (near zero on quiet charts, widening when the window spans large swings), the slope read, and price's position against the line. It also warns when the window holds non-positive data and the mean is undefined.")
+
+dashboardLocationInput = input.string("Top Right", "Location", options = ["Top Right", "Bottom Right", "Bottom Left", "Top Left"], group = "Dashboard",
+     tooltip = "Chart corner the dashboard is anchored to.")
+
+dashboardSizeInput     = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = "Dashboard",
+     tooltip = "Text size of the dashboard.")
+
+trendColorInput   = input.bool(true, "Slope Trend Coloring", group = "Style",
+     tooltip = "Colors the harmonic MA by its slope — bullish while the line rises, bearish while it falls. Slope timing matches the same-length SMA — the harmonic mean changes the level, not the schedule; disable to draw the line in the neutral color.")
+
+bullColorInput    = input.color(BULL_COLOR, "Bullish", inline = "direction", group = "Style",
+     tooltip = "Bullish color, used while the harmonic MA slopes upward and for bullish crossings/fill.")
+
+bearColorInput    = input.color(BEAR_COLOR, "Bearish", inline = "direction", group = "Style",
+     tooltip = "Bearish color, used while the harmonic MA slopes downward and for bearish crossings/fill.")
+
+neutralColorInput = input.color(NEUTRAL_COLOR, "Neutral", group = "Style",
+     tooltip = "Line color used when slope trend coloring is disabled, or when the slope is flat.")
+
+smaColorInput     = input.color(SMA_REF_COLOR, "SMA", group = "Style",
+     tooltip = "Color of the same-length arithmetic SMA comparison line.")
+
+lineWidthInput    = input.int(2, "Line Width", minval = 1, maxval = 5, group = "Style",
+     tooltip = "Width of the main harmonic MA line.")
+
+showFillInput     = input.bool(true, "Price / Harmonic MA Gradient Fill", group = "Style",
+     tooltip = "Fills the area between the source and the harmonic MA with a vertical gradient — bullish while price holds above the line, bearish while below — fading to fully transparent at the MA. Because the harmonic mean discounts upside outliers within its window rather than chasing them, it makes a deliberately conservative baseline for this side-of-the-line read.")
+
+showMarkersInput  = input.bool(false, "Price Crossing Markers", group = "Style",
+     tooltip = "Displays small triangle markers when the source crosses over or under the harmonic MA. Off by default to keep the chart clean — the crossing alerts work regardless.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Harmonic mean of the last N source values — invert each price, average the reciprocals, invert again:
+//   H = N / Σ(1/price)
+// It is the p = -1 member of the power-mean family, so for any positive window it sits at or below the
+// geometric mean, which sits at or below the arithmetic mean, with equality only when every value in the
+// window is identical. Averaging reciprocals gives the smallest values outsized influence: dips pull the
+// line down harder than spikes pull it up. The mean is defined for strictly positive data only — a zero
+// breaks the reciprocal outright and a near-zero value dominates the sum — so any window holding a
+// non-positive or missing sample returns na, with the domain violation flagged separately.
+harmonicWindow(float src, simple int length) =>
+    float value          = na
+    bool  hasNonPositive = false
+    if bar_index >= length - 1
+        float recipSum   = 0.0
+        bool  windowFull = true
+        for k = 0 to length - 1
+            float sample = src[k]
+            if na(sample)
+                windowFull := false
+                break
+            if sample <= 0
+                hasNonPositive := true
+                windowFull     := false
+                break
+            recipSum += 1.0 / sample
+        value := windowFull and recipSum > 0 ? length / recipSum : na
+    [value, hasNonPositive]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+// Harmonic mean over the window, with its strictly-positive domain flag — runs on every bar
+[harmonicValue, windowHasNonPositive] = harmonicWindow(srcInput, lengthInput)
+
+// Arithmetic sibling over the same window — same window, same lag, different mean
+smaValue = ta.sma(srcInput, lengthInput)
+
+// Level gap of the harmonic line to its arithmetic sibling, in percent. A window of 98/100/102 averages
+// 100 arithmetically vs ~99.97 harmonically — invisible; stretch it to 50/100/150 and the harmonic mean
+// drops to ~81.8. The gap only becomes usable information when the window spans large swings
+gapPct = not na(harmonicValue) and not na(smaValue) and smaValue != 0 ? (harmonicValue / smaValue - 1) * 100 : na
+
+// Slope of the harmonic MA — the trend read of the smoother
+slope = harmonicValue - nz(harmonicValue[1], harmonicValue)
+
+slopeTurnUp   = slope > 0 and nz(slope[1]) <= 0
+slopeTurnDown = slope < 0 and nz(slope[1]) >= 0
+
+// Price crossings — the conservative-baseline read; because the line leans toward the window's lows,
+// bearish crosses print slightly earlier after sharp dips than against an arithmetic baseline
+crossUp   = ta.crossover(srcInput, harmonicValue)
+crossDown = ta.crossunder(srcInput, harmonicValue)
+
+// Domain guard — the window just picked up a zero or negative value, so the reciprocal sum is undefined
+nonPositiveFlag  = windowHasNonPositive ? 1.0 : 0.0
+nonPositiveStart = nonPositiveFlag == 1 and nz(nonPositiveFlag[1]) == 0
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+harmonicColor = trendColorInput ? (slope > 0 ? bullColorInput : slope < 0 ? bearColorInput : neutralColorInput) : neutralColorInput
+
+priceAbove      = srcInput > harmonicValue
+fillTopColor    = showFillInput ? (priceAbove ? color.new(bullColorInput, FILL_PRICE_TRANSP) : color.new(bearColorInput, FILL_LINE_TRANSP)) : na
+fillBottomColor = showFillInput ? (priceAbove ? color.new(bullColorInput, FILL_LINE_TRANSP) : color.new(bearColorInput, FILL_PRICE_TRANSP)) : na
+
+srcPlotId      = plot(srcInput, "Source", color = na, editable = false, display = display.none)
+harmonicPlotId = plot(harmonicValue, "Harmonic MA", color = harmonicColor, linewidth = lineWidthInput, style = plot.style_linebr)
+
+plot(showSmaInput ? smaValue : na, "SMA (Same Length)", color = smaColorInput)
+
+fill(srcPlotId, harmonicPlotId, top_value = math.max(srcInput, harmonicValue), bottom_value = math.min(srcInput, harmonicValue), top_color = fillTopColor, bottom_color = fillBottomColor, title = "Price / Harmonic MA Gradient Fill")
+
+plotshape(showMarkersInput and crossUp, "Bullish Price Cross", shape.triangleup, location.belowbar, color = bullColorInput, size = size.tiny)
+plotshape(showMarkersInput and crossDown, "Bearish Price Cross", shape.triangledown, location.abovebar, color = bearColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+dashboardLocation = switch dashboardLocationInput
+    "Top Right"    => position.top_right
+    "Bottom Right" => position.bottom_right
+    "Bottom Left"  => position.bottom_left
+    => position.top_left
+
+dashboardTextSize = switch dashboardSizeInput
+    "Tiny"  => size.tiny
+    "Small" => size.small
+    => size.normal
+
+var table dashboardTable = table.new(dashboardLocation, 2, 4, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+if barstate.islast and showDashboardInput
+    // The concept's signature number: how far the harmonic line sags below its arithmetic sibling.
+    // For positive data it can never be above zero — and the domain warning replaces it when the
+    // window holds non-positive values and the reciprocal math breaks
+    gapText  = windowHasNonPositive ? "Input ≤ 0" : na(gapPct) ? "—" : str.tostring(gapPct, "0.00") + "%"
+    gapColor = windowHasNonPositive ? bearColorInput : DASH_TEXT
+
+    slopeNow   = nz(slope)
+    slopeText  = slopeNow > 0 ? "Rising" : slopeNow < 0 ? "Falling" : "Flat"
+    slopeColor = slopeNow > 0 ? bullColorInput : slopeNow < 0 ? bearColorInput : neutralColorInput
+
+    aboveNow  = not na(harmonicValue) and srcInput > harmonicValue
+    biasText  = na(harmonicValue) ? "—" : aboveNow ? "Above Harmonic" : "Below Harmonic"
+    biasColor = na(harmonicValue) ? neutralColorInput : aboveNow ? bullColorInput : bearColorInput
+
+    table.cell(dashboardTable, 0, 0, "Length",                  text_color = DASH_HEADER, text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 0, str.tostring(lengthInput), text_color = DASH_TEXT,   text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 1, "Vs SMA",                  text_color = DASH_HEADER, text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 1, gapText,                   text_color = gapColor,       text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 2, "Slope",                   text_color = DASH_HEADER, text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 2, slopeText,                 text_color = slopeColor,     text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 3, "Price",                   text_color = DASH_HEADER, text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 3, biasText,                  text_color = biasColor,      text_size = dashboardTextSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(crossUp, "Bullish Price Cross", "Price crossed above the harmonic MA on {{ticker}} ({{interval}})")
+alertcondition(crossDown, "Bearish Price Cross", "Price crossed below the harmonic MA on {{ticker}} ({{interval}})")
+alertcondition(slopeTurnUp, "Harmonic MA Slope Up", "Harmonic MA slope turned upward on {{ticker}} ({{interval}})")
+alertcondition(slopeTurnDown, "Harmonic MA Slope Down", "Harmonic MA slope turned downward on {{ticker}} ({{interval}})")
+alertcondition(nonPositiveStart, "Non-Positive Input", "Harmonic MA undefined — the window now contains a zero or negative value on {{ticker}} ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

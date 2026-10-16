@@ -1,0 +1,375 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("HTF-level Proximity Filters", shorttitle = "HTF-level Proximity Filters", overlay = true, format = format.price, max_labels_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+//gating modes
+string MODE_CLEARANCE = "Require Clearance"
+string MODE_PROXIMITY = "Require Proximity"
+
+//distance normalization units
+string UNIT_ATR = "ATR Multiples"
+string UNIT_PCT = "% of Price"
+
+//ATR context feeding the normalization
+string BASIS_DAILY = "Daily"
+string BASIS_CHART = "Chart"
+
+string POS_TR = "Top Right"
+string POS_TL = "Top Left"
+string POS_BR = "Bottom Right"
+string POS_BL = "Bottom Left"
+
+string SIZE_TINY   = "Tiny"
+string SIZE_SMALL  = "Small"
+string SIZE_NORMAL = "Normal"
+
+color COLOR_BULL = #089981 // support underneath, passing gates
+color COLOR_BEAR = #f23645 // resistance overhead, blocked gates
+color COLOR_GRAY = #787b86 // pressed from both sides, non-directional states
+color COLOR_NONE = #00000000
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+//inventory size: prior day, week and month high/low/close plus the five floor pivot rungs
+int LEVEL_COUNT = 14
+
+//proximity shading is strongest at the level line and fades to fully transparent at the threshold edge
+int TRANSP_GLOW = 60
+int TRANSP_EDGE = 100
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+string GROUP_FILTER = "Proximity Filter"
+string GROUP_LEVELS = "HTF Level Inventory"
+string GROUP_DASH   = "Dashboard"
+string GROUP_STYLE  = "Style"
+
+filterModeInput = input.string(MODE_CLEARANCE, "Filter Mode"
+  , options = [MODE_CLEARANCE, MODE_PROXIMITY]
+  , group   = GROUP_FILTER
+  , tooltip = "How lower-timeframe signals are gated. Require Clearance vetoes trades whose first obstacle arrives almost immediately: the long gate blocks while price sits within the threshold below a level overhead, the short gate while it sits within the threshold above a level underneath. Require Proximity is the inverse mode - it only passes signals that fire at a higher-timeframe level, confirming location before committing.")
+
+proximityInput = input.float(0.25, "Proximity Threshold"
+  , minval  = 0.05
+  , step    = 0.05
+  , group   = GROUP_FILTER
+  , tooltip = "Distance that counts as being at a level, expressed in the selected unit. There is no universal number: tighter thresholds select fewer, cleaner interactions, looser ones catch more but dilute the meaning of being at the level. Compare the gated and ungated signal streams over the same data to confirm the setting earns its rejections.")
+
+unitsInput = input.string(UNIT_ATR, "Distance Units"
+  , options = [UNIT_ATR, UNIT_PCT]
+  , group   = GROUP_FILTER
+  , tooltip = "Normalization of level distances. A fixed tick distance means completely different things on different instruments and timeframes, so distances are measured in ATR multiples or as a percentage of price.")
+
+atrBasisInput = input.string(BASIS_DAILY, "ATR Basis"
+  , options = [BASIS_DAILY, BASIS_CHART]
+  , inline  = "atr"
+  , group   = GROUP_FILTER
+  , tooltip = "ATR context when the unit is ATR multiples. Daily normalizes distances by the prior completed day's ATR - the common yardstick for how much room a session offers - and falls back to the chart ATR on timeframes above daily. Chart uses the chart-timeframe ATR directly.")
+
+atrLengthInput = input.int(14, "Length"
+  , minval  = 1
+  , inline  = "atr"
+  , group   = GROUP_FILTER
+  , tooltip = "Averaging length of the normalization ATR.")
+
+useDayInput = input.bool(true, "Prior Day High / Low / Close"
+  , group   = GROUP_LEVELS
+  , tooltip = "Include the prior completed day's high, low and close (PDH / PDL / PDC). Each value is fetched once per period and stays fixed until the next roll - nothing that prints today moves today's level. Ignored on charts above the daily timeframe.")
+
+useWeekInput = input.bool(true, "Prior Week High / Low / Close"
+  , group   = GROUP_LEVELS
+  , tooltip = "Include the prior completed week's high, low and close (PWH / PWL / PWC). Ignored on charts above the weekly timeframe.")
+
+useMonthInput = input.bool(true, "Prior Month High / Low / Close"
+  , group   = GROUP_LEVELS
+  , tooltip = "Include the prior completed month's high, low and close (PMH / PML / PMC). Ignored on charts above the monthly timeframe.")
+
+usePivotsInput = input.bool(true, "Floor Pivots"
+  , inline  = "pivots"
+  , group   = GROUP_LEVELS
+  , tooltip = "Include the floor pivot ladder P = (H + L + C) / 3, R1 = 2P - L, S1 = 2P - H, R2 = P + (H - L), S2 = P - (H - L), computed from the prior completed bar of the pivot timeframe.")
+
+pivotTfInput = input.timeframe("D", ""
+  , inline  = "pivots"
+  , group   = GROUP_LEVELS
+  , tooltip = "Timeframe supplying the prior high, low and close the pivot ladder is computed from. Daily pivots are the intraday convention; the timeframe must be at or above the chart timeframe or the ladder is ignored.")
+
+untestedOnlyInput = input.bool(false, "Untested Levels Only"
+  , group   = GROUP_LEVELS
+  , tooltip = "Prefer fresh levels: once price trades through a level it is dropped from the inventory until its period rolls and refreshes it. Feed the filter too many levels and everything is near one - keeping only untested references preserves the meaning of proximity.")
+
+showDashboardInput = input.bool(true, "Show Dashboard"
+  , group   = GROUP_DASH
+  , tooltip = "Status panel with the live gate: filter state (clear versus near-level), the nearest level on each side with its distance in the active unit, and the resulting long and short gates.")
+
+dashPositionInput = input.string(POS_TR, "Position"
+  , options = [POS_TR, POS_TL, POS_BR, POS_BL]
+  , group   = GROUP_DASH
+  , tooltip = "Corner of the chart holding the dashboard.")
+
+dashSizeInput = input.string(SIZE_SMALL, "Size"
+  , options = [SIZE_TINY, SIZE_SMALL, SIZE_NORMAL]
+  , group   = GROUP_DASH
+  , tooltip = "Dashboard text size.")
+
+resistanceColorInput = input.color(COLOR_BEAR, "Resistance / Blocked"
+  , inline  = "colors"
+  , group   = GROUP_STYLE
+  , tooltip = "Color of the nearest level overhead, its proximity shading and blocked gate states.")
+
+supportColorInput = input.color(COLOR_BULL, "Support / Pass"
+  , inline  = "colors"
+  , group   = GROUP_STYLE
+  , tooltip = "Color of the nearest level underneath, its proximity shading and passing gate states.")
+
+neutralColorInput = input.color(COLOR_GRAY, "Neutral"
+  , group   = GROUP_STYLE
+  , tooltip = "Accent used when levels press from both sides at once and for non-directional dashboard states.")
+
+lineWidthInput = input.int(1, "Line Width"
+  , minval  = 1
+  , maxval  = 5
+  , group   = GROUP_STYLE
+  , tooltip = "Width of the nearest-level lines.")
+
+showLabelsInput = input.bool(true, "Level Labels"
+  , group   = GROUP_STYLE
+  , tooltip = "Show the name, price and current distance of the nearest level on each side, next to the most recent bar.")
+
+bgHighlightInput = input.bool(false, "Background On Near-Level"
+  , group   = GROUP_STYLE
+  , tooltip = "Tint the chart background across every stretch where price sits inside the proximity threshold of a level - the caution zones where clearance mode withholds signals aimed into the reference. Off by default to keep the chart clean.")
+
+string dashTextSize = switch dashSizeInput
+    SIZE_TINY   => size.tiny
+    SIZE_NORMAL => size.normal
+    =>             size.small
+
+string dashPosition = switch dashPositionInput
+    POS_TL => position.top_left
+    POS_BR => position.bottom_right
+    POS_BL => position.bottom_left
+    =>        position.top_right
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+//distance expressed in the active unit, formatted for labels and the dashboard
+formatDistance(float unitValue) =>
+    na(unitValue) ? "—" : str.tostring(unitValue, "#.##") + (unitsInput == UNIT_ATR ? " ATR" : "%")
+
+//one dashboard row: muted key on the left, colored value on the right
+dashRow(table dashTable, int rowIndex, string keyText, string keyTip, string valueText, color valueColor) =>
+    table.cell(dashTable, 0, rowIndex, keyText, text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left, tooltip = keyTip)
+    table.cell(dashTable, 1, rowIndex, valueText, text_color = valueColor, text_size = dashTextSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// HTF Level Inventory
+//---------------------------------------------------------------------------------------------------------------------{
+//prior completed period values - the [1] offset with lookahead returns the finished period's values from the first
+//bar of the new period without repainting; the daily call also carries the prior day's ATR for the normalization
+[priorDayHigh, priorDayLow, priorDayClose, dailyAtr] = request.security(syminfo.tickerid, "D", [high[1], low[1], close[1], ta.atr(atrLengthInput)[1]], lookahead = barmerge.lookahead_on)
+[priorWeekHigh, priorWeekLow, priorWeekClose] = request.security(syminfo.tickerid, "W", [high[1], low[1], close[1]], lookahead = barmerge.lookahead_on)
+[priorMonthHigh, priorMonthLow, priorMonthClose] = request.security(syminfo.tickerid, "M", [high[1], low[1], close[1]], lookahead = barmerge.lookahead_on)
+[pivotSrcHigh, pivotSrcLow, pivotSrcClose] = request.security(syminfo.tickerid, pivotTfInput, [high[1], low[1], close[1]], lookahead = barmerge.lookahead_on)
+
+//a level source only qualifies while its timeframe is at or above the chart timeframe
+int  chartSeconds = timeframe.in_seconds(timeframe.period)
+bool dayOk        = useDayInput    and chartSeconds <= timeframe.in_seconds("D")
+bool weekOk       = useWeekInput   and chartSeconds <= timeframe.in_seconds("W")
+bool monthOk      = useMonthInput  and chartSeconds <= timeframe.in_seconds("M")
+bool pivotOk      = usePivotsInput and chartSeconds <= timeframe.in_seconds(pivotTfInput)
+
+//floor pivot ladder from the prior completed pivot-timeframe bar
+float pivotPoint = (pivotSrcHigh + pivotSrcLow + pivotSrcClose) / 3
+float pivotRange = pivotSrcHigh - pivotSrcLow
+float r1Level    = 2 * pivotPoint - pivotSrcLow
+float s1Level    = 2 * pivotPoint - pivotSrcHigh
+float r2Level    = pivotPoint + pivotRange
+float s2Level    = pivotPoint - pivotRange
+
+var array<string> levelNamesArray = array.from("PDH", "PDL", "PDC", "PWH", "PWL", "PWC", "PMH", "PML", "PMC", "P", "R1", "S1", "R2", "S2")
+var array<bool>   testedArray     = array.new<bool>(LEVEL_COUNT, false)
+var array<float>  priorValsArray  = array.new<float>(LEVEL_COUNT, na)
+
+//this bar's inventory - disabled or out-of-range sources contribute na and are skipped everywhere
+array<float> levelValsArray = array.from(dayOk ? priorDayHigh : na
+  , dayOk   ? priorDayLow     : na
+  , dayOk   ? priorDayClose   : na
+  , weekOk  ? priorWeekHigh   : na
+  , weekOk  ? priorWeekLow    : na
+  , weekOk  ? priorWeekClose  : na
+  , monthOk ? priorMonthHigh  : na
+  , monthOk ? priorMonthLow   : na
+  , monthOk ? priorMonthClose : na
+  , pivotOk ? pivotPoint      : na
+  , pivotOk ? r1Level         : na
+  , pivotOk ? s1Level         : na
+  , pivotOk ? r2Level         : na
+  , pivotOk ? s2Level         : na)
+
+//freshness bookkeeping and nearest-level scan: a level rolling to a new value is fresh again, and with
+//Untested Levels Only active a reference already traded through is skipped
+float  nearestAbove     = na
+float  nearestBelow     = na
+string nearestAboveName = na
+string nearestBelowName = na
+
+for i = 0 to LEVEL_COUNT - 1
+    float levelValue = array.get(levelValsArray, i)
+    float priorValue = array.get(priorValsArray, i)
+    bool  rolled     = na(levelValue) != na(priorValue) or (not na(levelValue) and not na(priorValue) and levelValue != priorValue)
+    if rolled
+        array.set(testedArray, i, false)
+    bool eligible = not na(levelValue) and (not untestedOnlyInput or not array.get(testedArray, i))
+    if eligible
+        if levelValue >= close and (na(nearestAbove) or levelValue < nearestAbove)
+            nearestAbove     := levelValue
+            nearestAboveName := array.get(levelNamesArray, i)
+        if levelValue < close and (na(nearestBelow) or levelValue > nearestBelow)
+            nearestBelow     := levelValue
+            nearestBelowName := array.get(levelNamesArray, i)
+
+//record this bar's touches and values for the next bar - marking touches after the scan keeps the touch bar
+//itself counted at the level, so proximity-mode qualification still passes on the test that spends a level
+for i = 0 to LEVEL_COUNT - 1
+    float levelValue = array.get(levelValsArray, i)
+    if not na(levelValue) and high >= levelValue and low <= levelValue
+        array.set(testedArray, i, true)
+    array.set(priorValsArray, i, levelValue)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Proximity & Filter State
+//---------------------------------------------------------------------------------------------------------------------{
+float chartAtr   = ta.atr(atrLengthInput)
+bool  dailyAtrOk = atrBasisInput == BASIS_DAILY and chartSeconds <= timeframe.in_seconds("D")
+float atrValue   = dailyAtrOk ? dailyAtr : chartAtr
+
+//one distance unit in price terms: an ATR, or one percent of the current price
+float unitPrice      = unitsInput == UNIT_ATR ? atrValue : close / 100
+float thresholdPrice = na(unitPrice) or unitPrice <= 0 ? na : proximityInput * unitPrice
+
+//distance from current price to the nearest reference on each side, in price terms and in the active unit
+float distAbovePrice = na(nearestAbove) ? na : nearestAbove - close
+float distBelowPrice = na(nearestBelow) ? na : close - nearestBelow
+float distAboveUnits = na(distAbovePrice) or na(unitPrice) or unitPrice <= 0 ? na : distAbovePrice / unitPrice
+float distBelowUnits = na(distBelowPrice) or na(unitPrice) or unitPrice <= 0 ? na : distBelowPrice / unitPrice
+float distNearestUnits = na(distAboveUnits) ? distBelowUnits : na(distBelowUnits) ? distAboveUnits : math.min(distAboveUnits, distBelowUnits)
+
+//filter state: clear versus near-level, split by side
+bool nearAbove = not na(distAbovePrice) and not na(thresholdPrice) and distAbovePrice <= thresholdPrice
+bool nearBelow = not na(distBelowPrice) and not na(thresholdPrice) and distBelowPrice <= thresholdPrice
+bool nearLevel = nearAbove or nearBelow
+
+//the gate itself: clearance discards signals whose first obstacle sits inside the threshold, proximity only
+//passes signals that fire at a level
+bool clearanceMode = filterModeInput == MODE_CLEARANCE
+bool longPass      = clearanceMode ? not nearAbove : nearLevel
+bool shortPass     = clearanceMode ? not nearBelow : nearLevel
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visuals
+//---------------------------------------------------------------------------------------------------------------------{
+//nearest levels as broken series: the plotted value jumps whenever the nearest reference changes - a period roll
+//or price crossing to the other side of a level - so each stretch draws as its own horizontal segment
+bool aboveRolled = na(nearestAbove) or na(nearestAbove[1]) or nearestAbove != nearestAbove[1]
+bool belowRolled = na(nearestBelow) or na(nearestBelow[1]) or nearestBelow != nearestBelow[1]
+
+float abovePlotValue = aboveRolled ? na : nearestAbove
+float belowPlotValue = belowRolled ? na : nearestBelow
+
+float aboveEdgeTop    = abovePlotValue + thresholdPrice
+float aboveEdgeBottom = abovePlotValue - thresholdPrice
+float belowEdgeTop    = belowPlotValue + thresholdPrice
+float belowEdgeBottom = belowPlotValue - thresholdPrice
+
+aboveTopPlot    = plot(aboveEdgeTop, "Level Above Upper Threshold Edge", color(na), style = plot.style_linebr, editable = false)
+aboveLevelPlot  = plot(abovePlotValue, "Nearest Level Above", resistanceColorInput, lineWidthInput, plot.style_linebr)
+aboveBottomPlot = plot(aboveEdgeBottom, "Level Above Lower Threshold Edge", color(na), style = plot.style_linebr, editable = false)
+
+belowTopPlot    = plot(belowEdgeTop, "Level Below Upper Threshold Edge", color(na), style = plot.style_linebr, editable = false)
+belowLevelPlot  = plot(belowPlotValue, "Nearest Level Below", supportColorInput, lineWidthInput, plot.style_linebr)
+belowBottomPlot = plot(belowEdgeBottom, "Level Below Lower Threshold Edge", color(na), style = plot.style_linebr, editable = false)
+
+//proximity shading: a glow spanning one threshold on each side of the level, strongest at the reference itself
+fill(aboveTopPlot, aboveLevelPlot, aboveEdgeTop, abovePlotValue, color.new(resistanceColorInput, TRANSP_EDGE), color.new(resistanceColorInput, TRANSP_GLOW), title = "Resistance Proximity Shading (Outer)")
+fill(aboveLevelPlot, aboveBottomPlot, abovePlotValue, aboveEdgeBottom, color.new(resistanceColorInput, TRANSP_GLOW), color.new(resistanceColorInput, TRANSP_EDGE), title = "Resistance Proximity Shading (Inner)")
+fill(belowTopPlot, belowLevelPlot, belowEdgeTop, belowPlotValue, color.new(supportColorInput, TRANSP_EDGE), color.new(supportColorInput, TRANSP_GLOW), title = "Support Proximity Shading (Inner)")
+fill(belowLevelPlot, belowBottomPlot, belowPlotValue, belowEdgeBottom, color.new(supportColorInput, TRANSP_GLOW), color.new(supportColorInput, TRANSP_EDGE), title = "Support Proximity Shading (Outer)")
+
+//near-level caution stretches, off by default
+color proximityTint = nearAbove and nearBelow ? neutralColorInput : nearAbove ? resistanceColorInput : supportColorInput
+bgcolor(bgHighlightInput and nearLevel ? color.new(proximityTint, 92) : na, title = "Near-Level Background")
+
+//composition outputs: normalized distances and gate states for the data window, alert placeholders and
+//other scripts reading this one as an external source
+plot(distAboveUnits, "Distance To Level Above", resistanceColorInput, 1, display = display.data_window, editable = false)
+plot(distBelowUnits, "Distance To Level Below", supportColorInput, 1, display = display.data_window, editable = false)
+plot(distNearestUnits, "Distance To Nearest Level", neutralColorInput, 1, display = display.data_window, editable = false)
+plot(thresholdPrice, "Proximity Threshold (Price Units)", neutralColorInput, 1, display = display.data_window, editable = false)
+plot(nearLevel ? 1 : 0, "Near-Level State [1 = Near]", neutralColorInput, 1, display = display.data_window, editable = false)
+plot(longPass ? 1 : 0, "Long Filter [1 = Pass]", supportColorInput, 1, display = display.data_window, editable = false)
+plot(shortPass ? 1 : 0, "Short Filter [1 = Pass]", resistanceColorInput, 1, display = display.data_window, editable = false)
+
+//name, price and live distance of the nearest reference on each side
+var label aboveLabel = na
+var label belowLabel = na
+
+if barstate.islast
+    label.delete(aboveLabel)
+    label.delete(belowLabel)
+    if showLabelsInput and not na(nearestAbove)
+        aboveLabel := label.new(bar_index, nearestAbove, nearestAboveName + "  " + str.tostring(nearestAbove, format.mintick) + " · " + formatDistance(distAboveUnits)
+          , color     = COLOR_NONE
+          , textcolor = resistanceColorInput
+          , style     = label.style_label_left
+          , size      = size.small)
+    if showLabelsInput and not na(nearestBelow)
+        belowLabel := label.new(bar_index, nearestBelow, nearestBelowName + "  " + str.tostring(nearestBelow, format.mintick) + " · " + formatDistance(distBelowUnits)
+          , color     = COLOR_NONE
+          , textcolor = supportColorInput
+          , style     = label.style_label_left
+          , size      = size.small)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dashboardTable = showDashboardInput ? table.new(dashPosition, 2, 6, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1) : table(na)
+
+if showDashboardInput and barstate.islast and not na(dashboardTable)
+    bool   inventoryEmpty = na(nearestAbove) and na(nearestBelow)
+    string stateText      = inventoryEmpty ? "No levels in range" : nearAbove and nearBelow ? "Near " + nearestAboveName + " & " + nearestBelowName : nearAbove ? "Near " + nearestAboveName : nearBelow ? "Near " + nearestBelowName : "Clear"
+    color  stateColor     = inventoryEmpty ? COLOR_GRAY : nearAbove and nearBelow ? neutralColorInput : nearAbove ? resistanceColorInput : nearBelow ? supportColorInput : supportColorInput
+    string specText       = (clearanceMode ? "Clearance · " : "Proximity · ") + str.tostring(proximityInput, "#.##") + (unitsInput == UNIT_ATR ? " ATR" : "%")
+    string aboveText      = na(nearestAbove) ? "—" : nearestAboveName + " " + str.tostring(nearestAbove, format.mintick) + " · " + formatDistance(distAboveUnits)
+    string belowText      = na(nearestBelow) ? "—" : nearestBelowName + " " + str.tostring(nearestBelow, format.mintick) + " · " + formatDistance(distBelowUnits)
+
+    table.cell(dashboardTable, 0, 0, "HTF Proximity", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 0, specText, text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+    dashRow(dashboardTable, 1, "State", "Clear means price sits farther than the threshold from every level in the inventory; near-level names the references price is currently at.", stateText, stateColor)
+    dashRow(dashboardTable, 2, "Above", "Nearest inventory level at or above price with its distance - the first obstacle in a long's path, and where the distance ranking says a first target or partial exit belongs.", aboveText, resistanceColorInput)
+    dashRow(dashboardTable, 3, "Below", "Nearest inventory level below price with its distance - the first obstacle in a short's path.", belowText, supportColorInput)
+    dashRow(dashboardTable, 4, "Long", "Gate for long signals under the active mode. Clearance blocks longs while a level sits within the threshold overhead; proximity requires firing at a level.", longPass ? "Pass" : "Blocked", longPass ? supportColorInput : resistanceColorInput)
+    dashRow(dashboardTable, 5, "Short", "Gate for short signals under the active mode. Clearance blocks shorts while a level sits within the threshold underneath; proximity requires firing at a level.", shortPass ? "Pass" : "Blocked", shortPass ? supportColorInput : resistanceColorInput)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+bool wasNearLevel = na(nearLevel[1]) ? false : nearLevel[1]
+bool wasNearAbove = na(nearAbove[1]) ? false : nearAbove[1]
+bool wasNearBelow = na(nearBelow[1]) ? false : nearBelow[1]
+
+alertcondition(nearLevel and not wasNearLevel, "Entered Level Proximity", "{{ticker}} moved within the proximity threshold of an HTF level - confluence for proximity entries, caution for signals aimed into the reference")
+alertcondition(not nearLevel and wasNearLevel, "Left Level Proximity", "{{ticker}} cleared the proximity threshold of every HTF level - the filter reads clear on both sides")
+alertcondition(nearAbove and not wasNearAbove, "Entered Proximity Of Level Above", "{{ticker}} is within the threshold below the nearest HTF level overhead - clearance mode blocks longs here, their room to run may be capped before it starts")
+alertcondition(nearBelow and not wasNearBelow, "Entered Proximity Of Level Below", "{{ticker}} is within the threshold above the nearest HTF level underneath - clearance mode blocks shorts here, proximity mode counts signals at this level as located")
+
+//---------------------------------------------------------------------------------------------------------------------}

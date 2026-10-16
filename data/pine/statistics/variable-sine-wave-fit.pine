@@ -1,0 +1,285 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Variable Sine Wave Fit", "Variable Sine Wave Fit", overlay = true, max_polylines_count = 100)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants & Inputs
+//---------------------------------------------------------------------------------------------------------------------{
+
+int windowInput        = input.int(100, "Window Size (N)", minval = 10, group = "Settings", tooltip = "Number of bars to fit the sine wave to.")
+bool autoPeriodInput   = input.bool(true, "Auto Period", group = "Settings", tooltip = "Automatically find the best matching period.")
+int periodInput        = input.int(20, "Fixed Period (P)", minval = 5, group = "Settings", tooltip = "The expected period of the sine wave if Auto Period is disabled.")
+int minPeriodInput     = input.int(10, "Min Search Period", minval = 5, group = "Settings", tooltip = "Minimum period to search for in Auto Period mode.")
+int maxPeriodInput     = input.int(60, "Max Search Period", minval = 5, group = "Settings", tooltip = "Maximum period to search for in Auto Period mode.")
+int forecastInput      = input.int(20, "Forecast Length", minval = 0, group = "Settings", tooltip = "Number of bars to project into the future.")
+float rmseMultInput    = input.float(2.0, "RMSE Band Multiplier", minval = 0.1, step = 0.1, group = "Settings", tooltip = "Multiplier for the RMSE bands.")
+
+color bullColorInput   = input.color(#089981, "Bullish Color", group = "Visuals")
+color bearColorInput   = input.color(#f23645, "Bearish Color", group = "Visuals")
+color bandColorInput   = input.color(color.gray, "Band Color", group = "Visuals")
+
+// Dashboard Constants
+DATA                    = #DBDBDB
+HEADERS                 = #808080
+BACKGROUND              = #161616
+BORDERS                 = #2E2E2E
+
+TOP_RIGHT               = 'Top Right'
+BOTTOM_RIGHT            = 'Bottom Right'
+BOTTOM_LEFT             = 'Bottom Left'
+
+TINY                    = 'Tiny'
+SMALL                   = 'Small'
+NORMAL                  = 'Normal'
+LARGE                   = 'Large'
+HUGE                    = 'Huge'
+
+DASHBOARD_GROUP         = 'Dashboard'
+
+dashboardTooltip        = 'Enable or disable the dashboard.'
+dashboardPositionTooltip= 'Select the dashboard location.'
+dashboardSizeTooltip    = 'Select the dashboard size.'
+
+dashboardInput          = input.bool(   true,       'Dashboard',    group = DASHBOARD_GROUP, tooltip = dashboardTooltip)
+dashboardPositionInput  = input.string( TOP_RIGHT,  'Position',     group = DASHBOARD_GROUP, tooltip = dashboardPositionTooltip , options = [TOP_RIGHT,BOTTOM_RIGHT,BOTTOM_LEFT])
+dashboardSizeInput      = input.string( SMALL,      'Size',         group = DASHBOARD_GROUP, tooltip = dashboardSizeTooltip,      options = [TINY,SMALL,NORMAL,LARGE,HUGE])
+
+// Global Dashboard Variables
+var parsedDashboardPosition = switch dashboardPositionInput
+    TOP_RIGHT       => position.top_right
+    BOTTOM_RIGHT    => position.bottom_right
+    BOTTOM_LEFT     => position.bottom_left
+
+var parsedDashboardSize     = switch dashboardSizeInput
+    TINY            => size.tiny
+    SMALL           => size.small
+    NORMAL          => size.normal
+    LARGE           => size.large
+    HUGE            => size.huge
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types & Methods
+//---------------------------------------------------------------------------------------------------------------------{
+
+// @function Solves Ordinary Least Squares for a given damping coefficient
+// @param prices The array of prices to fit
+// @param lambda The damping coefficient (amplitude growth/decay)
+// @param omega The angular frequency
+// @returns A tuple [a, b, m, c, sse]
+method fitSine(array<float> prices, float lambda, float omega) =>
+    int n = prices.size()
+    // We want to fit y = e^(lambda * t) * (a * sin(omega * t) + b * cos(omega * t)) + m * t + c
+    // t goes from 0 to n-1
+    
+    matrix<float> xMat = matrix.new<float>(n, 4)
+    matrix<float> yMat = matrix.new<float>(n, 1)
+    
+    for i = 0 to n - 1
+        float t = float(i)
+        float expTerm = math.exp(lambda * t)
+        xMat.set(i, 0, expTerm * math.sin(omega * t))
+        xMat.set(i, 1, expTerm * math.cos(omega * t))
+        xMat.set(i, 2, t)
+        xMat.set(i, 3, 1.0)
+        yMat.set(i, 0, prices.get(i))
+        
+    matrix<float> xT  = xMat.transpose()
+    matrix<float> xTx = xT.mult(xMat)
+    matrix<float> xTy = xT.mult(yMat)
+    
+    // Solve (xTx) * beta = xTy  => beta = pinv(xTx) * xTy
+    matrix<float> beta = xTx.pinv().mult(xTy)
+    
+    float a = beta.get(0, 0)
+    float b = beta.get(1, 0)
+    float m = beta.get(2, 0)
+    float c = beta.get(3, 0)
+    
+    // Calculate SSE
+    float sse = 0.0
+    for i = 0 to n - 1
+        float t = float(i)
+        float expTerm = math.exp(lambda * t)
+        float fit = expTerm * (a * math.sin(omega * t) + b * math.cos(omega * t)) + m * t + c
+        sse += math.pow(prices.get(i) - fit, 2)
+        
+    [a, b, m, c, sse]
+
+// Dashboard helper functions
+cell(table t_able, int column, int row, string data, color = #FFFFFF, align = text.align_right, color background = na, float height = 0) => 
+    t_able.cell(column, row, data, text_color = color, text_size = parsedDashboardSize, text_halign = align, bgcolor = background, height = height)
+
+divider(table t_able, int row, int lastColumn) =>    
+    string rowDivider = '━━━━━━━━━━━━'
+    t_able.merge_cells(0, row, lastColumn, row)
+    cell(t_able, 0, row, rowDivider, align = text.align_center, height = 0.5, color = BORDERS)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Logic
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Use a queue to store recent prices
+var array<float> priceArray = array.new<float>()
+if priceArray.size() >= windowInput
+    priceArray.shift()
+priceArray.push(close)
+
+// Global handles for drawing objects
+var array<label> extremaLabels = array.new<label>()
+var polyline fitLine           = na
+var polyline forecastLine      = na
+var polyline upperFitLine       = na
+var polyline lowerFitLine       = na
+var polyline upperForecastLine  = na
+var polyline lowerForecastLine  = na
+
+// Only calculate on the last bar for performance
+if barstate.islast and priceArray.size() == windowInput
+    float bestA      = 0.0
+    float bestB      = 0.0
+    float bestM      = 0.0
+    float bestC      = 0.0
+    float bestLambda = 0.0
+    float bestOmega  = 0.0
+    float minSSE     = 1e20
+    
+    // Determine period search range
+    int startP = autoPeriodInput ? minPeriodInput : periodInput
+    int endP   = autoPeriodInput ? maxPeriodInput : periodInput
+    int stepP  = autoPeriodInput ? 2 : 1
+    
+    // Grid search for best period P and damping coefficient lambda
+    for p = startP to endP by stepP
+        float omega = (2.0 * math.pi) / p
+        for l = -10 to 10
+            float lambda = l * 0.005
+            [a, b, m, c, sse] = priceArray.fitSine(lambda, omega)
+            
+            if sse < minSSE
+                minSSE     := sse
+                bestA      := a
+                bestB      := b
+                bestM      := m
+                bestC      := c
+                bestLambda := lambda
+                bestOmega  := omega
+
+    // Calculate RMSE for bands
+    float rmse = math.sqrt(minSSE / windowInput)
+    float bandOffset = rmse * rmseMultInput
+
+    // Generate the points for the polyline using optimized parameters
+    array<chart.point> points         = array.new<chart.point>()
+    array<chart.point> forecastPoints = array.new<chart.point>()
+    
+    array<chart.point> upperPoints         = array.new<chart.point>()
+    array<chart.point> lowerPoints         = array.new<chart.point>()
+    array<chart.point> upperForecastPoints = array.new<chart.point>()
+    array<chart.point> lowerForecastPoints = array.new<chart.point>()
+    
+    // Fit range
+    for i = 0 to windowInput - 1
+        float t = float(i)
+        float expTerm = math.exp(bestLambda * t)
+        float val = expTerm * (bestA * math.sin(bestOmega * t) + bestB * math.cos(bestOmega * t)) + bestM * t + bestC
+        
+        int barIndex = bar_index - (windowInput - 1 - i)
+        points.push(chart.point.from_index(barIndex, val))
+        upperPoints.push(chart.point.from_index(barIndex, val + bandOffset))
+        lowerPoints.push(chart.point.from_index(barIndex, val - bandOffset))
+        
+    // Forecast range
+    if forecastInput > 0
+        // Start forecast from the last fit point to ensure continuity
+        float lastT = float(windowInput - 1)
+        float lastExp = math.exp(bestLambda * lastT)
+        float lastVal = lastExp * (bestA * math.sin(bestOmega * lastT) + bestB * math.cos(bestOmega * lastT)) + bestM * lastT + bestC
+        
+        forecastPoints.push(chart.point.from_index(bar_index, lastVal))
+        upperForecastPoints.push(chart.point.from_index(bar_index, lastVal + bandOffset))
+        lowerForecastPoints.push(chart.point.from_index(bar_index, lastVal - bandOffset))
+
+        for i = windowInput to windowInput + forecastInput - 1
+            float t = float(i)
+            float expTerm = math.exp(bestLambda * t)
+            float val = expTerm * (bestA * math.sin(bestOmega * t) + bestB * math.cos(bestOmega * t)) + bestM * t + bestC
+            
+            int barIndex = bar_index + (i - (windowInput - 1))
+            forecastPoints.push(chart.point.from_index(barIndex, val))
+            upperForecastPoints.push(chart.point.from_index(barIndex, val + bandOffset))
+            lowerForecastPoints.push(chart.point.from_index(barIndex, val - bandOffset))
+
+    // Determine color based on forecast direction (final slope of the fit)
+    float finalVal = points.get(points.size() - 1).price
+    float prevVal  = points.get(math.max(0, points.size() - 2)).price
+    color lineColor = finalVal > prevVal ? bullColorInput : bearColorInput
+    
+    // Delete old objects
+    polyline.delete(fitLine)
+    polyline.delete(forecastLine)
+    polyline.delete(upperFitLine)
+    polyline.delete(lowerFitLine)
+    polyline.delete(upperForecastLine)
+    polyline.delete(lowerForecastLine)
+
+    for l in extremaLabels
+        label.delete(l)
+    extremaLabels.clear()
+    
+    // Draw historical fit and bands
+    fitLine      := polyline.new(points, curved = true, line_color = lineColor, line_width = 2)
+    upperFitLine := polyline.new(upperPoints, curved = true, line_color = color.new(bandColorInput, 50), line_width = 1)
+    lowerFitLine := polyline.new(lowerPoints, curved = true, line_color = color.new(bandColorInput, 50), line_width = 1)
+
+    // Draw forecast and markers
+    if forecastInput > 0
+        forecastLine      := polyline.new(forecastPoints, curved = true, line_color = lineColor, line_width = 2, line_style = line.style_dashed)
+        upperForecastLine := polyline.new(upperForecastPoints, curved = true, line_color = color.new(bandColorInput, 50), line_width = 1, line_style = line.style_dashed)
+        lowerForecastLine := polyline.new(lowerForecastPoints, curved = true, line_color = color.new(bandColorInput, 50), line_width = 1, line_style = line.style_dashed)
+
+        // Find extrema markers in the extrapolation
+        int extLength = forecastInput + 2 
+        array<float> extVals = array.new<float>()
+        for i = 0 to extLength - 1
+            float t = float(windowInput - 2 + i)
+            float expTerm = math.exp(bestLambda * t)
+            float val = expTerm * (bestA * math.sin(bestOmega * t) + bestB * math.cos(bestOmega * t)) + bestM * t + bestC
+            extVals.push(val)
+        
+        for i = 1 to extVals.size() - 2
+            float prev = extVals.get(i - 1)
+            float curr = extVals.get(i)
+            float next = extVals.get(i + 1)
+            
+            bool isMax = curr > prev and curr > next
+            bool isMin = curr < prev and curr < next
+            
+    // Dashboard Implementation
+    if dashboardInput
+        var table t_able = table.new(parsedDashboardPosition, 2, 8, bgcolor = BACKGROUND, border_width = 0, frame_color = BORDERS, frame_width = 1, force_overlay = false)
+        
+        // State Logic
+        string ampState   = bestLambda < -0.001 ? "Damped" : bestLambda > 0.001 ? "Expanding" : "Constant"
+        string trendState = math.abs(bestM * windowInput) > rmse ? "Trending" : "Ranging"
+        string fullState  = ampState + " & " + trendState
+        float  period     = (2.0 * math.pi) / bestOmega
+
+        t_able.merge_cells(0, 0, 1, 0)
+        cell(t_able, 0, 0, 'Sine Fit Dashboard', color = DATA, align = text.align_center)
+        divider(t_able, 1, 1)
+        
+        cell(t_able, 0, 2, 'Current State', color = HEADERS, align = text.align_left)
+        cell(t_able, 1, 2, fullState, color = DATA)
+        divider(t_able, 3, 1)
+
+        cell(t_able, 0, 4, 'Best Period', color = HEADERS, align = text.align_left)
+        cell(t_able, 1, 4, str.tostring(period, "#.##"), color = DATA)
+        divider(t_able, 5, 1)
+
+        cell(t_able, 0, 6, 'RMSE', color = HEADERS, align = text.align_left)
+        cell(t_able, 1, 6, str.tostring(rmse, format.mintick), color = DATA)
+        divider(t_able, 7, 1)
+
+//---------------------------------------------------------------------------------------------------------------------}

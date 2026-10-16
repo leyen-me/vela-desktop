@@ -1,0 +1,317 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Golden Pocket", "Golden Pocket", overlay = true, max_boxes_count = 50, max_lines_count = 100, max_labels_count = 50, max_bars_back = 300)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+int STATE_FRESH   = 0
+int STATE_TESTED  = 1
+int STATE_BROKEN  = 2
+int STATE_INVALID = 3
+
+float INVALIDATION_RATIO = 0.786
+
+color BULL_COLOR    = #089981
+color BEAR_COLOR    = #f23645
+color NEUTRAL_COLOR = #787b86
+
+string GROUP_SWING  = "Swing Detection"
+string GROUP_POCKET = "Golden Pocket"
+string GROUP_STYLE  = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+swingLengthInput = input.int(20, "Swing Length", minval = 2, maxval = 250, group = GROUP_SWING, tooltip = "Bars on each side required to confirm a swing high or swing low. Larger values anchor the retracement to more significant impulse legs - increase it to approximate higher timeframe legs, decrease it to track faster swings.")
+
+legFilterInput = input.string("Both", "Pocket Legs", options = ["Both", "Bullish", "Bearish"], group = GROUP_SWING, tooltip = "Which measured legs produce a pocket. Bullish pockets are retracement supports drawn across upward legs; bearish pockets are retracement resistances drawn across downward legs, the band targeted when fading the impulse.")
+
+pocketStartInput = input.float(0.618, "Pocket Band", minval = 0, maxval = 1, step = 0.001, inline = "band", group = GROUP_POCKET, tooltip = "Retracement ratio where the pocket begins. 0.618 is the golden ratio retracement, the classic deep pullback level.")
+
+pocketEndInput = input.float(0.65, "to", minval = 0, maxval = 1, step = 0.001, inline = "band", group = GROUP_POCKET, tooltip = "Retracement ratio where the pocket ends. The 0.65 edge is the conventional buffer that turns a single ratio line into a tradable band.")
+
+invalidationInput = input.string("0.786 Level", "Invalidation", options = ["0.786 Level", "Swing Origin"], group = GROUP_POCKET, tooltip = "Where the continuation premise is objectively broken. A close beyond the 0.786 retracement (default) or beyond the measuring swing's origin invalidates the pocket.")
+
+maxPocketsInput = input.int(3, "Maximum Pockets", minval = 1, maxval = 20, group = GROUP_POCKET, tooltip = "Most recent pockets kept on the chart. Keeping prior pockets visible helps spot overlaps between legs and confluence with other levels.")
+
+showInvalidatedInput = input.bool(false, "Keep Invalidated Pockets", group = GROUP_POCKET, tooltip = "Keep invalidated pockets on the chart, grayed out and frozen at their invalidation bar, instead of deleting them.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "colors", group = GROUP_STYLE, tooltip = "Color of bullish pockets, drawn across upward legs.")
+
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "colors", group = GROUP_STYLE, tooltip = "Color of bearish pockets, drawn across downward legs.")
+
+invalidColorInput = input.color(NEUTRAL_COLOR, "Invalidated", inline = "colors", group = GROUP_STYLE, tooltip = "Color applied to pockets once their invalidation level is closed through.")
+
+showLegInput = input.bool(true, "Show Swing Leg", group = GROUP_STYLE, tooltip = "Draw the measured leg from origin to extreme as a dotted line, showing the anchors every pocket level is inherited from.")
+
+showInvLineInput = input.bool(true, "Show Invalidation Level", group = GROUP_STYLE, tooltip = "Draw the invalidation level as a dashed line beyond the pocket, where stops framed by the zone logic belong.")
+
+showLabelsInput = input.bool(true, "Show Labels", group = GROUP_STYLE, tooltip = "Display a status label on each pocket tracking its lifecycle: fresh, tested, broken, or invalidated.")
+
+showMarkersInput = input.bool(false, "Rejection Markers", group = GROUP_STYLE, tooltip = "Mark rejection candles, bars that pierce the pocket and close back beyond it. Disabled by default, the rejection alerts cover the same events.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types & Variables
+//---------------------------------------------------------------------------------------------------------------------{
+type GoldenPocket
+    int   dir
+    float origin
+    int   originBar
+    float extreme
+    int   extremeBar
+    float zoneTop
+    float zoneBottom
+    float invLevel
+    int   state
+    bool  wasInside
+    bool  alive
+    box   zone
+    line  leg
+    line  inv
+    label tag
+
+var array<GoldenPocket> pockets = array.new<GoldenPocket>()
+
+var GoldenPocket currentBull = na
+var GoldenPocket currentBear = na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Methods & Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Price at a given retracement ratio of the measured leg (0 = extreme, 1 = origin)
+method levelAt(GoldenPocket gp, float ratio) =>
+    gp.extreme - ratio * (gp.extreme - gp.origin)
+
+// Compute the pocket band and its invalidation level from the leg anchors
+method setLevels(GoldenPocket gp) =>
+    float levelA  = gp.levelAt(pocketStartInput)
+    float levelB  = gp.levelAt(pocketEndInput)
+    gp.zoneTop    := math.max(levelA, levelB)
+    gp.zoneBottom := math.min(levelA, levelB)
+    gp.invLevel   := invalidationInput == "Swing Origin" ? gp.origin : gp.levelAt(INVALIDATION_RATIO)
+
+// Apply one bar of price action to the pocket state machine, returning the events it triggered
+// Zone tests run on wicks, break & invalidation run on closes
+method applyBar(GoldenPocket gp, float priceHigh, float priceLow, float priceClose) =>
+    bool enteredEvent     = false
+    bool rejectedEvent    = false
+    bool brokenEvent      = false
+    bool invalidatedEvent = false
+    if gp.state < STATE_INVALID and not na(priceHigh) and not na(priceLow) and not na(priceClose)
+        bool inside = priceLow <= gp.zoneTop and priceHigh >= gp.zoneBottom
+        if gp.state < STATE_BROKEN
+            if inside and not gp.wasInside
+                enteredEvent := true
+            if inside and gp.state == STATE_FRESH
+                gp.state := STATE_TESTED
+            rejectedEvent := gp.dir == 1 ? priceLow <= gp.zoneTop and priceClose > gp.zoneTop : priceHigh >= gp.zoneBottom and priceClose < gp.zoneBottom
+            if gp.dir == 1 ? priceClose < gp.zoneBottom : priceClose > gp.zoneTop
+                brokenEvent := true
+                gp.state    := STATE_BROKEN
+        if gp.state < STATE_INVALID
+            if gp.dir == 1 ? priceClose < gp.invLevel : priceClose > gp.invLevel
+                invalidatedEvent := true
+                gp.state         := STATE_INVALID
+        gp.wasInside := inside
+    [enteredEvent, rejectedEvent, brokenEvent, invalidatedEvent]
+
+// Re-apply the bars elapsed since the leg extreme so the pocket state reflects the confirmation lag
+method backfill(GoldenPocket gp) =>
+    if swingLengthInput > 1
+        for i = 1 to swingLengthInput - 1
+            int offset = swingLengthInput - i
+            [enteredEvent, rejectedEvent, brokenEvent, invalidatedEvent] = applyBar(gp, high[offset], low[offset], close[offset])
+
+// Sync the pocket drawings with its current lifecycle state
+method refresh(GoldenPocket gp) =>
+    color baseColor = gp.state == STATE_INVALID ? invalidColorInput : gp.dir == 1 ? bullColorInput : bearColorInput
+    int fillTransp  = gp.state == STATE_FRESH ? 85 : gp.state == STATE_TESTED ? 78 : 90
+    if not na(gp.zone)
+        gp.zone.set_right(bar_index)
+        gp.zone.set_bgcolor(color.new(baseColor, fillTransp))
+        gp.zone.set_border_color(color.new(baseColor, gp.state >= STATE_BROKEN ? 70 : 55))
+        gp.zone.set_border_style(gp.state >= STATE_BROKEN ? line.style_dashed : line.style_solid)
+    if not na(gp.inv)
+        gp.inv.set_x2(bar_index)
+        gp.inv.set_color(color.new(baseColor, 60))
+    if not na(gp.leg)
+        gp.leg.set_color(color.new(baseColor, 50))
+    if not na(gp.tag)
+        string stateText = gp.state == STATE_TESTED ? " (tested)" : gp.state == STATE_BROKEN ? " (broken)" : gp.state == STATE_INVALID ? " (invalidated)" : ""
+        gp.tag.set_x(bar_index)
+        gp.tag.set_y(math.avg(gp.zoneTop, gp.zoneBottom))
+        gp.tag.set_text("Golden Pocket" + stateText)
+        gp.tag.set_textcolor(color.new(baseColor, gp.state == STATE_INVALID ? 40 : 25))
+
+// Move the pocket onto updated leg anchors and reset its lifecycle
+method reanchor(GoldenPocket gp) =>
+    gp.setLevels()
+    gp.state     := STATE_FRESH
+    gp.wasInside := false
+    if not na(gp.zone)
+        gp.zone.set_lefttop(gp.extremeBar, gp.zoneTop)
+        gp.zone.set_rightbottom(bar_index, gp.zoneBottom)
+    if not na(gp.leg)
+        gp.leg.set_xy1(gp.originBar, gp.origin)
+        gp.leg.set_xy2(gp.extremeBar, gp.extreme)
+    if not na(gp.inv)
+        gp.inv.set_xy1(gp.extremeBar, gp.invLevel)
+        gp.inv.set_xy2(bar_index, gp.invLevel)
+
+// Delete the pocket drawings and mark it dead
+method wipe(GoldenPocket gp) =>
+    gp.alive := false
+    if not na(gp.zone)
+        box.delete(gp.zone)
+    if not na(gp.leg)
+        line.delete(gp.leg)
+    if not na(gp.inv)
+        line.delete(gp.inv)
+    if not na(gp.tag)
+        label.delete(gp.tag)
+
+// Build a pocket for a completed leg, backfill its state, and register it
+createPocket(int legDir, float legOrigin, int legOriginBar, float legExtreme, int legExtremeBar) =>
+    GoldenPocket gp = GoldenPocket.new(dir = legDir, origin = legOrigin, originBar = legOriginBar, extreme = legExtreme, extremeBar = legExtremeBar, state = STATE_FRESH, wasInside = false, alive = true)
+    gp.setLevels()
+    gp.zone := box.new(legExtremeBar, gp.zoneTop, bar_index, gp.zoneBottom)
+    if showLegInput
+        gp.leg := line.new(legOriginBar, legOrigin, legExtremeBar, legExtreme, style = line.style_dotted)
+    if showInvLineInput
+        gp.inv := line.new(legExtremeBar, gp.invLevel, bar_index, gp.invLevel, style = line.style_dashed)
+    if showLabelsInput
+        gp.tag := label.new(bar_index, math.avg(gp.zoneTop, gp.zoneBottom), "Golden Pocket", color = #00000000, style = label.style_label_left, size = size.tiny)
+    gp.backfill()
+    gp.refresh()
+    pockets.push(gp)
+    while pockets.size() > maxPocketsInput
+        GoldenPocket oldest = pockets.shift()
+        oldest.wipe()
+    gp
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Swing Detection
+//---------------------------------------------------------------------------------------------------------------------{
+var float lastAnchorPrice = na
+var int   lastAnchorBar   = na
+var int   lastAnchorDir   = 0
+var float prevAnchorPrice = na
+var int   prevAnchorBar   = na
+
+float pivotHigh = ta.pivothigh(swingLengthInput, swingLengthInput)
+float pivotLow  = ta.pivotlow(swingLengthInput, swingLengthInput)
+int   pivotBar  = bar_index - swingLengthInput
+
+// Confirmed swing high: extend the current up leg or complete a new one from the last swing low
+if not na(pivotHigh)
+    if lastAnchorDir == 1
+        if pivotHigh > lastAnchorPrice
+            lastAnchorPrice := pivotHigh
+            lastAnchorBar   := pivotBar
+            if not na(prevAnchorPrice) and pivotHigh > prevAnchorPrice and prevAnchorBar != pivotBar and legFilterInput != "Bearish"
+                bool reuseBull = false
+                if not na(currentBull)
+                    reuseBull := currentBull.alive and currentBull.state < STATE_INVALID
+                if reuseBull
+                    currentBull.origin     := prevAnchorPrice
+                    currentBull.originBar  := prevAnchorBar
+                    currentBull.extreme    := pivotHigh
+                    currentBull.extremeBar := pivotBar
+                    currentBull.reanchor()
+                    currentBull.backfill()
+                    currentBull.refresh()
+                else
+                    currentBull := createPocket(1, prevAnchorPrice, prevAnchorBar, pivotHigh, pivotBar)
+    else
+        prevAnchorPrice := lastAnchorPrice
+        prevAnchorBar   := lastAnchorBar
+        lastAnchorPrice := pivotHigh
+        lastAnchorBar   := pivotBar
+        lastAnchorDir   := 1
+        if not na(prevAnchorPrice) and pivotHigh > prevAnchorPrice and prevAnchorBar != pivotBar and legFilterInput != "Bearish"
+            currentBull := createPocket(1, prevAnchorPrice, prevAnchorBar, pivotHigh, pivotBar)
+
+// Confirmed swing low: extend the current down leg or complete a new one from the last swing high
+if not na(pivotLow)
+    if lastAnchorDir == -1
+        if pivotLow < lastAnchorPrice
+            lastAnchorPrice := pivotLow
+            lastAnchorBar   := pivotBar
+            if not na(prevAnchorPrice) and pivotLow < prevAnchorPrice and prevAnchorBar != pivotBar and legFilterInput != "Bullish"
+                bool reuseBear = false
+                if not na(currentBear)
+                    reuseBear := currentBear.alive and currentBear.state < STATE_INVALID
+                if reuseBear
+                    currentBear.origin     := prevAnchorPrice
+                    currentBear.originBar  := prevAnchorBar
+                    currentBear.extreme    := pivotLow
+                    currentBear.extremeBar := pivotBar
+                    currentBear.reanchor()
+                    currentBear.backfill()
+                    currentBear.refresh()
+                else
+                    currentBear := createPocket(-1, prevAnchorPrice, prevAnchorBar, pivotLow, pivotBar)
+    else
+        prevAnchorPrice := lastAnchorPrice
+        prevAnchorBar   := lastAnchorBar
+        lastAnchorPrice := pivotLow
+        lastAnchorBar   := pivotBar
+        lastAnchorDir   := -1
+        if not na(prevAnchorPrice) and pivotLow < prevAnchorPrice and prevAnchorBar != pivotBar and legFilterInput != "Bullish"
+            currentBear := createPocket(-1, prevAnchorPrice, prevAnchorBar, pivotLow, pivotBar)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Mitigation Tracking
+//---------------------------------------------------------------------------------------------------------------------{
+bool bullEntered     = false
+bool bullRejected    = false
+bool bullBroken      = false
+bool bullInvalidated = false
+bool bearEntered     = false
+bool bearRejected    = false
+bool bearBroken      = false
+bool bearInvalidated = false
+
+int idx = 0
+while idx < pockets.size()
+    GoldenPocket gp = pockets.get(idx)
+    if gp.state < STATE_INVALID
+        [enteredEvent, rejectedEvent, brokenEvent, invalidatedEvent] = applyBar(gp, high, low, close)
+        if gp.dir == 1
+            bullEntered     := bullEntered or enteredEvent
+            bullRejected    := bullRejected or rejectedEvent
+            bullBroken      := bullBroken or brokenEvent
+            bullInvalidated := bullInvalidated or invalidatedEvent
+        else
+            bearEntered     := bearEntered or enteredEvent
+            bearRejected    := bearRejected or rejectedEvent
+            bearBroken      := bearBroken or brokenEvent
+            bearInvalidated := bearInvalidated or invalidatedEvent
+        gp.refresh()
+    if gp.state == STATE_INVALID and not showInvalidatedInput
+        gp.wipe()
+        pockets.remove(idx)
+    else
+        idx += 1
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Rejection Markers
+//---------------------------------------------------------------------------------------------------------------------{
+plotshape(showMarkersInput and bullRejected, "Bullish Rejection", shape.triangleup, location.belowbar, bullColorInput, size = size.tiny)
+plotshape(showMarkersInput and bearRejected, "Bearish Rejection", shape.triangledown, location.abovebar, bearColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(bullEntered, "Bullish Pocket Entered", "Price traded into a bullish Golden Pocket (0.618 - 0.65 retracement support)")
+alertcondition(bullRejected, "Bullish Pocket Rejection", "Rejection inside a bullish Golden Pocket - the wick pierced the band and price closed back above it")
+alertcondition(bullBroken, "Bullish Pocket Broken", "Price closed through a bullish Golden Pocket - acceptance below the band points toward the 0.786 level")
+alertcondition(bullInvalidated, "Bullish Pocket Invalidated", "Bullish Golden Pocket invalidated - price closed beyond the invalidation level, breaking the continuation premise")
+alertcondition(bearEntered, "Bearish Pocket Entered", "Price traded into a bearish Golden Pocket (0.618 - 0.65 retracement resistance)")
+alertcondition(bearRejected, "Bearish Pocket Rejection", "Rejection inside a bearish Golden Pocket - the wick pierced the band and price closed back below it")
+alertcondition(bearBroken, "Bearish Pocket Broken", "Price closed through a bearish Golden Pocket - acceptance above the band points toward the 0.786 level")
+alertcondition(bearInvalidated, "Bearish Pocket Invalidated", "Bearish Golden Pocket invalidated - price closed beyond the invalidation level, breaking the continuation premise")
+
+//---------------------------------------------------------------------------------------------------------------------}

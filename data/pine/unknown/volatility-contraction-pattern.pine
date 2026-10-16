@@ -1,0 +1,475 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Volatility Contraction Pattern", shorttitle = "Volatility Contraction Pattern", overlay = true, max_lines_count = 500, max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+NEUTRAL_COLOR = #5b9cf6
+HIDDEN_COLOR  = #00000000
+
+//Swing memory kept while scanning - a base needs two swings per contraction, so this is ample headroom
+MAX_SWINGS = 30
+
+//Transparency of the earliest, widest contraction wave; segments strengthen toward the final coil
+WAVE_FADE = 60
+
+//Transparency of an invalidated pattern skeleton - kept on the chart, faded and dotted
+DEAD_FADE = 85
+
+PATTERN_GROUP = "Pattern Detection"
+TREND_GROUP   = "Trend Qualification"
+VOLUME_GROUP  = "Volume Signature"
+DASH_GROUP    = "Dashboard"
+STYLE_GROUP   = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+swingLengthInput = input.int(5, "Swing Length", minval = 2, maxval = 50, group = PATTERN_GROUP,
+  tooltip = "Bars to the left and right required to confirm a swing high or swing low. Each pullback is measured from a confirmed swing high to the following swing low, so this sets the scale of the contractions the base is read from. Larger values read bigger bases; smaller values find tighter coils sooner.")
+
+minContractionsInput = input.int(2, "Contractions", minval = 2, maxval = 8, inline = "cnt", group = PATTERN_GROUP,
+  tooltip = "Fewest pullbacks the tightening sequence must contain before the base qualifies. Minervini describes most bases as containing two to four contractions, occasionally five or six - and a base that tightens cleanly with three beats a sloppy one with five.")
+
+maxContractionsInput = input.int(4, "to", minval = 2, maxval = 8, inline = "cnt", group = PATTERN_GROUP,
+  tooltip = "Most contractions kept in the pattern. When a longer run of tightening pullbacks exists, the most recent ones are kept, since the final tight area is what defines the pivot. Two to four is typical, occasionally five or six.")
+
+maxRatioInput = input.float(0.75, "Max Depth Ratio", minval = 0.2, maxval = 1, step = 0.05, group = PATTERN_GROUP,
+  tooltip = "Each pullback may be at most this fraction of the depth of the pullback before it - the requirement that every contraction is meaningfully shallower than the last. Minervini describes contractions commonly near half (0.5) the prior depth; 0.75 admits any clearly tightening sequence, lower values demand textbook bases.")
+
+trendFilterInput = input.bool(true, "Qualify the Uptrend", group = TREND_GROUP,
+  tooltip = "Consider bases only when the symbol is in an established uptrend and trading in the upper portion of its yearly range - the prerequisite Minervini sets before any base is read. Disable to scan the contraction structure alone, e.g. on symbols without a year of history.")
+
+trendMaLengthInput = input.int(200, "Trend SMA Length", minval = 10, group = TREND_GROUP,
+  tooltip = "Close must hold above this simple moving average for the uptrend to count as established; 200 is the conventional long-term baseline on daily charts.")
+
+rangeLookbackInput = input.int(252, "Yearly Range Lookback", minval = 20, group = TREND_GROUP,
+  tooltip = "Bars defining the yearly range the trend is judged against; 252 approximates one year of daily sessions.")
+
+nearHighPctInput = input.float(25, "Max % Below Range High", minval = 1, maxval = 90, group = TREND_GROUP,
+  tooltip = "Close must sit no further than this percentage below the lookback high - the upper portion of the yearly range. Minervini's trend template asks for a stock within 25% of its 52-week high.")
+
+aboveLowPctInput = input.float(30, "Min % Above Range Low", minval = 0, maxval = 500, group = TREND_GROUP,
+  tooltip = "Close must stand at least this percentage above the lookback low. Minervini's trend template asks for a stock at least 30% above its 52-week low.")
+
+volumeFilterInput = input.bool(true, "Require the Volume Signature", group = VOLUME_GROUP,
+  tooltip = "Demand that volume contracts along with price: the final contraction must trade quieter on average than both the first contraction and the trailing volume average, and the pivot breakout must arrive on clear expansion. Automatically bypassed when the symbol reports no volume data.")
+
+volumeMaLengthInput = input.int(50, "Volume Average Length", minval = 1, group = VOLUME_GROUP,
+  tooltip = "Trailing simple average of volume used as the baseline for quiet sessions inside the base and for expansion on the breakout; 50 daily bars is the conventional reference.")
+
+breakoutVolMultInput = input.float(1.5, "Breakout Volume Multiplier", minval = 1, step = 0.1, group = VOLUME_GROUP,
+  tooltip = "Volume on the breakout bar must exceed the trailing average times this factor to count as clear expansion; 1.5 sits in line with the classical guidance of a break arriving 40-50% above average volume.")
+
+showDashInput = input.bool(true, "Show Dashboard", group = DASH_GROUP,
+  tooltip = "Summarizes the pattern state, the trend qualification, the measured contraction depths, the volume signature, and the live pivot and stop levels - the same checklist a VCP scanner computes.")
+
+dashPosInput = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = DASH_GROUP,
+  tooltip = "Chart corner where the dashboard is anchored.")
+
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = DASH_GROUP,
+  tooltip = "Dashboard text size.")
+
+showDepthLabelsInput = input.bool(true, "Contraction Depth Labels", group = STYLE_GROUP,
+  tooltip = "Label each contraction T1, T2, ... at its swing low with the measured pullback depth. The label tooltip reports the depth ratio against the prior contraction.")
+
+showStopInput = input.bool(true, "Show Stop Level", group = STYLE_GROUP,
+  tooltip = "Dashed line under the low of the final contraction - the conventional stop for the pivot trade, keeping risk small relative to the expected move. If that stop sits too far away, the base is not tight enough yet.")
+
+waveColorInput = input.color(NEUTRAL_COLOR, "Contraction Waves", group = STYLE_GROUP,
+  tooltip = "Color of the zigzag drawn through the pattern swings; segments strengthen from the widest contraction toward the final coil.")
+
+pivotColorInput = input.color(BULL_COLOR, "Pivot / Breakout", group = STYLE_GROUP,
+  tooltip = "Color of the pivot line at the high of the final tight area and of the breakout marker.")
+
+stopColorInput = input.color(BEAR_COLOR, "Stop Level", group = STYLE_GROUP,
+  tooltip = "Color of the stop line under the low of the final contraction.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+//Register a confirmed swing, keeping strict high/low alternation: consecutive swings on the same side
+//keep only the more extreme point. Returns true when the swing sequence changed
+addSwing(array<int> kindArray, array<float> priceArray, array<int> barArray, array<float> cvArray, int kindFlag, float priceValue, int barIx, float cvValue) =>
+    bool changed = false
+    int sizeCount = array.size(kindArray)
+    if sizeCount == 0
+        array.push(kindArray, kindFlag)
+        array.push(priceArray, priceValue)
+        array.push(barArray, barIx)
+        array.push(cvArray, cvValue)
+        changed := true
+    else if array.get(kindArray, sizeCount - 1) != kindFlag
+        array.push(kindArray, kindFlag)
+        array.push(priceArray, priceValue)
+        array.push(barArray, barIx)
+        array.push(cvArray, cvValue)
+        changed := true
+    else
+        float lastPrice = array.get(priceArray, sizeCount - 1)
+        if (kindFlag == 1 and priceValue > lastPrice) or (kindFlag == -1 and priceValue < lastPrice)
+            array.set(priceArray, sizeCount - 1, priceValue)
+            array.set(barArray, sizeCount - 1, barIx)
+            array.set(cvArray, sizeCount - 1, cvValue)
+            changed := true
+    changed
+
+//Remove every drawing of the pattern currently tracked - used before a redraw of an extended base
+erasePattern(array<line> linesArray, array<label> labelsArray, line pivotLn, line stopLn, label pivotLb, label stopLb) =>
+    if array.size(linesArray) > 0
+        for i = 0 to array.size(linesArray) - 1
+            line.delete(array.get(linesArray, i))
+    if array.size(labelsArray) > 0
+        for i = 0 to array.size(labelsArray) - 1
+            label.delete(array.get(labelsArray, i))
+    line.delete(pivotLn)
+    line.delete(stopLn)
+    label.delete(pivotLb)
+    label.delete(stopLb)
+    array.clear(linesArray)
+    array.clear(labelsArray)
+
+//Fade a failed pattern: the skeleton stays on the chart, dotted and dimmed, the text labels go away
+fadePattern(array<line> linesArray, array<label> labelsArray, line pivotLn, line stopLn, label pivotLb, label stopLb) =>
+    if array.size(linesArray) > 0
+        for i = 0 to array.size(linesArray) - 1
+            line lineId = array.get(linesArray, i)
+            line.set_color(lineId, color.new(waveColorInput, DEAD_FADE))
+            line.set_style(lineId, line.style_dotted)
+    if array.size(labelsArray) > 0
+        for i = 0 to array.size(labelsArray) - 1
+            label.delete(array.get(labelsArray, i))
+    if not na(pivotLn)
+        line.set_x2(pivotLn, bar_index)
+        line.set_color(pivotLn, color.new(pivotColorInput, DEAD_FADE))
+        line.set_style(pivotLn, line.style_dotted)
+    if not na(stopLn)
+        line.set_x2(stopLn, bar_index)
+        line.set_color(stopLn, color.new(stopColorInput, DEAD_FADE))
+        line.set_style(stopLn, line.style_dotted)
+    label.delete(pivotLb)
+    label.delete(stopLb)
+    array.clear(linesArray)
+    array.clear(labelsArray)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+//Swing memory (strictly alternating highs and lows) with cumulative volume recorded at each swing
+var array<int>   swingKindArray   = array.new<int>()
+var array<float> swingPriceArray  = array.new<float>()
+var array<int>   swingBarArray    = array.new<int>()
+var array<float> swingCumVolArray = array.new<float>()
+
+//Contractions of the pattern currently reported, stored oldest first
+var array<int>   patHiBarArray   = array.new<int>()
+var array<float> patHiPriceArray = array.new<float>()
+var array<int>   patLoBarArray   = array.new<int>()
+var array<float> patLoPriceArray = array.new<float>()
+var array<float> patDepthArray   = array.new<float>()
+
+var bool   patternActive = false
+var float  pivotPrice    = na
+var float  stopPrice     = na
+var int    patCount      = 0
+var int    volDryState   = 0
+var string statusText    = "Searching"
+var string depthsText    = "—"
+
+//Drawings of the pattern currently tracked
+var array<line>  waveLineArray   = array.new<line>()
+var array<label> depthLabelArray = array.new<label>()
+var line  pivotLineId  = na
+var line  stopLineId   = na
+var label pivotLabelId = na
+var label stopLabelId  = na
+
+//Cumulative volume makes the average volume of any past leg an O(1) lookup at swing time
+var float cumVol = 0.
+cumVol += nz(volume)
+
+//Confirmed swings, known swingLength bars after the fact
+float pivotHighPrice = ta.pivothigh(swingLengthInput, swingLengthInput)
+float pivotLowPrice  = ta.pivotlow(swingLengthInput, swingLengthInput)
+
+//Trend qualification context: an established uptrend trading in the upper portion of its yearly range
+float trendSma  = ta.sma(close, trendMaLengthInput)
+float rangeHigh = ta.highest(high, rangeLookbackInput)
+float rangeLow  = ta.lowest(low, rangeLookbackInput)
+
+bool trendPass = not na(trendSma) and close > trendSma
+  and not na(rangeHigh) and close >= rangeHigh * (1 - nearHighPctInput / 100)
+  and not na(rangeLow) and close >= rangeLow * (1 + aboveLowPctInput / 100)
+
+//Volume baseline for quiet sessions inside the base and expansion on the break
+float volumeSma   = ta.sma(nz(volume), volumeMaLengthInput)
+bool  volumeKnown = volumeSma > 0
+
+bool detectedEvent    = false
+bool breakoutEvent    = false
+bool invalidatedEvent = false
+
+if barstate.isconfirmed
+    //Register newly confirmed swings, enforcing alternation
+    bool swingsChanged = false
+    if not na(pivotHighPrice)
+        swingsChanged := addSwing(swingKindArray, swingPriceArray, swingBarArray, swingCumVolArray, 1, pivotHighPrice, bar_index - swingLengthInput, cumVol[swingLengthInput]) or swingsChanged
+    if not na(pivotLowPrice)
+        swingsChanged := addSwing(swingKindArray, swingPriceArray, swingBarArray, swingCumVolArray, -1, pivotLowPrice, bar_index - swingLengthInput, cumVol[swingLengthInput]) or swingsChanged
+    while array.size(swingKindArray) > MAX_SWINGS
+        array.shift(swingKindArray)
+        array.shift(swingPriceArray)
+        array.shift(swingBarArray)
+        array.shift(swingCumVolArray)
+
+    //A base is only re-read when a pullback completes, i.e. the swing sequence changed and now ends at a low
+    int swingCount = array.size(swingKindArray)
+    bool endsAtLow = false
+    if swingCount > 0
+        endsAtLow := array.get(swingKindArray, swingCount - 1) == -1
+
+    if swingsChanged and endsAtLow
+        //Walk the swings right to left, collecting the longest run of pullbacks in which each one
+        //is at most maxRatio times the depth of the one before it (newest kept first)
+        array<int>   runHiBarArray   = array.new<int>()
+        array<float> runHiPriceArray = array.new<float>()
+        array<int>   runLoBarArray   = array.new<int>()
+        array<float> runLoPriceArray = array.new<float>()
+        array<float> runDepthArray   = array.new<float>()
+        array<float> runVolArray     = array.new<float>()
+        int   effMaxCount = math.max(minContractionsInput, maxContractionsInput)
+        float newerDepth  = na
+        int   pairIx      = swingCount - 1
+        bool  chaining    = true
+        while chaining and pairIx >= 1 and array.size(runDepthArray) < effMaxCount
+            float hiPrice  = array.get(swingPriceArray, pairIx - 1)
+            float loPrice  = array.get(swingPriceArray, pairIx)
+            int   hiBar    = array.get(swingBarArray, pairIx - 1)
+            int   loBar    = array.get(swingBarArray, pairIx)
+            float depthPct = hiPrice > 0 ? (hiPrice - loPrice) / hiPrice * 100 : na
+            if na(depthPct) or depthPct <= 0
+                chaining := false
+            else if not na(newerDepth) and newerDepth > maxRatioInput * depthPct
+                chaining := false
+            else
+                array.push(runHiBarArray, hiBar)
+                array.push(runHiPriceArray, hiPrice)
+                array.push(runLoBarArray, loBar)
+                array.push(runLoPriceArray, loPrice)
+                array.push(runDepthArray, depthPct)
+                float legVolume = (array.get(swingCumVolArray, pairIx) - array.get(swingCumVolArray, pairIx - 1)) / math.max(1, loBar - hiBar)
+                array.push(runVolArray, legVolume)
+                newerDepth := depthPct
+                pairIx -= 2
+        int runCount = array.size(runDepthArray)
+
+        //Qualification: enough tightening steps, an intact final low, the uptrend prerequisite,
+        //and volume drying up into the final contraction
+        bool seqOk    = runCount >= minContractionsInput
+        bool intactOk = false
+        if runCount >= 1
+            intactOk := close >= array.get(runLoPriceArray, 0)
+        bool trendOk = not trendFilterInput or trendPass
+        //Volume read on the base: 1 = drying up into the final contraction, -1 = not, 0 = not assessable
+        int volRead = 0
+        if volumeKnown and runCount >= 2
+            float finalLegVolume = array.get(runVolArray, 0)
+            float firstLegVolume = array.get(runVolArray, runCount - 1)
+            volRead := finalLegVolume < firstLegVolume and finalLegVolume < volumeSma ? 1 : -1
+        bool volOk = not volumeFilterInput or not volumeKnown or volRead == 1
+
+        if seqOk and intactOk and trendOk and volOk
+            bool freshDetection = not patternActive
+            patternActive := true
+            patCount      := runCount
+            volDryState   := volRead
+            statusText    := "VCP Active"
+            detectedEvent := freshDetection
+            //Store the contractions oldest first for drawing and reporting
+            array.clear(patHiBarArray)
+            array.clear(patHiPriceArray)
+            array.clear(patLoBarArray)
+            array.clear(patLoPriceArray)
+            array.clear(patDepthArray)
+            for j = 0 to runCount - 1
+                int srcIx = runCount - 1 - j
+                array.push(patHiBarArray, array.get(runHiBarArray, srcIx))
+                array.push(patHiPriceArray, array.get(runHiPriceArray, srcIx))
+                array.push(patLoBarArray, array.get(runLoBarArray, srcIx))
+                array.push(patLoPriceArray, array.get(runLoPriceArray, srcIx))
+                array.push(patDepthArray, array.get(runDepthArray, srcIx))
+            pivotPrice := array.get(patHiPriceArray, runCount - 1)
+            stopPrice  := array.get(patLoPriceArray, runCount - 1)
+            string seqText = ""
+            for j = 0 to runCount - 1
+                seqText += (j > 0 ? " → " : "") + str.tostring(array.get(patDepthArray, j), "#.#") + "%"
+            depthsText := seqText
+
+            //Redraw the base: a zigzag through the swings strengthening toward the final coil,
+            //the pivot at the high of the final tight area, and the stop under its low
+            erasePattern(waveLineArray, depthLabelArray, pivotLineId, stopLineId, pivotLabelId, stopLabelId)
+            pivotLineId  := na
+            stopLineId   := na
+            pivotLabelId := na
+            stopLabelId  := na
+            int pivotBarIx = array.get(patHiBarArray, runCount - 1)
+            int stopBarIx  = array.get(patLoBarArray, runCount - 1)
+            for j = 0 to runCount - 1
+                int   hiBarIx  = array.get(patHiBarArray, j)
+                float hiPriceV = array.get(patHiPriceArray, j)
+                int   loBarIx  = array.get(patLoBarArray, j)
+                float loPriceV = array.get(patLoPriceArray, j)
+                color segColor = color.from_gradient(j, 0, math.max(1, runCount - 1), color.new(waveColorInput, WAVE_FADE), waveColorInput)
+                if j > 0
+                    array.push(waveLineArray, line.new(array.get(patLoBarArray, j - 1), array.get(patLoPriceArray, j - 1), hiBarIx, hiPriceV, color = segColor))
+                array.push(waveLineArray, line.new(hiBarIx, hiPriceV, loBarIx, loPriceV, color = segColor))
+                if showDepthLabelsInput
+                    float depthValue = array.get(patDepthArray, j)
+                    float ratioValue = j > 0 ? depthValue / array.get(patDepthArray, j - 1) : na
+                    string ratioTip = "Pullback depth: " + str.tostring(depthValue, "#.##") + "%" + (na(ratioValue) ? "\nFirst contraction of the sequence" : "\n" + str.tostring(ratioValue, "#.##") + "x the depth of the prior contraction")
+                    array.push(depthLabelArray, label.new(loBarIx, loPriceV, "T" + str.tostring(j + 1) + " " + str.tostring(depthValue, "#.#") + "%"
+                      , style     = label.style_label_up
+                      , color     = HIDDEN_COLOR
+                      , textcolor = segColor
+                      , size      = size.small
+                      , tooltip   = ratioTip))
+            pivotLineId := line.new(pivotBarIx, pivotPrice, bar_index, pivotPrice, color = pivotColorInput, width = 2)
+            pivotLabelId := label.new(bar_index, pivotPrice, "Pivot"
+              , style     = label.style_label_left
+              , color     = HIDDEN_COLOR
+              , textcolor = pivotColorInput
+              , size      = size.small
+              , tooltip   = "High of the final tight area - the actionable level. A push through it on expanding volume completes the pattern.")
+            if showStopInput
+                stopLineId := line.new(stopBarIx, stopPrice, bar_index, stopPrice, color = stopColorInput, style = line.style_dashed)
+                stopLabelId := label.new(bar_index, stopPrice, "Stop"
+                  , style     = label.style_label_left
+                  , color     = HIDDEN_COLOR
+                  , textcolor = stopColorInput
+                  , size      = size.small
+                  , tooltip   = "Low of the final contraction - the conventional stop, keeping risk small relative to the expected move.")
+        else if patternActive
+            //The newest pullback widened, or a prerequisite failed - the base is no longer this pattern
+            patternActive    := false
+            invalidatedEvent := true
+            statusText       := "Invalidated"
+            pivotPrice       := na
+            stopPrice        := na
+            fadePattern(waveLineArray, depthLabelArray, pivotLineId, stopLineId, pivotLabelId, stopLabelId)
+            pivotLineId  := na
+            stopLineId   := na
+            pivotLabelId := na
+            stopLabelId  := na
+
+    //Monitor an active pattern: an undercut of the final contraction low breaks the setup,
+    //a close through the pivot on expanding volume completes it, otherwise the levels extend
+    if patternActive
+        bool volExpansion = not volumeFilterInput or not volumeKnown or nz(volume) > breakoutVolMultInput * volumeSma
+        if close < stopPrice
+            patternActive    := false
+            invalidatedEvent := true
+            statusText       := "Invalidated"
+            pivotPrice       := na
+            stopPrice        := na
+            fadePattern(waveLineArray, depthLabelArray, pivotLineId, stopLineId, pivotLabelId, stopLabelId)
+            pivotLineId  := na
+            stopLineId   := na
+            pivotLabelId := na
+            stopLabelId  := na
+        else if close > pivotPrice and volExpansion
+            patternActive := false
+            breakoutEvent := true
+            statusText    := "Breakout"
+            if not na(pivotLineId)
+                line.set_x2(pivotLineId, bar_index)
+            if not na(stopLineId)
+                line.set_x2(stopLineId, bar_index)
+            label.delete(pivotLabelId)
+            label.delete(stopLabelId)
+            string breakTip = "Close through the pivot (" + str.tostring(pivotPrice, format.mintick) + ")"
+              + (volumeKnown ? " on " + str.tostring(nz(volume) / volumeSma, "#.##") + "x average volume" : "")
+              + ".\nConventional stop: under the final contraction low (" + str.tostring(stopPrice, format.mintick)
+              + ").\nA breakout that immediately sinks back into the base contradicts the setup."
+            label.new(bar_index, low, "Breakout"
+              , style     = label.style_label_up
+              , color     = pivotColorInput
+              , textcolor = chart.bg_color
+              , size      = size.small
+              , tooltip   = breakTip)
+            //The completed pattern stays on the chart; drop the references so the next base draws fresh objects
+            array.clear(waveLineArray)
+            array.clear(depthLabelArray)
+            pivotLineId  := na
+            stopLineId   := na
+            pivotLabelId := na
+            stopLabelId  := na
+        else
+            if not na(pivotLineId)
+                line.set_x2(pivotLineId, bar_index)
+            if not na(pivotLabelId)
+                label.set_x(pivotLabelId, bar_index)
+            if not na(stopLineId)
+                line.set_x2(stopLineId, bar_index)
+            if not na(stopLabelId)
+                label.set_x(stopLabelId, bar_index)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+dashPos = switch dashPosInput
+    "Top Right"    => position.top_right
+    "Top Left"     => position.top_left
+    "Bottom Right" => position.bottom_right
+    => position.bottom_left
+
+dashTextSize = switch dashSizeInput
+    "Tiny"  => size.tiny
+    "Small" => size.small
+    => size.normal
+
+var table dashTable = na
+
+if showDashInput and barstate.islast
+    if na(dashTable)
+        dashTable := table.new(dashPos, 2, 6, bgcolor = color.new(chart.bg_color, 25), frame_color = color.new(NEUTRAL_COLOR, 70), frame_width = 1)
+
+    color headColor  = color.new(chart.fg_color, 25)
+    color fadedColor = color.new(chart.fg_color, 40)
+
+    color statusColor = statusText == "VCP Active" ? waveColorInput : statusText == "Breakout" ? pivotColorInput : statusText == "Invalidated" ? stopColorInput : fadedColor
+
+    string trendText  = trendFilterInput ? (trendPass ? "Pass" : "Fail") : "Off"
+    color  trendColor = trendFilterInput ? (trendPass ? pivotColorInput : stopColorInput) : fadedColor
+
+    string volumeText  = volDryState == 0 ? "—" : volDryState == 1 ? "Drying up" : "Not drying"
+    color  volumeColor = volDryState == 0 ? fadedColor : volDryState == 1 ? pivotColorInput : stopColorInput
+
+    string countText  = patCount > 0 ? str.tostring(patCount) : "—"
+    string levelsText = (na(pivotPrice) ? "—" : str.tostring(pivotPrice, format.mintick)) + " / " + (na(stopPrice) ? "—" : str.tostring(stopPrice, format.mintick))
+
+    table.cell(dashTable, 0, 0, "Status",       text_color = headColor,      text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 0, statusText,     text_color = statusColor,    text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 1, "Trend Filter", text_color = headColor,      text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 1, trendText,      text_color = trendColor,     text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 2, "Contractions", text_color = headColor,      text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 2, countText,      text_color = chart.fg_color, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 3, "Depths",       text_color = headColor,      text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 3, depthsText,     text_color = chart.fg_color, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 4, "Volume",       text_color = headColor,      text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 4, volumeText,     text_color = volumeColor,    text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 5, "Pivot / Stop", text_color = headColor,      text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 5, levelsText,     text_color = chart.fg_color, text_size = dashTextSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(detectedEvent, "VCP Detected", "Volatility Contraction Pattern detected - successive pullbacks are tightening and the volume signature is intact. Pivot set at the high of the final tight area, conventional stop under its low")
+alertcondition(breakoutEvent, "VCP Pivot Breakout", "VCP pivot breakout - price pushed through the high of the final tight area on expanding volume, completing the pattern. A breakout that immediately sinks back into the base contradicts the setup")
+alertcondition(invalidatedEvent, "VCP Invalidated", "VCP invalidated - the contraction sequence stopped tightening or the final contraction low was undercut. The base may still resolve upward, but it no longer carries the tight risk framing")
+
+//---------------------------------------------------------------------------------------------------------------------}

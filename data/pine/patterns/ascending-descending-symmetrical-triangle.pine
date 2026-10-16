@@ -1,0 +1,433 @@
+// This work is licensed under Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Ascending/descending/symmetrical Triangle", shorttitle = "Triangles", overlay = true, max_lines_count = 500, max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+color BULL_COLOR    = #089981
+color BEAR_COLOR    = #f23645
+color NEUTRAL_COLOR = #787b86
+color HIDDEN_COLOR  = #00000000
+
+int MAX_SWINGS  = 40
+int FILL_TRANSP = 90
+
+int ASCENDING   = 1
+int DESCENDING  = 2
+int SYMMETRICAL = 3
+
+string DETECT_GROUP = 'Triangle Detection'
+string BREAK_GROUP  = 'Breakout & Measure Rule'
+string STYLE_GROUP  = 'Style'
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+swingLengthInput = input.int(5, 'Swing Length', minval = 2, maxval = 50, group = DETECT_GROUP, tooltip = 'Bars to the left and right a high or low must dominate to count as a confirmed swing. Boundary touches are taken from these swings, so a triangle is recognized this many bars after its latest touch.')
+
+maxSwingsInput = input.int(10, 'Maximum Swings', minval = 4, maxval = 20, group = DETECT_GROUP, tooltip = 'Most consecutive swings scanned for one triangle. The largest window that still converges with every bar contained is kept.')
+
+minTouchesInput = input.int(2, 'Touches per Boundary', minval = 2, maxval = 5, group = DETECT_GROUP, tooltip = 'Genuine swing touches required on each boundary. The common standard asks for at least two clean touches per side; quality rises with more.')
+
+minTotalInput = input.int(5, 'Minimum Total Touches', minval = 4, maxval = 12, group = DETECT_GROUP, tooltip = 'Touches required across both boundaries. Two points always define a line, so with four touches nothing has tested either boundary; five or more means at least one boundary held a third, independent test.')
+
+toleranceInput = input.float(0.3, 'Touch Tolerance (ATR)', minval = 0.05, maxval = 2, step = 0.05, group = DETECT_GROUP, tooltip = 'How close a swing must come to a boundary to count as a touch, and how far a swing may poke beyond it, as a multiple of the ATR. Closes must stay inside the boundaries (within the break buffer) for the whole pattern. Lines that need constant adjustment to contain price describe hope rather than structure.')
+
+flatInput = input.float(15.0, 'Flat Boundary Tolerance (%)', minval = 1, maxval = 50, step = 1, group = DETECT_GROUP, tooltip = 'A boundary whose drift across the pattern stays within this percentage of the opening height counts as flat. A flat ceiling over rising lows is ascending, a flat floor under falling highs is descending, and two sloping boundaries converging from both sides are symmetrical. Two flat sides form a rectangle and two boundaries sloping the same way form a wedge; both are rejected.')
+
+minHeightInput = input.float(2.0, 'Minimum Height (ATR)', minval = 0.5, maxval = 30, step = 0.5, group = DETECT_GROUP, tooltip = 'Smallest opening height of the triangle, at its first swing, as a multiple of the ATR.')
+
+minBarsInput = input.int(15, 'Minimum Length (bars)', minval = 5, maxval = 500, group = DETECT_GROUP, tooltip = 'Fewest bars from the first to the latest touch. Triangles are larger structures than pennants and flags.')
+
+minContractionInput = input.float(30.0, 'Minimum Contraction (%)', minval = 5, maxval = 95, step = 5, group = DETECT_GROUP, tooltip = 'How much narrower the pattern must be at its latest touch than at its first, so rotations genuinely shrink rather than run in a channel.')
+
+apexCutoffInput = input.float(85.0, 'Apex Cutoff (%)', minval = 50, maxval = 100, step = 5, group = DETECT_GROUP, tooltip = 'Share of the distance from the first touch to the apex after which an unresolved triangle dissolves. Breaks that arrive before the apex keep their tension; a drift into the apex usually dissolves the setup.')
+
+atrLengthInput = input.int(14, 'ATR Length', minval = 1, maxval = 200, group = DETECT_GROUP, tooltip = 'Average True Range length that scales the tolerance, the minimum height and the break buffer.')
+
+breakBufferInput = input.float(0.1, 'Decisive Break Buffer (ATR)', minval = 0, maxval = 3, step = 0.05, group = BREAK_GROUP, tooltip = 'Extra ATR multiple the close must clear beyond a boundary for the break to count. Guards against closes that barely pierce the line.')
+
+volumeConfirmInput = input.bool(false, 'Require Volume Expansion', group = BREAK_GROUP, tooltip = 'Only accept breaks on volume above its average. Volume conventionally contracts inside the coil and expands on the break, but useful breaks also occur without it, so this is a filter rather than a law. The breakout label always reports both readings. Ignored on symbols without volume data.')
+volumeLengthInput  = input.int(20, 'Volume Average Length', minval = 1, maxval = 200, group = BREAK_GROUP, tooltip = 'Length of the volume average used for the break volume ratio.')
+
+showTargetInput = input.bool(true, 'Measured Target', group = BREAK_GROUP, tooltip = 'Project the height at the widest point, the first touch, from the break as the measure-rule minimum objective. A planning estimate: targets are overshot or never reached.')
+
+failBarsInput = input.int(2, 'Closes Back Inside for Failure', minval = 1, maxval = 10, group = BREAK_GROUP, tooltip = 'Consecutive closes back inside the broken boundary that mark the break as false: acceptance back inside converts the breakout into a trap.')
+
+watchInput = input.int(60, 'Post-Break Watch (bars)', minval = 5, maxval = 500, group = BREAK_GROUP, tooltip = 'Bars the target and stop are tracked after the break. The watch ends early on a target, a stop or a failure.')
+
+typeColorInput    = input.color(#5b9cf6, 'Forming Triangle', group = STYLE_GROUP, tooltip = 'Color of a triangle that has not resolved yet. It turns to the bullish or bearish color with the direction of the actual break.')
+bullColorInput    = input.color(BULL_COLOR, 'Upside Break', inline = 'colors', group = STYLE_GROUP)
+bearColorInput    = input.color(BEAR_COLOR, 'Downside Break', inline = 'colors', group = STYLE_GROUP)
+neutralColorInput = input.color(NEUTRAL_COLOR, 'Stops & Failures', group = STYLE_GROUP)
+
+showTouchesInput = input.bool(true, 'Show Boundary Touches', group = STYLE_GROUP, tooltip = 'Mark the swing touches that prove each boundary.')
+showFillInput    = input.bool(true, 'Pattern Fill', group = STYLE_GROUP, tooltip = 'Shade the interior of the triangle.')
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types
+//---------------------------------------------------------------------------------------------------------------------{
+
+type Triangle
+    int   kind
+    int   x0
+    float u0
+    float uSlope
+    float l0
+    float lSlope
+    int   lastSwingBar
+    float apexX
+    float height
+    int   touchesUp
+    int   touchesDn
+    float lastHigh
+    float lastLow
+    float volRatio
+    line  upperLn
+    line  lowerLn
+    linefill fillId
+    label nameLb
+    array<label> marks
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Variables
+//---------------------------------------------------------------------------------------------------------------------{
+
+var array<float> zzPriceArray = array.new<float>()
+var array<int>   zzBarArray   = array.new<int>()
+var array<int>   zzDirArray   = array.new<int>()
+
+var array<float> closeArray  = array.new<float>()
+var array<float> cumVolArray = array.new<float>()
+
+var Triangle forming = na
+
+// New triangles may not reach back into one that already resolved
+var int nextStartBar = 0
+
+// Post-break watch
+var bool  tradeActive  = false
+var int   tradeDir     = 0
+var int   tradeBar     = na
+var float tradeTarget  = na
+var float tradeStop    = na
+var int   tradeX0      = na
+var float tradeLine0   = na
+var float tradeSlope   = na
+var int   insideCount  = 0
+var line  targetLineId = na
+var label targetLabelId = na
+var line  stopLineId   = na
+var label stopLabelId  = na
+
+float atrValue  = ta.atr(atrLengthInput)
+float volSma    = ta.sma(nz(volume), volumeLengthInput)
+bool  hasVol    = volSma > 0
+float pivotHigh = ta.pivothigh(high, swingLengthInput, swingLengthInput)
+float pivotLow  = ta.pivotlow(low, swingLengthInput, swingLengthInput)
+
+var float cumVol = 0.0
+cumVol += nz(volume)
+array.push(closeArray, close)
+array.push(cumVolArray, cumVol)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions & Methods
+//---------------------------------------------------------------------------------------------------------------------{
+
+method upperAt(Triangle this, int x) =>
+    this.u0 + this.uSlope * (x - this.x0)
+
+method lowerAt(Triangle this, int x) =>
+    this.l0 + this.lSlope * (x - this.x0)
+
+method erase(Triangle this) =>
+    line.delete(this.upperLn)
+    line.delete(this.lowerLn)
+    linefill.delete(this.fillId)
+    label.delete(this.nameLb)
+    if not na(this.marks)
+        for lb in this.marks
+            label.delete(lb)
+
+kindName(int kind) =>
+    kind == ASCENDING ? 'Ascending Triangle' : kind == DESCENDING ? 'Descending Triangle' : 'Symmetrical Triangle'
+
+kindLean(int kind) =>
+    kind == ASCENDING ? 'Classical lean: upside' : kind == DESCENDING ? 'Classical lean: downside' : 'Classical lean: with the prior trend'
+
+// Maintain the alternating swing sequence; a same-side swing that extends the last one replaces it
+pushSwing(float price, int swingBar, int swingDir) =>
+    bool changed = false
+    int  n       = array.size(zzPriceArray)
+    if n > 0 and array.get(zzDirArray, n - 1) == swingDir
+        if (swingDir == 1 and price >= array.get(zzPriceArray, n - 1)) or (swingDir == -1 and price <= array.get(zzPriceArray, n - 1))
+            array.set(zzPriceArray, n - 1, price)
+            array.set(zzBarArray, n - 1, swingBar)
+            changed := true
+    else
+        array.push(zzPriceArray, price)
+        array.push(zzBarArray, swingBar)
+        array.push(zzDirArray, swingDir)
+        if array.size(zzPriceArray) > MAX_SWINGS
+            array.shift(zzPriceArray)
+            array.shift(zzBarArray)
+            array.shift(zzDirArray)
+        changed := true
+    changed
+
+// Scan windows of the latest swings, smallest to largest, and return the largest one that forms a valid triangle:
+// boundaries through the first and last swing on each side, every close contained, enough touches per side,
+// converging to an apex ahead, and a flat/sloping combination that names an ascending, descending or symmetrical type
+findTriangle() =>
+    Triangle best = na
+    int n = array.size(zzPriceArray)
+    if n >= 4 and atrValue > 0
+        int maxWin = math.min(n, maxSwingsInput)
+        float tol  = toleranceInput * atrValue
+        float buf  = breakBufferInput * atrValue
+        for w = 4 to maxWin
+            int base = n - w
+            int   hFirstBar = na
+            float hFirst    = na
+            int   hLastBar  = na
+            float hLast     = na
+            int   lFirstBar = na
+            float lFirst    = na
+            int   lLastBar  = na
+            float lLast     = na
+            for k = base to n - 1
+                int   b = array.get(zzBarArray, k)
+                float p = array.get(zzPriceArray, k)
+                if array.get(zzDirArray, k) == 1
+                    if na(hFirstBar)
+                        hFirstBar := b
+                        hFirst    := p
+                    hLastBar := b
+                    hLast    := p
+                else
+                    if na(lFirstBar)
+                        lFirstBar := b
+                        lFirst    := p
+                    lLastBar := b
+                    lLast    := p
+            if not na(hFirstBar) and not na(lFirstBar) and hLastBar > hFirstBar and lLastBar > lFirstBar
+                float uSlope = (hLast - hFirst) / (hLastBar - hFirstBar)
+                float lSlope = (lLast - lFirst) / (lLastBar - lFirstBar)
+                int   x0     = math.min(hFirstBar, lFirstBar)
+                int   x1     = array.get(zzBarArray, n - 1)
+                float u0     = hFirst + uSlope * (x0 - hFirstBar)
+                float l0     = lFirst + lSlope * (x0 - lFirstBar)
+                float height = u0 - l0
+                float endHeight = (u0 + uSlope * (x1 - x0)) - (l0 + lSlope * (x1 - x0))
+                bool  shapeOk = x0 >= nextStartBar and uSlope < lSlope and height >= minHeightInput * atrValue and x1 - x0 >= minBarsInput and endHeight > 0 and endHeight <= (1 - minContractionInput / 100) * height
+                float apexX = shapeOk ? x0 + height / (lSlope - uSlope) : na
+                // The current bar must still sit before the apex cutoff
+                shapeOk := shapeOk and (bar_index - x0) < apexCutoffInput / 100 * (apexX - x0)
+
+                // Classification from each boundary's drift across the pattern
+                int kind = 0
+                if shapeOk
+                    float uDrift = uSlope * (x1 - x0)
+                    float lDrift = lSlope * (x1 - x0)
+                    float flatTol = flatInput / 100 * height
+                    bool  uFlat = math.abs(uDrift) <= flatTol
+                    bool  lFlat = math.abs(lDrift) <= flatTol
+                    kind := uFlat and not lFlat and lDrift > 0 ? ASCENDING : lFlat and not uFlat and uDrift < 0 ? DESCENDING : not uFlat and not lFlat and uDrift < 0 and lDrift > 0 ? SYMMETRICAL : 0
+
+                // Containment: every close from the first touch to now stays inside the boundaries
+                bool contained = kind > 0
+                if contained
+                    for b = x0 to bar_index - 1
+                        float c = array.get(closeArray, b)
+                        if c > u0 + uSlope * (b - x0) + buf or c < l0 + lSlope * (b - x0) - buf
+                            contained := false
+                            break
+
+                // Swing touches, and no swing beyond its boundary
+                int touchesUp = 0
+                int touchesDn = 0
+                if contained
+                    for k = base to n - 1
+                        int   b = array.get(zzBarArray, k)
+                        float p = array.get(zzPriceArray, k)
+                        if array.get(zzDirArray, k) == 1
+                            float d = p - (u0 + uSlope * (b - x0))
+                            if d > tol
+                                contained := false
+                            else if d >= -tol
+                                touchesUp += 1
+                        else
+                            float d = (l0 + lSlope * (b - x0)) - p
+                            if d > tol
+                                contained := false
+                            else if d >= -tol
+                                touchesDn += 1
+
+                if contained and touchesUp >= minTouchesInput and touchesDn >= minTouchesInput and touchesUp + touchesDn >= minTotalInput
+                    // Volume contraction: average volume over the second half against the first half
+                    int   mid      = int(math.round((x0 + x1) / 2))
+                    float firstAvg = mid > x0 ? (array.get(cumVolArray, mid) - array.get(cumVolArray, x0)) / (mid - x0) : na
+                    float lastAvg  = x1 > mid ? (array.get(cumVolArray, x1) - array.get(cumVolArray, mid)) / (x1 - mid) : na
+                    float volRatio = not na(firstAvg) and firstAvg > 0 and not na(lastAvg) ? lastAvg / firstAvg : na
+                    best := Triangle.new(kind = kind, x0 = x0, u0 = u0, uSlope = uSlope, l0 = l0, lSlope = lSlope, lastSwingBar = x1, apexX = apexX, height = height, touchesUp = touchesUp, touchesDn = touchesDn, lastHigh = hLast, lastLow = lLast, volRatio = volRatio)
+    best
+
+// Draw a triangle in the forming color, with its proven touches
+method draw(Triangle this) =>
+    color col = typeColorInput
+    this.upperLn := line.new(this.x0, this.u0, bar_index, this.upperAt(bar_index), color = col, width = 2)
+    this.lowerLn := line.new(this.x0, this.l0, bar_index, this.lowerAt(bar_index), color = col, width = 2)
+    if showFillInput
+        this.fillId := linefill.new(this.upperLn, this.lowerLn, color.new(col, FILL_TRANSP))
+    string tip = kindName(this.kind) + '\n' + kindLean(this.kind) + '\nTouches: ' + str.tostring(this.touchesUp) + ' upper, ' + str.tostring(this.touchesDn) + ' lower\nHeight at the widest point: ' + str.tostring(this.height, format.mintick) + (not na(this.volRatio) ? '\nVolume, second half vs first half: ' + str.tostring(this.volRatio, '#.##') + 'x' : '')
+    this.nameLb := label.new(this.x0, this.u0, kindName(this.kind), style = label.style_label_down, color = HIDDEN_COLOR, textcolor = col, size = size.small, tooltip = tip)
+    this.marks := array.new<label>()
+    if showTouchesInput
+        float tol = toleranceInput * atrValue
+        for k = 0 to array.size(zzPriceArray) - 1
+            int   b = array.get(zzBarArray, k)
+            float p = array.get(zzPriceArray, k)
+            if b >= this.x0
+                bool isHigh = array.get(zzDirArray, k) == 1
+                float ref = isHigh ? this.upperAt(b) : this.lowerAt(b)
+                if math.abs(p - ref) <= tol
+                    this.marks.push(label.new(b, p, '', style = label.style_circle, color = col, size = size.tiny, tooltip = (isHigh ? 'Upper' : 'Lower') + ' boundary touch at ' + str.tostring(p, format.mintick)))
+
+method recolor(Triangle this, color col) =>
+    line.set_color(this.upperLn, col)
+    line.set_color(this.lowerLn, col)
+    if not na(this.fillId)
+        linefill.set_color(this.fillId, color.new(col, FILL_TRANSP))
+    label.set_textcolor(this.nameLb, col)
+    if not na(this.marks)
+        for lb in this.marks
+            label.set_color(lb, col)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Detection
+//---------------------------------------------------------------------------------------------------------------------{
+
+bool formedAlert    = false
+bool upBreakAlert   = false
+bool downBreakAlert = false
+bool targetAlert    = false
+bool failAlert      = false
+bool stopAlert      = false
+bool dissolveAlert  = false
+
+if barstate.isconfirmed
+    bool swingsChanged = false
+    if not na(pivotHigh)
+        swingsChanged := pushSwing(pivotHigh, bar_index - swingLengthInput, 1) or swingsChanged
+    if not na(pivotLow)
+        swingsChanged := pushSwing(pivotLow, bar_index - swingLengthInput, -1) or swingsChanged
+
+    if swingsChanged
+        Triangle found = findTriangle()
+        if not na(found)
+            bool isNew = na(forming) or forming.x0 != found.x0 or forming.kind != found.kind
+            if not na(forming)
+                forming.erase()
+            forming := found
+            forming.draw()
+            formedAlert := isNew
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Tracking
+//---------------------------------------------------------------------------------------------------------------------{
+
+if barstate.isconfirmed
+    // -- post-break watch (an older break) ---------------------------------------------------------------------------
+    if tradeActive and bar_index > tradeBar
+        float edge = tradeLine0 + tradeSlope * (bar_index - tradeX0)
+        line.set_x2(stopLineId, bar_index)
+        label.set_x(stopLabelId, bar_index)
+        if not na(targetLineId)
+            line.set_x2(targetLineId, bar_index)
+        insideCount := (tradeDir == 1 ? close < edge : close > edge) ? insideCount + 1 : 0
+        bool targetHit = not na(tradeTarget) and (tradeDir == 1 ? high >= tradeTarget : low <= tradeTarget)
+        bool stopHit   = tradeDir == 1 ? close < tradeStop : close > tradeStop
+        color dirColor = tradeDir == 1 ? bullColorInput : bearColorInput
+        if targetHit
+            targetAlert := true
+            tradeActive := false
+            label.new(bar_index, tradeDir == 1 ? high : low, 'Target', style = tradeDir == 1 ? label.style_label_down : label.style_label_up, color = HIDDEN_COLOR, textcolor = dirColor, size = size.small, tooltip = 'Measure-rule objective ' + str.tostring(tradeTarget, format.mintick) + ' reached')
+        else if stopHit or insideCount >= failBarsInput
+            failAlert   := insideCount >= failBarsInput
+            stopAlert   := stopHit
+            tradeActive := false
+            if not na(targetLineId)
+                line.delete(targetLineId)
+                label.delete(targetLabelId)
+            label.new(bar_index, tradeDir == 1 ? low : high, stopHit ? 'Stop' : 'Failed', style = tradeDir == 1 ? label.style_label_up : label.style_label_down, color = HIDDEN_COLOR, textcolor = neutralColorInput, size = size.small, tooltip = stopHit ? 'Close beyond the last opposite swing inside the triangle' : str.tostring(failBarsInput) + ' closes back inside the broken boundary: false breakout')
+        else if bar_index - tradeBar >= watchInput
+            tradeActive := false
+
+    // -- forming triangle: break, or dissolve into the apex ----------------------------------------------------------
+    if not na(forming) and not formedAlert
+        float upperNow = forming.upperAt(bar_index)
+        float lowerNow = forming.lowerAt(bar_index)
+        float buffer   = breakBufferInput * atrValue
+        bool  volOk    = not volumeConfirmInput or not hasVol or nz(volume) > volSma
+        bool  upBreak  = close > upperNow + buffer and volOk
+        bool  dnBreak  = close < lowerNow - buffer and volOk
+        bool  pastCutoff = (bar_index - forming.x0) >= apexCutoffInput / 100 * (forming.apexX - forming.x0)
+
+        if upBreak or dnBreak
+            int   dir      = upBreak ? 1 : -1
+            color dirColor = dir == 1 ? bullColorInput : bearColorInput
+            float level    = dir == 1 ? upperNow : lowerNow
+            line.set_xy2(forming.upperLn, bar_index, upperNow)
+            line.set_xy2(forming.lowerLn, bar_index, lowerNow)
+            forming.recolor(dirColor)
+            upBreakAlert   := dir == 1
+            downBreakAlert := dir == -1
+
+            string volText = hasVol ? '\nBreak volume ' + str.tostring(nz(volume) / volSma, '#.##') + 'x average' : ''
+            string coilText = not na(forming.volRatio) ? '\nCoil volume, second half vs first half: ' + str.tostring(forming.volRatio, '#.##') + 'x' : ''
+            label.new(bar_index, dir == 1 ? low : high, dir == 1 ? 'Breakout' : 'Breakdown', style = dir == 1 ? label.style_label_up : label.style_label_down, color = dirColor, textcolor = chart.bg_color, size = size.small, tooltip = kindName(forming.kind) + ' resolved ' + (dir == 1 ? 'upward' : 'downward') + ' at ' + str.tostring(math.round(100 * (bar_index - forming.x0) / (forming.apexX - forming.x0))) + '% of the way to the apex' + volText + coilText)
+
+            // Close a watch still running from an older triangle, then start this one
+            tradeActive := true
+            tradeDir    := dir
+            tradeBar    := bar_index
+            tradeX0     := forming.x0
+            tradeLine0  := dir == 1 ? forming.u0 : forming.l0
+            tradeSlope  := dir == 1 ? forming.uSlope : forming.lSlope
+            tradeStop   := dir == 1 ? forming.lastLow : forming.lastHigh
+            tradeTarget := showTargetInput ? level + dir * forming.height : na
+            insideCount := 0
+            if showTargetInput
+                targetLineId  := line.new(bar_index, tradeTarget, bar_index, tradeTarget, color = dirColor, style = line.style_dashed)
+                targetLabelId := label.new(bar_index, tradeTarget, 'Target ' + str.tostring(tradeTarget, format.mintick), style = label.style_label_right, color = HIDDEN_COLOR, textcolor = dirColor, size = size.small, tooltip = 'Height at the widest point projected from the break (measure rule)')
+            stopLineId  := line.new(bar_index, tradeStop, bar_index, tradeStop, color = neutralColorInput, style = line.style_dotted)
+            stopLabelId := label.new(bar_index, tradeStop, 'Stop ' + str.tostring(tradeStop, format.mintick), style = label.style_label_left, color = HIDDEN_COLOR, textcolor = neutralColorInput, size = size.small, tooltip = 'Last opposite swing inside the triangle')
+            nextStartBar := bar_index
+            forming := na
+        else if pastCutoff
+            dissolveAlert := true
+            forming.erase()
+            forming := na
+        else
+            line.set_xy2(forming.upperLn, bar_index, upperNow)
+            line.set_xy2(forming.lowerLn, bar_index, lowerNow)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(formedAlert, 'Triangle Formed', 'A new ascending, descending or symmetrical triangle is confirmed: converging boundaries with the required touches, awaiting a decisive close through a boundary')
+alertcondition(upBreakAlert, 'Upside Breakout', 'Triangle resolved upward: decisive close above the upper boundary')
+alertcondition(downBreakAlert, 'Downside Breakout', 'Triangle resolved downward: decisive close below the lower boundary')
+alertcondition(targetAlert, 'Target Reached', 'Triangle measure-rule target reached')
+alertcondition(failAlert, 'False Breakout', 'Triangle breakout failed: acceptance back inside the broken boundary')
+alertcondition(stopAlert, 'Stop Hit', 'Triangle trade stop hit: close beyond the last opposite swing inside the pattern')
+alertcondition(dissolveAlert, 'Apex Drift', 'Triangle dissolved: price drifted into the apex without a decisive break')
+
+//---------------------------------------------------------------------------------------------------------------------}

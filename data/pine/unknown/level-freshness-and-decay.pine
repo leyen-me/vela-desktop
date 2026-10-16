@@ -1,0 +1,375 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Level Freshness & Decay", shorttitle = "Level Freshness & Decay", overlay = true, format = format.price, max_lines_count = 500, max_labels_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+//Lifecycle states: fresh (zero-touch) -> tested (touches consume interest) -> spent (retired)
+int ST_FRESH  = 0
+int ST_TESTED = 1
+int ST_SPENT  = 2
+
+int   ATR_LENGTH   = 200
+int   MAX_STORE    = 100
+int   LABEL_OFFSET = 3
+color LABEL_BG     = #00000000
+
+//Opacity ramp of the visual decay: fully fresh lines render near solid, a score of zero renders faint
+int TRANSP_FRESH      = 15
+int TRANSP_DECAYED    = 65
+int TRANSP_GHOST      = 70
+int TRANSP_GHOST_TEXT = 55
+
+string TOUCH_WICK  = "Wick Into Zone"
+string TOUCH_CLOSE = "Close Inside Zone"
+string SPENT_FADE  = "Fade Out"
+string SPENT_HIDE  = "Hide"
+
+string SIZE_TINY   = "Tiny"
+string SIZE_SMALL  = "Small"
+string SIZE_NORMAL = "Normal"
+
+string GROUP_LEVELS = "Level Map"
+string GROUP_TOUCH  = "Touch Rule"
+string GROUP_DECAY  = "Freshness & Decay"
+string GROUP_STYLE  = "Style"
+
+swingLengthInput = input.int(14, "Swing Length"
+  , minval  = 2
+  , group   = GROUP_LEVELS
+  , tooltip = "Bars a swing point must dominate on each side to be confirmed. Each confirmed swing high births a resistance level and each swing low a support level, recorded as zero-touch from that moment.")
+
+maxLevelsInput = input.int(6, "Maximum Levels per Side"
+  , minval  = 1
+  , maxval  = 20
+  , group   = GROUP_LEVELS
+  , tooltip = "Active levels kept per side. When a new level is born beyond this count the oldest active level is dropped, keeping the map focused on the structure that still matters.")
+
+touchRuleInput = input.string(TOUCH_WICK, "Touch Rule"
+  , options = [TOUCH_WICK, TOUCH_CLOSE]
+  , group   = GROUP_TOUCH
+  , tooltip = "What registers as a test of a level: any wick trading into its tolerance zone, or only a bar closing inside it. Whichever rule is chosen, it is applied without exceptions - touch counts depend directly on it.")
+
+zoneWidthInput = input.float(0.25, "Zone Width (ATR)"
+  , minval  = 0.05
+  , step    = 0.05
+  , group   = GROUP_TOUCH
+  , tooltip = "Half-width of the tolerance zone above and below each level, as a multiple of the ATR(200). Touches, penetration depth and break acceptance are all measured against this zone.")
+
+touchGapInput = input.int(5, "Minimum Bars Between Touches"
+  , minval  = 1
+  , group   = GROUP_TOUCH
+  , tooltip = "A new touch only registers when price re-enters the zone after leaving it, and at least this many bars after the previous touch - so one consolidation sitting on the level does not count as five separate tests.")
+
+breakBarsInput = input.int(2, "Break Acceptance (Closes)"
+  , minval  = 1
+  , group   = GROUP_TOUCH
+  , tooltip = "Consecutive closes beyond the far edge of the zone that make a break decisive. A decisively broken level no longer owes a bounce and is removed from the map.")
+
+touchDecayInput = input.float(30, "Decay per Touch %"
+  , minval  = 1
+  , maxval  = 100
+  , step    = 5
+  , group   = GROUP_DECAY
+  , tooltip = "Share of the freshness score an average test consumes: each touch fills part of the resting interest that formed the level. At 30% a level is near spent by its third average test. There is no published constant - treat the weight as convention and calibration.")
+
+gradeTouchesInput = input.bool(true, "Grade Touch Quality"
+  , group   = GROUP_DECAY
+  , tooltip = "Weigh each test by how it traded instead of counting all touches equally: a deep penetration met by a slow, shallow rejection spends up to 1.5x the base decay (the defenders are being absorbed), while a quick probe rejected hard spends as little as 0.5x (the defenders remain).")
+
+reactionBarsInput = input.int(5, "Reaction Window (Bars)"
+  , minval  = 1
+  , maxval  = 50
+  , group   = GROUP_DECAY
+  , tooltip = "Bars after a touch used to grade it. Penetration is measured against the zone width, and the rejection as how far price gets away from the level within the window, benchmarked to one ATR(200).")
+
+halfLifeInput = input.int(500, "Time Half-Life (Bars)"
+  , minval  = 0
+  , group   = GROUP_DECAY
+  , tooltip = "Elapsed-time decay: the score halves every this many bars since the level's birth, retiring levels whose market context has moved on even if price never returned to test them. Anchor it to the timeframe that builds your levels. 0 disables time decay.")
+
+spentThresholdInput = input.float(20, "Spent Threshold %"
+  , minval  = 0
+  , maxval  = 90
+  , group   = GROUP_DECAY
+  , tooltip = "Score below which a level is retired as spent: its resting interest is presumed consumed and it is no longer owed a reaction. Heavily tested levels near this floor are failure-watch candidates, not bounce candidates.")
+
+maxTouchesInput = input.int(0, "Maximum Touches"
+  , minval  = 0
+  , group   = GROUP_DECAY
+  , tooltip = "Optional hard cap retiring a level as spent once it has been tested this many times, whatever its score - the 'drop it after the second or third test' rule of strict zero-touch systems. 0 disables the cap.")
+
+supportColorInput = input.color(#089981, "Support"
+  , inline  = "colors"
+  , group   = GROUP_STYLE
+  , tooltip = "Fresh support color. As the score decays the line blends toward the Spent color and fades.")
+
+resistanceColorInput = input.color(#f23645, "Resistance"
+  , inline  = "colors"
+  , group   = GROUP_STYLE
+  , tooltip = "Fresh resistance color. As the score decays the line blends toward the Spent color and fades.")
+
+spentColorInput = input.color(#787b86, "Spent"
+  , inline  = "colors"
+  , group   = GROUP_STYLE
+  , tooltip = "Color a decayed level blends into, and the color of retired ghost levels.")
+
+showLabelsInput = input.bool(true, "Level Labels"
+  , inline  = "labels"
+  , group   = GROUP_STYLE
+  , tooltip = "Tag each level with its lifecycle state, touch count and freshness score. Hover a tag for the full bookkeeping: side, state, level, score, age and touches.")
+
+labelSizeInput = input.string(SIZE_SMALL, ""
+  , options = [SIZE_TINY, SIZE_SMALL, SIZE_NORMAL]
+  , inline  = "labels"
+  , group   = GROUP_STYLE
+  , tooltip = "Label text size.")
+
+spentModeInput = input.string(SPENT_FADE, "Spent Levels"
+  , options = [SPENT_FADE, SPENT_HIDE]
+  , group   = GROUP_STYLE
+  , tooltip = "Fade Out freezes a spent level as a dotted gray ghost at the bar it decayed, keeping the mitigation history on the chart; Hide deletes it so only levels that plausibly still carry standing interest remain.")
+
+string labelTextSize = labelSizeInput == SIZE_TINY ? size.tiny : labelSizeInput == SIZE_NORMAL ? size.normal : size.small
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types
+//---------------------------------------------------------------------------------------------------------------------{
+//One tracked level: a swing-born support or resistance line with its freshness bookkeeping - touch count,
+//graded spend, score, lifecycle state, pending touch grade - and its chart objects
+type SRLevel
+    float price
+    bool  isSupport
+    int   birthBar
+    int   touches      = 0
+    float spend        = 0.0
+    float score        = 100.0
+    int   state        = 0
+    int   lastTouchBar = 0
+    int   breakRun     = 0
+    bool  wasInZone    = false
+    bool  grading      = false
+    int   gradeStart   = 0
+    float gradePen     = 0.0
+    float gradeBounce  = 0.0
+    float gradeAtr     = 1.0
+    float gradeWidth   = 1.0
+    line  levelLine
+    label infoLabel
+
+//The level map, ordered by birth (spent ghosts stay stored until pruned; broken levels leave entirely)
+var levelArray = array.new<SRLevel>()
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+//True when the current bar trades the zone around a level under the configured touch rule
+inZone(float price, float halfWidth) =>
+    float upperEdge = price + halfWidth
+    float lowerEdge = price - halfWidth
+    touchRuleInput == TOUCH_WICK ? low <= upperEdge and high >= lowerEdge : close <= upperEdge and close >= lowerEdge
+
+//Freshness color: blends from the side color toward the spent color and fades as the score decays
+levelColor(SRLevel lvl) =>
+    color sideColor = lvl.isSupport ? supportColorInput : resistanceColorInput
+    color blended   = color.from_gradient(lvl.score, 0, 100, spentColorInput, sideColor)
+    color.new(blended, math.round(TRANSP_DECAYED - (TRANSP_DECAYED - TRANSP_FRESH) * lvl.score / 100))
+
+//Label text: lifecycle state, touch count and current score
+levelText(SRLevel lvl) =>
+    string scoreText = str.tostring(math.round(lvl.score)) + "%"
+    lvl.state == ST_SPENT ? "Spent" : lvl.touches == 0 ? "Fresh · " + scoreText : "×" + str.tostring(lvl.touches) + " · " + scoreText
+
+//Hover text with the level's full bookkeeping
+levelTooltip(SRLevel lvl) =>
+    string sideText  = lvl.isSupport ? "Support" : "Resistance"
+    string stateText = lvl.state == ST_FRESH ? "Fresh (untested)" : lvl.state == ST_TESTED ? "Tested" : "Spent"
+    string touchText = lvl.touches == 0 ? "None" : str.tostring(lvl.touches) + " (last " + str.tostring(bar_index - lvl.lastTouchBar) + " bars ago)"
+    sideText + " - " + stateText + "\nLevel: " + str.tostring(lvl.price, format.mintick) + "\nFreshness: " + str.tostring(math.round(lvl.score)) + "%\nAge: " + str.tostring(bar_index - lvl.birthBar) + " bars\nTouches: " + touchText
+
+//Deletes a level's drawings
+deleteDrawings(SRLevel lvl) =>
+    if not na(lvl.levelLine)
+        line.delete(lvl.levelLine)
+        lvl.levelLine := na
+    if not na(lvl.infoLabel)
+        label.delete(lvl.infoLabel)
+        lvl.infoLabel := na
+
+//Settles the graded share of a touch's decay once its reaction window has run: penetration depth relative
+//to the zone raises the spend, rejection strength relative to one ATR lowers it (0.5x to 1.5x the base)
+settleGrade(SRLevel lvl, float baseDecay) =>
+    if lvl.grading
+        float depthFraction  = math.min(math.max(lvl.gradePen / lvl.gradeWidth, 0), 1)
+        float bounceFraction = math.min(math.max(lvl.gradeBounce / lvl.gradeAtr, 0), 1)
+        float qualityFactor  = 1 + 0.5 * depthFraction - 0.5 * bounceFraction
+        lvl.spend   := lvl.spend + baseDecay * (qualityFactor - 1)
+        lvl.grading := false
+
+//Retires a spent level: frozen as a dotted gray ghost at the bar it decayed, or removed when hidden
+retireLevel(SRLevel lvl) =>
+    if spentModeInput == SPENT_HIDE
+        deleteDrawings(lvl)
+    else
+        if not na(lvl.levelLine)
+            line.set_extend(lvl.levelLine, extend.none)
+            line.set_x2(lvl.levelLine, bar_index)
+            line.set_style(lvl.levelLine, line.style_dotted)
+            line.set_width(lvl.levelLine, 1)
+            line.set_color(lvl.levelLine, color.new(spentColorInput, TRANSP_GHOST))
+        if not na(lvl.infoLabel)
+            label.set_x(lvl.infoLabel, bar_index)
+            label.set_text(lvl.infoLabel, "Spent")
+            label.set_textcolor(lvl.infoLabel, color.new(spentColorInput, TRANSP_GHOST_TEXT))
+            label.set_tooltip(lvl.infoLabel, levelTooltip(lvl))
+
+//Registers a confirmed swing as a new fresh level, dropping the oldest active level of that side when the
+//map is full. A swing printing inside an existing active zone is skipped: that revisit is the old level's
+//touch to count, not a new line
+createLevel(float price, bool isSup, float halfWidth) =>
+    bool duplicate   = false
+    int  activeCount = 0
+    int  oldestIdx   = -1
+    int  levelCount  = array.size(levelArray)
+    if levelCount > 0
+        for i = 0 to levelCount - 1
+            SRLevel other = array.get(levelArray, i)
+            if other.state != ST_SPENT and other.isSupport == isSup
+                activeCount += 1
+                if oldestIdx == -1
+                    oldestIdx := i
+                if math.abs(other.price - price) <= halfWidth
+                    duplicate := true
+    if not duplicate
+        if activeCount >= maxLevelsInput and oldestIdx >= 0
+            SRLevel oldest = array.get(levelArray, oldestIdx)
+            deleteDrawings(oldest)
+            array.remove(levelArray, oldestIdx)
+        int   birthBar  = bar_index - swingLengthInput
+        color sideColor = isSup ? supportColorInput : resistanceColorInput
+        line  levelLine = line.new(birthBar, price, bar_index, price, color = color.new(sideColor, TRANSP_FRESH), width = 2, extend = extend.right)
+        label infoLabel = na
+        if showLabelsInput
+            infoLabel := label.new(bar_index + LABEL_OFFSET, price, "Fresh", color = LABEL_BG, textcolor = color.new(sideColor, TRANSP_FRESH), style = label.style_label_left, size = labelTextSize)
+        array.push(levelArray, SRLevel.new(price = price, isSupport = isSup, birthBar = birthBar, lastTouchBar = birthBar, wasInZone = inZone(price, halfWidth), levelLine = levelLine, infoLabel = infoLabel))
+        if array.size(levelArray) > MAX_STORE
+            int dropIdx = 0
+            for i = 0 to array.size(levelArray) - 1
+                if array.get(levelArray, i).state == ST_SPENT
+                    dropIdx := i
+                    break
+            SRLevel dropped = array.get(levelArray, dropIdx)
+            deleteDrawings(dropped)
+            array.remove(levelArray, dropIdx)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+//Volatility yardstick sizing the tolerance zone and benchmarking penetration and rejection
+float atrRaw   = ta.atr(ATR_LENGTH)
+float trMean   = ta.cum(ta.tr(true)) / math.max(bar_index, 1)
+float atrValue = math.max(nz(atrRaw, trMean), syminfo.mintick)
+float zoneHalf = zoneWidthInput * atrValue
+
+//Confirmed swings seed the level map, born zero-touch at the swing bar
+float pivotHigh = ta.pivothigh(swingLengthInput, swingLengthInput)
+float pivotLow  = ta.pivotlow(swingLengthInput, swingLengthInput)
+
+//Per-bar lifecycle transitions feeding the alert runner
+bool freshSupportTested    = false
+bool freshResistanceTested = false
+bool supportSpent          = false
+bool resistanceSpent       = false
+
+if not na(pivotLow)
+    createLevel(pivotLow, true, zoneHalf)
+if not na(pivotHigh)
+    createLevel(pivotHigh, false, zoneHalf)
+
+//Lifecycle pass: apply the touch rule, grade pending reactions, tally break acceptance, decay the score
+//per touch and per elapsed period, and retire spent levels or remove decisively broken ones
+float baseDecay = touchDecayInput / 100
+
+int levelIdx = array.size(levelArray) - 1
+while levelIdx >= 0
+    SRLevel lvl = array.get(levelArray, levelIdx)
+    if lvl.state != ST_SPENT
+        bool insideZone = inZone(lvl.price, zoneHalf)
+        bool newTouch   = insideZone and not lvl.wasInZone and bar_index - lvl.lastTouchBar >= touchGapInput
+        if newTouch
+            settleGrade(lvl, baseDecay)
+            lvl.touches      := lvl.touches + 1
+            lvl.lastTouchBar := bar_index
+            lvl.spend        := lvl.spend + baseDecay
+            if gradeTouchesInput
+                lvl.grading     := true
+                lvl.gradeStart  := bar_index
+                lvl.gradeAtr    := atrValue
+                lvl.gradeWidth  := zoneHalf
+                lvl.gradePen    := math.max(lvl.isSupport ? lvl.price - low : high - lvl.price, 0)
+                lvl.gradeBounce := math.max(lvl.isSupport ? high - lvl.price : lvl.price - low, 0)
+            if lvl.touches == 1
+                lvl.state := ST_TESTED
+                if lvl.isSupport
+                    freshSupportTested := true
+                else
+                    freshResistanceTested := true
+        else if lvl.grading
+            lvl.gradePen    := math.max(lvl.gradePen, lvl.isSupport ? lvl.price - low : high - lvl.price)
+            lvl.gradeBounce := math.max(lvl.gradeBounce, lvl.isSupport ? high - lvl.price : lvl.price - low)
+            if bar_index - lvl.gradeStart >= reactionBarsInput
+                settleGrade(lvl, baseDecay)
+        lvl.wasInZone := insideZone
+
+        //Decisive break with acceptance beyond the zone removes the level from the map
+        bool closedBeyond = lvl.isSupport ? close < lvl.price - zoneHalf : close > lvl.price + zoneHalf
+        lvl.breakRun := closedBeyond ? lvl.breakRun + 1 : 0
+        if lvl.breakRun >= breakBarsInput
+            deleteDrawings(lvl)
+            array.remove(levelArray, levelIdx)
+        else
+            float timeFactor = halfLifeInput > 0 ? math.pow(0.5, (bar_index - lvl.birthBar) / (halfLifeInput * 1.0)) : 1.0
+            lvl.score := 100 * math.max(1 - lvl.spend, 0) * timeFactor
+            bool nowSpent = lvl.score < spentThresholdInput or (maxTouchesInput > 0 and lvl.touches >= maxTouchesInput)
+            if nowSpent
+                lvl.state := ST_SPENT
+                if lvl.isSupport
+                    supportSpent := true
+                else
+                    resistanceSpent := true
+                retireLevel(lvl)
+                if spentModeInput == SPENT_HIDE
+                    array.remove(levelArray, levelIdx)
+            else
+                //Visual decay: color blends toward gray and fades with the score, width drops after the first test
+                if not na(lvl.levelLine)
+                    line.set_color(lvl.levelLine, levelColor(lvl))
+                    line.set_width(lvl.levelLine, lvl.state == ST_FRESH ? 2 : 1)
+    levelIdx -= 1
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visuals
+//---------------------------------------------------------------------------------------------------------------------{
+//Pin the bookkeeping tags of active levels to the right of the latest bar and refresh their hover context
+if barstate.islast and showLabelsInput
+    int labelCount = array.size(levelArray)
+    if labelCount > 0
+        for i = 0 to labelCount - 1
+            SRLevel lvl = array.get(levelArray, i)
+            if lvl.state != ST_SPENT and not na(lvl.infoLabel)
+                label.set_x(lvl.infoLabel, bar_index + LABEL_OFFSET)
+                label.set_text(lvl.infoLabel, levelText(lvl))
+                label.set_textcolor(lvl.infoLabel, levelColor(lvl))
+                label.set_tooltip(lvl.infoLabel, levelTooltip(lvl))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(freshSupportTested,    "Fresh Support First Test",    "Fresh support level tested for the first time on {{ticker}} - its zero-touch interest is being spent")
+alertcondition(freshResistanceTested, "Fresh Resistance First Test", "Fresh resistance level tested for the first time on {{ticker}} - its zero-touch interest is being spent")
+alertcondition(supportSpent,          "Support Level Spent",         "Support level on {{ticker}} is spent - freshness score exhausted, level retired from the map")
+alertcondition(resistanceSpent,       "Resistance Level Spent",      "Resistance level on {{ticker}} is spent - freshness score exhausted, level retired from the map")
+
+//---------------------------------------------------------------------------------------------------------------------}

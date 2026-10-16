@@ -1,0 +1,408 @@
+// This work is licensed under Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Spike Rules", shorttitle = "Spike Rules", overlay = true
+  , max_boxes_count  = 500
+  , max_lines_count  = 500
+  , max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+int OPEN_NONE   = 0
+int OPEN_BEYOND = 1 // open beyond the spike extreme: the spike's prices are accepted
+int OPEN_WITHIN = 2 // open inside the spike: the spike becomes the day's reference area
+int OPEN_AGAINST = 3 // open beyond the spike base: the spike is rejected
+
+int MIN_BASELINE = 3
+
+BULL_COLOR    = #089981 // buying spikes and the long side
+BEAR_COLOR    = #f23645 // selling spikes and the short side
+ACCENT_COLOR  = #ff9800 // the one accent - an open inside the spike, a market balancing on the spike
+NEUTRAL_COLOR = #787b86
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+string TZ_EXCHANGE = "Exchange"
+
+string FAIL_EXTREME = "Back Inside the Spike"
+string FAIL_BASE    = "Through the Spike Base"
+
+string GRP_SESSION = "Session"
+string GRP_SPIKE   = "Spike Detection"
+string GRP_RULES   = "Next-Day Rules"
+string GRP_STYLE   = "Style"
+string GRP_DASH    = "Dashboard"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+sessionInput = input.session("0930-1600", "Regular Session", group = GRP_SESSION
+  , tooltip = "The day session whose final minutes are scanned for a spike, 09:30-16:00 for US equities and index products. The window must not cross midnight. Shortened sessions that close early are skipped.")
+
+tzInput = input.string(TZ_EXCHANGE, "Timezone", group = GRP_SESSION
+  , options = [TZ_EXCHANGE, "America/New_York", "America/Chicago", "Europe/London", "Europe/Berlin", "Asia/Tokyo", "Asia/Hong_Kong", "Australia/Sydney", "UTC"]
+  , tooltip = "Timezone the Regular Session is expressed in. Exchange uses the symbol's own timezone, correct for US stocks. For CME index futures select America/New_York to keep the cash session.")
+
+windowInput = input.int(30, "Spike Window (minutes)", minval = 5, maxval = 120, group = GRP_SPIKE
+  , tooltip = "The final stretch of the session a spike must print in, 30 minutes by default: the last Market Profile period. A spike is a late breakout, so the session's new extreme has to be made inside this window.")
+
+minSizeInput = input.float(0.15, "Minimum Spike (x average range)", minval = 0.01, step = 0.05, group = GRP_SPIKE
+  , tooltip = "Distance between the spike base (the session extreme standing before the window) and the spike extreme, as a multiple of the average session range of recent days. Filters one-tick pokes to a new high or low.")
+
+closeLocInput = input.float(50, "Close Location in Spike (%)", minval = 0, maxval = 100, step = 5, group = GRP_SPIKE
+  , tooltip = "Where the session must close inside the spike, measured from the base: 0 only asks for a close beyond the base, 50 asks for a close in the outer half. A late break that is sold back below its base into the close is a failed poke, not a spike.")
+
+baselineInput = input.int(10, "Average Range Sessions", minval = 3, maxval = 50, group = GRP_SPIKE
+  , tooltip = "Completed sessions averaged for the session range the spike size is measured against.")
+
+periodInput = input.int(30, "Read On Period Closes (minutes)", minval = 1, maxval = 240, group = GRP_RULES
+  , tooltip = "Base breaks and failures are judged on the close of each Market Profile period, 30 minutes from the session open by default, instead of every bar, so a single bar poking through a level does not flip the read. Set it to the chart timeframe to judge every bar close.")
+
+tolInput = input.float(0.1, "Level Tolerance (x average range)", minval = 0, step = 0.05, group = GRP_RULES
+  , tooltip = "A period must close this far beyond a spike level, as a multiple of the average session range, to break or fail a read. Absorbs closes that only graze the level.")
+
+failModeInput = input.string(FAIL_BASE, "Acceptance Fails On", options = [FAIL_EXTREME, FAIL_BASE], group = GRP_RULES
+  , tooltip = "Open beyond the spike: the spike's prices are accepted. Through the Spike Base uses the base, the usual stop reference for trades in the spike's direction, and fails the read only on a period close beyond it. Back Inside the Spike is tighter and fails it on the first period close back inside the spike.")
+
+showTradesInput = input.bool(true, "Track Next-Day Trades", group = GRP_RULES
+  , tooltip = "Open beyond the spike: trade in the spike's direction from the open. Open beyond the base: trade against the spike from the open. Open inside the spike: no trade while the base holds; a bar close through the base turns the read into a rejection, traded against the spike from that close. Each trade is held to the session close and closed early on a bar close back through its failure level.")
+
+historyInput = input.int(10, "Spikes on Chart", minval = 1, maxval = 50, group = GRP_STYLE
+  , tooltip = "Most recent spikes whose drawings stay on the chart. Older drawings are removed; the dashboard keeps counting every spike.")
+
+bullColorInput    = input.color(BULL_COLOR, "Buying Spike", inline = "c1", group = GRP_STYLE)
+bearColorInput    = input.color(BEAR_COLOR, "Selling Spike", inline = "c1", group = GRP_STYLE)
+accentColorInput  = input.color(ACCENT_COLOR, "Open Inside Spike", inline = "c2", group = GRP_STYLE)
+neutralColorInput = input.color(NEUTRAL_COLOR, "Neutral", inline = "c2", group = GRP_STYLE)
+
+showDashInput = input.bool(true, "Show Dashboard", group = GRP_DASH
+  , tooltip = "The latest spike and the next day's read, then every spike on the chart by next-day open: how many there were and how many held their read through the session.")
+dashPosInput  = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], inline = "dash", group = GRP_DASH)
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], inline = "dash", group = GRP_DASH)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types & Functions
+//---------------------------------------------------------------------------------------------------------------------{
+type Spike
+    int   dir       = 0
+    float extreme   = na
+    float base      = na
+    float size      = na
+    int   startBar  = na
+    int   extBar    = na
+    int   openRead  = 0
+    float entry     = na
+    float failLevel = na
+    bool  failed    = false
+    bool  done      = false
+    bool  broke     = false
+    float tradeIn   = na
+    float tol       = 0.0
+    bool  rejFailed = false
+    box   zone      = na
+    line  extLine   = na
+    line  baseLine  = na
+    line  tradeLine = na
+    label tag       = na
+    label openTag   = na
+    label exitTag   = na
+
+getSize(string s) =>
+    switch s
+        "Tiny"   => size.tiny
+        "Normal" => size.normal
+        =>          size.small
+
+getPosition(string p) =>
+    switch p
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        "Bottom Left"  => position.bottom_left
+        =>                position.top_right
+
+fmtPct(float x) =>
+    na(x) ? "-" : (x >= 0 ? "+" : "") + str.tostring(x, "0.00") + "%"
+
+readName(int r, int dir) =>
+    r == OPEN_BEYOND ? (dir == 1 ? "Open Above Spike" : "Open Below Spike") :
+      r == OPEN_WITHIN ? "Open Within Spike" :
+      r == OPEN_AGAINST ? (dir == 1 ? "Open Below Base" : "Open Above Base") : "-"
+
+readVerdict(int r) =>
+    r == OPEN_BEYOND ? "Accepted" : r == OPEN_WITHIN ? "Weak Acceptance" : r == OPEN_AGAINST ? "Rejected" : "-"
+
+deleteSpike(Spike s) =>
+    box.delete(s.zone)
+    line.delete(s.extLine)
+    line.delete(s.baseLine)
+    line.delete(s.tradeLine)
+    label.delete(s.tag)
+    label.delete(s.openTag)
+    label.delete(s.exitTag)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Session Clock
+//---------------------------------------------------------------------------------------------------------------------{
+string tz        = tzInput == TZ_EXCHANGE ? syminfo.timezone : tzInput
+bool   validTf   = timeframe.isintraday and timeframe.in_seconds() * 2 <= windowInput * 60
+bool   inSession = validTf and not na(time(timeframe.period, sessionInput, tz))
+bool   newDay    = timeframe.change("D")
+bool   sessStart = inSession and (not inSession[1] or newDay)
+
+// session end from the session string, e.g. "0930-1600" ends at 16:00
+int    endHour   = int(str.tonumber(str.substring(sessionInput, 5, 7)))
+int    endMinute = int(str.tonumber(str.substring(sessionInput, 7, 9)))
+int    sessEnd   = timestamp(tz, year(time, tz), month(time, tz), dayofmonth(time, tz), endHour, endMinute)
+bool   inWindow  = inSession and time >= sessEnd - windowInput * 60000
+bool   sessLast  = inSession and time_close >= sessEnd
+
+var int sessOpenTime = na
+if sessStart
+    sessOpenTime := time
+int  periodMs    = math.max(periodInput, timeframe.in_seconds() / 60) * 60000
+bool periodClose = inSession and not na(sessOpenTime) and ((time_close - sessOpenTime) % periodMs == 0 or sessLast)
+
+if barstate.islast and not validTf
+    runtime.error("Spike Rules reads the final minutes of each session: use an intraday chart whose bars are at most half the spike window.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// State
+//---------------------------------------------------------------------------------------------------------------------{
+var array<float> rangeArray = array.new_float()
+var array<Spike> spikes     = array.new<Spike>()
+var Spike        live       = na  // spike whose next session is being read
+var Spike        latest     = na
+
+var array<int> countArray = array.new_int(4, 0)
+var array<int> heldArray  = array.new_int(4, 0)
+
+var bool  sessActive = false
+var float sessHigh   = na
+var float sessLow    = na
+var float preHigh    = na
+var float preLow     = na
+var float winHigh    = na
+var float winLow     = na
+var int   winStart   = na
+var int   winHighBar = na
+var int   winLowBar  = na
+var int   upBreakBar = na
+var int   dnBreakBar = na
+
+bool newBuySpike  = false
+bool newSellSpike = false
+bool readBeyond   = false
+bool readWithin   = false
+bool readAgainst  = false
+bool readFailed   = false
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Next-Day Read
+//---------------------------------------------------------------------------------------------------------------------{
+// the open of the session after a spike decides the read
+if sessStart and not na(live) and live.openRead == OPEN_NONE
+    float o = open
+    int   d = live.dir
+    float hi = math.max(live.extreme, live.base)
+    float lo = math.min(live.extreme, live.base)
+    live.openRead := o > hi ? (d == 1 ? OPEN_BEYOND : OPEN_AGAINST) : o < lo ? (d == 1 ? OPEN_AGAINST : OPEN_BEYOND) : OPEN_WITHIN
+    live.entry    := o
+    // failure level of the read: acceptance fails back inside the spike (or through its base), a rejection fails back
+    // inside the spike, a balance read fails through the base
+    live.failLevel := live.openRead == OPEN_BEYOND ? (failModeInput == FAIL_EXTREME ? live.extreme : live.base) : live.base
+    readBeyond  := live.openRead == OPEN_BEYOND
+    readWithin  := live.openRead == OPEN_WITHIN
+    readAgainst := live.openRead == OPEN_AGAINST
+    countArray.set(live.openRead, countArray.get(live.openRead) + 1)
+
+    color c = live.openRead == OPEN_WITHIN ? accentColorInput : (live.openRead == OPEN_BEYOND) == (d == 1) ? bullColorInput : bearColorInput
+    bool tradeSideUp = live.openRead == OPEN_BEYOND ? d == 1 : d == -1
+    string tip = live.openRead == OPEN_BEYOND ? "The session opened beyond the spike: its prices are accepted. Spike rules favor continuation in the spike's direction while the spike extreme holds."
+      : live.openRead == OPEN_WITHIN ? "The session opened inside the spike: weaker acceptance. Expect two-sided trade with the spike base as the level to hold; a close back through the base turns the read toward rejection."
+      : "The session opened beyond the spike base: the late breakout is rejected. Spike rules favor a move against the spike while price stays outside it."
+    live.openTag := label.new(bar_index, tradeSideUp ? low : high, readName(live.openRead, d) + "\n" + readVerdict(live.openRead)
+      , style = tradeSideUp ? label.style_label_up : label.style_label_down, color = c, textcolor = color.white, size = size.small, tooltip = tip)
+    if showTradesInput and live.openRead != OPEN_WITHIN
+        live.tradeLine := line.new(bar_index, o, bar_index, close, color = c, width = 2, style = line.style_dashed)
+
+// failure checks and the session-end verdict
+if not na(live) and live.openRead != OPEN_NONE and not live.done and inSession and not na(live.tradeLine)
+    line.set_x2(live.tradeLine, bar_index)
+    line.set_y2(live.tradeLine, close)
+
+if not na(live) and live.openRead != OPEN_NONE and not live.done and inSession and barstate.isconfirmed and periodClose
+    int  d       = live.dir
+    bool tradeUp = live.openRead == OPEN_BEYOND ? d == 1 : d == -1
+    bool brokeNow = false
+    float t = live.tol
+    if live.openRead == OPEN_BEYOND
+        brokeNow := d == 1 ? close < live.failLevel - t : close > live.failLevel + t
+    else if live.openRead == OPEN_AGAINST
+        // a rejection fails once price closes back inside the spike
+        brokeNow := d == 1 ? close > live.base + t : close < live.base - t
+    else if not live.broke
+        // an open inside the spike that then closes through the base turns into a rejection of the spike
+        if d == 1 ? close < live.base - t : close > live.base + t
+            live.broke   := true
+            live.tradeIn := close
+            readFailed   := true
+            label.new(bar_index, d == 1 ? high : low, "Base broken\nRejected", style = d == 1 ? label.style_label_down : label.style_label_up
+              , color = d == 1 ? bearColorInput : bullColorInput, textcolor = color.white, size = size.small
+              , tooltip = "A period closed through the spike base after an open inside the spike: the read turns toward rejection, traded against the spike from this close.")
+            if showTradesInput
+                live.tradeLine := line.new(bar_index, close, bar_index, close, color = d == 1 ? bearColorInput : bullColorInput, width = 2, style = line.style_dashed)
+    else
+        // the converted rejection fails on a close back inside the spike
+        brokeNow := d == 1 ? close > live.base + t : close < live.base - t
+    if live.openRead == OPEN_WITHIN
+        tradeUp := d == -1
+    if brokeNow or sessLast
+        live.failed    := brokeNow or live.broke
+        live.rejFailed := live.broke and brokeNow
+        live.done   := true
+        if live.openRead != OPEN_WITHIN
+            readFailed := readFailed or brokeNow
+        if not live.failed
+            heldArray.set(live.openRead, heldArray.get(live.openRead) + 1)
+        float ref = live.openRead == OPEN_WITHIN ? live.tradeIn : live.entry
+        float chg = na(ref) ? na : (tradeUp ? 1 : -1) * (close - ref) / ref * 100
+        string txt = live.openRead == OPEN_WITHIN and not live.broke ? "Base held" : (brokeNow ? "Failed " : "Close ") + fmtPct(chg)
+        live.exitTag := label.new(bar_index, tradeUp ? high : low, txt, style = tradeUp ? label.style_label_down : label.style_label_up
+          , color = color.new(neutralColorInput, 20), textcolor = DASH_TEXT, size = size.small
+          , tooltip = live.openRead == OPEN_WITHIN and not live.broke ? "The spike base held all session: the spike stayed the day's reference area."
+              : brokeNow ? "A period closed back through the failure level: the read failed. Change from entry: " + fmtPct(chg) : "The read held to the session close. Change from entry: " + fmtPct(chg))
+
+// keep the spike zone running through the session that reads it
+if not na(live) and not live.done
+    box.set_right(live.zone, bar_index)
+    line.set_x2(live.extLine, bar_index)
+    line.set_x2(live.baseLine, bar_index)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Session Tracking & Spike Detection
+//---------------------------------------------------------------------------------------------------------------------{
+if sessStart
+    sessActive := true
+    sessHigh   := high
+    sessLow    := low
+    preHigh    := na
+    preLow     := na
+    winHigh    := na
+    winLow     := na
+    winStart   := na
+    upBreakBar := na
+    dnBreakBar := na
+else if inSession and sessActive
+    sessHigh := math.max(sessHigh, high)
+    sessLow  := math.min(sessLow, low)
+
+if inSession and sessActive
+    if inWindow
+        if na(winStart)
+            // the session range standing before the window is the balance a spike breaks out of
+            winStart := bar_index
+            preHigh  := sessHigh[1]
+            preLow   := sessLow[1]
+            if sessStart
+                preHigh := high
+                preLow  := low
+            winHigh    := high
+            winLow     := low
+            winHighBar := bar_index
+            winLowBar  := bar_index
+        else
+            if high > winHigh
+                winHigh    := high
+                winHighBar := bar_index
+            if low < winLow
+                winLow    := low
+                winLowBar := bar_index
+        if na(upBreakBar) and high > preHigh
+            upBreakBar := bar_index
+        if na(dnBreakBar) and low < preLow
+            dnBreakBar := bar_index
+
+if sessLast and sessActive and barstate.isconfirmed
+    float adr = rangeArray.size() >= MIN_BASELINE ? rangeArray.avg() : na
+    if not na(adr) and not na(winStart)
+        float upSize = winHigh - preHigh
+        float dnSize = preLow - winLow
+        bool  upOk   = upSize >= minSizeInput * adr and close > preHigh and (close - preHigh) >= closeLocInput / 100 * upSize
+        bool  dnOk   = dnSize >= minSizeInput * adr and close < preLow and (preLow - close) >= closeLocInput / 100 * dnSize
+        if upOk or dnOk
+            int   d    = upOk ? 1 : -1
+            float ext  = d == 1 ? winHigh : winLow
+            float base = d == 1 ? preHigh : preLow
+            int   sb   = d == 1 ? upBreakBar : dnBreakBar
+            Spike s = Spike.new(d, ext, base, math.abs(ext - base) / adr, sb, d == 1 ? winHighBar : winLowBar)
+            s.tol := tolInput * adr
+            color c = d == 1 ? bullColorInput : bearColorInput
+            s.zone     := box.new(sb, math.max(ext, base), bar_index, math.min(ext, base), border_color = color.new(c, 60), bgcolor = color.new(c, 85))
+            s.extLine  := line.new(sb, ext, bar_index, ext, color = c, width = 1)
+            s.baseLine := line.new(sb, base, bar_index, base, color = c, width = 1, style = line.style_dashed)
+            s.tag      := label.new(s.extBar, ext, (d == 1 ? "Buying Spike" : "Selling Spike") + " " + str.tostring(s.size, "0.00") + " ADR"
+              , style = d == 1 ? label.style_label_down : label.style_label_up, color = color.new(c, 0), textcolor = color.white, size = size.small
+              , tooltip = "Late-session breakout " + (d == 1 ? "above" : "below") + " the day's range: base " + str.tostring(base, format.mintick) + ", extreme " + str.tostring(ext, format.mintick) + ", " + str.tostring(s.size, "0.00") + "x the average session range. Tomorrow's open against this spike sets the read.")
+            newBuySpike  := d == 1
+            newSellSpike := d == -1
+            spikes.push(s)
+            if spikes.size() > historyInput
+                deleteSpike(spikes.shift())
+            live   := s
+            latest := s
+    rangeArray.push(sessHigh - sessLow)
+    if rangeArray.size() > baselineInput
+        rangeArray.shift()
+    sessActive := false
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dash = table.new(getPosition(dashPosInput), 3, 6, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+if barstate.islast and showDashInput
+    ts = getSize(dashSizeInput)
+    table.cell(dash, 0, 0, "Last Spike", text_color = DASH_HEADER, text_halign = text.align_left, text_size = ts)
+    string spikeText = na(latest) ? "-" : (latest.dir == 1 ? "Buying " : "Selling ") + str.tostring(latest.size, "0.00") + " ADR"
+    table.cell(dash, 1, 0, spikeText, text_color = na(latest) ? DASH_HEADER : latest.dir == 1 ? bullColorInput : bearColorInput, text_halign = text.align_right, text_size = ts)
+    table.merge_cells(dash, 1, 0, 2, 0)
+    table.cell(dash, 0, 1, "Next Open", text_color = DASH_HEADER, text_halign = text.align_left, text_size = ts)
+    string readText = "-"
+    if not na(latest)
+        if latest.openRead == OPEN_NONE
+            readText := "Pending"
+        else if latest.openRead == OPEN_WITHIN and latest.broke
+            readText := "Base broken, " + (latest.done ? (latest.rejFailed ? "rejection failed" : "rejection held") : "rejection live")
+        else
+            readText := readVerdict(latest.openRead) + (latest.done ? (latest.failed ? ", failed" : ", held") : ", live")
+    table.cell(dash, 1, 1, readText, text_color = DASH_TEXT, text_halign = text.align_right, text_size = ts)
+    table.merge_cells(dash, 1, 1, 2, 1)
+    table.cell(dash, 0, 2, "Open", text_color = DASH_HEADER, text_halign = text.align_left, text_size = ts)
+    table.cell(dash, 1, 2, "Spikes", text_color = DASH_HEADER, text_halign = text.align_right, text_size = ts)
+    table.cell(dash, 2, 2, "Held", text_color = DASH_HEADER, text_halign = text.align_right, text_size = ts
+      , tooltip = "Reads that held to the session close: no bar closed through the read's failure level.")
+    array<string> names = array.from("Beyond", "Within", "Against")
+    array<string> tips  = array.from("Opened beyond the spike extreme: accepted.", "Opened inside the spike: weaker acceptance, the base should hold.", "Opened beyond the spike base: rejected.")
+    array<color>  cols  = array.from(bullColorInput, accentColorInput, bearColorInput)
+    for i = 0 to 2
+        int r = i + 1
+        table.cell(dash, 0, 3 + i, names.get(i), text_color = cols.get(i), text_halign = text.align_left, text_size = ts, tooltip = tips.get(i))
+        table.cell(dash, 1, 3 + i, str.tostring(countArray.get(r)), text_color = DASH_TEXT, text_halign = text.align_right, text_size = ts)
+        table.cell(dash, 2, 3 + i, str.tostring(heldArray.get(r)), text_color = DASH_TEXT, text_halign = text.align_right, text_size = ts)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(newBuySpike, "Buying Spike", "Buying spike into the close on {{ticker}}: watch tomorrow's open against it")
+alertcondition(newSellSpike, "Selling Spike", "Selling spike into the close on {{ticker}}: watch tomorrow's open against it")
+alertcondition(readBeyond, "Open Beyond Spike", "{{ticker}} opened beyond yesterday's spike: the spike is accepted")
+alertcondition(readWithin, "Open Within Spike", "{{ticker}} opened inside yesterday's spike: weaker acceptance, the spike base should hold")
+alertcondition(readAgainst, "Open Beyond Spike Base", "{{ticker}} opened beyond yesterday's spike base: the spike is rejected")
+alertcondition(readFailed, "Spike Read Failed", "The spike read on {{ticker}} failed: a bar closed through its failure level")
+
+//---------------------------------------------------------------------------------------------------------------------}

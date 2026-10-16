@@ -1,0 +1,497 @@
+// This work is licensed under Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Bump-and-run Reversal", shorttitle = "Bump-and-run Reversal", overlay = true, max_lines_count = 500, max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+color BULL_COLOR    = #089981
+color BEAR_COLOR    = #f23645
+color NEUTRAL_COLOR = #787b86
+color HIDDEN_COLOR  = #00000000
+
+int MAX_SWINGS = 30
+
+string LEAD_GROUP  = 'Lead-in Trendline'
+string BUMP_GROUP  = 'Bump'
+string RUN_GROUP   = 'Run & Trade Levels'
+string STYLE_GROUP = 'Style'
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+swingLengthInput = input.int(5, 'Swing Length', minval = 2, maxval = 50, group = LEAD_GROUP, tooltip = 'Bars to the left and right a low (or high) must dominate to count as a confirmed swing. Lead-in trendline touches are taken from these swings.')
+
+minTouchesInput = input.int(3, 'Minimum Touches', minval = 2, maxval = 8, group = LEAD_GROUP, tooltip = 'Swing touches the lead-in trendline needs. The lead-in is a steady advance that respects the line several times; three or more touches separate a real trendline from two points joined by a ruler.')
+
+toleranceInput = input.float(0.5, 'Touch Tolerance (ATR)', minval = 0.05, maxval = 3, step = 0.05, group = LEAD_GROUP, tooltip = 'How close a swing must come to the trendline to count as a touch, and how far price may poke through it during the lead-in, as a multiple of the ATR.')
+
+minLeadBarsInput = input.int(30, 'Lead-in Length (bars)', minval = 5, maxval = 1000, inline = 'lead', group = LEAD_GROUP, tooltip = 'Fewest bars from the first to the last trendline touch of the lead-in phase.')
+maxLeadBarsInput = input.int(300, '', minval = 10, maxval = 2000, inline = 'lead', group = LEAD_GROUP, tooltip = 'Most bars the lead-in trendline may span.')
+
+atrLengthInput = input.int(14, 'ATR Length', minval = 1, maxval = 200, group = LEAD_GROUP, tooltip = 'Average True Range length scaling the touch tolerance, the minimum bump height and the break buffer.')
+
+bumpRatioInput = input.float(2.0, 'Bump Height (x Lead-in)', minval = 1.2, maxval = 10, step = 0.1, group = BUMP_GROUP, tooltip = 'How far above the trendline price must climb, measured as a multiple of the lead-in height (the widest distance between price and the line during the lead-in). The working test from the pattern definition is a bump at least about twice the lead-in height.')
+
+steepInput = input.float(2.0, 'Bump Steepness (x Lead-in Slope)', minval = 1, maxval = 20, step = 0.1, group = BUMP_GROUP, tooltip = 'How much steeper, in price per bar, the bump must climb than the lead-in trendline. Chart angles depend on scaling, so the guideline of roughly 30 degrees steepening to 45-60 degrees is tested as a slope ratio instead.')
+
+minBumpInput = input.float(4.0, 'Minimum Bump Height (ATR)', minval = 0, maxval = 50, step = 0.5, group = BUMP_GROUP, tooltip = 'Smallest bump height above the trendline as a multiple of the ATR, so a line hugged tightly during the lead-in does not turn ordinary swings into bumps.')
+
+windowInput = input.int(150, 'Run Window (bars)', minval = 10, maxval = 1000, group = BUMP_GROUP, tooltip = 'Bars after the bump extreme within which the trendline break must arrive before the setup expires.')
+
+detectTopsInput    = input.bool(true, 'Tops', inline = 'dir', group = RUN_GROUP, tooltip = 'Detect bump-and-run tops (accelerating advances failing back through a rising lead-in line) and the inverted bottoms (accelerating declines failing back up through a falling lead-in line).')
+detectBottomsInput = input.bool(true, 'Bottoms', inline = 'dir', group = RUN_GROUP)
+
+breakBufferInput = input.float(0.0, 'Decisive Break Buffer (ATR)', minval = 0, maxval = 3, step = 0.05, group = RUN_GROUP, tooltip = 'Extra ATR multiple the close must clear beyond the lead-in trendline for the break to complete the pattern.')
+
+targetModeInput = input.string('Bump Height', 'Target', options = ['Bump Height', 'Bump Start', 'None'], group = RUN_GROUP, tooltip = 'Bump Height projects the bump height beyond the trendline break, in the spirit of the measure rule. Bump Start targets the price where the bump left the lead-in line, a shallower objective. Outcomes vary widely and partial retracements are common.')
+
+failBarsInput = input.int(2, 'Closes Back for Failure', minval = 1, maxval = 10, group = RUN_GROUP, tooltip = 'Consecutive closes back on the original side of the broken trendline that mark the break as failed.')
+
+watchInput = input.int(80, 'Post-Break Watch (bars)', minval = 5, maxval = 500, group = RUN_GROUP, tooltip = 'Bars the target and stop are tracked after the break.')
+
+bullColorInput    = input.color(BULL_COLOR, 'Bottoms', inline = 'colors', group = STYLE_GROUP)
+bearColorInput    = input.color(BEAR_COLOR, 'Tops', inline = 'colors', group = STYLE_GROUP)
+neutralColorInput = input.color(NEUTRAL_COLOR, 'Unconfirmed', inline = 'colors', group = STYLE_GROUP, tooltip = 'Color of a bump that has not broken its trendline yet, and of stops and failures.')
+
+showPhasesInput = input.bool(true, 'Phase Labels', group = STYLE_GROUP, tooltip = 'Label the lead-in, the bump and the run, and draw the bump and lead-in heights.')
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types
+//---------------------------------------------------------------------------------------------------------------------{
+
+// e = 1: top (rising lead-in line under price, break down). e = -1: bottom (falling line over price, break up)
+type Barr
+    int   e
+    // lead-in trendline
+    bool  lineOn     = false
+    int   x1
+    float y1
+    float slope
+    int   lastTouch
+    int   touches    = 0
+    float leadHeight
+    int   leadHeightBar
+    // bump
+    bool  bumpOn     = false
+    int   topBar
+    float topPrice
+    float bumpHeight
+    float bumpStart
+    bool  retouched  = false
+    int   lastSwingBar
+    float lastSwingPrice
+    float runBest    = 0.0
+    int   runBestBar
+    // drawings
+    line  trendLn
+    line  bumpLn
+    line  leadLn
+    label leadLb
+    label bumpLb
+    array<label> marks
+    // run
+    bool  tradeOn    = false
+    int   breakBar
+    float target
+    float stop
+    int   tX1
+    float tY1
+    float tSlope
+    int   backCount  = 0
+    bool  retested   = false
+    line  targetLn
+    label targetLb
+    line  stopLn
+    label stopLb
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Variables
+//---------------------------------------------------------------------------------------------------------------------{
+
+var array<float> highArray = array.new<float>()
+var array<float> lowArray  = array.new<float>()
+
+var array<int>   lowBarArray    = array.new<int>()
+var array<float> lowPriceArray  = array.new<float>()
+var array<int>   highBarArray   = array.new<int>()
+var array<float> highPriceArray = array.new<float>()
+
+var Barr topState    = Barr.new(e = 1)
+var Barr bottomState = Barr.new(e = -1)
+
+array.push(highArray, high)
+array.push(lowArray, low)
+
+float atrValue  = ta.atr(atrLengthInput)
+float pivotHigh = ta.pivothigh(high, swingLengthInput, swingLengthInput)
+float pivotLow  = ta.pivotlow(low, swingLengthInput, swingLengthInput)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions & Methods
+//---------------------------------------------------------------------------------------------------------------------{
+
+method lineAt(Barr this, int x) =>
+    this.y1 + this.slope * (x - this.x1)
+
+// Price extreme on the bump side (highs for a top) and on the line side (lows for a top)
+bumpSide(int e, int b) =>
+    e == 1 ? array.get(highArray, b) : array.get(lowArray, b)
+
+lineSide(int e, int b) =>
+    e == 1 ? array.get(lowArray, b) : array.get(highArray, b)
+
+method patternColor(Barr this) =>
+    this.e == 1 ? bearColorInput : bullColorInput
+
+method clearDrawings(Barr this) =>
+    line.delete(this.trendLn)
+    line.delete(this.bumpLn)
+    line.delete(this.leadLn)
+    label.delete(this.leadLb)
+    label.delete(this.bumpLb)
+    if not na(this.marks)
+        for lb in this.marks
+            label.delete(lb)
+    this.trendLn := na
+    this.bumpLn  := na
+    this.leadLn  := na
+    this.leadLb  := na
+    this.bumpLb  := na
+    this.marks   := na
+
+method resetLine(Barr this) =>
+    this.lineOn    := false
+    this.bumpOn    := false
+    this.retouched := false
+    this.touches   := 0
+
+// Lead-in height: widest distance between price and the line from the first to the last touch
+method measureLead(Barr this) =>
+    float h    = 0.0
+    int   hBar = this.x1
+    for b = this.x1 to this.lastTouch
+        float d = this.e * (bumpSide(this.e, b) - this.lineAt(b))
+        if d > h
+            h    := d
+            hBar := b
+    this.leadHeight    := h
+    this.leadHeightBar := hBar
+    // Restart the running excursion beyond the line from the bar after the latest touch
+    this.runBest    := 0.0
+    this.runBestBar := na
+    if this.lastTouch < bar_index
+        for b = this.lastTouch + 1 to bar_index
+            float d = this.e * (bumpSide(this.e, b) - this.lineAt(b))
+            if d > this.runBest
+                this.runBest    := d
+                this.runBestBar := b
+
+// Fit a lead-in line ending at the newest touch-side swing: the earliest older swing that gives a line sloping with
+// the trend, with price never closing through it and enough swing touches along it
+method fitLine(Barr this, array<int> barArr, array<float> priceArr) =>
+    int n = array.size(barArr)
+    if n >= 2 and atrValue > 0
+        float tol = toleranceInput * atrValue
+        int   sBar = array.get(barArr, n - 1)
+        float sP   = array.get(priceArr, n - 1)
+        for i = 0 to n - 2
+            int   iBar = array.get(barArr, i)
+            float iP   = array.get(priceArr, i)
+            if sBar - iBar <= maxLeadBarsInput and sBar - iBar >= minLeadBarsInput
+                float slope = (sP - iP) / (sBar - iBar)
+                if this.e * slope > 0
+                    bool ok = true
+                    for b = iBar to sBar
+                        if this.e * (lineSide(this.e, b) - (iP + slope * (b - iBar))) < -tol
+                            ok := false
+                            break
+                    int touches = 0
+                    if ok
+                        for k = i to n - 1
+                            float d = this.e * (array.get(priceArr, k) - (iP + slope * (array.get(barArr, k) - iBar)))
+                            if d <= tol
+                                touches += 1
+                    if ok and touches >= minTouchesInput
+                        this.lineOn    := true
+                        this.bumpOn    := false
+                        this.retouched := false
+                        this.x1        := iBar
+                        this.y1        := iP
+                        this.slope     := slope
+                        this.lastTouch := sBar
+                        this.touches   := touches
+                        this.measureLead()
+                        break
+
+// Draw the lead-in line, its touches and the phase marks once the bump qualifies
+method drawBump(Barr this, array<int> barArr, array<float> priceArr) =>
+    color col = neutralColorInput
+    this.trendLn := line.new(this.x1, this.y1, bar_index, this.lineAt(bar_index), color = col, width = 2)
+    this.marks   := array.new<label>()
+    float tol = toleranceInput * atrValue
+    for k = 0 to array.size(barArr) - 1
+        int   b = array.get(barArr, k)
+        float p = array.get(priceArr, k)
+        if b >= this.x1 and b <= this.lastTouch and math.abs(p - this.lineAt(b)) <= tol
+            this.marks.push(label.new(b, p, '', style = label.style_circle, color = col, size = size.tiny, tooltip = 'Lead-in trendline touch'))
+    if showPhasesInput
+        this.leadLn := line.new(this.leadHeightBar, this.lineAt(this.leadHeightBar), this.leadHeightBar, this.lineAt(this.leadHeightBar) + this.e * this.leadHeight, color = col, style = line.style_dotted)
+        this.leadLb := label.new(this.leadHeightBar, this.lineAt(this.leadHeightBar) + this.e * this.leadHeight, 'Lead-in', style = this.e == 1 ? label.style_label_down : label.style_label_up, color = HIDDEN_COLOR, textcolor = col, size = size.small, tooltip = 'Lead-in height: ' + str.tostring(this.leadHeight, format.mintick))
+        this.bumpLn := line.new(this.topBar, this.lineAt(this.topBar), this.topBar, this.topPrice, color = col, style = line.style_dashed)
+        this.bumpLb := label.new(this.topBar, this.topPrice, '', style = this.e == 1 ? label.style_label_down : label.style_label_up, color = HIDDEN_COLOR, textcolor = col, size = size.small)
+
+method updateBumpMarks(Barr this) =>
+    if not na(this.bumpLn)
+        line.set_xy1(this.bumpLn, this.topBar, this.lineAt(this.topBar))
+        line.set_xy2(this.bumpLn, this.topBar, this.topPrice)
+    if not na(this.bumpLb)
+        label.set_xy(this.bumpLb, this.topBar, this.topPrice)
+        label.set_text(this.bumpLb, 'Bump ' + str.tostring(this.bumpHeight / this.leadHeight, '#.#') + 'x lead-in')
+        label.set_tooltip(this.bumpLb, 'Bump height above the trendline: ' + str.tostring(this.bumpHeight, format.mintick) + '\nLead-in height: ' + str.tostring(this.leadHeight, format.mintick))
+
+method recolor(Barr this, color col) =>
+    line.set_color(this.trendLn, col)
+    if not na(this.bumpLn)
+        line.set_color(this.bumpLn, col)
+        line.set_color(this.leadLn, col)
+        label.set_textcolor(this.leadLb, col)
+        label.set_textcolor(this.bumpLb, col)
+    if not na(this.marks)
+        for lb in this.marks
+            label.set_color(lb, col)
+
+// Register a touch-side swing: extend the line on a new touch, otherwise refit when no bump is live
+method onSwing(Barr this, array<int> barArr, array<float> priceArr) =>
+    int   n   = array.size(barArr)
+    int   sBar = array.get(barArr, n - 1)
+    float sP   = array.get(priceArr, n - 1)
+    float tol  = toleranceInput * atrValue
+    if this.lineOn and not this.bumpOn
+        float d = this.e * (sP - this.lineAt(sBar))
+        if d <= tol and d >= -tol
+            this.lastTouch := sBar
+            this.touches   += 1
+            this.measureLead()
+        else if d < -tol
+            this.resetLine()
+            this.fitLine(barArr, priceArr)
+    else if not this.lineOn
+        this.fitLine(barArr, priceArr)
+
+// Advance one bar: bump qualification, run (break), invalidation. Returns 1 = bump qualified, 2 = completed,
+// 3 = invalidated or expired
+method step(Barr this, array<int> barArr, array<float> priceArr) =>
+    int evt = 0
+    if this.lineOn and atrValue > 0
+        int   e        = this.e
+        float lineNow  = this.lineAt(bar_index)
+        float tol      = toleranceInput * atrValue
+        float extreme  = e == 1 ? high : low
+        float dist     = e * (extreme - lineNow)
+        bool  brokeNow = e == 1 ? close < lineNow - breakBufferInput * atrValue : close > lineNow + breakBufferInput * atrValue
+
+        if not this.bumpOn
+            if brokeNow
+                // The line gave way before any bump: no pattern, look for a fresh lead-in
+                this.resetLine()
+            else if bar_index > this.lastTouch and this.leadHeight > 0
+                // Widest excursion beyond the line since the last touch, and its slope against the line's
+                if dist > this.runBest
+                    this.runBest    := dist
+                    this.runBestBar := bar_index
+                int   bestBar = this.runBestBar
+                float best    = this.runBest
+                float startPrice = lineSide(e, this.lastTouch)
+                float bumpSlope  = not na(bestBar) and bestBar > this.lastTouch ? e * (bumpSide(e, bestBar) - startPrice) / (bestBar - this.lastTouch) : 0.0
+                bool  tall  = best >= bumpRatioInput * this.leadHeight and best >= minBumpInput * atrValue
+                bool  steep = bumpSlope >= steepInput * math.abs(this.slope)
+                if tall and steep
+                    this.bumpOn     := true
+                    this.topBar     := bestBar
+                    this.topPrice   := bumpSide(e, bestBar)
+                    this.bumpHeight := best
+                    this.bumpStart  := startPrice
+                    this.retouched  := false
+                    this.drawBump(barArr, priceArr)
+                    this.updateBumpMarks()
+                    evt := 1
+        else
+            line.set_xy2(this.trendLn, bar_index, lineNow)
+            if e * (extreme - this.topPrice) > 0
+                if this.retouched
+                    // Price held the line and the advance resumed past the bump: the reversal case is off
+                    this.clearDrawings()
+                    this.resetLine()
+                    evt := 3
+                else
+                    this.topBar     := bar_index
+                    this.topPrice   := extreme
+                    this.bumpHeight := dist
+                    this.updateBumpMarks()
+            if evt == 0
+                if brokeNow
+                    evt := 2
+                else if e * (lineSide(e, bar_index) - lineNow) <= tol
+                    this.retouched := true
+                if evt == 0 and bar_index - this.topBar > windowInput
+                    this.clearDrawings()
+                    this.resetLine()
+                    evt := 3
+    evt
+
+// Complete the pattern on the trendline break and start the trade watch
+method complete(Barr this) =>
+    int   e       = this.e
+    color col     = this.patternColor()
+    float lineNow = this.lineAt(bar_index)
+    line.set_xy2(this.trendLn, bar_index, lineNow)
+    this.recolor(col)
+    string name = e == 1 ? 'Bump-and-Run Top' : 'Bump-and-Run Bottom'
+    // The event tag sits beyond the last three bars, clear of the candles that led into the break
+    label.new(bar_index, e == 1 ? math.max(high, high[1], high[2]) : math.min(low, low[1], low[2]), 'Run', style = e == 1 ? label.style_label_down : label.style_label_up, color = col, textcolor = chart.bg_color, size = size.small, tooltip = name + ' completed: close through the lead-in trendline at ' + str.tostring(lineNow, format.mintick) + '\nBump ' + str.tostring(this.bumpHeight / this.leadHeight, '#.#') + 'x the lead-in height')
+    this.tradeOn   := true
+    this.breakBar  := bar_index
+    this.backCount := 0
+    this.retested  := false
+    this.tX1       := this.x1
+    this.tY1       := this.y1
+    this.tSlope    := this.slope
+    this.target    := targetModeInput == 'Bump Height' ? lineNow - e * this.bumpHeight : targetModeInput == 'Bump Start' ? this.bumpStart : na
+    // Stop beyond the latest swing on the bump side since the bump extreme (the rollover's lower high), else the extreme
+    this.stop := this.lastSwingBar > this.topBar ? this.lastSwingPrice : this.topPrice
+    if not na(this.target)
+        this.targetLn := line.new(bar_index, this.target, bar_index, this.target, color = col, style = line.style_dashed)
+        this.targetLb := label.new(bar_index, this.target, 'Target ' + str.tostring(this.target, format.mintick), style = label.style_label_right, color = HIDDEN_COLOR, textcolor = col, size = size.small, tooltip = targetModeInput == 'Bump Height' ? 'Bump height projected beyond the trendline break' : 'Price where the bump left the lead-in line')
+    this.stopLn := line.new(bar_index, this.stop, bar_index, this.stop, color = neutralColorInput, style = line.style_dotted)
+    this.stopLb := label.new(bar_index, this.stop, 'Stop ' + str.tostring(this.stop, format.mintick), style = label.style_label_left, color = HIDDEN_COLOR, textcolor = neutralColorInput, size = size.small, tooltip = 'Beyond the latest swing of the rollover')
+    // Release the pattern drawings and the line: the next lead-in starts fresh
+    this.trendLn := na
+    this.bumpLn  := na
+    this.leadLn  := na
+    this.leadLb  := na
+    this.bumpLb  := na
+    this.marks   := na
+    this.resetLine()
+
+// Track the run after the break. Returns 1 = target, 2 = stop or failure, 3 = retest
+method watch(Barr this) =>
+    int evt = 0
+    if this.tradeOn and bar_index > this.breakBar
+        int   e   = this.e
+        color col = this.patternColor()
+        if not na(this.targetLn)
+            line.set_x2(this.targetLn, bar_index)
+        line.set_x2(this.stopLn, bar_index)
+        label.set_x(this.stopLb, bar_index)
+        // Broken trendline, extended from the anchors stored at the break
+        float brokenLine = this.tY1 + this.tSlope * (bar_index - this.tX1)
+        this.backCount := e * (close - brokenLine) > 0 ? this.backCount + 1 : 0
+        bool targetHit = not na(this.target) and (e == 1 ? low <= this.target : high >= this.target)
+        bool stopHit   = e == 1 ? close > this.stop : close < this.stop
+        bool failed    = this.backCount >= failBarsInput
+        if targetHit
+            label.new(bar_index, e == 1 ? low : high, 'Target', style = e == 1 ? label.style_label_up : label.style_label_down, color = HIDDEN_COLOR, textcolor = col, size = size.small, tooltip = 'Target ' + str.tostring(this.target, format.mintick) + ' reached')
+            this.tradeOn := false
+            evt := 1
+        else if stopHit or failed
+            if not na(this.targetLn)
+                line.delete(this.targetLn)
+                label.delete(this.targetLb)
+            label.new(bar_index, e == 1 ? high : low, stopHit ? 'Stop' : 'Failed', style = e == 1 ? label.style_label_down : label.style_label_up, color = HIDDEN_COLOR, textcolor = neutralColorInput, size = size.small, tooltip = stopHit ? 'Close beyond the stop' : str.tostring(failBarsInput) + ' closes back across the broken trendline: the run failed')
+            this.tradeOn := false
+            evt := 2
+        else if not this.retested and (e == 1 ? high >= brokenLine and close < brokenLine : low <= brokenLine and close > brokenLine)
+            this.retested := true
+            label.new(bar_index, e == 1 ? high : low, 'Retest', style = e == 1 ? label.style_label_down : label.style_label_up, color = HIDDEN_COLOR, textcolor = col, size = size.small, tooltip = 'Failed retest of the broken lead-in trendline')
+            evt := 3
+        else if bar_index - this.breakBar >= watchInput
+            this.tradeOn := false
+    evt
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Detection
+//---------------------------------------------------------------------------------------------------------------------{
+
+bool topBumpAlert      = false
+bool bottomBumpAlert   = false
+bool topRunAlert       = false
+bool bottomRunAlert    = false
+bool topTargetAlert    = false
+bool bottomTargetAlert = false
+bool topStopAlert      = false
+bool bottomStopAlert   = false
+bool topVoidAlert      = false
+bool bottomVoidAlert   = false
+bool topRetestAlert    = false
+bool bottomRetestAlert = false
+
+if barstate.isconfirmed
+    if not na(pivotLow)
+        array.push(lowBarArray, bar_index - swingLengthInput)
+        array.push(lowPriceArray, pivotLow)
+        if array.size(lowBarArray) > MAX_SWINGS
+            array.shift(lowBarArray)
+            array.shift(lowPriceArray)
+        if detectTopsInput
+            topState.onSwing(lowBarArray, lowPriceArray)
+        bottomState.lastSwingBar   := bar_index - swingLengthInput
+        bottomState.lastSwingPrice := pivotLow
+    if not na(pivotHigh)
+        array.push(highBarArray, bar_index - swingLengthInput)
+        array.push(highPriceArray, pivotHigh)
+        if array.size(highBarArray) > MAX_SWINGS
+            array.shift(highBarArray)
+            array.shift(highPriceArray)
+        if detectBottomsInput
+            bottomState.onSwing(highBarArray, highPriceArray)
+        topState.lastSwingBar   := bar_index - swingLengthInput
+        topState.lastSwingPrice := pivotHigh
+
+    // Trade watches first, so a new break on this bar starts its own watch afterwards
+    int topWatch = topState.watch()
+    topTargetAlert := topWatch == 1
+    topStopAlert   := topWatch == 2
+    topRetestAlert := topWatch == 3
+    int bottomWatch = bottomState.watch()
+    bottomTargetAlert := bottomWatch == 1
+    bottomStopAlert   := bottomWatch == 2
+    bottomRetestAlert := bottomWatch == 3
+
+    if detectTopsInput
+        int evt = topState.step(lowBarArray, lowPriceArray)
+        topBumpAlert := evt == 1
+        topVoidAlert := evt == 3
+        if evt == 2
+            topRunAlert := true
+            topState.complete()
+    if detectBottomsInput
+        int evt = bottomState.step(highBarArray, highPriceArray)
+        bottomBumpAlert := evt == 1
+        bottomVoidAlert := evt == 3
+        if evt == 2
+            bottomRunAlert := true
+            bottomState.complete()
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(topBumpAlert, 'Bump Qualified (Top)', 'Bump-and-run top: price has pulled away from the lead-in trendline by the required multiple of the lead-in height. Watching for the run through the line.')
+alertcondition(bottomBumpAlert, 'Bump Qualified (Bottom)', 'Bump-and-run bottom: price has fallen away from the lead-in trendline by the required multiple of the lead-in height. Watching for the run back through the line.')
+alertcondition(topRunAlert, 'Bump-and-Run Top Completed', 'Bump-and-run top completed: close below the lead-in trendline after a qualified bump.')
+alertcondition(bottomRunAlert, 'Bump-and-Run Bottom Completed', 'Bump-and-run bottom completed: close above the lead-in trendline after a qualified bump.')
+alertcondition(topTargetAlert, 'Top Target Reached', 'Bump-and-run top: target reached.')
+alertcondition(bottomTargetAlert, 'Bottom Target Reached', 'Bump-and-run bottom: target reached.')
+alertcondition(topStopAlert, 'Top Stop or Failure', 'Bump-and-run top: close beyond the stop, or closes back above the broken trendline.')
+alertcondition(bottomStopAlert, 'Bottom Stop or Failure', 'Bump-and-run bottom: close beyond the stop, or closes back below the broken trendline.')
+alertcondition(topRetestAlert, 'Top Retest', 'Bump-and-run top: failed retest of the broken lead-in trendline from below.')
+alertcondition(bottomRetestAlert, 'Bottom Retest', 'Bump-and-run bottom: failed retest of the broken lead-in trendline from above.')
+alertcondition(topVoidAlert, 'Top Setup Voided', 'Bump-and-run top voided: price held the lead-in line and the advance resumed past the bump, or no break arrived in time.')
+alertcondition(bottomVoidAlert, 'Bottom Setup Voided', 'Bump-and-run bottom voided: price held the lead-in line and the decline resumed past the bump, or no break arrived in time.')
+
+//---------------------------------------------------------------------------------------------------------------------}

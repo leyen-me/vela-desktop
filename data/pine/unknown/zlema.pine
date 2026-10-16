@@ -1,0 +1,173 @@
+//@version=6
+indicator("ZLEMA", shorttitle = "ZLEMA", overlay = true)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+NEUTRAL_COLOR = #787b86
+SLOW_COLOR    = #787b86               // the slow line of the pair is structure - grey
+EMA_REF_COLOR = #ff9800               // the one accent - the same-length EMA benchmark
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+FILL_PRICE_TRANSP = 60  // gradient transparency at the price end of the fill
+FILL_LINE_TRANSP  = 100 // gradient transparency at the ZLEMA end of the fill
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+srcInput    = input.source(close, "Source", group = "Settings",
+     tooltip = "Price series the average de-lags and then smooths. The correction term is built from this same series, so any source works — close is the usual choice.")
+
+lengthInput = input.int(21, "ZLEMA Length", minval = 1, group = "Settings",
+     tooltip = "EMA length N. It sets both the smoothing (alpha = 2 / (N + 1)) and the correction: an EMA of length N describes the market as it stood about (N - 1)/2 bars ago, and the de-lagging step is sized to cancel exactly that amount. There is no standard ZLEMA setting — traders start from the EMA lengths they already use, and because de-lagging makes any length behave faster, some lengthen it to restore a comparable signal rate.")
+
+pairInput       = input.bool(false, "Second ZLEMA", group = "Crossover Pair",
+     tooltip = "Adds a second, slower ZLEMA to form a fast/slow crossover pair — the classic setup where EMA lag is the main complaint. Both lines turn earlier than equal-length EMAs, so the pair signals sooner at the cost of more failed crosses. Crossings between the two lines are covered by the pair alerts.")
+
+pairLengthInput = input.int(50, "Second ZLEMA Length", minval = 1, group = "Crossover Pair",
+     tooltip = "Length of the second ZLEMA. Set it slower than the main line so the pair reads fast against slow — e.g. 21 against 50.")
+
+showEmaInput = input.bool(false, "EMA — Same Length", group = "Comparison",
+     tooltip = "Overlays a plain EMA of the same length — the sanity check of the construction. The ZLEMA should sit closer to price in trends and cross earlier at turns, including some turns that never follow through; the side-by-side measure of the lag removed and the overshoot paid for it.")
+
+showDashboardInput     = input.bool(true, "Show Dashboard", group = "Dashboard",
+     tooltip = "Displays a compact panel with the lag the correction is sized to cancel ((N - 1)/2 bars), the slope read, and price's position against the line.")
+
+dashboardLocationInput = input.string("Top Right", "Location", options = ["Top Right", "Bottom Right", "Bottom Left", "Top Left"], group = "Dashboard",
+     tooltip = "Chart corner the dashboard is anchored to.")
+
+dashboardSizeInput     = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = "Dashboard",
+     tooltip = "Text size of the dashboard.")
+
+trendColorInput   = input.bool(true, "Slope Trend Coloring", group = "Style",
+     tooltip = "Colors the ZLEMA by its slope — bullish while the line rises, bearish while it falls. The slope doubles as a quick regime read that flips sooner than an equal-length EMA's; disable to draw the line in the neutral color.")
+
+bullColorInput    = input.color(BULL_COLOR, "Bullish", inline = "direction", group = "Style",
+     tooltip = "Bullish color, used while the ZLEMA slopes upward and for bullish crossings/fill.")
+
+bearColorInput    = input.color(BEAR_COLOR, "Bearish", inline = "direction", group = "Style",
+     tooltip = "Bearish color, used while the ZLEMA slopes downward and for bearish crossings/fill.")
+
+neutralColorInput = input.color(NEUTRAL_COLOR, "Neutral", group = "Style",
+     tooltip = "Line color used when slope trend coloring is disabled, or when the slope is flat.")
+
+slowColorInput    = input.color(SLOW_COLOR, "Second ZLEMA", inline = "reference", group = "Style",
+     tooltip = "Color of the second, slower ZLEMA of the crossover pair.")
+
+emaColorInput     = input.color(EMA_REF_COLOR, "EMA", inline = "reference", group = "Style",
+     tooltip = "Color of the same-length EMA comparison line.")
+
+lineWidthInput    = input.int(2, "Line Width", minval = 1, maxval = 5, group = "Style",
+     tooltip = "Width of the ZLEMA lines.")
+
+showFillInput     = input.bool(true, "Price / ZLEMA Gradient Fill", group = "Style",
+     tooltip = "Fills the area between the source and the ZLEMA with a vertical gradient — bullish while price holds above the line, bearish while below — fading to fully transparent at the ZLEMA. The reduced lag keeps the line close enough for ordinary pullbacks to reach it, so price's side of the line is the dynamic support/resistance read.")
+
+showMarkersInput  = input.bool(false, "Price Crossing Markers", group = "Style",
+     tooltip = "Displays small triangle markers when the source crosses over or under the ZLEMA. Off by default to keep the chart clean — the crossing alerts work regardless.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+// Zero-lag construction — popularized by John Ehlers & Ric Way, "Zero Lag (Well, Almost)" (TASC, 2010),
+// in the de-lagged-input form most implementations ship. An EMA of nominal length N carries an average
+// delay of about (N - 1)/2 bars, so the input is corrected by that amount before smoothing:
+//   lag = (N - 1)/2 rounded to whole bars, de-lagged input = 2 * price - price[lag], ZLEMA = EMA(de-lagged input, N)
+// Adding the last half-window's change back is extrapolation — the line hugs trends and turns sooner,
+// at the price of overshooting when the market snaps back.
+lagBars    = math.round((lengthInput - 1) / 2.0)
+deLagged   = 2 * srcInput - srcInput[lagBars]
+zlemaValue = ta.ema(deLagged, lengthInput)
+
+// Second, slower ZLEMA of the optional crossover pair — computed on every bar so its history stays consistent while hidden
+pairLagBars  = math.round((pairLengthInput - 1) / 2.0)
+pairDeLagged = 2 * srcInput - srcInput[pairLagBars]
+slowValue    = ta.ema(pairDeLagged, pairLengthInput)
+
+// Plain EMA of the same length — the lag benchmark the correction is sized against
+emaValue = ta.ema(srcInput, lengthInput)
+
+// Slope of the ZLEMA — the fast regime read of the line
+slope = zlemaValue - nz(zlemaValue[1], zlemaValue)
+
+// Price crossings and slope reversals of the main line
+crossUp       = ta.crossover(srcInput, zlemaValue)
+crossDown     = ta.crossunder(srcInput, zlemaValue)
+slopeTurnUp   = slope > 0 and nz(slope[1]) <= 0
+slopeTurnDown = slope < 0 and nz(slope[1]) >= 0
+
+// Crossings of the pair — the main (fast) ZLEMA against the second (slow) ZLEMA
+pairCrossUp   = ta.crossover(zlemaValue, slowValue)
+pairCrossDown = ta.crossunder(zlemaValue, slowValue)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+zlemaColor = trendColorInput ? (slope > 0 ? bullColorInput : slope < 0 ? bearColorInput : neutralColorInput) : neutralColorInput
+
+priceAbove      = srcInput > zlemaValue
+fillTopColor    = showFillInput ? (priceAbove ? color.new(bullColorInput, FILL_PRICE_TRANSP) : color.new(bearColorInput, FILL_LINE_TRANSP)) : na
+fillBottomColor = showFillInput ? (priceAbove ? color.new(bullColorInput, FILL_LINE_TRANSP) : color.new(bearColorInput, FILL_PRICE_TRANSP)) : na
+
+srcPlotId   = plot(srcInput, "Source", color = na, editable = false, display = display.none)
+zlemaPlotId = plot(zlemaValue, "ZLEMA", color = zlemaColor, linewidth = lineWidthInput)
+
+plot(pairInput ? slowValue : na, "Second ZLEMA", color = slowColorInput, linewidth = lineWidthInput)
+plot(showEmaInput ? emaValue : na, "EMA (Same Length)", color = emaColorInput)
+
+fill(srcPlotId, zlemaPlotId, top_value = math.max(srcInput, zlemaValue), bottom_value = math.min(srcInput, zlemaValue), top_color = fillTopColor, bottom_color = fillBottomColor, title = "Price / ZLEMA Gradient Fill")
+
+plotshape(showMarkersInput and crossUp, "Bullish Price Cross", shape.triangleup, location.belowbar, color = bullColorInput, size = size.tiny)
+plotshape(showMarkersInput and crossDown, "Bearish Price Cross", shape.triangledown, location.abovebar, color = bearColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+dashboardLocation = switch dashboardLocationInput
+    "Top Right"    => position.top_right
+    "Bottom Right" => position.bottom_right
+    "Bottom Left"  => position.bottom_left
+    => position.top_left
+
+dashboardTextSize = switch dashboardSizeInput
+    "Tiny"  => size.tiny
+    "Small" => size.small
+    => size.normal
+
+var table dashboardTable = table.new(dashboardLocation, 2, 3, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+if barstate.islast and showDashboardInput
+    // The correction size — the average delay of an N-bar EMA, which the de-lagging step is built to cancel
+    lagText = str.tostring(lagBars) + (lagBars == 1 ? " bar" : " bars")
+
+    slopeNow   = nz(slope)
+    slopeText  = slopeNow > 0 ? "Rising" : slopeNow < 0 ? "Falling" : "Flat"
+    slopeColor = slopeNow > 0 ? bullColorInput : slopeNow < 0 ? bearColorInput : neutralColorInput
+
+    aboveNow  = not na(zlemaValue) and srcInput > zlemaValue
+    biasText  = na(zlemaValue) ? "—" : aboveNow ? "Above ZLEMA" : "Below ZLEMA"
+    biasColor = na(zlemaValue) ? neutralColorInput : aboveNow ? bullColorInput : bearColorInput
+
+    table.cell(dashboardTable, 0, 0, "Lag Canceled", text_color = DASH_HEADER,    text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 0, lagText,        text_color = DASH_TEXT,      text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 1, "Slope",        text_color = DASH_HEADER,    text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 1, slopeText,      text_color = slopeColor,     text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 2, "Price",        text_color = DASH_HEADER,    text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 2, biasText,       text_color = biasColor,      text_size = dashboardTextSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(crossUp, "Bullish Price Cross", "Price crossed above the ZLEMA on {{ticker}} ({{interval}})")
+alertcondition(crossDown, "Bearish Price Cross", "Price crossed below the ZLEMA on {{ticker}} ({{interval}})")
+alertcondition(slopeTurnUp, "ZLEMA Slope Up", "ZLEMA slope turned upward on {{ticker}} ({{interval}})")
+alertcondition(slopeTurnDown, "ZLEMA Slope Down", "ZLEMA slope turned downward on {{ticker}} ({{interval}})")
+alertcondition(pairInput and pairCrossUp, "Pair Bullish Cross", "Fast ZLEMA crossed above the slow ZLEMA on {{ticker}} ({{interval}})")
+alertcondition(pairInput and pairCrossDown, "Pair Bearish Cross", "Fast ZLEMA crossed below the slow ZLEMA on {{ticker}} ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

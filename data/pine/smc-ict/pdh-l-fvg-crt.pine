@@ -1,0 +1,327 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/ MPL-2.0
+//@version=6
+indicator("PDH/L FVG (CRT)", "PDH/L FVG (CRT)", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
+
+// --- Constants ---
+const int MILLISECONDS_PER_DAY = 86400000
+string DAYS_TOOLTIP = "Number of previous daily high and low levels to keep on the chart."
+string WIDTH_TOOLTIP = "Line width for previous daily levels."
+string COLOR_TOOLTIP = "Color used for this group of daily levels."
+
+// --- Inputs ---
+int daysToKeepInput = input.int(10, "Days to keep", minval = 1, maxval = 250, tooltip = DAYS_TOOLTIP, group = "Levels")
+int lineWidthInput = input.int(1, "Line width", minval = 1, maxval = 4, tooltip = WIDTH_TOOLTIP, group = "Style")
+color highColorInput = input.color(#f23645, "High color", tooltip = COLOR_TOOLTIP, group = "Style")
+color lowColorInput = input.color(#089981, "Low color", tooltip = COLOR_TOOLTIP, group = "Style")
+
+bool showFvgsInput = input.bool(true, "Show FVGs", tooltip = "Display bullish and bearish three-candle fair value gaps.", group = "FVGs")
+int maxFvgsInput = input.int(10, "Maximum FVGs", minval = 1, maxval = 250, tooltip = "Maximum number of fair value gaps to keep on the chart.", group = "FVGs")
+bool useFvgVolatilityFilterInput = input.bool(true, "Use volatility filter", tooltip = "Only display FVGs whose gap size is at least the selected fraction of ATR.", group = "FVGs")
+int fvgAtrLengthInput = input.int(14, "FVG ATR length", minval = 1, maxval = 500, tooltip = "ATR lookback used by the FVG volatility filter.", group = "FVGs")
+float fvgAtrMultiplierInput = input.float(0.25, "Minimum gap / ATR", minval = 0.0, step = 0.05, tooltip = "Minimum FVG size as a multiple of ATR.", group = "FVGs")
+bool keepFilledFvgsInput = input.bool(false, "Keep filled FVGs", tooltip = "Keep a fair value gap visible after price fully fills it.", group = "FVGs")
+bool showFvgMidpointInput = input.bool(true, "Show 50% lines", tooltip = "Draw a dotted line through the midpoint of each FVG.", group = "FVGs")
+
+bool enableLongsInput = input.bool(true, "Enable long signals", tooltip = "Show long signals when a bullish FVG forms after the previous-day low has been taken.", group = "Signals")
+bool enableShortsInput = input.bool(true, "Enable short signals", tooltip = "Show short signals when a bearish FVG forms after the previous-day high has been taken.", group = "Signals")
+bool invertStrategyInput = input.bool(false, "Invert signals", tooltip = "Reverse the signal direction: long signals become shorts and short signals become longs.", group = "Signals")
+string entryModeInput = input.string("At 50% retest", "Entry timing", options = ["On FVG formation", "At 50% retest"], tooltip = "On FVG formation signals immediately. At 50% retest waits for price to touch the first qualifying FVG midpoint.", group = "Signals")
+bool useTrendFilterInput = input.bool(false, "Use EMA trend filter", tooltip = "Only allow long signals above the EMA and short signals below the EMA.", group = "Trend Filter")
+int trendEmaLengthInput = input.int(200, "EMA period", minval = 1, maxval = 5000, tooltip = "EMA length used to define the trend filter.", group = "Trend Filter")
+int setupWindowBarsInput = input.int(30, "Bars allowed after sweep", minval = 1, maxval = 500, tooltip = "Maximum number of chart bars after a high or low sweep in which an opposite FVG may form.", group = "Signals")
+int stopAtrLengthInput = input.int(14, "Trade ATR length", minval = 1, maxval = 500, tooltip = "ATR lookback used for the simulated stop-loss and take-profit levels.", group = "Signals")
+float stopAtrMultiplierInput = input.float(1.5, "Stop-loss ATR multiple", minval = 0.1, step = 0.1, tooltip = "ATR multiple used to place the simulated stop-loss from the indicator entry price.", group = "Signals")
+float takeProfitAtrMultiplierInput = input.float(3.0, "Take-profit ATR multiple", minval = 0.1, step = 0.1, tooltip = "ATR multiple used to place the simulated take-profit from the indicator entry price.", group = "Signals")
+
+color bullishFvgColorInput = input.color(#089981, "Bullish FVG color", tooltip = "Fill and label color for bullish fair value gaps.", group = "Style")
+color bearishFvgColorInput = input.color(#f23645, "Bearish FVG color", tooltip = "Fill and label color for bearish fair value gaps.", group = "Style")
+
+// --- User-defined functions ---
+getHighLabel(int age) =>
+    age == 1 ? "PDH" : str.tostring(age) + "DH"
+
+getLowLabel(int age) =>
+    age == 1 ? "PDL" : str.tostring(age) + "DL"
+
+// --- Persistent level storage ---
+var array<line> highLineArray = array.new<line>()
+var array<float> highLevelArray = array.new<float>()
+var array<bool> highTouchedArray = array.new<bool>()
+var array<int> highAgeArray = array.new<int>()
+var array<label> highLabelArray = array.new<label>()
+var array<line> lowLineArray = array.new<line>()
+var array<float> lowLevelArray = array.new<float>()
+var array<bool> lowTouchedArray = array.new<bool>()
+var array<int> lowAgeArray = array.new<int>()
+var array<label> lowLabelArray = array.new<label>()
+
+// --- Daily calculations ---
+float previousDayHigh = request.security(syminfo.tickerid, "D", high[1], lookahead = barmerge.lookahead_on)
+float previousDayLow = request.security(syminfo.tickerid, "D", low[1], lookahead = barmerge.lookahead_on)
+bool isNewDay = timeframe.change("D")
+int sessionStartTime = timestamp(syminfo.timezone, year, month, dayofmonth, 18, 0)
+bool isNewSession = not na(time[1]) and time >= sessionStartTime and time[1] < sessionStartTime
+var int setupDirection = 0
+var int setupBarsSinceSweep = na
+var bool setupActive = false
+var bool setupTraded = false
+bool highSweepEvent = false
+bool lowSweepEvent = false
+
+// --- Add each completed daily level and age existing levels ---
+if isNewDay
+    if array.size(highAgeArray) > 0
+        for ageIndex = 0 to array.size(highAgeArray) - 1
+            array.set(highAgeArray, ageIndex, array.get(highAgeArray, ageIndex) + 1)
+    if array.size(lowAgeArray) > 0
+        for ageIndex = 0 to array.size(lowAgeArray) - 1
+            array.set(lowAgeArray, ageIndex, array.get(lowAgeArray, ageIndex) + 1)
+
+    if not na(previousDayHigh)
+        line newHighLine = line.new(bar_index, previousDayHigh, bar_index, previousDayHigh, xloc = xloc.bar_index, color = highColorInput, style = line.style_dotted, width = lineWidthInput)
+        label newHighLabel = label.new(bar_index, previousDayHigh, getHighLabel(1), xloc = xloc.bar_index, style = label.style_label_left, color = #00000000, textcolor = highColorInput, size = size.small)
+        array.push(highLineArray, newHighLine)
+        array.push(highLevelArray, previousDayHigh)
+        array.push(highTouchedArray, false)
+        array.push(highAgeArray, 1)
+        array.push(highLabelArray, newHighLabel)
+
+    if not na(previousDayLow)
+        line newLowLine = line.new(bar_index, previousDayLow, bar_index, previousDayLow, xloc = xloc.bar_index, color = lowColorInput, style = line.style_dotted, width = lineWidthInput)
+        label newLowLabel = label.new(bar_index, previousDayLow, getLowLabel(1), xloc = xloc.bar_index, style = label.style_label_left, color = #00000000, textcolor = lowColorInput, size = size.small)
+        array.push(lowLineArray, newLowLine)
+        array.push(lowLevelArray, previousDayLow)
+        array.push(lowTouchedArray, false)
+        array.push(lowAgeArray, 1)
+        array.push(lowLabelArray, newLowLabel)
+
+    while array.size(highLineArray) > daysToKeepInput
+        line.delete(array.shift(highLineArray))
+        label.delete(array.shift(highLabelArray))
+        array.shift(highLevelArray)
+        array.shift(highTouchedArray)
+        array.shift(highAgeArray)
+
+    while array.size(lowLineArray) > daysToKeepInput
+        line.delete(array.shift(lowLineArray))
+        label.delete(array.shift(lowLabelArray))
+        array.shift(lowLevelArray)
+        array.shift(lowTouchedArray)
+        array.shift(lowAgeArray)
+
+// --- Extend levels and stop lines on their first touch ---
+if array.size(highLineArray) > 0
+    for index = 0 to array.size(highLineArray) - 1
+        line currentHighLine = array.get(highLineArray, index)
+        label currentHighLabel = array.get(highLabelArray, index)
+        float currentHighLevel = array.get(highLevelArray, index)
+        bool highWasTouched = array.get(highTouchedArray, index)
+
+        if not highWasTouched
+            bool highIsTouched = high >= currentHighLevel
+            line.set_x2(currentHighLine, bar_index)
+            label.set_x(currentHighLabel, bar_index)
+            label.set_y(currentHighLabel, currentHighLevel)
+            if highIsTouched
+                array.set(highTouchedArray, index, true)
+                highSweepEvent := true
+                line.set_style(currentHighLine, line.style_solid)
+            else
+                line.set_style(currentHighLine, line.style_dotted)
+
+        label.set_text(currentHighLabel, getHighLabel(array.get(highAgeArray, index)))
+
+if array.size(lowLineArray) > 0
+    for index = 0 to array.size(lowLineArray) - 1
+        line currentLowLine = array.get(lowLineArray, index)
+        label currentLowLabel = array.get(lowLabelArray, index)
+        float currentLowLevel = array.get(lowLevelArray, index)
+        bool lowWasTouched = array.get(lowTouchedArray, index)
+
+        if not lowWasTouched
+            bool lowIsTouched = low <= currentLowLevel
+            line.set_x2(currentLowLine, bar_index)
+            label.set_x(currentLowLabel, bar_index)
+            label.set_y(currentLowLabel, currentLowLevel)
+            if lowIsTouched
+                array.set(lowTouchedArray, index, true)
+                lowSweepEvent := true
+                line.set_style(currentLowLine, line.style_solid)
+            else
+                line.set_style(currentLowLine, line.style_dotted)
+
+        label.set_text(currentLowLabel, getLowLabel(array.get(lowAgeArray, index)))
+
+// --- Track session sweep setup ---
+if isNewSession
+    setupActive := false
+    setupDirection := 0
+    setupBarsSinceSweep := na
+    setupTraded := false
+
+if highSweepEvent or lowSweepEvent
+    setupActive := true
+    setupDirection := highSweepEvent and lowSweepEvent ? 2 : lowSweepEvent ? 1 : -1
+    setupBarsSinceSweep := 0
+    setupTraded := false
+else if setupActive and not na(setupBarsSinceSweep)
+    setupBarsSinceSweep += 1
+
+// --- Fair value gap calculations ---
+var array<box> fvgBoxArray = array.new<box>()
+var array<label> fvgLabelArray = array.new<label>()
+var array<line> fvgMidlineArray = array.new<line>()
+var array<int> fvgCreationDayArray = array.new<int>()
+var array<bool> fvgBullishArray = array.new<bool>()
+var array<bool> fvgActiveArray = array.new<bool>()
+var array<int> pendingDirectionArray = array.new<int>()
+var array<float> pendingPriceArray = array.new<float>()
+var array<float> pendingAtrArray = array.new<float>()
+var int positionDirection = 0
+var float positionEntryPrice = na
+var float tradeAtrValue = na
+
+float fvgAtr = ta.atr(fvgAtrLengthInput)
+float tradeAtr = ta.atr(stopAtrLengthInput)
+float trendEma = ta.ema(close, trendEmaLengthInput)
+bool bullishFvg = bar_index >= 2 and low > high[2]
+bool bearishFvg = bar_index >= 2 and high < low[2]
+bool hasFvg = bullishFvg or bearishFvg
+float fvgSize = bullishFvg ? low - high[2] : bearishFvg ? low[2] - high : na
+bool passesVolatilityFilter = not useFvgVolatilityFilterInput or (not na(fvgAtr) and fvgSize >= fvgAtr * fvgAtrMultiplierInput)
+bool passesSweepFilter = setupActive and not na(setupBarsSinceSweep) and setupBarsSinceSweep <= setupWindowBarsInput and (setupDirection == 2 or (setupDirection == 1 and bullishFvg) or (setupDirection == -1 and bearishFvg))
+bool validFvgSignal = barstate.isconfirmed and hasFvg and passesVolatilityFilter and passesSweepFilter
+float fvgTop = bullishFvg ? low : low[2]
+float fvgBottom = bullishFvg ? high[2] : high
+float fvgMidpoint = (fvgTop + fvgBottom) / 2.0
+
+// --- Simulate midpoint fills and cancel competing pending entries ---
+bool longEntryPlot = false
+bool shortEntryPlot = false
+bool exitPlot = false
+
+if positionDirection == 0 and array.size(pendingPriceArray) > 0
+    int pendingFillIndex = na
+    for pendingIndex = 0 to array.size(pendingPriceArray) - 1
+        float pendingPrice = array.get(pendingPriceArray, pendingIndex)
+        if na(pendingFillIndex) and low <= pendingPrice and high >= pendingPrice
+            pendingFillIndex := pendingIndex
+
+    if not na(pendingFillIndex)
+        positionDirection := array.get(pendingDirectionArray, pendingFillIndex)
+        positionEntryPrice := array.get(pendingPriceArray, pendingFillIndex)
+        tradeAtrValue := array.get(pendingAtrArray, pendingFillIndex)
+        array.clear(pendingDirectionArray)
+        array.clear(pendingPriceArray)
+        array.clear(pendingAtrArray)
+        setupTraded := true
+        longEntryPlot := positionDirection > 0
+        shortEntryPlot := positionDirection < 0
+
+if positionDirection == 0 and (isNewSession or highSweepEvent or lowSweepEvent)
+    array.clear(pendingDirectionArray)
+    array.clear(pendingPriceArray)
+    array.clear(pendingAtrArray)
+
+// --- Draw qualifying fair value gaps ---
+if showFvgsInput and validFvgSignal
+    while array.size(fvgBoxArray) >= maxFvgsInput
+        box.delete(array.shift(fvgBoxArray))
+        label.delete(array.shift(fvgLabelArray))
+        line.delete(array.shift(fvgMidlineArray))
+        array.shift(fvgCreationDayArray)
+        array.shift(fvgBullishArray)
+        array.shift(fvgActiveArray)
+
+    color fvgColor = bullishFvg ? bullishFvgColorInput : bearishFvgColorInput
+    float fvgLabelPrice = (fvgTop + fvgBottom) / 2.0
+    box newFvgBox = box.new(left = bar_index, top = fvgTop, right = bar_index, bottom = fvgBottom, xloc = xloc.bar_index, bgcolor = color.new(fvgColor, 85), border_color = #00000000)
+    label newFvgLabel = label.new(bar_index, fvgLabelPrice, "FVG", xloc = xloc.bar_index, style = label.style_label_left, color = #00000000, textcolor = fvgColor, size = size.tiny)
+    line newFvgMidline = line.new(bar_index, fvgMidpoint, bar_index, fvgMidpoint, xloc = xloc.bar_index, color = showFvgMidpointInput ? color.new(fvgColor, 15) : #00000000, style = line.style_dotted, width = 1)
+    array.push(fvgBoxArray, newFvgBox)
+    array.push(fvgLabelArray, newFvgLabel)
+    array.push(fvgMidlineArray, newFvgMidline)
+    array.push(fvgCreationDayArray, time("D"))
+    array.push(fvgBullishArray, bullishFvg)
+    array.push(fvgActiveArray, true)
+
+// --- Maintain FVGs and their labels ---
+int fvgIndex = array.size(fvgBoxArray) - 1
+while fvgIndex >= 0
+    box currentFvgBox = array.get(fvgBoxArray, fvgIndex)
+    label currentFvgLabel = array.get(fvgLabelArray, fvgIndex)
+    line currentFvgMidline = array.get(fvgMidlineArray, fvgIndex)
+    bool fvgIsActive = array.get(fvgActiveArray, fvgIndex)
+    int fvgAgeDays = int(math.max(0.0, (time("D") - array.get(fvgCreationDayArray, fvgIndex)) / MILLISECONDS_PER_DAY))
+
+    label.set_text(currentFvgLabel, fvgAgeDays > 0 ? "FVG " + str.tostring(fvgAgeDays) + "D" : "FVG")
+
+    if fvgIsActive
+        box.set_right(currentFvgBox, bar_index)
+        line.set_x2(currentFvgMidline, bar_index)
+        label.set_x(currentFvgLabel, box.get_right(currentFvgBox))
+        bool fvgIsBullish = array.get(fvgBullishArray, fvgIndex)
+        float mitigationLevel = fvgIsBullish ? box.get_bottom(currentFvgBox) : box.get_top(currentFvgBox)
+        bool fvgIsFilled = fvgIsBullish ? low <= mitigationLevel : high >= mitigationLevel
+
+        if fvgIsFilled
+            if keepFilledFvgsInput
+                array.set(fvgActiveArray, fvgIndex, false)
+            else
+                box.delete(array.remove(fvgBoxArray, fvgIndex))
+                label.delete(array.remove(fvgLabelArray, fvgIndex))
+                line.delete(array.remove(fvgMidlineArray, fvgIndex))
+                array.remove(fvgCreationDayArray, fvgIndex)
+                array.remove(fvgBullishArray, fvgIndex)
+                array.remove(fvgActiveArray, fvgIndex)
+
+    fvgIndex -= 1
+
+// --- Signal conditions ---
+bool trendAllowsLong = not useTrendFilterInput or close > trendEma
+bool trendAllowsShort = not useTrendFilterInput or close < trendEma
+bool normalLongEntrySignal = validFvgSignal and not setupTraded and bullishFvg and enableLongsInput and trendAllowsLong
+bool normalShortEntrySignal = validFvgSignal and not setupTraded and bearishFvg and enableShortsInput and trendAllowsShort
+bool longEntrySignal = invertStrategyInput ? normalShortEntrySignal : normalLongEntrySignal
+bool shortEntrySignal = invertStrategyInput ? normalLongEntrySignal : normalShortEntrySignal
+
+if positionDirection == 0 and (longEntrySignal or shortEntrySignal) and not na(tradeAtr)
+    if entryModeInput == "On FVG formation"
+        array.clear(pendingDirectionArray)
+        array.clear(pendingPriceArray)
+        array.clear(pendingAtrArray)
+        positionDirection := longEntrySignal ? 1 : -1
+        positionEntryPrice := close
+        tradeAtrValue := tradeAtr
+        setupTraded := true
+        longEntryPlot := positionDirection > 0
+        shortEntryPlot := positionDirection < 0
+    else
+        array.push(pendingDirectionArray, longEntrySignal ? 1 : -1)
+        array.push(pendingPriceArray, fvgMidpoint)
+        array.push(pendingAtrArray, tradeAtr)
+
+// --- Simulated exits ---
+float strategyStop = positionDirection > 0 and not na(tradeAtrValue) ? positionEntryPrice - tradeAtrValue * stopAtrMultiplierInput : positionDirection < 0 and not na(tradeAtrValue) ? positionEntryPrice + tradeAtrValue * stopAtrMultiplierInput : na
+float strategyTarget = positionDirection > 0 and not na(tradeAtrValue) ? positionEntryPrice + tradeAtrValue * takeProfitAtrMultiplierInput : positionDirection < 0 and not na(tradeAtrValue) ? positionEntryPrice - tradeAtrValue * takeProfitAtrMultiplierInput : na
+bool stopHit = positionDirection > 0 ? low <= strategyStop : positionDirection < 0 ? high >= strategyStop : false
+bool targetHit = positionDirection > 0 ? high >= strategyTarget : positionDirection < 0 ? low <= strategyTarget : false
+
+if positionDirection != 0 and (stopHit or targetHit)
+    positionDirection := 0
+    positionEntryPrice := na
+    tradeAtrValue := na
+    exitPlot := true
+
+// --- Indicator visuals ---
+plot(strategyStop, "ATR stop-loss", color = #f23645, style = plot.style_linebr, linewidth = 1)
+plot(strategyTarget, "ATR take-profit", color = #089981, style = plot.style_linebr, linewidth = 1)
+plot(useTrendFilterInput ? trendEma : na, "Trend EMA", color = #5b9cf6, linewidth = 2)
+plotshape(longEntryPlot, "Long signal", shape.triangleup, location.belowbar, #089981, size = size.tiny, text = "L", textcolor = chart.fg_color)
+plotshape(shortEntryPlot, "Short signal", shape.triangledown, location.abovebar, #f23645, size = size.tiny, text = "S", textcolor = chart.fg_color)
+plotshape(exitPlot, "Exit signal", shape.xcross, location.abovebar, chart.fg_color, size = size.tiny, text = "X", textcolor = chart.fg_color)
+
+// --- Alerts ---
+alertcondition(longEntryPlot, "Long signal", "Long signal generated by the Previous Days Highs & Lows FVG indicator.")
+alertcondition(shortEntryPlot, "Short signal", "Short signal generated by the Previous Days Highs & Lows FVG indicator.")
+alertcondition(exitPlot, "Exit signal", "Simulated ATR exit generated by the Previous Days Highs & Lows FVG indicator.")

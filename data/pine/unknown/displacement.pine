@@ -1,0 +1,299 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Displacement", "Displacement", overlay = true, max_boxes_count = 500, max_labels_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BASE_BODY = "Average Body"
+BASE_ATR  = "ATR"
+LABEL_BG  = #00000000
+
+//Visual tuning
+FILL_TRANSPARENCY   = 85
+BORDER_TRANSPARENCY = 60
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+baselineInput = input.string(BASE_BODY, "Baseline", options = [BASE_BODY, BASE_ATR], group = "Displacement Criteria",
+  tooltip = "Reference the leg is measured against. 'Average Body' compares the delivery to the average candle body of the recent tape, the read the concept describes; 'ATR' uses the average true range instead, which also accounts for wicks and gaps and therefore sets a stricter bar for the same multiple. The baseline is sampled one bar before the leg starts, so a leg never inflates its own threshold.")
+
+baselineLengthInput = input.int(40, "Baseline Length", minval = 2, group = "Displacement Criteria",
+  tooltip = "Number of bars in the trailing baseline - the 'last few dozen bars' the leg is judged against. Displacement is always a relative read: candles that qualify on a quiet tape should not qualify on an already violent one.")
+
+travelMultInput = input.float(4, "Travel Multiple", minval = 0.5, step = 0.25, group = "Displacement Criteria",
+  tooltip = "Minimum net one-directional travel of the leg (first open to latest close) as a multiple of the baseline. The concept has no fixed threshold, so calibrate to the instrument: one enormous candle can clear it alone, and three to five strong stacked closes clear it together without any single bar being spectacular. If you have to squint it is not displacement - when in doubt raise the multiple rather than lower it.")
+
+bodyMultInput = input.float(1, "Min Candle Body Multiple", minval = 0, step = 0.1, group = "Displacement Criteria",
+  tooltip = "Body floor every candle inside the leg must clear, as a multiple of the baseline. Keeps drifty runs padded with small candles from qualifying on total travel alone. Set to 0 to disable the per-candle test.")
+
+minBarsInput = input.int(1, "Leg Length (Min / Max)", minval = 1, inline = "legLength", group = "Displacement Criteria",
+  tooltip = "Fewest consecutive one-directional closes that can qualify. One allows a single enormous candle to count on its own.")
+
+maxBarsInput = input.int(5, " ", minval = 1, maxval = 50, inline = "legLength", group = "Displacement Criteria",
+  tooltip = "Most consecutive one-directional closes that can still read as a repricing rather than a grind - displacement covers in a handful of candles what the prior tape needed dozens to travel.")
+
+efficiencyInput = input.float(60, "Min Body Efficiency %", minval = 0, maxval = 100, step = 5, group = "Displacement Criteria",
+  tooltip = "Net travel as a share of the leg's full high-to-low span. Genuine displacement leaves little rejection at either end of its candles; long wicks or heavy bar-to-bar overlap say contested auction, not repricing.")
+
+requireGapInput = input.bool(false, "Require Imbalance Residue", group = "Displacement Criteria",
+  tooltip = "Only qualify legs that have already left a three-candle imbalance (fair value gap) inside the run. Most teaching treats the gap as strong supporting evidence rather than a strict requirement - and a single-candle leg usually prints its gap only on the following bar - so by default the residue is simply reported in each tag's tooltip instead.")
+
+swingLengthInput = input.int(5, "Swing Length", minval = 1, group = "Context",
+  tooltip = "Bars to the left and right required to confirm the swing highs and lows used for context: the swing point a leg closes through (structure shift) and the resting liquidity a raid runs before the leg (sweep origin).")
+
+mssOnlyInput = input.bool(false, "Only Through Structure", group = "Context",
+  tooltip = "Only qualify legs that close through the most recent untaken swing point in their direction - a structure break backed by displacement, the market structure shift read. Slow drifts through the same level never qualify because the displacement criteria still apply to the breaking leg.")
+
+sweepOnlyInput = input.bool(false, "Only From Liquidity Sweep", group = "Context",
+  tooltip = "Only qualify legs delivered out of a raid on the opposite-side swing: a wick through an untaken swing low (for bullish legs) or swing high (for bearish legs) that closed back inside just before or as the leg started. The standard sweep-then-displace sequence read as evidence of a turn.")
+
+sweepLookbackInput = input.int(5, "Sweep Window (Bars Before Leg)", minval = 0, group = "Context",
+  tooltip = "How many bars before the leg's first candle a liquidity raid may sit and still count as the leg's origin. The raid may also print inside the leg itself.")
+
+killzoneOnlyInput = input.bool(false, "Only Inside Killzones", group = "Context",
+  tooltip = "Only qualify legs printing inside the London or New York killzone windows below. Many models trust displacement only at these time anchors and grade off-hours bursts skeptically. Intraday charts only - session windows do not apply to daily and higher timeframes.")
+
+londonSessionInput = input.session("0200-0500", "London Killzone", group = "Context",
+  tooltip = "London killzone window, expressed in the killzone timezone. The conventional window is 02:00-05:00 New York time.")
+
+newYorkSessionInput = input.session("0700-1000", "New York Killzone", group = "Context",
+  tooltip = "New York killzone window, expressed in the killzone timezone. The conventional window is 07:00-10:00 New York time.")
+
+timezoneInput = input.string("America/New_York", "Killzone Timezone", group = "Context",
+  tooltip = "Timezone both killzone windows are expressed in. Killzones are conventionally anchored to New York time.")
+
+highlightInput = input.bool(true, "Highlight Displacement Legs", group = "Style",
+  tooltip = "Shade the full span of each qualifying leg from its first candle onward, extending while the one-directional delivery keeps running.")
+
+showLabelsInput = input.bool(true, "Displacement Labels", group = "Style",
+  tooltip = "Tag each qualifying leg at its extreme. Hover a tag for the leg's measured statistics: bars, travel versus the baseline, body efficiency, imbalance residue, and any structure, sweep or killzone context it printed with.")
+
+bullColorInput = input.color(#089981, "Bullish", inline = "colors", group = "Style",
+  tooltip = "Color of bullish displacement highlights and tags.")
+
+bearColorInput = input.color(#f23645, "Bearish", inline = "colors", group = "Style",
+  tooltip = "Color of bearish displacement highlights and tags.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Displacement Leg Detection
+//---------------------------------------------------------------------------------------------------------------------{
+body = math.abs(close - open)
+
+//Trailing context series, computed unconditionally on every bar
+averageBody = ta.sma(body, baselineLengthInput)
+atrValue    = ta.atr(baselineLengthInput)
+baseline    = baselineInput == BASE_ATR ? atrValue : averageBody
+
+//Three-candle imbalances - the classic residue a repricing leaves behind
+bullGapBar = not na(high[2]) and low > high[2]
+bearGapBar = not na(low[2]) and high < low[2]
+
+//Effective leg length bounds
+maxLegBars = math.max(maxBarsInput, minBarsInput)
+
+//Run of consecutive one-directional closes - the unit the concept is judged on
+int barDirection = close > open ? 1 : close < open ? -1 : 0
+
+var int   runDirection      = 0
+var int   runLength         = 0
+var int   legStartBar       = na
+var float legOpen           = na
+var float legHigh           = na
+var float legLow            = na
+var float legBaseline       = na
+var bool  legBodiesOk       = false
+var bool  legHasGap         = false
+var bool  legBrokeStructure = false
+var bool  legFired          = false
+var bool  mssAlerted        = false
+var bool  sweepAlerted      = false
+
+if barDirection == 0
+    //A doji closes on neither side - the run is broken
+    runDirection := 0
+    runLength    := 0
+else if barDirection == runDirection
+    //The delivery keeps running one way
+    runLength   += 1
+    legHigh     := math.max(legHigh, high)
+    legLow      := math.min(legLow, low)
+    legBodiesOk := legBodiesOk and body >= bodyMultInput * legBaseline
+else
+    //First close in a new direction opens a fresh leg; the baseline is frozen one bar back
+    runDirection      := barDirection
+    runLength         := 1
+    legStartBar       := bar_index
+    legOpen           := open
+    legHigh           := high
+    legLow            := low
+    legBaseline       := baseline[1]
+    legBodiesOk       := not na(legBaseline) and body >= bodyMultInput * legBaseline
+    legHasGap         := false
+    legBrokeStructure := false
+    legFired          := false
+    mssAlerted        := false
+    sweepAlerted      := false
+
+//Credit an imbalance to the leg only when its middle candle belongs to the run
+if runLength >= 2
+    if runDirection == 1 and bullGapBar
+        legHasGap := true
+    if runDirection == -1 and bearGapBar
+        legHasGap := true
+
+//Composite leg measurements, refreshed while the run extends
+legTravel      = runLength >= 1 ? math.abs(close - legOpen) : na
+legSpan        = runLength >= 1 ? legHigh - legLow : na
+travelMultiple = runLength >= 1 and not na(legBaseline) and legBaseline > 0 ? legTravel / legBaseline : na
+legEfficiency  = not na(legSpan) and legSpan > 0 ? 100 * legTravel / legSpan : na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Structure, Liquidity & Killzone Context
+//---------------------------------------------------------------------------------------------------------------------{
+//Confirmed swing points (known swingLength bars after the fact)
+pivotHighPrice = ta.pivothigh(swingLengthInput, swingLengthInput)
+pivotLowPrice  = ta.pivotlow(swingLengthInput, swingLengthInput)
+
+var float lastSwingHigh  = na
+var float lastSwingLow   = na
+var bool  swingHighTaken = true
+var bool  swingLowTaken  = true
+
+if not na(pivotHighPrice)
+    lastSwingHigh  := pivotHighPrice
+    swingHighTaken := close > pivotHighPrice
+if not na(pivotLowPrice)
+    lastSwingLow  := pivotLowPrice
+    swingLowTaken := close < pivotLowPrice
+
+//Liquidity raids: a wick through an untaken swing that closes back inside
+sweepLowBar  = not na(lastSwingLow) and not swingLowTaken and low < lastSwingLow and close >= lastSwingLow
+sweepHighBar = not na(lastSwingHigh) and not swingHighTaken and high > lastSwingHigh and close <= lastSwingHigh
+
+//Structure breaks: a close through an untaken swing
+bullBreakBar = not na(lastSwingHigh) and not swingHighTaken and close > lastSwingHigh
+bearBreakBar = not na(lastSwingLow) and not swingLowTaken and close < lastSwingLow
+
+if bullBreakBar
+    swingHighTaken := true
+if bearBreakBar
+    swingLowTaken := true
+
+//A break only qualifies the leg when the breaking candle belongs to it
+if runLength >= 1
+    if runDirection == 1 and bullBreakBar
+        legBrokeStructure := true
+    if runDirection == -1 and bearBreakBar
+        legBrokeStructure := true
+
+//Sweep origin: the raid may print inside the leg or within the window just before it
+barsSinceSweepLow  = ta.barssince(sweepLowBar)
+barsSinceSweepHigh = ta.barssince(sweepHighBar)
+
+sweepWindowBars  = runLength - 1 + sweepLookbackInput
+bullSweepContext = runLength >= 1 and runDirection == 1 and not na(barsSinceSweepLow) and barsSinceSweepLow <= sweepWindowBars
+bearSweepContext = runLength >= 1 and runDirection == -1 and not na(barsSinceSweepHigh) and barsSinceSweepHigh <= sweepWindowBars
+sweepContext     = bullSweepContext or bearSweepContext
+
+//Killzone session windows (intraday timeframes)
+inLondonKillzone  = not na(time(timeframe.period, londonSessionInput, timezoneInput))
+inNewYorkKillzone = not na(time(timeframe.period, newYorkSessionInput, timezoneInput))
+inKillzone        = inLondonKillzone or inNewYorkKillzone
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Displacement Qualification
+//---------------------------------------------------------------------------------------------------------------------{
+lengthOk     = runLength >= minBarsInput and runLength <= maxLegBars
+travelOk     = not na(travelMultiple) and travelMultiple >= travelMultInput
+efficiencyOk = not na(legEfficiency) and legEfficiency >= efficiencyInput
+gapOk        = not requireGapInput or legHasGap
+structureOk  = not mssOnlyInput or legBrokeStructure
+sweepOk      = not sweepOnlyInput or sweepContext
+killzoneOk   = not killzoneOnlyInput or inKillzone
+
+qualifies = runLength >= 1 and barstate.isconfirmed and legBodiesOk
+  and lengthOk and travelOk and efficiencyOk
+  and gapOk and structureOk and sweepOk and killzoneOk
+
+//Each leg fires once, on the first confirmed close where every criterion is met
+displacementEvent = qualifies and not legFired
+if displacementEvent
+    legFired := true
+
+bullDisplacement = displacementEvent and runDirection == 1
+bearDisplacement = displacementEvent and runDirection == -1
+
+//Context upgrades fire once per qualified leg, on the close they are first observed
+legQualified = runLength >= 1 and legFired and barstate.isconfirmed
+
+bullMssEvent = legQualified and runDirection == 1 and legBrokeStructure and not mssAlerted
+bearMssEvent = legQualified and runDirection == -1 and legBrokeStructure and not mssAlerted
+if bullMssEvent or bearMssEvent
+    mssAlerted := true
+
+bullSweepEvent = legQualified and runDirection == 1 and bullSweepContext and not sweepAlerted
+bearSweepEvent = legQualified and runDirection == -1 and bearSweepContext and not sweepAlerted
+if bullSweepEvent or bearSweepEvent
+    sweepAlerted := true
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visuals
+//---------------------------------------------------------------------------------------------------------------------{
+var box   legBox   = na
+var label legLabel = na
+
+directionColor = runDirection == 1 ? bullColorInput : bearColorInput
+legExtending   = legFired and not displacementEvent and runLength >= 1
+
+//Measured statistics reported on each tag, refreshed while the delivery extends
+string legDetails = na
+if (displacementEvent or legExtending) and showLabelsInput
+    legDetails := (runDirection == 1 ? "Bullish displacement" : "Bearish displacement")
+      + "\nLeg: " + str.tostring(runLength) + (runLength == 1 ? " bar" : " bars")
+      + "\nTravel: " + str.tostring(travelMultiple, "#.##") + "x baseline"
+      + "\nBody efficiency: " + str.tostring(legEfficiency, "#.#") + "%"
+      + "\nImbalance left inside: " + (legHasGap ? "Yes" : "No")
+      + (legBrokeStructure ? "\nClosed through the prior swing point - structure shift" : "")
+      + (sweepContext ? "\nDelivered out of a liquidity sweep" : "")
+      + (inKillzone ? "\nPrinted inside a killzone" : "")
+
+if displacementEvent
+    legBox   := na
+    legLabel := na
+    if highlightInput
+        legBox := box.new(legStartBar, legHigh, bar_index, legLow
+          , border_color = color.new(directionColor, BORDER_TRANSPARENCY)
+          , border_width = 1
+          , bgcolor      = color.new(directionColor, FILL_TRANSPARENCY))
+    if showLabelsInput
+        legLabel := label.new(bar_index, runDirection == 1 ? legLow : legHigh, "Displacement"
+          , style     = runDirection == 1 ? label.style_label_up : label.style_label_down
+          , color     = LABEL_BG
+          , textcolor = directionColor
+          , size      = size.small
+          , tooltip   = legDetails)
+else if legExtending
+    //The one-directional delivery is still running - keep the highlight and tag in sync
+    if not na(legBox)
+        box.set_right(legBox, bar_index)
+        box.set_top(legBox, legHigh)
+        box.set_bottom(legBox, legLow)
+    if not na(legLabel)
+        label.set_y(legLabel, runDirection == 1 ? legLow : legHigh)
+        label.set_tooltip(legLabel, legDetails)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(bullDisplacement, "Bullish Displacement", "Bullish displacement - fast one-sided delivery up, conspicuously larger than the recent tape")
+alertcondition(bearDisplacement, "Bearish Displacement", "Bearish displacement - fast one-sided delivery down, conspicuously larger than the recent tape")
+alertcondition(bullDisplacement or bearDisplacement, "Any Displacement", "Displacement - aggressive one-sided repricing relative to the recent tape")
+alertcondition(bullMssEvent, "Bullish Displacement Through Structure", "Bullish displacement closed through the prior swing high - structure break backed by displacement (market structure shift)")
+alertcondition(bearMssEvent, "Bearish Displacement Through Structure", "Bearish displacement closed through the prior swing low - structure break backed by displacement (market structure shift)")
+alertcondition(bullSweepEvent, "Bullish Displacement From Liquidity Sweep", "Bullish displacement delivered out of a raid on the prior swing low - standard evidence the sweep marked a turn")
+alertcondition(bearSweepEvent, "Bearish Displacement From Liquidity Sweep", "Bearish displacement delivered out of a raid on the prior swing high - standard evidence the sweep marked a turn")
+
+//---------------------------------------------------------------------------------------------------------------------}

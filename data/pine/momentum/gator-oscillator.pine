@@ -1,0 +1,282 @@
+//@version=6
+indicator("Gator Oscillator"
+  , shorttitle = "Gator Oscillator"
+  , overlay    = false
+  , format     = format.price)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+int PHASE_SLEEPING  = 0
+int PHASE_AWAKENING = 1
+int PHASE_EATING    = 2
+int PHASE_SATED     = 3
+
+int PHASE_BG_TRANSP = 88
+
+color GREEN  = #089981   // expanding spreads, the eating phase
+color RED    = #f23645   // contracting spreads, the sated phase - the move losing steam
+color ORANGE = #ff9800   // the one accent - the awakening phase, the averages starting to separate
+color GRAY   = #787b86   // sleeping - braided averages, nothing to act on
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+string SMMA_TYPE = "SMMA (Wilder)"
+string SMA_TYPE  = "SMA"
+string EMA_TYPE  = "EMA"
+
+string GRP_LINES  = "Alligator Lines"
+string GRP_PHASES = "Phases"
+string GRP_DASH   = "Dashboard"
+string GRP_STYLE  = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+sourceInput = input.source(hl2, "Source"
+  , group   = GRP_LINES
+  , tooltip = "Price series fed to the three Alligator averages. Bill Williams' original recipe uses the median price (high + low) / 2.")
+
+maTypeInput = input.string(SMMA_TYPE, "Smoothing"
+  , options = [SMMA_TYPE, SMA_TYPE, EMA_TYPE]
+  , group   = GRP_LINES
+  , tooltip = "Moving average applied to the source for the jaw, teeth and lips. The original uses the smoothed (Wilder-style) moving average; some platforms substitute simple or exponential averages, which makes the spreads and phases differ slightly.")
+
+jawLengthInput = input.int(13, "Jaw Length"
+  , minval  = 1
+  , maxval  = 500
+  , inline  = "jaw"
+  , group   = GRP_LINES
+  , tooltip = "Averaging length of the jaw line.")
+
+jawOffsetInput = input.int(8, "Offset"
+  , minval  = 0
+  , maxval  = 100
+  , inline  = "jaw"
+  , group   = GRP_LINES
+  , tooltip = "Jaw = 13-bar smoothed average of the source, displaced 8 bars forward in the original recipe. The upper histogram measures the absolute spread between the displaced jaw and teeth.")
+
+teethLengthInput = input.int(8, "Teeth Length"
+  , minval  = 1
+  , maxval  = 500
+  , inline  = "teeth"
+  , group   = GRP_LINES
+  , tooltip = "Averaging length of the teeth line.")
+
+teethOffsetInput = input.int(5, "Offset"
+  , minval  = 0
+  , maxval  = 100
+  , inline  = "teeth"
+  , group   = GRP_LINES
+  , tooltip = "Teeth = 8-bar smoothed average of the source, displaced 5 bars forward in the original recipe. The teeth line enters both the upper and the lower spread.")
+
+lipsLengthInput = input.int(5, "Lips Length"
+  , minval  = 1
+  , maxval  = 500
+  , inline  = "lips"
+  , group   = GRP_LINES
+  , tooltip = "Averaging length of the lips line.")
+
+lipsOffsetInput = input.int(3, "Offset"
+  , minval  = 0
+  , maxval  = 100
+  , inline  = "lips"
+  , group   = GRP_LINES
+  , tooltip = "Lips = 5-bar smoothed average of the source, displaced 3 bars forward in the original recipe. The lower histogram measures the negative absolute spread between the displaced teeth and lips.")
+
+deepSleepBarsInput = input.int(10, "Deep Sleep After (bars)"
+  , minval  = 1
+  , maxval  = 500
+  , group   = GRP_PHASES
+  , tooltip = "Number of consecutive sleeping bars after which the deep-sleep alert fires. A long run of shrinking bars keeps the averages braided together, and extended convergence often precedes a volatility expansion.")
+
+showDashInput = input.bool(true, "Show Dashboard"
+  , group   = GRP_DASH
+  , tooltip = "Displays a compact readout of the current feeding phase, how many bars it has lasted, and both spreads with their expanding/contracting direction.")
+
+dashPositionInput = input.string("Top Right", "Position"
+  , options = ["Top Right", "Top Left", "Middle Right", "Middle Left", "Bottom Right", "Bottom Left"]
+  , group   = GRP_DASH
+  , tooltip = "Corner of the pane where the dashboard is anchored.")
+
+dashSizeInput = input.string("Small", "Size"
+  , options = ["Tiny", "Small", "Normal"]
+  , group   = GRP_DASH
+  , tooltip = "Text size of the dashboard.")
+
+growColorInput = input.color(GREEN, "Expanding", inline = "hist", group = GRP_STYLE)
+
+shrinkColorInput = input.color(RED, "Contracting", inline = "hist", group = GRP_STYLE
+  , tooltip = "Column colors. Each side is compared with its own previous bar: green when the spread grew, red when it shrank, so color encodes whether the averages are spreading apart or converging — not trade direction.")
+
+zeroColorInput = input.color(GRAY, "Zero Line", group = GRP_STYLE)
+
+showPhaseBgInput = input.bool(false, "Phase Background"
+  , group   = GRP_STYLE
+  , tooltip = "Tints the pane background with the color of the current feeding phase. The four phase colors below also drive the dashboard readout.")
+
+sleepingColorInput  = input.color(GRAY, "Sleeping", inline = "bg1", group = GRP_STYLE)
+
+awakeningColorInput = input.color(ORANGE, "Awakening", inline = "bg1", group = GRP_STYLE)
+
+eatingColorInput    = input.color(GREEN, "Eating", inline = "bg2", group = GRP_STYLE)
+
+satedColorInput     = input.color(RED, "Sated", inline = "bg2", group = GRP_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Bill Williams' balance-line smoothing: the Wilder-style smoothed moving average (RMA),
+// with SMA/EMA substitutes offered for parity with platforms that use them.
+// All three averages run unconditionally so their internal states stay consistent on every bar.
+smoothedAverage(float src, simple int length) =>
+    rmaValue = ta.rma(src, length)
+    smaValue = ta.sma(src, length)
+    emaValue = ta.ema(src, length)
+    switch maTypeInput
+        SMA_TYPE => smaValue
+        EMA_TYPE => emaValue
+        =>          rmaValue
+
+// Feeding-phase label shown in the dashboard
+phaseName(int phaseId) =>
+    switch phaseId
+        PHASE_SLEEPING  => "Sleeping"
+        PHASE_AWAKENING => "Awakening"
+        PHASE_EATING    => "Eating"
+        =>                 "Sated"
+
+// Feeding-phase accent color used by the dashboard and the optional background tint
+phaseColor(int phaseId) =>
+    switch phaseId
+        PHASE_SLEEPING  => sleepingColorInput
+        PHASE_AWAKENING => awakeningColorInput
+        PHASE_EATING    => eatingColorInput
+        =>                 satedColorInput
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Alligator balance lines on the selected source
+float jawValue   = smoothedAverage(sourceInput, jawLengthInput)
+float teethValue = smoothedAverage(sourceInput, teethLengthInput)
+float lipsValue  = smoothedAverage(sourceInput, lipsLengthInput)
+
+// Lines as displayed on the chart: each average is displaced forward, so the value
+// visible above the current bar was computed `offset` bars earlier
+float jawShifted   = jawValue[jawOffsetInput]
+float teethShifted = teethValue[teethOffsetInput]
+float lipsShifted  = lipsValue[lipsOffsetInput]
+
+// Mirrored histograms around zero: absolute spreads between adjacent displaced lines
+float upperSpread    = math.abs(jawShifted - teethShifted)
+float lowerSpread    = math.abs(teethShifted - lipsShifted)
+float lowerHistogram = -lowerSpread
+
+// A bar can only be graded once the current and previous spreads are both defined
+bool comparisonReady = not na(upperSpread) and not na(lowerSpread) and not na(upperSpread[1]) and not na(lowerSpread[1])
+
+// Each side compared with its own previous bar: green when the spread grew,
+// red when it shrank, previous state kept on an exact tie
+var bool upperGrowing = false
+var bool lowerGrowing = false
+
+if comparisonReady
+    upperGrowing := upperSpread > upperSpread[1] ? true : upperSpread < upperSpread[1] ? false : upperGrowing
+    lowerGrowing := lowerSpread > lowerSpread[1] ? true : lowerSpread < lowerSpread[1] ? false : lowerGrowing
+
+// Feeding-phase state machine: sleeping (both sides red), awakening (one side turns
+// green out of sleep), eating (both sides green), sated (one side back to red after eating)
+var int gatorPhase = PHASE_SLEEPING
+
+if comparisonReady
+    if upperGrowing and lowerGrowing
+        gatorPhase := PHASE_EATING
+    else if not upperGrowing and not lowerGrowing
+        gatorPhase := PHASE_SLEEPING
+    else
+        gatorPhase := gatorPhase >= PHASE_EATING ? PHASE_SATED : PHASE_AWAKENING
+
+int  previousPhase = nz(gatorPhase[1], PHASE_SLEEPING)
+bool phaseChanged  = gatorPhase != previousPhase
+
+// Consecutive bars spent in the current phase
+var int barsInPhase = 0
+barsInPhase := not comparisonReady ? 0 : phaseChanged ? 1 : barsInPhase + 1
+
+// Phase transitions
+bool awakeningStart = phaseChanged and gatorPhase == PHASE_AWAKENING
+bool eatingStart    = phaseChanged and gatorPhase == PHASE_EATING
+bool satedStart     = phaseChanged and gatorPhase == PHASE_SATED
+bool sleepingStart  = phaseChanged and gatorPhase == PHASE_SLEEPING
+
+// Extended convergence: the market has slept for the configured number of bars
+bool deepSleep = gatorPhase == PHASE_SLEEPING and barsInPhase == deepSleepBarsInput
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+
+color upperColumnColor = upperGrowing ? growColorInput : shrinkColorInput
+color lowerColumnColor = lowerGrowing ? growColorInput : shrinkColorInput
+
+plot(upperSpread, "Upper Histogram (Jaw - Teeth)", upperColumnColor, 1, plot.style_columns)
+plot(lowerHistogram, "Lower Histogram (Teeth - Lips)", lowerColumnColor, 1, plot.style_columns)
+
+hline(0, "Zero Line", zeroColorInput, hline.style_solid)
+
+bgcolor(showPhaseBgInput and comparisonReady ? color.new(phaseColor(gatorPhase), PHASE_BG_TRANSP) : na, title = "Phase Background")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+
+dashLocation = switch dashPositionInput
+    "Top Right"    => position.top_right
+    "Top Left"     => position.top_left
+    "Middle Right" => position.middle_right
+    "Middle Left"  => position.middle_left
+    "Bottom Right" => position.bottom_right
+    =>                position.bottom_left
+
+dashTextSize = switch dashSizeInput
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    =>          size.small
+
+if showDashInput and barstate.islast
+    var table dashTable = table.new(dashLocation, 2, 4, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+    string upperText = comparisonReady ? str.tostring(upperSpread, format.mintick) + (upperGrowing ? " ▲" : " ▼") : "..."
+    string lowerText = comparisonReady ? str.tostring(lowerSpread, format.mintick) + (lowerGrowing ? " ▲" : " ▼") : "..."
+
+    table.cell(dashTable, 0, 0, "Gator Phase", text_color = DASH_HEADER, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 0, phaseName(gatorPhase), text_color = phaseColor(gatorPhase), text_halign = text.align_right, text_size = dashTextSize)
+
+    table.cell(dashTable, 0, 1, "Bars in Phase", text_color = DASH_HEADER, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 1, str.tostring(barsInPhase), text_color = DASH_TEXT, text_halign = text.align_right, text_size = dashTextSize)
+
+    table.cell(dashTable, 0, 2, "Jaw - Teeth", text_color = DASH_HEADER, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 2, upperText, text_color = comparisonReady ? upperColumnColor : DASH_TEXT, text_halign = text.align_right, text_size = dashTextSize)
+
+    table.cell(dashTable, 0, 3, "Teeth - Lips", text_color = DASH_HEADER, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 3, lowerText, text_color = comparisonReady ? lowerColumnColor : DASH_TEXT, text_halign = text.align_right, text_size = dashTextSize)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(awakeningStart, "Gator Awakening", "Gator oscillator awakening on {{ticker}} ({{interval}}): one side turned green, the Alligator averages are starting to separate")
+alertcondition(eatingStart, "Gator Eating", "Gator oscillator eating on {{ticker}} ({{interval}}): both sides green, the trend phase is fully underway")
+alertcondition(satedStart, "Gator Sated", "Gator oscillator sated on {{ticker}} ({{interval}}): one side flipped back to red after the eating run, the move may be losing steam")
+alertcondition(sleepingStart, "Gator Sleeping", "Gator oscillator sleeping on {{ticker}} ({{interval}}): both sides red, the averages are braided and the market is ranging")
+alertcondition(deepSleep, "Gator Deep Sleep", "Gator oscillator deep sleep on {{ticker}} ({{interval}}): sleeping has lasted the configured number of bars, extended convergence often precedes a volatility expansion")
+
+//---------------------------------------------------------------------------------------------------------------------}

@@ -1,0 +1,319 @@
+// This work is licensed under Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Bar Counting H1/H2"
+  , shorttitle       = "Bar Counting H1/H2"
+  , overlay          = true
+  , format           = format.price
+  , max_lines_count  = 500
+  , max_labels_count = 500
+  , max_boxes_count  = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+color BULL_COLOR    = #089981
+color BEAR_COLOR    = #f23645
+color NEUTRAL_COLOR = #787b86
+color LABEL_BG      = #00000000
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+int POSITION_BG_TRANSP = 88
+int COUNT_TEXT_TRANSP  = 25
+
+string TRADE_SECOND = "Second Entries (H2/L2)"
+string TRADE_FIRST  = "First and Second Entries"
+string TRADE_NONE   = "None"
+
+string STOP_SIGNAL   = "Signal Bar"
+string STOP_PULLBACK = "Pullback Extreme"
+
+string TARGET_EXTREME = "Test of Trend Extreme"
+string TARGET_R       = "R Multiple"
+
+string GROUP_TREND = "Trend Context"
+string GROUP_COUNT = "Count"
+string GROUP_TRADE = "Trade Plan"
+string GROUP_DASH  = "Dashboard"
+string GROUP_STYLE = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+emaLengthInput = input.int(20, "Moving Average Length", minval = 2, maxval = 200, group = GROUP_TREND
+  , tooltip = "Exponential moving average defining the trend, the 20-bar EMA Brooks uses. A bull count needs a rising average with price closing above it at the trend high; a bear count mirrors it.")
+
+trendLengthInput = input.int(20, "Trend Extreme Lookback", minval = 5, maxval = 200, group = GROUP_TREND
+  , tooltip = "A count starts at a new high of this many bars (a new low for a bear count): the higher highs that make a bull trend. Every later new trend high resets the count, as the method requires.")
+
+maxCountInput = input.int(4, "Maximum Count", minval = 2, maxval = 6, group = GROUP_COUNT
+  , tooltip = "Highest attempt numbered before the count stops. A third attempt is the wedge flag; by a fourth the pullback has lasted long enough to question the trend itself.")
+
+showCountsInput = input.bool(true, "Show Every Count", group = GROUP_COUNT
+  , tooltip = "Label every attempt (H1, H2, H3, H4 under the bar in bull pullbacks; L1 to L4 above the bar in bear rallies). Off, only traded setups are labelled.")
+
+tradeModeInput = input.string(TRADE_SECOND, "Trade", options = [TRADE_SECOND, TRADE_FIRST, TRADE_NONE], group = GROUP_TRADE
+  , tooltip = "Second Entries trades only the H2 and L2, the entry after a two-legged pullback. First and Second Entries also trades the H1 and L1, which work in strong trends with shallow pullbacks.")
+
+stopModeInput = input.string(STOP_SIGNAL, "Protective Stop", options = [STOP_SIGNAL, STOP_PULLBACK], group = GROUP_TRADE
+  , tooltip = "One tick beyond the signal bar's other end, or beyond the pullback's extreme. A trade that triggers and then breaks the signal bar's other end is a failed H2 or L2, information in its own right: often a range or a reversal.")
+
+targetModeInput = input.string(TARGET_EXTREME, "Target", options = [TARGET_EXTREME, TARGET_R], group = GROUP_TRADE
+  , tooltip = "Test of Trend Extreme aims at the trend high the pullback started from (the trend low for an L entry), never closer than the minimum reward. R Multiple aims a fixed multiple of the risk away.")
+
+minRewardInput = input.float(1, "Minimum Reward / R Multiple (R)", minval = 0.5, maxval = 10, step = 0.25, group = GROUP_TRADE
+  , tooltip = "Floor for the trend extreme target, and the target itself in R Multiple mode.")
+
+maxHoldInput = input.int(30, "Maximum Hold (Bars)", minval = 2, maxval = 300, group = GROUP_TRADE
+  , tooltip = "A trade that reaches neither its target nor its stop within this many bars is closed and recorded as Timed Out.")
+
+showDashInput = input.bool(true, "Show Dashboard", group = GROUP_DASH
+  , tooltip = "The live count on each side and how the traded setups on the chart resolved.")
+
+dashPosInput  = input.string("Top Right", "Position", options = ["Top Right", "Bottom Right", "Bottom Left", "Top Left"], group = GROUP_DASH)
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = GROUP_DASH)
+
+showEmaInput = input.bool(true, "Show Moving Average", group = GROUP_STYLE)
+
+bullColorInput    = input.color(BULL_COLOR, "Bull", inline = "colors", group = GROUP_STYLE)
+bearColorInput    = input.color(BEAR_COLOR, "Bear", inline = "colors", group = GROUP_STYLE)
+neutralColorInput = input.color(NEUTRAL_COLOR, "Average", inline = "colors", group = GROUP_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types
+//---------------------------------------------------------------------------------------------------------------------{
+// One side's count: dir 1 numbers the attempts of bull pullbacks (H), dir -1 those of bear rallies (L)
+type CountState
+    int   dir
+    bool  active      = false
+    float extreme     = na
+    int   extremeBar  = na
+    float legOrigin   = na
+    float pbExtreme   = na
+    int   count       = 0
+    bool  armed       = false
+    int   lastCount   = 0
+    // open trade
+    bool  inTrade     = false
+    int   tradeBar    = na
+    int   tradeCount  = 0
+    float entry       = na
+    float stop        = na
+    float target      = na
+    box   rewardBox
+    box   riskBox
+    // tallies
+    int   taken       = 0
+    int   reached     = 0
+    int   failed      = 0
+    int   timedOut    = 0
+
+var CountState bullState = CountState.new(dir = 1)
+var CountState bearState = CountState.new(dir = -1)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+getTablePosition(string positionText) =>
+    switch positionText
+        "Top Right"   => position.top_right
+        "Top Left"    => position.top_left
+        "Bottom Left" => position.bottom_left
+        =>               position.bottom_right
+
+getTableSize(string sizeText) =>
+    switch sizeText
+        "Tiny"   => size.tiny
+        "Normal" => size.normal
+        =>          size.small
+
+countName(int dir, int n) =>
+    (dir == 1 ? "H" : "L") + str.tostring(n)
+
+// Advances one side's count on a confirmed bar and returns [count event (0 = none), traded, target reached, failed]
+updateCount(CountState s, float emaValue, bool emaRising, bool emaFalling, float trendHigh, float trendLow, color dirColor, color oppColor) =>
+    int  eventCount = 0
+    bool traded     = false
+    bool targetHit  = false
+    bool failedHit  = false
+    int  d          = s.dir
+
+    // -- open trade: stop first, then target, then time ----------------------------------------------------------
+    if s.inTrade and bar_index > s.tradeBar
+        box.set_right(s.rewardBox, bar_index)
+        box.set_right(s.riskBox, bar_index)
+        bool stopped = d == 1 ? low <= s.stop : high >= s.stop
+        bool reached = d == 1 ? high >= s.target : low <= s.target
+        if stopped
+            failedHit := true
+            s.failed  += 1
+            s.inTrade := false
+            label.new(bar_index, d == 1 ? high : low, "Failed " + countName(d, s.tradeCount), style = d == 1 ? label.style_label_down : label.style_label_up, color = LABEL_BG, textcolor = oppColor, size = size.small
+              , tooltip = "The " + countName(d, s.tradeCount) + " triggered, then traded through its stop " + str.tostring(s.stop, format.mintick) + ". A failed second entry often means a trading range or a reversal.")
+        else if reached
+            targetHit  := true
+            s.reached  += 1
+            s.inTrade  := false
+            label.new(bar_index, d == 1 ? high : low, "Target", style = d == 1 ? label.style_label_down : label.style_label_up, color = LABEL_BG, textcolor = dirColor, size = size.small
+              , tooltip = "Target " + str.tostring(s.target, format.mintick) + " reached " + str.tostring(bar_index - s.tradeBar) + " bars after the " + countName(d, s.tradeCount) + " entry")
+        else if bar_index - s.tradeBar >= maxHoldInput
+            s.timedOut += 1
+            s.inTrade  := false
+
+    // -- the count ------------------------------------------------------------------------------------------------
+    float barExtreme = d == 1 ? high : low
+    bool  newExtreme = s.active and d * (barExtreme - s.extreme) > 0
+    if newExtreme
+        // The trend made a new extreme: the pullback is over and the count restarts. The low of the finished
+        // pullback becomes the higher low that must hold
+        if not na(s.pbExtreme)
+            s.legOrigin := s.pbExtreme
+        s.extreme    := barExtreme
+        s.extremeBar := bar_index
+        s.pbExtreme  := na
+        s.count      := 0
+        s.armed      := false
+    else if not s.active
+        bool context = d == 1 ? high >= trendHigh and emaRising and close > emaValue : low <= trendLow and emaFalling and close < emaValue
+        if context
+            s.active     := true
+            s.extreme    := barExtreme
+            s.extremeBar := bar_index
+            s.legOrigin  := d == 1 ? trendLow : trendHigh
+            s.pbExtreme  := na
+            s.count      := 0
+            s.armed      := false
+    else
+        float pbBar = d == 1 ? low : high
+        s.pbExtreme := na(s.pbExtreme) ? pbBar : d == 1 ? math.min(s.pbExtreme, pbBar) : math.max(s.pbExtreme, pbBar)
+        bool againstBar = d == 1 ? high < high[1] : low > low[1]
+        bool attemptBar = d == 1 ? high > high[1] : low < low[1]
+        // A pullback bar arms the next attempt; the first bar to trade beyond the prior bar after it is the attempt
+        if attemptBar and s.armed
+            s.count     += 1
+            s.armed     := false
+            s.lastCount := s.count
+            eventCount  := s.count
+        else if againstBar
+            s.armed := true
+        // The pullback broke the start of the trend leg, or ran out of attempts: the trend is in question, stop counting
+        if d * (s.pbExtreme - s.legOrigin) < 0 or s.count >= maxCountInput
+            s.active := false
+
+    // -- trade the setup ------------------------------------------------------------------------------------------
+    bool tradeable = eventCount == 2 or eventCount == 1 and tradeModeInput == TRADE_FIRST
+    if eventCount > 0 and tradeModeInput != TRADE_NONE and tradeable and not s.inTrade
+        float tick       = syminfo.mintick
+        float trigger    = d == 1 ? high[1] + tick : low[1] - tick
+        float entryPrice = d == 1 ? math.max(open, trigger) : math.min(open, trigger)
+        float stopPrice  = stopModeInput == STOP_SIGNAL ? (d == 1 ? low[1] - tick : high[1] + tick) : (d == 1 ? s.pbExtreme - tick : s.pbExtreme + tick)
+        float risk       = math.abs(entryPrice - stopPrice)
+        if risk > 0
+            float floorTarget = entryPrice + d * minRewardInput * risk
+            float target      = targetModeInput == TARGET_R ? floorTarget : d == 1 ? math.max(s.extreme, floorTarget) : math.min(s.extreme, floorTarget)
+            traded       := true
+            s.inTrade    := true
+            s.tradeBar   := bar_index
+            s.tradeCount := eventCount
+            s.entry      := entryPrice
+            s.stop       := stopPrice
+            s.target     := target
+            s.taken      += 1
+            s.rewardBox  := box.new(bar_index, math.max(entryPrice, target), bar_index, math.min(entryPrice, target), border_color = color.new(bullColorInput, 70), bgcolor = color.new(bullColorInput, POSITION_BG_TRANSP))
+            s.riskBox    := box.new(bar_index, math.max(entryPrice, stopPrice), bar_index, math.min(entryPrice, stopPrice), border_color = color.new(bearColorInput, 70), bgcolor = color.new(bearColorInput, POSITION_BG_TRANSP))
+            // A bar that triggers and closes beyond the stop has failed at once
+            if d * (close - stopPrice) < 0
+                failedHit := true
+                s.failed  += 1
+                s.inTrade := false
+                label.new(bar_index, d == 1 ? high : low, "Failed " + countName(d, eventCount), style = d == 1 ? label.style_label_down : label.style_label_up, color = LABEL_BG, textcolor = oppColor, size = size.small
+                  , tooltip = "The " + countName(d, eventCount) + " triggered and closed beyond its stop on the same bar.")
+
+    // -- labels -------------------------------------------------------------------------------------------------------
+    if eventCount > 0
+        string name = countName(d, eventCount)
+        string tip  = name + ": attempt " + str.tostring(eventCount) + " to end the " + (d == 1 ? "pullback" : "rally") + ", this bar traded " + (d == 1 ? "above" : "below") + " the prior bar " + (d == 1 ? "high " + str.tostring(high[1], format.mintick) : "low " + str.tostring(low[1], format.mintick)) + "\nSignal bar " + (d == 1 ? (close[1] > open[1] ? "bull" : "bear") : (close[1] < open[1] ? "bear" : "bull")) + " body, closed in the " + ((d == 1 ? close[1] - low[1] : high[1] - close[1]) >= 0.5 * (high[1] - low[1]) ? "strong" : "weak") + " half of its range"
+        if traded
+            label.new(bar_index, d == 1 ? low : high, name, style = d == 1 ? label.style_label_up : label.style_label_down, color = dirColor, textcolor = color.white, size = size.small
+              , tooltip = tip + "\nEntry " + str.tostring(s.entry, format.mintick) + ", stop " + str.tostring(s.stop, format.mintick) + ", target " + str.tostring(s.target, format.mintick))
+        else if showCountsInput
+            label.new(bar_index, d == 1 ? low : high, name, style = d == 1 ? label.style_label_up : label.style_label_down, color = LABEL_BG, textcolor = color.new(dirColor, eventCount == 2 ? 0 : COUNT_TEXT_TRANSP), size = size.small, tooltip = tip)
+    [eventCount, traded, targetHit, failedHit]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+float emaValue   = ta.ema(close, emaLengthInput)
+bool  emaRising  = emaValue > emaValue[1]
+bool  emaFalling = emaValue < emaValue[1]
+float trendHigh  = ta.highest(high, trendLengthInput)
+float trendLow   = ta.lowest(low, trendLengthInput)
+
+int  bullEvent  = 0
+bool bullTrade  = false
+bool bullTarget = false
+bool bullFailed = false
+int  bearEvent  = 0
+bool bearTrade  = false
+bool bearTarget = false
+bool bearFailed = false
+
+if barstate.isconfirmed and bar_index > trendLengthInput
+    [e1, t1, r1, f1] = updateCount(bullState, emaValue, emaRising, emaFalling, trendHigh, trendLow, bullColorInput, bearColorInput)
+    bullEvent  := e1
+    bullTrade  := t1
+    bullTarget := r1
+    bullFailed := f1
+    [e2, t2, r2, f2] = updateCount(bearState, emaValue, emaRising, emaFalling, trendHigh, trendLow, bearColorInput, bullColorInput)
+    bearEvent  := e2
+    bearTrade  := t2
+    bearTarget := r2
+    bearFailed := f2
+
+plot(showEmaInput ? emaValue : na, "Moving Average", color = color.new(neutralColorInput, 20), linewidth = 1)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dashTable = table.new(getTablePosition(dashPosInput), 2, 4, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+dashRow(int row, string labelText, string valueText, color valueColor, string textSize) =>
+    table.cell(dashTable, 0, row, labelText, text_color = DASH_HEADER, text_halign = text.align_left, text_size = textSize)
+    table.cell(dashTable, 1, row, valueText, text_color = valueColor, text_halign = text.align_right, text_size = textSize)
+
+liveText(CountState s) =>
+    string result = "-"
+    if s.active
+        result := s.count == 0 ? (na(s.pbExtreme) ? "At trend extreme" : (s.dir == 1 ? "Pullback, H1 next" : "Rally, L1 next")) : (s.dir == 1 ? "Pullback at " : "Rally at ") + countName(s.dir, s.count)
+    result
+
+if showDashInput and barstate.islast
+    string dashSize = getTableSize(dashSizeInput)
+    bool   bullOn   = bullState.active
+    bool   bearOn   = bearState.active
+    string ctx      = bullOn and not bearOn ? "Bull trend" : bearOn and not bullOn ? "Bear trend" : bullOn ? "Two-sided" : "No trend"
+    color  ctxColor = ctx == "Bull trend" ? bullColorInput : ctx == "Bear trend" ? bearColorInput : DASH_HEADER
+    string live     = bullOn and not bearOn ? liveText(bullState) : bearOn and not bullOn ? liveText(bearState) : bullOn ? liveText(bullState) + " / " + liveText(bearState) : "Count stopped"
+    string openText = bullState.inTrade ? countName(1, bullState.tradeCount) + " long open" : bearState.inTrade ? countName(-1, bearState.tradeCount) + " short open" : "Flat"
+    table.cell(dashTable, 0, 0, "Bar Counting", text_color = DASH_TEXT, text_halign = text.align_left, text_size = dashSize)
+    table.cell(dashTable, 1, 0, ctx, text_color = ctxColor, text_halign = text.align_right, text_size = dashSize)
+    dashRow(1, "Live count", live, ctxColor == DASH_HEADER ? DASH_TEXT : ctxColor, dashSize)
+    dashRow(2, "Entries H / L", str.tostring(bullState.taken) + " / " + str.tostring(bearState.taken) + "  (" + str.tostring(bullState.reached + bearState.reached) + " target, " + str.tostring(bullState.failed + bearState.failed) + " failed)", DASH_TEXT, dashSize)
+    dashRow(3, "Position", openText, bullState.inTrade ? bullColorInput : bearState.inTrade ? bearColorInput : DASH_TEXT, dashSize)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(bullEvent == 1, "High 1", "High 1 on {{ticker}} ({{interval}}): first attempt to end the bull pullback.")
+alertcondition(bullEvent == 2, "High 2", "High 2 on {{ticker}} ({{interval}}): second attempt to end the bull pullback, the second-entry buy.")
+alertcondition(bearEvent == 1, "Low 1", "Low 1 on {{ticker}} ({{interval}}): first attempt to end the bear rally.")
+alertcondition(bearEvent == 2, "Low 2", "Low 2 on {{ticker}} ({{interval}}): second attempt to end the bear rally, the second-entry sell.")
+alertcondition(bullFailed or bearFailed, "Failed Entry", "Bar counting on {{ticker}} ({{interval}}): a traded H or L entry broke its stop.")
+alertcondition(bullTarget or bearTarget, "Target Reached", "Bar counting on {{ticker}} ({{interval}}): a traded H or L entry reached its target.")
+
+//---------------------------------------------------------------------------------------------------------------------}

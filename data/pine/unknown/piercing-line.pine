@@ -1,0 +1,197 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Piercing Line", shorttitle = "Piercing Line", overlay = true, format = format.price, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR = #089981
+BEAR_COLOR = #f23645
+LABEL_BG   = #00000000
+
+HIGHLIGHT_BORDER_TRANSP = 60
+HIGHLIGHT_FILL_TRANSP   = 90
+MIDPOINT_TRANSP         = 40
+
+OPEN_CLASSIC = "Below Prior Close (Classic)"
+OPEN_STRICT  = "Below Prior Low (Strict)"
+OPEN_RELAXED = "At/Below Prior Close (Relaxed)"
+
+TRIGGER_HIGH  = "Pattern High"
+TRIGGER_CLOSE = "Second Candle Close"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+openRuleInput = input.string(OPEN_CLASSIC, "Open Requirement", options = [OPEN_CLASSIC, OPEN_STRICT, OPEN_RELAXED], group = "Pattern Detection",
+     tooltip = "How the second candle must open. The classic stock-market form wants an open below the first candle's close - sellers are handed the weak open they positioned for. The strict reading demands a true gap below the first candle's low. The relaxed reading, standard in markets that trade nearly continuously and rarely gap, accepts an open at or below the prior close; it makes the pattern more common but looser, since the failed gap-down open is part of the classical pattern's logic.")
+
+bodyLenInput = input.int(14, "Body Average Length", minval = 2, maxval = 100, group = "Pattern Detection",
+     tooltip = "Number of candles in the average real body used to size the first candle. The average is taken over the bars immediately preceding the pattern, so the pattern's own candles do not distort their own yardstick.")
+
+longBodyInput = input.float(1.0, "Long Body Multiplier", minval = 0.1, maxval = 5, step = 0.1, group = "Pattern Detection",
+     tooltip = "Minimum real body of the first candle, as a multiple of the average real body. The pattern needs a long bearish candle for the recovery to reclaim - a longer first body gives the close more ground to cover, so higher values keep only the more meaningful prints.")
+
+depthInput = input.float(50, "Minimum Penetration %", minval = 0, maxval = 95, step = 5, group = "Pattern Detection",
+     tooltip = "How far up into the first candle's real body the second candle must close, measured from the body's bottom. 50 is the standard above-the-midpoint threshold that defines the piercing line - a close short of the midpoint belongs to its weaker relatives (the thrusting and on-neck lines), and deeper closes are stronger evidence. The close must also hold below the first candle's open - a close through the entire body is a bullish engulfing, a separate pattern this script deliberately leaves out.")
+
+trendFilterInput = input.bool(true, "Downtrend Filter", inline = "trend", group = "Context Filters",
+     tooltip = "Require a decline into the pattern: the first candle must close below the moving average, so the recovery answers an established down leg instead of printing as mid-range noise, where the same two candles carry far less weight.")
+
+trendLenInput = input.int(50, "SMA Length", minval = 2, maxval = 500, inline = "trend", group = "Context Filters",
+     tooltip = "Length of the simple moving average used by the downtrend filter.")
+
+swingFilterInput = input.bool(false, "New Low Location", inline = "swing", group = "Context Filters",
+     tooltip = "Only keep patterns printing at the bottom of the recent window: the pattern's low must be the lowest low of the location window. Sellers being handed new lows and losing more than half the prior session's fall anyway is the point of the pattern, and instances buried mid-range usually deserve less chart time.")
+
+swingLenInput = input.int(20, "Window", minval = 2, maxval = 500, inline = "swing", group = "Context Filters",
+     tooltip = "Number of bars in the location window used by the new-low location filter, the pattern's two candles included.")
+
+volumeFilterInput = input.bool(false, "Volume Filter", inline = "volume", group = "Context Filters",
+     tooltip = "Require elevated participation on the second candle: heavier volume on the recovery implies more meaningful absorption of the prior selling. Supporting evidence rather than part of the definition. Automatically bypassed when the symbol reports no volume data.")
+
+volMultInput = input.float(1.0, "Multiple", minval = 0.1, maxval = 5, step = 0.1, inline = "volume", group = "Context Filters",
+     tooltip = "Minimum second-candle volume as a multiple of the trailing volume average.")
+
+volLenInput = input.int(20, "Length", minval = 1, maxval = 500, inline = "volume", group = "Context Filters",
+     tooltip = "Number of bars in the trailing volume average. The average is taken one bar back so the second candle's own volume does not inflate the threshold.")
+
+showLevelsInput = input.bool(true, "Trigger & Stop Levels", group = "Trigger & Invalidation",
+     tooltip = "Draw each pattern's reference points as dashed levels: the conventional entry trigger, and the invalidation below the second candle's low - the rejected gap-down low, since a trade back below it says sellers were not actually absorbed.")
+
+triggerModeInput = input.string(TRIGGER_HIGH, "Trigger Level", options = [TRIGGER_HIGH, TRIGGER_CLOSE], group = "Trigger & Invalidation",
+     tooltip = "Entry convention marked by the trigger level. 'Pattern High' waits for upside follow-through - a break of the two candles' high - before the reversal is treated as active. 'Second Candle Close' records the signal candle's closing price for immediate entries. The trigger-break alert fires once price trades above this level after the pattern completes.")
+
+extendInput = input.int(10, "Levels Extension", minval = 1, maxval = 250, group = "Trigger & Invalidation",
+     tooltip = "Number of bars the trigger and stop levels extend to the right of the pattern.")
+
+showLabelsInput = input.bool(true, "Pattern Labels", group = "Style",
+     tooltip = "Mark each pattern with a Piercing Line label below the two candles; hovering a label reports how the open qualified, how deep the close pierced the first body, the second candle's volume versus its average, and the trigger and stop prices.")
+
+highlightInput = input.bool(true, "Pattern Highlight", group = "Style",
+     tooltip = "Shade the two candles of each detected pattern and mark the first body's midpoint - the standard penetration threshold - with a dotted tick.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "colors", group = "Style",
+     tooltip = "Color of pattern labels, highlights and trigger levels.")
+
+invalidColorInput = input.color(BEAR_COLOR, "Invalidation", inline = "colors", group = "Style",
+     tooltip = "Color of the invalidation level below the second candle's low.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Pattern Detection
+//---------------------------------------------------------------------------------------------------------------------{
+// Trailing context series, computed unconditionally on every bar
+body        = math.abs(close - open)
+bodyAvg     = ta.sma(body, bodyLenInput)
+trendSma    = ta.sma(close, trendLenInput)
+volSma      = ta.sma(volume, volLenInput)
+swingLowest = ta.lowest(low, swingLenInput)
+
+// Baselines: the body average is taken from the candles immediately preceding the two-candle pattern, and the
+// volume average one bar back, so the pattern's own candles do not inflate their own thresholds
+refBody    = bodyAvg[2]
+volSmaPrev = volSma[1]
+
+// Act one - a long bearish candle extending the decline
+firstBearish = close[1] < open[1]
+firstLong    = body[1] >= refBody * longBodyInput
+firstBodyMid = (open[1] + close[1]) / 2
+
+// Act two - sellers get the weak open they positioned for and buyers reclaim it anyway: an open below the first
+// candle answered by a recovery closing above the required share of its real body, yet below its open (a close
+// through the open would be a bullish engulfing)
+gapOpen = open < low[1]
+openOk  = switch openRuleInput
+    OPEN_STRICT  => gapOpen
+    OPEN_CLASSIC => open < close[1]
+    => open <= close[1]
+
+secondBullish  = close > open
+closeDeep      = close > close[1] + body[1] * depthInput / 100
+staysBelowOpen = close < open[1]
+
+// Pattern extremes - the second candle's low is the rejected gap-down low, the two candles' high the follow-through line
+patternHigh = math.max(high, high[1])
+patternLow  = math.min(low, low[1])
+
+// Context filters - trend, location and participation separate tradable prints from mid-range noise
+inDowntrend = not trendFilterInput or (not na(trendSma[1]) and close[1] < trendSma[1])
+swingOk     = not swingFilterInput or (not na(swingLowest) and patternLow <= swingLowest)
+
+hasVolumeData = not na(volume) and not na(volSmaPrev)
+volumeOk      = not volumeFilterInput or not hasVolumeData or volume > volSmaPrev * volMultInput
+
+piercingLine = not na(refBody) and firstBearish and firstLong and openOk and secondBullish and closeDeep and staysBelowOpen and inDowntrend and swingOk and volumeOk
+
+// Grading figures reported in label tooltips - the deeper the close pierces the first body, the more of the prior
+// selling has been absorbed, so piercing lines are conventionally ranked by penetration depth
+achievedDepth = firstBearish ? (close - close[1]) / body[1] * 100 : na
+volumeRatio   = hasVolumeData and volSmaPrev > 0 ? volume / volSmaPrev : na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Trigger & Invalidation Tracking
+//---------------------------------------------------------------------------------------------------------------------{
+triggerPrice = triggerModeInput == TRIGGER_HIGH ? patternHigh : close
+
+// Reference points of the most recent pattern, cleared once price resolves them
+var float triggerLevel = na
+var float stopLevel    = na
+
+bool triggerBreak      = false
+bool invalidationBreak = false
+
+if piercingLine
+    triggerLevel := triggerPrice
+    stopLevel    := low
+else
+    if not na(triggerLevel) and high > triggerLevel
+        triggerBreak := true
+        triggerLevel := na
+    if not na(stopLevel) and low < stopLevel
+        invalidationBreak := true
+        stopLevel         := na
+        triggerLevel      := na
+
+// The conventional next-candle confirmation - the candle immediately after the pattern closing higher
+followThrough = piercingLine[1] and close > close[1]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+if piercingLine
+    if highlightInput
+        box.new(bar_index - 1, patternHigh, bar_index, patternLow, border_color = color.new(bullColorInput, HIGHLIGHT_BORDER_TRANSP), bgcolor = color.new(bullColorInput, HIGHLIGHT_FILL_TRANSP))
+        line.new(bar_index - 1, firstBodyMid, bar_index, firstBodyMid, color = color.new(bullColorInput, MIDPOINT_TRANSP), style = line.style_dotted)
+
+    if showLabelsInput
+        openText   = gapOpen ? "gapped below the prior low" : open < close[1] ? "opened below the prior close" : "opened at the prior close (relaxed)"
+        volumeText = na(volumeRatio) ? "" : "\nSecond-candle volume: " + str.tostring(volumeRatio, "#.##") + "x its " + str.tostring(volLenInput) + "-bar average"
+        patternTip = "Piercing Line - " + openText
+          + "\nPenetration into first body: " + str.tostring(achievedDepth, "#.#") + "%"
+          + volumeText
+          + "\nTrigger: " + str.tostring(triggerPrice, format.mintick)
+          + "\nStop (second candle low): " + str.tostring(low, format.mintick)
+
+        label.new(bar_index, patternLow, "Piercing Line"
+          , style     = label.style_label_up
+          , color     = bullColorInput
+          , textcolor = chart.bg_color
+          , size      = size.small
+          , tooltip   = patternTip)
+
+    if showLevelsInput
+        line.new(bar_index, triggerPrice, bar_index + extendInput, triggerPrice, color = bullColorInput, style = line.style_dashed)
+        line.new(bar_index, low, bar_index + extendInput, low, color = invalidColorInput, style = line.style_dashed)
+        label.new(bar_index + extendInput, triggerPrice, "Trigger", style = label.style_label_left, color = LABEL_BG, textcolor = bullColorInput, size = size.tiny)
+        label.new(bar_index + extendInput, low, "Stop", style = label.style_label_left, color = LABEL_BG, textcolor = invalidColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(piercingLine, "Piercing Line", "Piercing Line on {{ticker}} ({{interval}}) - a long bearish candle answered by a weak open and a close reclaiming more than half of its real body, with all active filters passed")
+alertcondition(followThrough, "Bullish Follow-Through", "Bullish follow-through candle after a Piercing Line on {{ticker}} ({{interval}}) - the next candle closed higher, the conventional confirmation")
+alertcondition(triggerBreak, "Trigger Level Break", "Piercing Line trigger broken on {{ticker}} ({{interval}}) - price traded above the pattern's trigger level")
+alertcondition(invalidationBreak, "Pattern Invalidated", "Piercing Line invalidated on {{ticker}} ({{interval}}) - price traded back below the second candle's low, the rejected gap-down low")
+
+//---------------------------------------------------------------------------------------------------------------------}

@@ -1,0 +1,329 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Volatility Regime Switches", shorttitle = "Volatility Regime Switches", overlay = false, format = format.price, precision = 2, max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+MEASURE_ATR = "ATR"
+MEASURE_RV  = "Realized Volatility"
+MEASURE_BBW = "Bollinger Band Width"
+
+METHOD_RATIO = "Ratio to Average"
+METHOD_PCT   = "Percentile Rank"
+
+TOP_RIGHT    = "Top Right"
+TOP_LEFT     = "Top Left"
+BOTTOM_RIGHT = "Bottom Right"
+BOTTOM_LEFT  = "Bottom Left"
+
+TINY_SIZE   = "Tiny"
+SMALL_SIZE  = "Small"
+NORMAL_SIZE = "Normal"
+
+STRESSED_REGIME = 1     // expansion state - volatility above its norm
+NORMAL_REGIME   = 0     // baseline state
+QUIET_REGIME    = -1    // compression state - volatility below its norm
+
+STRESS_COLOR = #f23645  // expansion - volatility above its norm
+NORMAL_COLOR = #787b86  // baseline state - structure grey
+QUIET_COLOR  = #089981  // compression - volatility below its norm
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+BB_MULT = 2.0           // standard Bollinger deviation multiplier for the band-width measure
+
+FILL_VALUE_TRANSP = 50  // gradient transparency at the score
+FILL_BASE_TRANSP  = 100 // gradient transparency at the baseline
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+measureInput = input.string(MEASURE_ATR, "Volatility Measure", options = [MEASURE_ATR, MEASURE_RV, MEASURE_BBW]
+  , group   = "Volatility Measure"
+  , tooltip = "Volatility series the switch reads. ATR is Wilder's average true range in price units; Realized Volatility is the standard deviation of one-bar log returns (un-annualized); Bollinger Band Width is (upper - lower) / basis of a 2-deviation Bollinger Band. Normalization makes their scales interchangeable, so the regime logic is identical for all three.")
+
+lengthInput = input.int(14, "Measurement Length", minval = 2
+  , group   = "Volatility Measure"
+  , tooltip = "Lookback of the volatility measure itself - the fast side of the comparison. The baseline lookback below supplies the slow side.")
+
+methodInput = input.string(METHOD_RATIO, "Normalization", options = [METHOD_RATIO, METHOD_PCT]
+  , group   = "Regime Detection"
+  , tooltip = "How the raw measure becomes the regime score. Ratio to Average divides the measure by its own long-run average, so 1 means volatility sits exactly at its norm. Percentile Rank places the current reading inside the last N readings on a 0-100 scale, so 50 means the rolling median.")
+
+baselineLengthInput = input.int(100, "Baseline Lookback", minval = 10
+  , group   = "Regime Detection"
+  , tooltip = "Long-run window on the measure: the average that a ratio of 1 refers to, or the distribution the percentile is ranked against. Longer windows define the regime against a slower norm and switch less often.")
+
+stressOnRatioInput = input.float(1.25, "Ratio · Stressed ≥", minval = 1.0, step = 0.05, inline = "ratio"
+  , group   = "Regime Detection"
+  , tooltip = "Switch-on level for the Stressed regime in ratio mode: 1.25 arms it when volatility runs 25% above its long-run average.")
+
+quietOnRatioInput = input.float(0.80, "Quiet ≤", minval = 0.0, maxval = 1.0, step = 0.05, inline = "ratio"
+  , group   = "Regime Detection"
+  , tooltip = "Switch-on level for the Quiet regime in ratio mode: 0.80 arms it when volatility runs 20% below its long-run average.")
+
+ratioHysteresisInput = input.float(0.10, "Ratio Hysteresis", minval = 0.0, step = 0.01
+  , group   = "Regime Detection"
+  , tooltip = "Gap between the switch-on and switch-off levels in ratio units - the buffer a standing state keeps until the score retreats through it (off levels are capped at the baseline of 1). Volatility loiters around any single line, so a switch without this buffer flips constantly.")
+
+stressOnPctInput = input.float(80, "Percentile · Stressed ≥", minval = 50, maxval = 100, step = 1, inline = "pct"
+  , group   = "Regime Detection"
+  , tooltip = "Switch-on level for the Stressed regime in percentile mode: 80 arms it when the reading enters the top fifth of its rolling distribution.")
+
+quietOnPctInput = input.float(20, "Quiet ≤", minval = 0, maxval = 50, step = 1, inline = "pct"
+  , group   = "Regime Detection"
+  , tooltip = "Switch-on level for the Quiet regime in percentile mode: 20 arms it when the reading falls into the bottom fifth of its rolling distribution.")
+
+pctHysteresisInput = input.float(10, "Percentile Hysteresis", minval = 0, maxval = 50, step = 1
+  , group   = "Regime Detection"
+  , tooltip = "Gap between the switch-on and switch-off levels in percentile points (off levels are capped at the 50 baseline). Stressed arming at 80 with a buffer of 10 only disarms below 70.")
+
+confirmBarsInput = input.int(2, "Confirmation Bars", minval = 1, maxval = 50
+  , group   = "Regime Detection"
+  , tooltip = "Consecutive evaluated bars a new candidate regime must hold before the switch commits - the minimum-dwell requirement that, together with hysteresis, stops borderline readings from flapping the state. 1 commits on the first qualifying bar.")
+
+closedBarsInput = input.bool(true, "Evaluate on Closed Bars"
+  , group   = "Regime Detection"
+  , tooltip = "Update the state machine on confirmed bars only, so live states match a replay of closed bars and never flip intrabar. Disable to react inside the forming bar at the cost of repaint risk.")
+
+showDashboardInput = input.bool(true, "Show Dashboard"
+  , group   = "Dashboard"
+  , tooltip = "Panel with the volatility measure, the standing regime, the current score, time in regime, the last committed switch, and the parameter playbook the current state calls for.")
+
+dashboardPositionInput = input.string(TOP_RIGHT, "Position", options = [TOP_RIGHT, TOP_LEFT, BOTTOM_RIGHT, BOTTOM_LEFT], inline = "dash"
+  , group   = "Dashboard"
+  , tooltip = "Corner of the pane the dashboard is anchored to.")
+
+dashboardSizeInput = input.string(SMALL_SIZE, "Size", options = [TINY_SIZE, SMALL_SIZE, NORMAL_SIZE], inline = "dash"
+  , group   = "Dashboard"
+  , tooltip = "Dashboard text size.")
+
+showMarkersInput = input.bool(true, "Switch Markers"
+  , group   = "Style"
+  , tooltip = "Label on the bar each switch commits, named after the incoming regime. Its tooltip records the transition, the time spent in the outgoing regime, and the playbook line for the new state.")
+
+showZonesInput = input.bool(true, "Thresholds & Hysteresis Zones"
+  , group   = "Style"
+  , tooltip = "Plot the switch-on and switch-off levels and shade the hysteresis buffer between them - the corridor the score can occupy without changing the state.")
+
+backgroundInput = input.bool(true, "Background by State"
+  , group   = "Style"
+  , tooltip = "Tint the pane background while a Quiet or Stressed state is in force. Persistent blocks of color mean the thresholds describe real regimes; single-bar flickers mean they are too tight or the input too noisy.")
+
+stressColorInput = input.color(STRESS_COLOR, "Stressed", inline = "regime"
+  , group   = "Style"
+  , tooltip = "Color of the score, gradient, zone and background while the Stressed regime is in force.")
+
+normalColorInput = input.color(NORMAL_COLOR, "Normal", inline = "regime"
+  , group   = "Style"
+  , tooltip = "Color of the score and gradient while the Normal regime is in force.")
+
+quietColorInput = input.color(QUIET_COLOR, "Quiet", inline = "regime"
+  , group   = "Style"
+  , tooltip = "Color of the score, gradient, zone and background while the Quiet regime is in force.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Dashboard anchor from the position option
+tableLocation(string positionText) =>
+    switch
+        positionText == TOP_RIGHT    => position.top_right
+        positionText == TOP_LEFT     => position.top_left
+        positionText == BOTTOM_RIGHT => position.bottom_right
+        => position.bottom_left
+
+// Dashboard text size from the size option
+tableTextSize(string sizeText) =>
+    switch
+        sizeText == TINY_SIZE  => size.tiny
+        sizeText == SMALL_SIZE => size.small
+        => size.normal
+
+// State name for labels, dashboard and switch descriptions
+regimeName(int state) =>
+    state == STRESSED_REGIME ? "Stressed" : state == QUIET_REGIME ? "Quiet" : "Normal"
+
+// Post-switch parameter playbook: what each incoming state asks of the system it gates
+regimePlaybook(int state) =>
+    state == STRESSED_REGIME ? "Widen stops / trend module / or stand aside"
+      : state == QUIET_REGIME ? "Tighten stops / reversion module"
+      : "Baseline parameter set"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Volatility Measure & Regime Score
+//---------------------------------------------------------------------------------------------------------------------{
+// Every selectable measure is computed on every bar, so the selection only picks a value and never changes what executes
+atrValue = ta.atr(lengthInput)
+
+logReturn = close > 0 and close[1] > 0 ? math.log(close / close[1]) : na
+rvValue   = ta.stdev(logReturn, lengthInput)
+
+bbBasis  = ta.sma(close, lengthInput)
+bbDev    = BB_MULT * ta.stdev(close, lengthInput)
+bbwValue = na(bbBasis) or bbBasis == 0 ? na : 2 * bbDev / bbBasis
+
+measureSelected = switch measureInput
+    MEASURE_ATR => atrValue
+    MEASURE_RV  => rvValue
+    => bbwValue
+
+// Slow side of the comparison: the long-run average for the ratio, the rolling distribution for the percentile
+measureAverage    = ta.sma(measureSelected, baselineLengthInput)
+measurePercentile = ta.percentrank(measureSelected, baselineLengthInput)
+
+isRatioMethod = methodInput == METHOD_RATIO
+
+regimeScore   = isRatioMethod ? (na(measureAverage) or measureAverage == 0 ? na : measureSelected / measureAverage) : measurePercentile
+baselineLevel = isRatioMethod ? 1.0 : 50.0
+
+// Switch-on levels arm a regime; switch-off levels sit closer to the baseline by the hysteresis buffer
+stressOnLevel  = isRatioMethod ? stressOnRatioInput : stressOnPctInput
+quietOnLevel   = isRatioMethod ? quietOnRatioInput : quietOnPctInput
+hysteresisGap  = isRatioMethod ? ratioHysteresisInput : pctHysteresisInput
+stressOffLevel = math.max(stressOnLevel - hysteresisGap, baselineLevel)
+quietOffLevel  = math.min(quietOnLevel + hysteresisGap, baselineLevel)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Switch State Machine
+//---------------------------------------------------------------------------------------------------------------------{
+var int    regime         = NORMAL_REGIME
+var int    previousRegime = NORMAL_REGIME
+var int    pendingState   = NORMAL_REGIME
+var int    pendingCount   = 0
+var int    barsInRegime   = 0
+var string lastSwitchText = "None yet"
+
+bool switchToStressed = false
+bool switchToQuiet    = false
+bool switchToNormal   = false
+int  previousDwell    = 0
+
+// Closed-bar evaluation keeps live states identical to a replay of closed bars
+evalThisBar = (not closedBarsInput or barstate.isconfirmed) and not na(regimeScore)
+
+if evalThisBar
+    // Hysteresis: entering a state uses its switch-on level, leaving it uses the pulled-back switch-off level
+    int candidateState = switch regime
+        STRESSED_REGIME => regimeScore >= stressOffLevel ? STRESSED_REGIME : regimeScore <= quietOnLevel ? QUIET_REGIME : NORMAL_REGIME
+        QUIET_REGIME    => regimeScore <= quietOffLevel ? QUIET_REGIME : regimeScore >= stressOnLevel ? STRESSED_REGIME : NORMAL_REGIME
+        => regimeScore >= stressOnLevel ? STRESSED_REGIME : regimeScore <= quietOnLevel ? QUIET_REGIME : NORMAL_REGIME
+
+    // Persistence: a candidate that differs from the standing state must survive the full confirmation run
+    bool committed = false
+    if candidateState == regime
+        pendingState := regime
+        pendingCount := 0
+    else
+        if candidateState == pendingState
+            pendingCount += 1
+        else
+            pendingState := candidateState
+            pendingCount := 1
+        committed := pendingCount >= confirmBarsInput
+
+    if committed
+        previousDwell    := barsInRegime
+        previousRegime   := regime
+        regime           := candidateState
+        lastSwitchText   := regimeName(previousRegime) + " → " + regimeName(regime)
+        switchToStressed := regime == STRESSED_REGIME
+        switchToQuiet    := regime == QUIET_REGIME
+        switchToNormal   := regime == NORMAL_REGIME
+        barsInRegime     := 1
+        pendingState     := regime
+        pendingCount     := 0
+    else
+        barsInRegime += 1
+
+anySwitch = switchToStressed or switchToQuiet or switchToNormal
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+regimeColor = regime == STRESSED_REGIME ? stressColorInput : regime == QUIET_REGIME ? quietColorInput : normalColorInput
+
+stressOnColor  = showZonesInput ? color.new(stressColorInput, 40) : na
+stressOffColor = showZonesInput ? color.new(stressColorInput, 70) : na
+quietOnColor   = showZonesInput ? color.new(quietColorInput, 40) : na
+quietOffColor  = showZonesInput ? color.new(quietColorInput, 70) : na
+
+stressOnPlotId  = plot(stressOnLevel, "Stressed Switch-On", stressOnColor, 1)
+stressOffPlotId = plot(stressOffLevel, "Stressed Switch-Off", stressOffColor, 1)
+quietOnPlotId   = plot(quietOnLevel, "Quiet Switch-On", quietOnColor, 1)
+quietOffPlotId  = plot(quietOffLevel, "Quiet Switch-Off", quietOffColor, 1)
+
+fill(stressOnPlotId, stressOffPlotId, showZonesInput ? color.new(stressColorInput, 90) : na, title = "Stressed Hysteresis Buffer")
+fill(quietOnPlotId, quietOffPlotId, showZonesInput ? color.new(quietColorInput, 90) : na, title = "Quiet Hysteresis Buffer")
+
+basePlotId  = plot(baselineLevel, "Baseline", color.new(NORMAL_COLOR, 40), 1)
+scorePlotId = plot(regimeScore, "Regime Score", regimeColor, 2)
+
+// Vertical gradient between baseline and score, colored by the standing regime
+scoreAbove      = regimeScore >= baselineLevel
+fillTopColor    = scoreAbove ? color.new(regimeColor, FILL_VALUE_TRANSP) : color.new(regimeColor, FILL_BASE_TRANSP)
+fillBottomColor = scoreAbove ? color.new(regimeColor, FILL_BASE_TRANSP) : color.new(regimeColor, FILL_VALUE_TRANSP)
+
+fill(scorePlotId, basePlotId
+  , math.max(regimeScore, baselineLevel)
+  , math.min(regimeScore, baselineLevel)
+  , fillTopColor
+  , fillBottomColor
+  , title = "Score Gradient")
+
+bgcolor(backgroundInput and regime != NORMAL_REGIME ? color.new(regimeColor, 92) : na, title = "Regime State Background")
+
+// Switch markers: one label per committed switch, placed on the score at the commit bar
+if showMarkersInput and anySwitch
+    risingSwitch = switchToStressed or (switchToNormal and previousRegime == QUIET_REGIME)
+    label.new(bar_index, regimeScore, regimeName(regime)
+      , style     = risingSwitch ? label.style_label_up : label.style_label_down
+      , color     = regimeColor
+      , textcolor = color.white
+      , size      = size.small
+      , tooltip   = lastSwitchText + " after " + str.tostring(previousDwell) + " bars\nPlaybook: " + regimePlaybook(regime))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dashboardTable = na
+
+if barstate.islast and showDashboardInput
+    if na(dashboardTable)
+        dashboardTable := table.new(tableLocation(dashboardPositionInput), 2, 6, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+    string textSize   = tableTextSize(dashboardSizeInput)
+    color  labelColor = DASH_HEADER
+    color  valueColor = DASH_TEXT
+
+    string scoreText = na(regimeScore) ? "n/a" : isRatioMethod ? str.tostring(regimeScore, "#.##") + "× avg" : str.tostring(regimeScore, "#.#") + " pctile"
+    string dwellText = str.tostring(barsInRegime) + " bars"
+
+    table.cell(dashboardTable, 0, 0, "Measure", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 0, measureInput, text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 1, "Regime", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 1, regimeName(regime), text_color = regimeColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 2, "Score", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 2, scoreText, text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 3, "Time in Regime", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 3, dwellText, text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 4, "Last Switch", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 4, lastSwitchText, text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 5, "Playbook", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 5, regimePlaybook(regime), text_color = regimeColor, text_size = textSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(switchToStressed, "Stressed Regime Switch", "Volatility Regime Switches: {{ticker}} switched into the Stressed regime - widen stops, slow lookbacks, or stand aside ({{interval}})")
+alertcondition(switchToQuiet, "Quiet Regime Switch", "Volatility Regime Switches: {{ticker}} switched into the Quiet regime - compression conditions, tighten parameters ({{interval}})")
+alertcondition(switchToNormal, "Normal Regime Switch", "Volatility Regime Switches: {{ticker}} returned to the Normal regime - baseline parameter set applies ({{interval}})")
+alertcondition(anySwitch, "Any Regime Switch", "Volatility Regime Switches: volatility regime switch on {{ticker}} ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

@@ -1,0 +1,428 @@
+// This work is licensed under Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Volatility Breakout", shorttitle = "Volatility Breakout", overlay = true
+  , max_lines_count  = 500
+  , max_labels_count = 500
+  , max_boxes_count  = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR    = #089981 // buy trigger and long trades
+BEAR_COLOR    = #f23645 // sell trigger and short trades
+NEUTRAL_COLOR = #787b86 // period open and the zone between the triggers
+ACCENT_COLOR  = #ff9800 // the one accent: periods that follow a range contraction
+
+color COLOR_HIDDEN = #00000000
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+string GRP_LEVELS = "Trigger Levels"
+string GRP_FILTER = "Setup Filter"
+string GRP_TRADES = "Trades"
+string GRP_DASH   = "Dashboard"
+string GRP_STYLE  = "Style"
+
+string BASIS_RANGE   = "Prior Range"
+string BASIS_TR      = "Prior True Range"
+string BASIS_AVG     = "Average Range"
+string BASIS_STRETCH = "Crabel Stretch"
+
+string FILTER_NONE   = "None"
+string FILTER_NR4    = "NR4"
+string FILTER_NR7    = "NR7"
+string FILTER_INSIDE = "Inside Period"
+string FILTER_BELOW  = "Range Below Average"
+
+string EXIT_CLOSE  = "Period Close"
+string EXIT_NEXT   = "Next Open"
+string EXIT_OPEN   = "First Profitable Open"
+
+string TXT_NA = "-"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+anchorInput = input.timeframe("D", "Period", group = GRP_LEVELS
+  , tooltip = "The period whose open anchors the triggers and whose prior range sizes them. Daily is the classic setting. On a chart of the same timeframe every bar is its own period and the triggers plot as steps; on a lower timeframe chart they are drawn across each period and the breakout is caught on the bar that crosses them.")
+
+basisInput = input.string(BASIS_RANGE, "Range Basis", options = [BASIS_RANGE, BASIS_TR, BASIS_AVG, BASIS_STRETCH], group = GRP_LEVELS
+  , tooltip = "Distance unit the triggers are set in. Prior Range: the last period's high minus low, Larry Williams' form. Prior True Range: the same including any gap from the prior close. Average Range: the mean range of the last Basis Length periods, steadier after an outlier day. Crabel Stretch: the average of the smaller of each period's open-to-high and open-to-low distances over Basis Length periods, Toby Crabel's measure of how far price usually travels against its first move.")
+
+kInput = input.float(0.5, "Multiplier (k)", minval = 0.05, maxval = 3, step = 0.05, group = GRP_LEVELS
+  , tooltip = "Triggers sit at the period open plus and minus k times the basis. Smaller values trigger more often and earlier; larger values wait for a move that is already unusual. Around 0.5 is a common start with the Prior Range basis; the Crabel Stretch is usually used at 1.")
+
+lenInput = input.int(10, "Basis Length", minval = 2, maxval = 100, group = GRP_LEVELS
+  , tooltip = "Periods averaged by the Average Range and Crabel Stretch bases. Ignored by the prior-period bases.")
+
+filterInput = input.string(FILTER_NONE, "Contraction Filter", options = [FILTER_NONE, FILTER_NR4, FILTER_NR7, FILTER_INSIDE, FILTER_BELOW], group = GRP_FILTER
+  , tooltip = "Crabel's observation: range expansion tends to follow range contraction. With a filter selected, breakouts only count in periods that follow a contraction: NR4 or NR7 (the prior period's range was the narrowest of the last 4 or 7), Inside Period (the prior period traded inside the one before it) or Range Below Average (the prior range was under the Average Range). Periods that qualify are outlined in the accent color either way.")
+
+trendLenInput = input.int(0, "Trend Filter (Periods)", minval = 0, maxval = 200, group = GRP_FILTER
+  , tooltip = "When above 0, only the side that agrees with the trend is taken: buy triggers while the prior period closed above the average close of this many periods, sell triggers while it closed below. 0 trades both sides.")
+
+tradesInput = input.bool(true, "Show Trades", group = GRP_TRADES
+  , tooltip = "Draw the trade each breakout implies: entry at the trigger, a protective stop (the opposite trigger by default), exit by the rule below, with the result in percent. One trade per period, the first trigger reached; the other side is cancelled.")
+
+exitInput = input.string(EXIT_CLOSE, "Exit Rule", options = [EXIT_CLOSE, EXIT_NEXT, EXIT_OPEN], group = GRP_TRADES
+  , tooltip = "Period Close: a day trade, flat at the end of the period the breakout happened in. Next Open: held overnight and closed at the next period's open. First Profitable Open: Williams' bailout exit, held until the first new period that opens beyond the entry price, or until Max Hold periods have passed.")
+
+stopInput = input.float(0, "Stop (x Basis)", minval = 0, maxval = 5, step = 0.05, group = GRP_TRADES
+  , tooltip = "Protective stop distance from the entry in multiples of the basis. 0 places it at the opposite trigger, the bracket's own stop.")
+
+maxHoldInput = input.int(5, "Max Hold (Periods)", minval = 1, maxval = 50, group = GRP_TRADES
+  , tooltip = "With First Profitable Open, the trade is closed at the open of this many periods after entry if no profitable open came first.")
+
+keepInput = input.int(20, "Periods Kept", minval = 1, maxval = 100, group = GRP_STYLE
+  , tooltip = "Number of recent periods whose levels and trades stay drawn on lower timeframe charts. The dashboard statistics count every period.")
+
+showDashInput = input.bool(true, "Show Dashboard", group = GRP_DASH
+  , tooltip = "The current period's triggers and state, and how the period range behaved on breakout periods versus quiet ones over the whole chart.")
+
+dashPosInput = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], inline = "dash", group = GRP_DASH)
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], inline = "dash", group = GRP_DASH
+  , tooltip = "Dashboard position and text size.")
+
+bullColorInput = input.color(BULL_COLOR, "Buy Trigger", inline = "dir", group = GRP_STYLE)
+bearColorInput = input.color(BEAR_COLOR, "Sell Trigger", inline = "dir", group = GRP_STYLE
+  , tooltip = "Colors of the buy and sell triggers and of the long and short trades.")
+openColorInput = input.color(NEUTRAL_COLOR, "Open & Zone", inline = "ref", group = GRP_STYLE)
+qualColorInput = input.color(ACCENT_COLOR, "Contraction", inline = "ref", group = GRP_STYLE
+  , tooltip = "Color of the period open line and the zone between the triggers, and of the outline marking periods that follow a contraction.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types & Variables
+//---------------------------------------------------------------------------------------------------------------------{
+//Drawings of one period on lower timeframe charts
+type PeriodDraw
+    line upLine
+    line dnLine
+    line openLine
+    box  zone
+    label upTag
+    label dnTag
+
+//An open trade
+type Trade
+    int   dir
+    float entry
+    float stop
+    int   entryBar
+    int   periods
+    line  path
+    label entryMark
+
+var array<PeriodDraw> drawArray  = array.new<PeriodDraw>()
+var array<label>      tradeMarks = array.new<label>()
+var array<line>       tradePaths = array.new<line>()
+var PeriodDraw        cur        = na
+var Trade             trade      = na
+
+//Completed period history
+var array<float> rangeArray   = array.new_float()
+var array<float> stretchArray = array.new_float()
+var array<float> closeArray   = array.new_float()
+var int          trendSide    = 0
+
+//Current period
+var float pOpen  = na
+var float pHigh  = na
+var float pLow   = na
+var float pClose = na
+
+//Prior period
+var float lastHigh  = na
+var float lastLow   = na
+var float lastClose = na
+
+//Triggers of the current period
+var float upper     = na
+var float lower     = na
+var float basisVal  = na
+var bool  qualified = false
+var int   firedDir  = 0
+
+//Statistics
+var int   periodsCount = 0
+var int   upCount      = 0
+var int   dnCount      = 0
+var int   bothCount    = 0
+var float trigExpSum   = 0.
+var int   trigExpN     = 0
+var float quietExpSum  = 0.
+var int   quietExpN    = 0
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+//Drops a drawing when it exists
+dropLine(line l) =>
+    if not na(l)
+        line.delete(l)
+dropBox(box b) =>
+    if not na(b)
+        box.delete(b)
+dropLabel(label l) =>
+    if not na(l)
+        label.delete(l)
+
+dropPeriod(PeriodDraw d) =>
+    dropLine(d.upLine)
+    dropLine(d.dnLine)
+    dropLine(d.openLine)
+    dropBox(d.zone)
+    dropLabel(d.upTag)
+    dropLabel(d.dnTag)
+
+//Signed percent text
+pctText(float v) =>
+    (v >= 0 ? "+" : "") + str.tostring(v, "0.00") + "%"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Period Tracking
+//---------------------------------------------------------------------------------------------------------------------{
+bool chartIsPeriod = timeframe.in_seconds(timeframe.period) >= timeframe.in_seconds(anchorInput)
+bool newPeriod     = chartIsPeriod or timeframe.change(anchorInput)
+bool lowerTf       = not chartIsPeriod
+//the last bar of a daily period is known on its own bar; longer periods are closed out on the next period's first bar
+bool dailyAnchor   = timeframe.in_seconds(anchorInput) == 86400
+bool periodEnds    = chartIsPeriod or (dailyAnchor and session.islastbar)
+
+bool upEvent    = false
+bool dnEvent    = false
+bool exitEvent  = false
+bool qualEvent  = false
+
+//Closes the open trade at a price and bar, drawing its path and result
+closeTrade(float px, int bx, string reason) =>
+    float res = trade.dir * (px - trade.entry) / trade.entry * 100
+    if tradesInput
+        color c = trade.dir == 1 ? bullColorInput : bearColorInput
+        trade.path := line.new(trade.entryBar, trade.entry, bx, px, color = color.new(c, 20), style = line.style_dotted, width = 2)
+        tradePaths.push(trade.path)
+        //the result sits just left of the exit, on the side the trade moved to, so it never spills into the next period
+        tradeMarks.push(label.new(bx, px, pctText(res), color = COLOR_HIDDEN, style = (trade.dir == 1) == (res >= 0) ? label.style_label_lower_right : label.style_label_upper_right
+          , textcolor = res >= 0 ? bullColorInput : bearColorInput, size = size.small, tooltip = reason + " at " + str.tostring(px, format.mintick)))
+    res
+
+//Period close exit on lower timeframes: the period ended on the previous bar
+if newPeriod and lowerTf and not na(trade) and exitInput == EXIT_CLOSE
+    closeTrade(close[1], bar_index - 1, "Period close")
+    exitEvent := true
+    trade     := na
+
+//Completed period: history, statistics, the prior period references
+if newPeriod and not na(pOpen)
+    float rng = pHigh - pLow
+    if firedDir != 0 and basisVal > 0
+        trigExpSum += rng / basisVal
+        trigExpN   += 1
+    else if basisVal > 0
+        quietExpSum += rng / basisVal
+        quietExpN   += 1
+    if basisVal > 0
+        periodsCount += 1
+    rangeArray.unshift(rng)
+    stretchArray.unshift(math.min(pHigh - pOpen, pOpen - pLow))
+    closeArray.unshift(pClose)
+    if rangeArray.size() > 200
+        rangeArray.pop()
+        stretchArray.pop()
+        closeArray.pop()
+    //trend side from the completed period's close against the average close
+    trendSide := trendLenInput > 0 and closeArray.size() >= trendLenInput ? (pClose > closeArray.slice(0, trendLenInput).avg() ? 1 : -1) : 0
+
+//New period: anchor the triggers at the open
+if newPeriod
+    //contraction read on the period that just completed
+    bool nr4    = rangeArray.size() >= 4 and rangeArray.get(0) <= rangeArray.slice(0, 4).min()
+    bool nr7    = rangeArray.size() >= 7 and rangeArray.get(0) <= rangeArray.slice(0, 7).min()
+    bool inside = not na(lastHigh) and not na(pHigh) and pHigh <= lastHigh and pLow >= lastLow
+    float avgRange = rangeArray.size() >= lenInput ? rangeArray.slice(0, lenInput).avg() : na
+    bool below  = not na(avgRange) and rangeArray.size() > 0 and rangeArray.get(0) < avgRange
+    qualified := switch filterInput
+        FILTER_NR4    => nr4
+        FILTER_NR7    => nr7
+        FILTER_INSIDE => inside
+        FILTER_BELOW  => below
+        => false
+
+    float tr = na(pHigh) ? na : math.max(pHigh, nz(lastClose, pHigh)) - math.min(pLow, nz(lastClose, pLow))
+    basisVal := switch basisInput
+        BASIS_RANGE   => rangeArray.size() > 0 ? rangeArray.get(0) : na
+        BASIS_TR      => tr
+        BASIS_AVG     => avgRange
+        => stretchArray.size() >= lenInput ? stretchArray.slice(0, lenInput).avg() : na
+
+    //roll the prior period references
+    if not na(pHigh)
+        lastHigh  := pHigh
+        lastLow   := pLow
+        lastClose := pClose
+
+    pOpen    := open
+    pHigh    := high
+    pLow     := low
+    firedDir := 0
+    upper    := na(basisVal) ? na : pOpen + kInput * basisVal
+    lower    := na(basisVal) ? na : pOpen - kInput * basisVal
+    qualEvent := qualified and filterInput != FILTER_NONE
+
+    //open-based exits, checked at each new period's open
+    if not na(trade) and (exitInput == EXIT_OPEN or exitInput == EXIT_NEXT)
+        trade.periods += 1
+        if exitInput == EXIT_NEXT or trade.dir * (open - trade.entry) > 0 or trade.periods >= maxHoldInput
+            closeTrade(open, bar_index, exitInput == EXIT_NEXT ? "Next open" : trade.dir * (open - trade.entry) > 0 ? "First profitable open" : "Max hold reached")
+            exitEvent := true
+            trade     := na
+
+    //lower timeframe drawings for the new period
+    if lowerTf and not na(upper)
+        cur := PeriodDraw.new()
+        color zoneColor = qualified and filterInput != FILTER_NONE ? qualColorInput : openColorInput
+        cur.zone     := box.new(bar_index, upper, bar_index, lower, border_color = qualified and filterInput != FILTER_NONE ? color.new(qualColorInput, 30) : COLOR_HIDDEN, border_width = 1, bgcolor = color.new(zoneColor, 93))
+        cur.upLine   := line.new(bar_index, upper, bar_index, upper, color = bullColorInput, width = 2)
+        cur.dnLine   := line.new(bar_index, lower, bar_index, lower, color = bearColorInput, width = 2)
+        cur.openLine := line.new(bar_index, pOpen, bar_index, pOpen, color = color.new(openColorInput, 20), style = line.style_dashed)
+        cur.upTag    := label.new(bar_index, upper, "Buy " + str.tostring(upper, format.mintick), color = COLOR_HIDDEN, style = label.style_label_lower_right, textcolor = bullColorInput, size = size.small)
+        cur.dnTag    := label.new(bar_index, lower, "Sell " + str.tostring(lower, format.mintick), color = COLOR_HIDDEN, style = label.style_label_upper_right, textcolor = bearColorInput, size = size.small)
+        drawArray.push(cur)
+        while drawArray.size() > keepInput
+            dropPeriod(drawArray.shift())
+    //trade drawings kept for the same number of recent periods
+    while tradeMarks.size() > 2 * keepInput
+        dropLabel(tradeMarks.shift())
+    while tradePaths.size() > keepInput
+        dropLine(tradePaths.shift())
+else
+    pHigh := math.max(pHigh, high)
+    pLow  := math.min(pLow, low)
+pClose := close
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Breakouts & Trades
+//---------------------------------------------------------------------------------------------------------------------{
+bool allowed = filterInput == FILTER_NONE or qualified
+
+if not na(upper) and firedDir == 0 and allowed
+    bool upHit = high >= upper and trendSide >= 0
+    bool dnHit = low <= lower and trendSide <= 0
+    int  dir   = 0
+    bool both  = upHit and dnHit
+    if both
+        //both triggers inside one bar: an up-closing bar most likely traded its low first
+        dir := close >= open ? -1 : 1
+    else if upHit
+        dir := 1
+    else if dnHit
+        dir := -1
+
+    if dir != 0
+        firedDir := dir
+        upEvent  := dir == 1
+        dnEvent  := dir == -1
+        if dir == 1
+            upCount += 1
+        else
+            dnCount += 1
+        if both
+            bothCount += 1
+        float entryPx = dir == 1 ? math.max(upper, open) : math.min(lower, open)
+        //a new breakout replaces a trade still held from an earlier period
+        if not na(trade)
+            closeTrade(entryPx, bar_index, "Opposite breakout")
+            trade    := na
+        label mark = tradesInput ? label.new(bar_index, entryPx, "", color = dir == 1 ? bullColorInput : bearColorInput, style = label.style_circle, size = size.tiny, tooltip = (dir == 1 ? "Buy trigger hit at " : "Sell trigger hit at ") + str.tostring(entryPx, format.mintick) + (both ? "\nBoth triggers traded inside this bar" : "")) : na
+        if not na(mark)
+            tradeMarks.push(mark)
+        float stopPx = stopInput > 0 ? entryPx - dir * stopInput * basisVal : (dir == 1 ? lower : upper)
+        trade := Trade.new(dir, entryPx, stopPx, bar_index, 0, na, mark)
+
+//protective stop, checked from the bar after entry (or on the entry bar when the bar traded through both sides)
+if not na(trade) and not exitEvent
+    bool sameBar = trade.entryBar == bar_index
+    bool both    = sameBar and (trade.dir == 1 ? low <= trade.stop : high >= trade.stop) and (high >= upper and low <= lower or stopInput > 0)
+    bool stopHit = (not sameBar or both) and (trade.dir == 1 ? low <= trade.stop : high >= trade.stop)
+    if stopHit
+        float px = trade.dir == 1 ? math.min(trade.stop, open) : math.max(trade.stop, open)
+        px := sameBar ? trade.stop : px
+        closeTrade(px, bar_index, "Stopped")
+        exitEvent := true
+        trade     := na
+
+//period close exit on the period's last bar
+if not na(trade) and periodEnds and exitInput == EXIT_CLOSE
+    closeTrade(close, bar_index, "Period close")
+    exitEvent := true
+    trade     := na
+
+//extend the current period's drawings
+if lowerTf and not na(cur)
+    line.set_x2(cur.upLine, bar_index)
+    line.set_x2(cur.dnLine, bar_index)
+    line.set_x2(cur.openLine, bar_index)
+    box.set_right(cur.zone, bar_index)
+    //trigger tags ride the right end of their lines
+    label.set_x(cur.upTag, bar_index)
+    label.set_x(cur.dnTag, bar_index)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Plots (period-per-bar charts)
+//---------------------------------------------------------------------------------------------------------------------{
+plot(chartIsPeriod ? upper : na, "Buy Trigger", bullColorInput, 2, plot.style_stepline)
+plot(chartIsPeriod ? lower : na, "Sell Trigger", bearColorInput, 2, plot.style_stepline)
+plotshape(chartIsPeriod and qualified and filterInput != FILTER_NONE, "Contraction Period", shape.diamond, location.top, qualColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+dashPosition = switch dashPosInput
+    "Top Left"     => position.top_left
+    "Bottom Right" => position.bottom_right
+    "Bottom Left"  => position.bottom_left
+    => position.top_right
+
+dashTextSize = switch dashSizeInput
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    => size.small
+
+var table dashTable = na
+
+dashRow(int row, string name, string value, color valueColor, string tip) =>
+    table.cell(dashTable, 0, row, name, text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left, tooltip = tip)
+    table.cell(dashTable, 1, row, value, text_color = valueColor, text_size = dashTextSize, text_halign = text.align_right)
+
+if barstate.islast and showDashInput
+    if na(dashTable)
+        dashTable := table.new(dashPosition, 2, 7, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+    string stateText  = na(upper) ? "Building basis" : not allowed ? "No contraction" : firedDir == 1 ? "Buy hit" : firedDir == -1 ? "Sell hit" : "Inside"
+    color  stateColor = firedDir == 1 ? bullColorInput : firedDir == -1 ? bearColorInput : DASH_TEXT
+    float  trigExp    = trigExpN > 0 ? trigExpSum / trigExpN : na
+    float  quietExp   = quietExpN > 0 ? quietExpSum / quietExpN : na
+    int    trigTotal  = upCount + dnCount
+    table.cell(dashTable, 0, 0, "Volatility Breakout", text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 0, "k " + str.tostring(kInput), text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_right)
+    dashRow(1, "Basis", basisInput, DASH_TEXT, "Distance unit of the triggers. The current basis is " + (na(basisVal) ? TXT_NA : str.tostring(basisVal, format.mintick)) + ".")
+    dashRow(2, "Buy / Sell", na(upper) ? TXT_NA : str.tostring(upper, format.mintick) + " / " + str.tostring(lower, format.mintick), DASH_TEXT, "Current period open plus and minus k times the basis.")
+    dashRow(3, "Now", stateText, stateColor, "Which trigger, if any, the current period has reached.")
+    dashRow(4, "Breakouts", periodsCount > 0 ? str.tostring(trigTotal) + "/" + str.tostring(periodsCount + (na(upper) ? 0 : 1)) + " (" + str.tostring(upCount) + "▲ " + str.tostring(dnCount) + "▼)" : TXT_NA, DASH_TEXT
+      , "Periods on the chart that reached a trigger, out of all periods, by direction. " + str.tostring(bothCount) + " traded both triggers inside a single bar.")
+    dashRow(5, "Range, Breakout", na(trigExp) ? "none yet" : str.tostring(trigExp, "0.00") + "x", DASH_TEXT, "Average full range of completed breakout periods, in multiples of the basis they were set with.")
+    dashRow(6, "Range, Quiet", na(quietExp) ? "none yet" : str.tostring(quietExp, "0.00") + "x", DASH_TEXT, "Average full range of completed periods that never reached a trigger, in multiples of their basis. The gap between the two rows is the range expansion the triggers capture.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(upEvent, "Buy Trigger Hit", "Volatility breakout on {{ticker}}: price traded through the buy trigger (open plus k times the range basis)")
+alertcondition(dnEvent, "Sell Trigger Hit", "Volatility breakout on {{ticker}}: price traded through the sell trigger (open minus k times the range basis)")
+alertcondition(upEvent or dnEvent, "Any Trigger Hit", "Volatility breakout on {{ticker}}: a trigger was hit")
+alertcondition(exitEvent, "Trade Exit", "Volatility breakout on {{ticker}}: the breakout trade was closed by its exit rule or stop")
+alertcondition(qualEvent, "Contraction Period Starts", "Volatility breakout on {{ticker}}: a new period follows a range contraction, triggers are armed")
+
+//---------------------------------------------------------------------------------------------------------------------}

@@ -1,0 +1,632 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Trading-range Position"
+  , shorttitle       = "Trading-range Position"
+  , overlay          = true
+  , format           = format.price
+  , max_boxes_count  = 500
+  , max_lines_count  = 500
+  , max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+//Territory codes for the position readout
+int TERRITORY_NONE = -1
+int TERRITORY_BUY  = 0
+int TERRITORY_MID  = 1
+int TERRITORY_SELL = 2
+
+//Reversal swings remembered for seeding the edge tests when a range confirms
+int PIVOT_CAP = 60
+
+//Bars the active structure extends to the right of the last bar
+int EXTEND_BARS = 4
+
+//Minimum edge-band thickness as a fraction of one subdivision's height
+float MIN_BAND_FRAC = 0.15
+
+//Floor for the formation window height, as a fraction of the volatility baseline
+float MIN_HEIGHT_ATR = 0.1
+
+//Default palette
+color BULL_COLOR    = #089981 // buy territory, tested support
+color BEAR_COLOR    = #f23645 // sell territory, tested resistance
+color NEUTRAL_COLOR = #787b86 // structure - the range frame, subdivision lines, the no-trade zone
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+string SUBDIV_THIRDS   = "Thirds"
+string SUBDIV_QUARTERS = "Quarters"
+
+string LOC_TOP_RIGHT    = "Top Right"
+string LOC_BOTTOM_RIGHT = "Bottom Right"
+string LOC_BOTTOM_LEFT  = "Bottom Left"
+
+string SIZE_TINY   = "Tiny"
+string SIZE_SMALL  = "Small"
+string SIZE_NORMAL = "Normal"
+
+string GROUP_DETECTION = "Range Detection"
+string GROUP_POSITION  = "Range Position"
+string GROUP_DASH      = "Dashboard"
+string GROUP_STYLE     = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+formationLengthInput = input.int(20, "Formation Length"
+  , minval  = 10
+  , maxval  = 200
+  , group   = GROUP_DETECTION
+  , tooltip = "Bars used to detect a new trading range. A range is confirmed when the highest high and lowest low of this window fit inside the maximum range height; the window's reversal extremes become the initial support and resistance.")
+
+maxHeightAtrInput = input.float(3, "Maximum Range Height"
+  , minval  = 0.5
+  , step    = 0.25
+  , group   = GROUP_DETECTION
+  , tooltip = "Maximum height of the formation window, as a multiple of the volatility baseline ATR. Lower values demand a tighter consolidation before a trading range is recognized.")
+
+atrLengthInput = input.int(200, "Volatility Baseline"
+  , minval  = 10
+  , group   = GROUP_DETECTION
+  , tooltip = "ATR length used as the volatility baseline for the maximum range height filter.")
+
+swingLengthInput = input.int(5, "Swing Length"
+  , minval  = 1
+  , maxval  = 50
+  , group   = GROUP_DETECTION
+  , tooltip = "Bars on each side used to confirm reversal swings. Swing lows confirmed inside the lower subdivision register as support tests and swing highs inside the upper subdivision as resistance tests, refining each edge band to the zone price repeatedly reversed from.")
+
+breakClosesInput = input.int(2, "Breakout Confirmation"
+  , minval  = 1
+  , maxval  = 10
+  , group   = GROUP_DETECTION
+  , tooltip = "Consecutive closes beyond an effective extreme required to resolve the range. Penetrations that recover before reaching this count reset the effective extreme instead, the way a spring or shakeout resets the working low.")
+
+resetMinPctInput = input.float(5, "Edge Reset Sensitivity %"
+  , minval  = 0
+  , maxval  = 50
+  , step    = 0.5
+  , group   = GROUP_DETECTION
+  , tooltip = "Minimum penetration depth, as a percentage of the range height, for a recovered poke beyond an edge to be reported as an effective low/high reset. Shallower pokes still extend the working extremes silently.")
+
+subdivisionInput = input.string(SUBDIV_THIRDS, "Subdivision"
+  , options = [SUBDIV_THIRDS, SUBDIV_QUARTERS]
+  , group   = GROUP_POSITION
+  , tooltip = "Grid used to read position inside the range: the lowest subdivision is buy territory, the highest is sell territory, and everything between is the no-trade zone for range-based entries.")
+
+showDashboardInput = input.bool(true, "Show Dashboard"
+  , group   = GROUP_DASH
+  , tooltip = "Displays the position readout: where the last close sits inside the range, the current territory and its duration, the edge test counts, and the effective extremes stops are measured against.")
+
+dashboardLocationInput = input.string(LOC_TOP_RIGHT, "Location"
+  , options = [LOC_TOP_RIGHT, LOC_BOTTOM_RIGHT, LOC_BOTTOM_LEFT]
+  , group   = GROUP_DASH
+  , tooltip = "Dashboard position on the chart.")
+
+dashboardSizeInput = input.string(SIZE_SMALL, "Size"
+  , options = [SIZE_TINY, SIZE_SMALL, SIZE_NORMAL]
+  , group   = GROUP_DASH
+  , tooltip = "Dashboard text size.")
+
+showZonesInput = input.bool(true, "Territory Fills"
+  , group   = GROUP_STYLE
+  , tooltip = "Shades the buy, no-trade and sell subdivisions of the active range.")
+
+showBandsInput = input.bool(true, "Edge Test Bands"
+  , group   = GROUP_STYLE
+  , tooltip = "Draws the support and resistance bands spanned by the reversal swings that actually tested each edge.")
+
+showPositionLabelInput = input.bool(true, "Position Label"
+  , group   = GROUP_STYLE
+  , tooltip = "Shows the live range position readout at the right edge of the active range.")
+
+showResetMarkersInput = input.bool(false, "Edge Reset Markers"
+  , group   = GROUP_STYLE
+  , tooltip = "Marks the penetration extremes of the recovered pokes that reset an effective extreme. Alerts cover these events regardless.")
+
+keepPreviousInput = input.bool(true, "Keep Previous Ranges"
+  , group   = GROUP_STYLE
+  , tooltip = "Keeps the drawings of resolved ranges on the chart instead of deleting them.")
+
+bullColorInput = input.color(BULL_COLOR, "Buy Side", inline = "rangeColors", group = GROUP_STYLE)
+
+bearColorInput = input.color(BEAR_COLOR, "Sell Side", inline = "rangeColors", group = GROUP_STYLE)
+
+neutralColorInput = input.color(NEUTRAL_COLOR, "Frame", inline = "rangeColors", group = GROUP_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+//Maps the dashboard size setting to a text size constant
+textSizeOf(string sizeKey) =>
+    switch sizeKey
+        SIZE_TINY  => size.tiny
+        SIZE_SMALL => size.small
+        => size.normal
+
+//Maps the dashboard location setting to a table position constant
+tablePositionOf(string locationKey) =>
+    switch locationKey
+        LOC_BOTTOM_RIGHT => position.bottom_right
+        LOC_BOTTOM_LEFT  => position.bottom_left
+        => position.top_right
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+
+int divCount = subdivisionInput == SUBDIV_QUARTERS ? 4 : 3
+
+//Volatility baseline with a short-history fallback
+float trueRange    = ta.tr(true)
+float cumTrueRange = ta.cum(trueRange)
+float atrRaw       = ta.atr(atrLengthInput)
+float atrBase      = nz(atrRaw, cumTrueRange / (bar_index + 1))
+
+//Reversal swings
+float swingHigh = ta.pivothigh(swingLengthInput, swingLengthInput)
+float swingLow  = ta.pivotlow(swingLengthInput, swingLengthInput)
+int   swingBar  = bar_index - swingLengthInput
+
+//Formation window envelope: the reversal extremes trading actually respected
+float envelopeTop    = ta.highest(high, formationLengthInput)
+float envelopeBottom = ta.lowest(low, formationLengthInput)
+float envelopeHeight = envelopeTop - envelopeBottom
+
+//Swing memory used to seed the edge tests once a range confirms
+var array<float> swingHighPriceArray = array.new<float>()
+var array<int>   swingHighBarArray   = array.new<int>()
+var array<float> swingLowPriceArray  = array.new<float>()
+var array<int>   swingLowBarArray    = array.new<int>()
+
+if not na(swingHigh)
+    array.push(swingHighPriceArray, swingHigh)
+    array.push(swingHighBarArray, swingBar)
+    if array.size(swingHighPriceArray) > PIVOT_CAP
+        array.shift(swingHighPriceArray)
+        array.shift(swingHighBarArray)
+
+if not na(swingLow)
+    array.push(swingLowPriceArray, swingLow)
+    array.push(swingLowBarArray, swingBar)
+    if array.size(swingLowPriceArray) > PIVOT_CAP
+        array.shift(swingLowPriceArray)
+        array.shift(swingLowBarArray)
+
+//Range state
+var bool  rangeActive        = false
+var float effLow             = na
+var float effHigh            = na
+var int   rangeStartBar      = na
+var int   lastEndBar         = -1
+var int   supTestCount       = 0
+var int   resTestCount       = 0
+var float supBandTopRaw      = na
+var float resBandBottomRaw   = na
+var int   upCloses           = 0
+var int   dnCloses           = 0
+var float penetrationHigh    = na
+var float penetrationLow     = na
+var int   penetrationHighBar = na
+var int   penetrationLowBar  = na
+var int   resolvedDirection  = 0
+var int   territoryPrev      = TERRITORY_NONE
+var int   territoryBars      = 0
+
+//Per-bar events
+bool newRangeEvent   = false
+bool resolvedUpEvent = false
+bool resolvedDnEvent = false
+bool lowResetEvent   = false
+bool highResetEvent  = false
+bool supTestEvent    = false
+bool resTestEvent    = false
+int  lowResetBar     = na
+int  highResetBar    = na
+
+//Containment machine: recoveries first, then the current bar's location, then resolution
+if rangeActive
+    float rangeHeightNow = effHigh - effLow
+    float resetThreshold = resetMinPctInput / 100 * rangeHeightNow
+
+    //A pending penetration below support recovered - the spring/shakeout low becomes the effective low
+    if dnCloses > 0 and close >= effLow
+        float recoveredLow = math.min(nz(penetrationLow, low), low)
+        if recoveredLow < effLow
+            lowResetEvent := effLow - recoveredLow >= resetThreshold
+            lowResetBar   := na(penetrationLow) or low < penetrationLow ? bar_index : penetrationLowBar
+            effLow        := recoveredLow
+        dnCloses       := 0
+        penetrationLow := na
+
+    //A pending penetration above resistance recovered - the failed poke resets the effective high
+    if upCloses > 0 and close <= effHigh
+        float recoveredHigh = math.max(nz(penetrationHigh, high), high)
+        if recoveredHigh > effHigh
+            highResetEvent := recoveredHigh - effHigh >= resetThreshold
+            highResetBar   := na(penetrationHigh) or high > penetrationHigh ? bar_index : penetrationHighBar
+            effHigh        := recoveredHigh
+        upCloses        := 0
+        penetrationHigh := na
+
+    //Locate the current close against the working extremes
+    if close > effHigh
+        upCloses += 1
+        if na(penetrationHigh) or high > penetrationHigh
+            penetrationHigh    := high
+            penetrationHighBar := bar_index
+    else if close < effLow
+        dnCloses += 1
+        if na(penetrationLow) or low < penetrationLow
+            penetrationLow    := low
+            penetrationLowBar := bar_index
+    else
+        //Same-bar wick pokes that closed back inside extend the working extremes
+        if low < effLow
+            lowResetEvent := lowResetEvent or effLow - low >= resetThreshold
+            lowResetBar   := na(lowResetBar) ? bar_index : lowResetBar
+            effLow        := low
+        if high > effHigh
+            highResetEvent := highResetEvent or high - effHigh >= resetThreshold
+            highResetBar   := na(highResetBar) ? bar_index : highResetBar
+            effHigh        := high
+
+    //Sustained acceptance beyond an edge resolves the range
+    if upCloses >= breakClosesInput
+        resolvedUpEvent := true
+    else if dnCloses >= breakClosesInput
+        resolvedDnEvent := true
+
+    if resolvedUpEvent or resolvedDnEvent
+        rangeActive       := false
+        resolvedDirection := resolvedUpEvent ? 1 : -1
+        lastEndBar        := bar_index
+        upCloses          := 0
+        dnCloses          := 0
+        penetrationHigh   := na
+        penetrationLow    := na
+
+//Formation: a compressed window that fully clears the previous range confirms a new trading range
+bool windowClear     = bar_index - formationLengthInput + 1 > lastEndBar
+float minHeight      = math.max(4 * syminfo.mintick, MIN_HEIGHT_ATR * atrBase)
+bool  envelopeReady  = not na(envelopeHeight) and not na(atrBase)
+bool  envelopeCompressed = envelopeReady and envelopeHeight <= maxHeightAtrInput * atrBase and envelopeHeight >= minHeight
+
+if not rangeActive and windowClear and envelopeCompressed
+    rangeActive       := true
+    newRangeEvent     := true
+    effLow            := envelopeBottom
+    effHigh           := envelopeTop
+    rangeStartBar     := bar_index - formationLengthInput + 1
+    supTestCount      := 0
+    resTestCount      := 0
+    supBandTopRaw     := na
+    resBandBottomRaw  := na
+    upCloses          := 0
+    dnCloses          := 0
+    penetrationHigh   := na
+    penetrationLow    := na
+    resolvedDirection := 0
+    territoryPrev     := TERRITORY_NONE
+
+    //Seed the edge tests from the reversal swings inside the formation window
+    float seedZoneHeight = envelopeHeight / divCount
+    if array.size(swingLowPriceArray) > 0
+        for i = 0 to array.size(swingLowPriceArray) - 1
+            float testPrice = array.get(swingLowPriceArray, i)
+            if array.get(swingLowBarArray, i) >= rangeStartBar and testPrice <= effLow + seedZoneHeight
+                supTestCount  += 1
+                supBandTopRaw := math.max(nz(supBandTopRaw, testPrice), testPrice)
+    if array.size(swingHighPriceArray) > 0
+        for i = 0 to array.size(swingHighPriceArray) - 1
+            float testPrice = array.get(swingHighPriceArray, i)
+            if array.get(swingHighBarArray, i) >= rangeStartBar and testPrice >= effHigh - seedZoneHeight
+                resTestCount     += 1
+                resBandBottomRaw := math.min(nz(resBandBottomRaw, testPrice), testPrice)
+
+//New confirmed swings inside the active range register as edge tests and refine the bands
+if rangeActive and not newRangeEvent
+    float zoneHeightNow = (effHigh - effLow) / divCount
+    if not na(swingLow) and swingBar >= rangeStartBar and swingLow <= effLow + zoneHeightNow
+        supTestEvent  := true
+        supTestCount  += 1
+        supBandTopRaw := math.max(nz(supBandTopRaw, swingLow), swingLow)
+    if not na(swingHigh) and swingBar >= rangeStartBar and swingHigh >= effHigh - zoneHeightNow
+        resTestEvent     := true
+        resTestCount     += 1
+        resBandBottomRaw := math.min(nz(resBandBottomRaw, swingHigh), swingHigh)
+
+//Position within the range: where the last close sits between the effective extremes
+float rangeHeight     = rangeActive ? effHigh - effLow : na
+float zoneHeight      = rangeActive ? rangeHeight / divCount : na
+float lowerZoneTop    = rangeActive ? effLow + zoneHeight : na
+float upperZoneBottom = rangeActive ? effHigh - zoneHeight : na
+float positionPct     = rangeActive ? 100 * (close - effLow) / rangeHeight : na
+
+int territoryNow = TERRITORY_NONE
+if rangeActive
+    territoryNow := close <= lowerZoneTop ? TERRITORY_BUY : close >= upperZoneBottom ? TERRITORY_SELL : TERRITORY_MID
+
+bool enterBuyEvent  = rangeActive and not newRangeEvent and territoryNow == TERRITORY_BUY  and territoryPrev != TERRITORY_BUY
+bool enterSellEvent = rangeActive and not newRangeEvent and territoryNow == TERRITORY_SELL and territoryPrev != TERRITORY_SELL
+bool enterMidEvent  = rangeActive and not newRangeEvent and territoryNow == TERRITORY_MID  and territoryPrev != TERRITORY_MID
+
+territoryBars := territoryNow == territoryPrev ? territoryBars + 1 : 1
+territoryPrev := territoryNow
+
+//Edge bands: from each effective extreme to the far side of its tested reversal cluster
+float supBandTop    = na
+float resBandBottom = na
+if rangeActive
+    supBandTop    := math.min(math.max(nz(supBandTopRaw, effLow), effLow + MIN_BAND_FRAC * zoneHeight), lowerZoneTop)
+    resBandBottom := math.max(math.min(nz(resBandBottomRaw, effHigh), effHigh - MIN_BAND_FRAC * zoneHeight), upperZoneBottom)
+
+string territoryText = switch territoryNow
+    TERRITORY_BUY  => "Buy territory"
+    TERRITORY_MID  => "No-trade zone"
+    TERRITORY_SELL => "Sell territory"
+    => "-"
+
+color territoryColor = switch territoryNow
+    TERRITORY_BUY  => bullColorInput
+    TERRITORY_MID  => neutralColorInput
+    TERRITORY_SELL => bearColorInput
+    => NEUTRAL_COLOR
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+
+color frameLineColor  = color.new(neutralColorInput, 40)
+color boundaryColor   = color.new(neutralColorInput, 60)
+color lowerFillColor  = color.new(bullColorInput, 92)
+color upperFillColor  = color.new(bearColorInput, 92)
+color middleFillColor = color.new(neutralColorInput, 97)
+color supBandColor    = color.new(bullColorInput, 78)
+color resBandColor    = color.new(bearColorInput, 78)
+
+var box   frameBox          = na
+var box   lowerZoneBox      = na
+var box   middleZoneBox     = na
+var box   upperZoneBox      = na
+var box   supBandBox        = na
+var box   resBandBox        = na
+var line  lowerBoundaryLine = na
+var line  upperBoundaryLine = na
+var label positionLabel     = na
+
+//Draw a freshly confirmed range
+if newRangeEvent
+    int rightEdge = bar_index + EXTEND_BARS
+    frameBox := box.new(rangeStartBar, effHigh, rightEdge, effLow
+      , border_color = frameLineColor
+      , border_width = 1
+      , border_style = line.style_dashed
+      , bgcolor      = color(na))
+    if showZonesInput
+        lowerZoneBox := box.new(rangeStartBar, lowerZoneTop, rightEdge, effLow
+          , border_color = color(na)
+          , bgcolor      = lowerFillColor
+          , text         = "Buy territory"
+          , text_size    = size.tiny
+          , text_color   = color.new(bullColorInput, 45)
+          , text_halign  = text.align_right
+          , text_valign  = text.align_center)
+        middleZoneBox := box.new(rangeStartBar, upperZoneBottom, rightEdge, lowerZoneTop
+          , border_color = color(na)
+          , bgcolor      = middleFillColor
+          , text         = "No-trade zone"
+          , text_size    = size.tiny
+          , text_color   = color.new(neutralColorInput, 45)
+          , text_halign  = text.align_right
+          , text_valign  = text.align_center)
+        upperZoneBox := box.new(rangeStartBar, effHigh, rightEdge, upperZoneBottom
+          , border_color = color(na)
+          , bgcolor      = upperFillColor
+          , text         = "Sell territory"
+          , text_size    = size.tiny
+          , text_color   = color.new(bearColorInput, 45)
+          , text_halign  = text.align_right
+          , text_valign  = text.align_center)
+        lowerBoundaryLine := line.new(rangeStartBar, lowerZoneTop, rightEdge, lowerZoneTop
+          , color = boundaryColor
+          , style = line.style_dotted
+          , width = 1)
+        upperBoundaryLine := line.new(rangeStartBar, upperZoneBottom, rightEdge, upperZoneBottom
+          , color = boundaryColor
+          , style = line.style_dotted
+          , width = 1)
+    if showBandsInput
+        supBandBox := box.new(rangeStartBar, supBandTop, rightEdge, effLow
+          , border_color = color(na)
+          , bgcolor      = supBandColor)
+        resBandBox := box.new(rangeStartBar, effHigh, rightEdge, resBandBottom
+          , border_color = color(na)
+          , bgcolor      = resBandColor)
+
+//Track the working structure while the range stays active
+if rangeActive
+    int rightEdge = bar_index + EXTEND_BARS
+    if not na(frameBox)
+        box.set_top(frameBox, effHigh)
+        box.set_bottom(frameBox, effLow)
+        box.set_right(frameBox, rightEdge)
+    if not na(lowerZoneBox)
+        box.set_top(lowerZoneBox, lowerZoneTop)
+        box.set_bottom(lowerZoneBox, effLow)
+        box.set_right(lowerZoneBox, rightEdge)
+    if not na(middleZoneBox)
+        box.set_top(middleZoneBox, upperZoneBottom)
+        box.set_bottom(middleZoneBox, lowerZoneTop)
+        box.set_right(middleZoneBox, rightEdge)
+    if not na(upperZoneBox)
+        box.set_top(upperZoneBox, effHigh)
+        box.set_bottom(upperZoneBox, upperZoneBottom)
+        box.set_right(upperZoneBox, rightEdge)
+    if not na(supBandBox)
+        box.set_top(supBandBox, supBandTop)
+        box.set_bottom(supBandBox, effLow)
+        box.set_right(supBandBox, rightEdge)
+    if not na(resBandBox)
+        box.set_top(resBandBox, effHigh)
+        box.set_bottom(resBandBox, resBandBottom)
+        box.set_right(resBandBox, rightEdge)
+    if not na(lowerBoundaryLine)
+        line.set_xy1(lowerBoundaryLine, rangeStartBar, lowerZoneTop)
+        line.set_xy2(lowerBoundaryLine, rightEdge, lowerZoneTop)
+    if not na(upperBoundaryLine)
+        line.set_xy1(upperBoundaryLine, rangeStartBar, upperZoneBottom)
+        line.set_xy2(upperBoundaryLine, rightEdge, upperZoneBottom)
+
+//Freeze the structure at resolution, or discard it when previous ranges are hidden
+if resolvedUpEvent or resolvedDnEvent
+    if not na(frameBox)
+        if keepPreviousInput
+            box.set_right(frameBox, bar_index)
+        else
+            box.delete(frameBox)
+    if not na(lowerZoneBox)
+        if keepPreviousInput
+            box.set_right(lowerZoneBox, bar_index)
+        else
+            box.delete(lowerZoneBox)
+    if not na(middleZoneBox)
+        if keepPreviousInput
+            box.set_right(middleZoneBox, bar_index)
+        else
+            box.delete(middleZoneBox)
+    if not na(upperZoneBox)
+        if keepPreviousInput
+            box.set_right(upperZoneBox, bar_index)
+        else
+            box.delete(upperZoneBox)
+    if not na(supBandBox)
+        if keepPreviousInput
+            box.set_right(supBandBox, bar_index)
+        else
+            box.delete(supBandBox)
+    if not na(resBandBox)
+        if keepPreviousInput
+            box.set_right(resBandBox, bar_index)
+        else
+            box.delete(resBandBox)
+    if not na(lowerBoundaryLine)
+        if keepPreviousInput
+            line.set_x2(lowerBoundaryLine, bar_index)
+        else
+            line.delete(lowerBoundaryLine)
+    if not na(upperBoundaryLine)
+        if keepPreviousInput
+            line.set_x2(upperBoundaryLine, bar_index)
+        else
+            line.delete(upperBoundaryLine)
+    frameBox          := na
+    lowerZoneBox      := na
+    middleZoneBox     := na
+    upperZoneBox      := na
+    supBandBox        := na
+    resBandBox        := na
+    lowerBoundaryLine := na
+    upperBoundaryLine := na
+
+//Live position readout at the right edge of the active range
+if rangeActive and showPositionLabelInput
+    if na(positionLabel)
+        positionLabel := label.new(bar_index + EXTEND_BARS, close, ""
+          , style = label.style_label_left
+          , color = #00000000
+          , size  = size.small)
+    label.set_xy(positionLabel, bar_index + EXTEND_BARS, close)
+    label.set_text(positionLabel, str.tostring(positionPct, "#.#") + "% (" + territoryText + ")")
+    label.set_textcolor(positionLabel, territoryColor)
+else if not na(positionLabel)
+    label.delete(positionLabel)
+    positionLabel := na
+
+//Optional markers on the penetration extremes that reset an effective extreme
+if showResetMarkersInput and lowResetEvent
+    label.new(na(lowResetBar) ? bar_index : lowResetBar, effLow, ""
+      , style = label.style_circle
+      , color = color.new(bullColorInput, 30)
+      , size  = size.tiny)
+
+if showResetMarkersInput and highResetEvent
+    label.new(na(highResetBar) ? bar_index : highResetBar, effHigh, ""
+      , style = label.style_circle
+      , color = color.new(bearColorInput, 30)
+      , size  = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+
+if showDashboardInput and barstate.islast
+    var table dashboardTable = table.new(tablePositionOf(dashboardLocationInput), 2, 6
+      , bgcolor      = DASH_BG
+      , border_width = 0
+      , frame_color  = DASH_FRAME
+      , frame_width  = 1)
+
+    string dashSize   = textSizeOf(dashboardSizeInput)
+    color  keyColor   = DASH_HEADER
+    color  valueColor = DASH_TEXT
+
+    string statusText = rangeActive ? "Active (" + str.tostring(bar_index - rangeStartBar + 1) + " bars)" : resolvedDirection == 1 ? "Resolved up" : resolvedDirection == -1 ? "Resolved down" : "No active range"
+    color  statusColor = rangeActive ? neutralColorInput : resolvedDirection == 1 ? bullColorInput : resolvedDirection == -1 ? bearColorInput : NEUTRAL_COLOR
+
+    string positionText  = na(positionPct) ? "-" : str.tostring(positionPct, "#.#") + "% of range"
+    color  positionColor = na(positionPct) ? NEUTRAL_COLOR : color.from_gradient(positionPct, 0, 100, bullColorInput, bearColorInput)
+
+    string territoryCell = rangeActive ? territoryText + " (" + str.tostring(territoryBars) + " bars)" : "-"
+    string rangeCell     = rangeActive ? str.tostring(effLow, format.mintick) + " - " + str.tostring(effHigh, format.mintick) : "-"
+
+    table.cell(dashboardTable, 0, 0, "Status", text_color = keyColor, text_size = dashSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 0, statusText, text_color = statusColor, text_size = dashSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 1, "Position", text_color = keyColor, text_size = dashSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 1, positionText, text_color = positionColor, text_size = dashSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 2, "Territory", text_color = keyColor, text_size = dashSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 2, territoryCell, text_color = territoryColor, text_size = dashSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 3, "Support tests", text_color = keyColor, text_size = dashSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 3, str.tostring(supTestCount), text_color = valueColor, text_size = dashSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 4, "Resistance tests", text_color = keyColor, text_size = dashSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 4, str.tostring(resTestCount), text_color = valueColor, text_size = dashSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 5, "Effective range", text_color = keyColor, text_size = dashSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 5, rangeCell, text_color = valueColor, text_size = dashSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Plots & Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+plot(positionPct, "Range Position %", color = neutralColorInput, display = display.data_window)
+
+alertcondition(newRangeEvent, "New Trading Range", "A trading range confirmed on {{ticker}} ({{interval}}) - initial support and resistance set from the formation window's reversal extremes")
+
+alertcondition(enterBuyEvent, "Entered Buy Territory", "Price on {{ticker}} ({{interval}}) entered the lower subdivision of the trading range - buy territory near tested support")
+
+alertcondition(enterSellEvent, "Entered Sell Territory", "Price on {{ticker}} ({{interval}}) entered the upper subdivision of the trading range - sell territory near tested resistance")
+
+alertcondition(enterMidEvent, "Entered No-Trade Zone", "Price on {{ticker}} ({{interval}}) returned to the middle of the trading range - neither location nor information favors range-based entries here")
+
+alertcondition(supTestEvent, "Support Test Confirmed", "A reversal swing confirmed inside the lower subdivision on {{ticker}} ({{interval}}) - the support band registered another test")
+
+alertcondition(resTestEvent, "Resistance Test Confirmed", "A reversal swing confirmed inside the upper subdivision on {{ticker}} ({{interval}}) - the resistance band registered another test")
+
+alertcondition(lowResetEvent, "Effective Low Reset", "A spring/shakeout-style penetration below support recovered on {{ticker}} ({{interval}}) - the effective low was reset and range position re-anchored")
+
+alertcondition(highResetEvent, "Effective High Reset", "A failed penetration above resistance recovered on {{ticker}} ({{interval}}) - the effective high was reset and range position re-anchored")
+
+alertcondition(resolvedUpEvent, "Range Resolved Up", "Price on {{ticker}} ({{interval}}) held beyond the effective high for the confirmation count - the trading range resolved upward")
+
+alertcondition(resolvedDnEvent, "Range Resolved Down", "Price on {{ticker}} ({{interval}}) held beyond the effective low for the confirmation count - the trading range resolved downward")
+
+//---------------------------------------------------------------------------------------------------------------------}

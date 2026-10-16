@@ -1,0 +1,201 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("MLMA", shorttitle = "MLMA", overlay = true, format = format.price, max_bars_back = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+NEUTRAL_COLOR = #787b86
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+FILL_EDGE_TRANSP = 80  // gradient fill transparency at the band edges
+FILL_MEAN_TRANSP = 100 // gradient fill transparency at the fitted mean
+BAND_LINE_TRANSP = 65  // transparency of the band edge lines
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+srcInput          = input.source(close, "Source", group = "Settings",
+     tooltip = "Price series the kernel regression fits. The fit is strictly causal — every value is computed from the current and prior bars only and is final on bar close — so plotted history does not repaint.")
+
+windowInput       = input.int(100, "Window Length", minval = 2, maxval = 500, group = "Settings",
+     tooltip = "Number of past bars the model sees — the one-sided fitting window. Longer windows smooth more and lag more; shorter windows hug price and risk fitting the window's noise instead of its trend.")
+
+bandwidthInput    = input.float(8.0, "Kernel Bandwidth", minval = 0.5, step = 0.5, group = "Settings",
+     tooltip = "Bandwidth h of the Gaussian (radial basis function) kernel: a bar k bars back is weighted exp(-k² / (2h²)), so the bandwidth sets how quickly a bar's influence decays with age — the role length plays for an EMA. Wider bandwidths reach deeper into the window and smooth more; narrow bandwidths let the fit bend easily and can overfit recent noise.")
+
+showBandsInput    = input.bool(true, "Show Uncertainty Bands", group = "Uncertainty Bands",
+     tooltip = "Plots an envelope around the fitted mean at a multiple of the model's residual dispersion. The bands widen when recent prices fit the model poorly and tighten when the fit explains them well, framing how stretched price is from the fitted mean — an adaptive alternative to fixed-percentage envelopes.")
+
+bandMultInput     = input.float(2.0, "Band Multiplier", minval = 0, step = 0.1, group = "Uncertainty Bands",
+     tooltip = "Multiple of the kernel-weighted residual standard deviation at which the bands sit from the fitted mean. Larger multiples frame deeper stretch, reversion and breakout zones.")
+
+showDashInput     = input.bool(true, "Show Dashboard", group = "Dashboard",
+     tooltip = "Displays the current slope bias of the fit, price's side of the fitted line, and how stretched price is from the fitted mean in units of the model's uncertainty.")
+
+dashLocationInput = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = "Dashboard",
+     tooltip = "Chart corner where the dashboard is drawn.")
+
+dashSizeInput     = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = "Dashboard",
+     tooltip = "Text size of the dashboard.")
+
+trendColorInput   = input.bool(true, "Slope Trend Coloring", group = "Style",
+     tooltip = "Colors the fitted line by its slope — bullish while rising, bearish while falling — the standard directional-bias read of a smoother. Disable to draw the line in the neutral color.")
+
+bullColorInput    = input.color(BULL_COLOR, "Bullish", inline = "direction", group = "Style",
+     tooltip = "Bullish color, used while the fit slopes upward and for bullish crossing markers.")
+
+bearColorInput    = input.color(BEAR_COLOR, "Bearish", inline = "direction", group = "Style",
+     tooltip = "Bearish color, used while the fit slopes downward and for bearish crossing markers.")
+
+neutralColorInput = input.color(NEUTRAL_COLOR, "Neutral", group = "Style",
+     tooltip = "Line color used when slope trend coloring is disabled, or when the slope is flat.")
+
+showFillInput     = input.bool(true, "Uncertainty Gradient Fill", group = "Style",
+     tooltip = "Shades the uncertainty envelope with a vertical gradient — fully transparent at the fitted mean, deepening toward the band edges — so the cloud reads as model confidence: tight where the fit explains recent prices, wide where it does not.")
+
+showMarkersInput  = input.bool(false, "Price Crossing Markers", group = "Style",
+     tooltip = "Displays small triangle markers when the source crosses over or under the fitted line. Off by default to keep the chart clean — the crossing alerts work regardless.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Causal Nadaraya-Watson kernel regression (Nadaraya & Watson, 1964) with a Gaussian / radial basis function
+// kernel, evaluated one-sided so each estimate uses only the current and prior bars — no future data, no repaint:
+//   kernel weight of a bar k bars back : w(k) = exp(-k² / (2h²)),                h = kernel bandwidth
+//   fitted mean                        : m(t) = Σ w(k) · src[t-k] / Σ w(k),      k = 0..N-1
+//   residual dispersion (uncertainty)  : s(t) = sqrt(Σ w(k) · (src[t-k] - m(t))² / Σ w(k))
+// Familiar averages are just fixed kernels — an SMA is a rectangular kernel, an EMA an exponential decay — and the
+// Gaussian kernel generalizes the weighting so the fit can bend with local curvature that fixed weights round off.
+
+// Builds the kernel weights a single time — they depend only on the inputs, which are constant through the run
+gaussianWeights(simple int windowSize, simple float bandwidth) =>
+    weightsArray = array.new_float(windowSize, 0.0)
+    for k = 0 to windowSize - 1
+        array.set(weightsArray, k, math.exp(-(k * k) / (2.0 * bandwidth * bandwidth)))
+    weightsArray
+
+// Kernel-weighted fitted mean and residual dispersion over the trailing window. Weights are renormalized over the
+// bars actually available, so the estimate warms up naturally from the first bar and skips na samples gracefully.
+kernelRegression(float src, array<float> weightsArray) =>
+    int sampleCount   = math.min(array.size(weightsArray), bar_index + 1)
+    float weightSum   = 0.0
+    float weightedSum = 0.0
+    for k = 0 to sampleCount - 1
+        float sample = src[k]
+        if not na(sample)
+            float kernelWeight = array.get(weightsArray, k)
+            weightedSum += kernelWeight * sample
+            weightSum   += kernelWeight
+    float fitValue    = weightSum > 0 ? weightedSum / weightSum : na
+    float residualSum = 0.0
+    if not na(fitValue)
+        for k = 0 to sampleCount - 1
+            float sample = src[k]
+            if not na(sample)
+                residualSum += array.get(weightsArray, k) * math.pow(sample - fitValue, 2)
+    float sigmaValue = not na(fitValue) ? math.sqrt(residualSum / weightSum) : na
+    [fitValue, sigmaValue]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+var kernelWeightsArray = gaussianWeights(windowInput, bandwidthInput)
+
+[mlma, fitSigma] = kernelRegression(srcInput, kernelWeightsArray)
+
+// Model-driven envelope — distance from the fitted mean scaled by the residual dispersion of the fit
+upperBand = mlma + bandMultInput * fitSigma
+lowerBand = mlma - bandMultInput * fitSigma
+
+// Slope of the fit — the directional-bias read of the smoother
+slope         = mlma - nz(mlma[1], mlma)
+slopeTurnUp   = slope > 0 and nz(slope[1]) <= 0
+slopeTurnDown = slope < 0 and nz(slope[1]) >= 0
+
+// Price against the fitted mean — the regime read
+priceCrossUp   = ta.crossover(srcInput, mlma)
+priceCrossDown = ta.crossunder(srcInput, mlma)
+
+// Price against the uncertainty envelope — stretch/breakout and reversion reads
+upperBreakout  = ta.crossover(srcInput, upperBand)
+lowerBreakdown = ta.crossunder(srcInput, lowerBand)
+upperReversion = ta.crossunder(srcInput, upperBand)
+lowerReversion = ta.crossover(srcInput, lowerBand)
+
+// Stretch of price from the fitted mean, in units of the model's uncertainty
+stretchSigma = not na(mlma) and not na(fitSigma) and fitSigma > 0 ? (srcInput - mlma) / fitSigma : float(na)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+mlmaColor = trendColorInput ? (slope > 0 ? bullColorInput : slope < 0 ? bearColorInput : neutralColorInput) : neutralColorInput
+
+upperPlotValue = showBandsInput ? upperBand : na
+lowerPlotValue = showBandsInput ? lowerBand : na
+
+fillEdgeColor = showBandsInput and showFillInput ? color.new(mlmaColor, FILL_EDGE_TRANSP) : na
+fillMeanColor = showBandsInput and showFillInput ? color.new(mlmaColor, FILL_MEAN_TRANSP) : na
+
+mlmaPlotId  = plot(mlma, "MLMA", color = mlmaColor, linewidth = 2)
+upperPlotId = plot(upperPlotValue, "Upper Band", color = color.new(mlmaColor, BAND_LINE_TRANSP), linewidth = 1)
+lowerPlotId = plot(lowerPlotValue, "Lower Band", color = color.new(mlmaColor, BAND_LINE_TRANSP), linewidth = 1)
+
+fill(mlmaPlotId, upperPlotId, top_value = upperPlotValue, bottom_value = mlma, top_color = fillEdgeColor, bottom_color = fillMeanColor, title = "Upper Uncertainty Fill")
+fill(mlmaPlotId, lowerPlotId, top_value = mlma, bottom_value = lowerPlotValue, top_color = fillMeanColor, bottom_color = fillEdgeColor, title = "Lower Uncertainty Fill")
+
+plotshape(showMarkersInput and priceCrossUp, "Bullish Cross Marker", shape.triangleup, location.belowbar, color = bullColorInput, size = size.tiny)
+plotshape(showMarkersInput and priceCrossDown, "Bearish Cross Marker", shape.triangledown, location.abovebar, color = bearColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+dashLocation = switch dashLocationInput
+    "Top Right"    => position.top_right
+    "Top Left"     => position.top_left
+    "Bottom Right" => position.bottom_right
+    => position.bottom_left
+
+dashTextSize = switch dashSizeInput
+    "Tiny"  => size.tiny
+    "Small" => size.small
+    => size.normal
+
+var table dashboardTable = showDashInput ? table.new(dashLocation, 2, 3, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1) : na
+
+if barstate.islast and not na(dashboardTable)
+    slopeText    = slope > 0 ? "Rising" : slope < 0 ? "Falling" : "Flat"
+    slopeColor   = slope > 0 ? bullColorInput : slope < 0 ? bearColorInput : neutralColorInput
+    regimeText   = na(mlma) ? "n/a" : srcInput > mlma ? "Above" : srcInput < mlma ? "Below" : "At Fit"
+    regimeColor  = na(mlma) ? neutralColorInput : srcInput > mlma ? bullColorInput : srcInput < mlma ? bearColorInput : neutralColorInput
+    stretchText  = na(stretchSigma) ? "n/a" : (stretchSigma >= 0 ? "+" : "") + str.tostring(stretchSigma, "#.##") + "σ"
+    stretchColor = na(stretchSigma) ? neutralColorInput : stretchSigma >= 0 ? bullColorInput : bearColorInput
+    labelColor   = DASH_HEADER
+
+    table.cell(dashboardTable, 0, 0, "Slope", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 0, slopeText, text_color = slopeColor, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 1, "Price vs Fit", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 1, regimeText, text_color = regimeColor, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 2, "Stretch", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 2, stretchText, text_color = stretchColor, text_size = dashTextSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(slopeTurnUp, "Slope Turned Up", "MLMA kernel fit slope turned upward on {{ticker}} ({{interval}}) — bullish trend bias")
+alertcondition(slopeTurnDown, "Slope Turned Down", "MLMA kernel fit slope turned downward on {{ticker}} ({{interval}}) — bearish trend bias")
+alertcondition(priceCrossUp, "Bullish Price Cross", "Price crossed above the MLMA fitted mean on {{ticker}} ({{interval}}) — bullish regime read")
+alertcondition(priceCrossDown, "Bearish Price Cross", "Price crossed below the MLMA fitted mean on {{ticker}} ({{interval}}) — bearish regime read")
+alertcondition(showBandsInput and upperBreakout, "Upper Band Breakout", "Price crossed above the MLMA upper uncertainty band on {{ticker}} ({{interval}}) — stretched above the fitted mean")
+alertcondition(showBandsInput and lowerBreakdown, "Lower Band Breakdown", "Price crossed below the MLMA lower uncertainty band on {{ticker}} ({{interval}}) — stretched below the fitted mean")
+alertcondition(showBandsInput and upperReversion, "Reversion From Upper Band", "Price crossed back below the MLMA upper uncertainty band on {{ticker}} ({{interval}}) — reversion toward the fitted mean")
+alertcondition(showBandsInput and lowerReversion, "Reversion From Lower Band", "Price crossed back above the MLMA lower uncertainty band on {{ticker}} ({{interval}}) — reversion toward the fitted mean")
+
+//---------------------------------------------------------------------------------------------------------------------}

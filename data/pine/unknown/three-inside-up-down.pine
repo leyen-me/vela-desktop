@@ -1,0 +1,242 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Three Inside Up/down"
+  , shorttitle       = "Three Inside Up/down"
+  , overlay          = true
+  , max_labels_count = 500
+  , max_lines_count  = 500
+  , max_boxes_count  = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+//Completion rule options
+STRICT_RULE = "Strict: Close Beyond First Candle's Extreme"
+LOOSE_RULE  = "Loose: Close Beyond Second Candle's Close"
+
+//Second candle color options
+CLASSIC_SECOND = "Opposite To First Candle"
+ANY_SECOND     = "Any Contained Body"
+
+//Trend detection options
+TREND_MA   = "Moving Average"
+TREND_NET  = "Net Price Change"
+TREND_NONE = "None"
+
+//Input groups
+DETECTION_GROUP = "Pattern Detection"
+TREND_GROUP     = "Trend Context"
+LEVEL_GROUP     = "Invalidation"
+STYLE_GROUP     = "Style"
+
+//Default colors
+BULL_CSS = #089981
+BEAR_CSS = #f23645
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+completionInput = input.string(STRICT_RULE, "Completion Rule", options = [STRICT_RULE, LOOSE_RULE], group = DETECTION_GROUP
+  , tooltip = "Rule the third candle must satisfy to complete the pattern. The strict form requires a close beyond the first candle's extreme (above its high for three inside up, below its low for three inside down). The loose form only requires a close beyond the second candle's close. Strict rules give fewer, cleaner signals.")
+
+secondBodyInput = input.string(CLASSIC_SECOND, "Second Candle Color", options = [CLASSIC_SECOND, ANY_SECOND], group = DETECTION_GROUP
+  , tooltip = "Classical definitions require the contained second candle to be colored against the trend (white inside dark for three inside up). 'Any Contained Body' relaxes this and accepts any contained real body, including a doji.")
+
+longBodyLenInput = input.int(14, "Long Body Lookback", minval = 2, maxval = 200, group = DETECTION_GROUP
+  , tooltip = "Number of candles used to compute the average real body size preceding the pattern. The first candle must be long relative to this average.")
+
+longBodyMultInput = input.float(1.0, "Long Body Multiplier", minval = 0, step = 0.1, group = DETECTION_GROUP
+  , tooltip = "The first candle's real body must be larger than the average real body multiplied by this factor to qualify as a long candle. Increase for stricter, more decisive first candles.")
+
+decisiveThirdInput = input.bool(true, "Decisive Third Candle", inline = "third", group = DETECTION_GROUP
+  , tooltip = "Requires a decisive third real body rather than a marginal poke. A doji-like third candle leaves the reversal claim unconfirmed in spirit.")
+
+decisivePctInput = input.float(30, "Min Body/Range %", minval = 0, maxval = 100, step = 5, inline = "third", group = DETECTION_GROUP
+  , tooltip = "When enabled, requires the third candle's real body to be at least this percentage of its high-low range, filtering doji-like completion candles that leave the reversal claim unconfirmed in spirit.")
+
+trendMethodInput = input.string(TREND_MA, "Trend Detection", options = [TREND_MA, TREND_NET, TREND_NONE], group = TREND_GROUP
+  , tooltip = "How the prior trend is confirmed at the first candle of the pattern. 'Moving Average' requires the first candle to close below (decline) or above (advance) a simple moving average. 'Net Price Change' compares its close against the close 'Trend Length' bars earlier. 'None' disables the trend context filter.")
+
+trendLenInput = input.int(50, "Trend Length", minval = 1, maxval = 500, group = TREND_GROUP
+  , tooltip = "Length of the simple moving average or of the net price change lookback used by the trend detection method.")
+
+showLevelInput = input.bool(true, "Show Invalidation Level", group = LEVEL_GROUP
+  , tooltip = "Extends a dashed level from the pattern's far extreme, the location of the pattern's invalidation/stop. A close back through this level negates the confirmed reversal and is marked with a cross.")
+
+levelDurationInput = input.int(50, "Maximum Level Duration", minval = 1, maxval = 500, group = LEVEL_GROUP
+  , tooltip = "Maximum number of bars an invalidation level is monitored and extended when price does not close back through it.")
+
+showLabelsInput = input.bool(true, "Show Pattern Labels", group = STYLE_GROUP)
+
+showBoxesInput = input.bool(true, "Highlight Pattern Candles", group = STYLE_GROUP)
+
+bullColorInput = input.color(BULL_CSS, "Bullish Pattern", group = STYLE_GROUP)
+
+bearColorInput = input.color(BEAR_CSS, "Bearish Pattern", group = STYLE_GROUP)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types & Variables
+//---------------------------------------------------------------------------------------------------------------------{
+
+//Tracked invalidation level of a detected pattern
+type PatternLevel
+    line  levelLine
+    bool  isBull
+    float level
+    int   startBar
+
+//Currently monitored pattern levels
+var activeLevelsArray = array.new<PatternLevel>()
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Pattern Detection
+//---------------------------------------------------------------------------------------------------------------------{
+
+//Candle anatomy
+float bodySize = math.abs(close - open)
+float bodyTop  = math.max(close, open)
+float bodyBot  = math.min(close, open)
+
+//Average real body used by the long first candle test
+float avgBody = ta.sma(bodySize, longBodyLenInput)
+
+//Trend basis
+float trendMa = ta.sma(close, trendLenInput)
+
+//Prior trend evaluated at the first candle of the pattern
+bool declineBefore = switch trendMethodInput
+    TREND_MA  => not na(trendMa[2]) and close[2] < trendMa[2]
+    TREND_NET => not na(close[2 + trendLenInput]) and close[2] < close[2 + trendLenInput]
+    => true
+
+bool advanceBefore = switch trendMethodInput
+    TREND_MA  => not na(trendMa[2]) and close[2] > trendMa[2]
+    TREND_NET => not na(close[2 + trendLenInput]) and close[2] > close[2 + trendLenInput]
+    => true
+
+//First candle: long real body in the trend direction
+bool longFirst = not na(avgBody[3]) and bodySize[2] > longBodyMultInput * avgBody[3]
+
+//Second candle: real body contained within the first candle's real body (the harami)
+bool containedSecond = bodyTop[1] <= bodyTop[2] and bodyBot[1] >= bodyBot[2] and bodySize[1] < bodySize[2]
+
+//Second candle color rule
+bool anySecondBody = secondBodyInput == ANY_SECOND
+bool bullSecondOk  = anySecondBody or close[1] > open[1]
+bool bearSecondOk  = anySecondBody or close[1] < open[1]
+
+//Third candle: decisive real body filter (screens doji-like completion candles)
+float thirdRange     = high - low
+bool decisiveThirdOk = not decisiveThirdInput or (thirdRange > 0 and bodySize / thirdRange * 100 >= decisivePctInput)
+
+//Completion rule for the third candle
+bool strictRule   = completionInput == STRICT_RULE
+bool bullComplete = strictRule ? close > high[2] : close > close[1]
+bool bearComplete = strictRule ? close < low[2] : close < close[1]
+
+//Three inside up: decline, long dark first candle, contained counter-trend second, confirming third close
+bool threeInsideUp = declineBefore and close[2] < open[2] and longFirst and containedSecond and bullSecondOk and close > open and bullComplete and decisiveThirdOk
+
+//Three inside down: advance, long white first candle, contained counter-trend second, confirming third close
+bool threeInsideDown = advanceBefore and close[2] > open[2] and longFirst and containedSecond and bearSecondOk and close < open and bearComplete and decisiveThirdOk
+
+//Pattern far extremes, the invalidation/stop locations
+float patternLow  = math.min(low, math.min(low[1], low[2]))
+float patternHigh = math.max(high, math.max(high[1], high[2]))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Invalidation Levels
+//---------------------------------------------------------------------------------------------------------------------{
+
+bool bullInvalidated = false
+bool bearInvalidated = false
+
+int idx = 0
+
+while idx < array.size(activeLevelsArray)
+    PatternLevel activeLevel = array.get(activeLevelsArray, idx)
+    bool removeLevel = false
+
+    if not na(activeLevel.levelLine)
+        line.set_x2(activeLevel.levelLine, bar_index)
+
+    bool crossedBack = activeLevel.isBull ? close < activeLevel.level : close > activeLevel.level
+
+    if crossedBack
+        if activeLevel.isBull
+            bullInvalidated := true
+        else
+            bearInvalidated := true
+
+        if showLevelInput
+            label.new(bar_index, activeLevel.level, "✕"
+              , style     = label.style_label_center
+              , color     = #00000000
+              , textcolor = activeLevel.isBull ? bullColorInput : bearColorInput
+              , size      = size.small
+              , tooltip   = "Confirmed reversal failed - close back through the pattern extreme")
+
+        removeLevel := true
+    else if bar_index - activeLevel.startBar >= levelDurationInput
+        removeLevel := true
+
+    if removeLevel
+        array.remove(activeLevelsArray, idx)
+    else
+        idx += 1
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visuals
+//---------------------------------------------------------------------------------------------------------------------{
+
+if threeInsideUp
+    if showBoxesInput
+        box.new(bar_index - 2, patternHigh, bar_index, patternLow
+          , border_color = color.new(bullColorInput, 50)
+          , bgcolor      = color.new(bullColorInput, 90))
+
+    if showLabelsInput
+        label.new(bar_index, low, "3 Inside Up"
+          , style     = label.style_label_up
+          , color     = #00000000
+          , textcolor = bullColorInput
+          , size      = size.small
+          , tooltip   = "Invalidation level: " + str.tostring(patternLow, format.mintick))
+
+    line bullLevelLine = showLevelInput ? line.new(bar_index, patternLow, bar_index, patternLow, color = bullColorInput, style = line.style_dashed) : line(na)
+    array.push(activeLevelsArray, PatternLevel.new(bullLevelLine, true, patternLow, bar_index))
+
+if threeInsideDown
+    if showBoxesInput
+        box.new(bar_index - 2, patternHigh, bar_index, patternLow
+          , border_color = color.new(bearColorInput, 50)
+          , bgcolor      = color.new(bearColorInput, 90))
+
+    if showLabelsInput
+        label.new(bar_index, high, "3 Inside Down"
+          , style     = label.style_label_down
+          , color     = #00000000
+          , textcolor = bearColorInput
+          , size      = size.small
+          , tooltip   = "Invalidation level: " + str.tostring(patternHigh, format.mintick))
+
+    line bearLevelLine = showLevelInput ? line.new(bar_index, patternHigh, bar_index, patternHigh, color = bearColorInput, style = line.style_dashed) : line(na)
+    array.push(activeLevelsArray, PatternLevel.new(bearLevelLine, false, patternHigh, bar_index))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(threeInsideUp, "Three Inside Up", "Three inside up on {{ticker}} - bullish harami confirmed by the third candle's close")
+
+alertcondition(threeInsideDown, "Three Inside Down", "Three inside down on {{ticker}} - bearish harami confirmed by the third candle's close")
+
+alertcondition(bullInvalidated, "Three Inside Up Invalidated", "Three inside up invalidated on {{ticker}} - close back below the pattern low")
+
+alertcondition(bearInvalidated, "Three Inside Down Invalidated", "Three inside down invalidated on {{ticker}} - close back above the pattern high")
+
+//---------------------------------------------------------------------------------------------------------------------}

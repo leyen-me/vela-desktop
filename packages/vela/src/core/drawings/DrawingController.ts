@@ -1,0 +1,692 @@
+import type { Unsubscribe } from '../util/types';
+import type { IChartRenderer } from '../ports/IChartRenderer';
+import type { TypedEventBus } from '../events/EventBus';
+import type { VelaEventMap } from '../events/types';
+import type { IDrawingsRendererPort, DrawingIntent, DrawingMode } from './port';
+import type { DrawingSeriesGateway } from './series';
+import type { DrawingsOption } from './toolbar';
+import { getDrawingType } from './registry';
+import { buildToolbar } from './toolbar';
+import { DrawingStore } from './DrawingStore';
+import { DrawingHistory } from './DrawingHistory';
+import { createDrawing, deserializeDrawing } from './registry';
+import type { Drawing, DrawingTypeKey, SerializedDrawing } from './Drawing';
+import type { SnapMode } from './geometry';
+import { clonePlain, type DrawingsDocument } from './document';
+import {
+    applyToolDefaults,
+    captureToolDefaults,
+    sameToolDefaults,
+    sanitizeToolDefaults,
+    sanitizeToolTemplates,
+    type DrawingToolDefaults,
+    type DrawingToolTemplate,
+} from './defaults';
+
+/** What a fresh, unstyled drawing of `d`'s type would remember — the factory look, keeping
+ *  `d`'s pane so a pane-dependent default compares like for like. */
+function factoryDefaults(d: Drawing): DrawingToolDefaults | undefined {
+    const fresh = createDrawing(d.type, { paneId: d.paneId });
+    return fresh ? captureToolDefaults(fresh) : undefined;
+}
+
+/** Optional seed for a programmatic {@link DrawingController.add}. */
+export interface AddInit {
+    paneId?: string;
+    anchors?: SerializedDrawing['anchors'];
+    style?: Partial<SerializedDrawing['style']>;
+    text?: SerializedDrawing['text'];
+    /** Per-type extras (e.g. a glyph stamp's `glyph`, a fib tool's `levels`). */
+    props?: SerializedDrawing['props'];
+    /** Draw-order key. Defaults to just under the pane's price on a renderer with
+     *  `drawingDepth` — the candles read on top of a fresh drawing; pass an explicit key
+     *  for any other slot in the stack. */
+    zIndex?: number;
+}
+
+/**
+ * Renderer-agnostic owner of the user-drawing model + tool/selection state. Holds
+ * the {@link DrawingStore} (source of truth), pushes snapshots to the renderer
+ * through {@link IDrawingsRendererPort}, and turns renderer intents into store
+ * mutations + `drawing:*` events. Inert (but persistence still works) when the
+ * active renderer lacks `userDrawings` — that's the LwC path.
+ */
+export class DrawingController {
+    private readonly store = new DrawingStore();
+    private readonly history = new DrawingHistory();
+    private readonly port: IDrawingsRendererPort | null;
+    private readonly enabled: boolean;
+    private activeTool: DrawingTypeKey | null = null;
+    /** Mirror of the renderer's sticky magnet mode (the renderer default is 'off'). */
+    private snapMode: SnapMode = 'off';
+    /** When on, finishing a drawing leaves the tool armed (instead of one-shot disarm). */
+    private stayInDrawingMode = false;
+    /** Mirror of the renderer-local mode (measure/eraser/none). */
+    private mode: DrawingMode = null;
+    /** FAVORITE tool types (insertion-ordered) — user prefs, not document data. */
+    private favs = new Set<DrawingTypeKey>();
+    private selectedIds: string[] = []; // ordered; [0] is the primary (settings-popup) selection
+    private clipboard: SerializedDrawing[] = []; // in-memory copy buffer (per chart)
+    /** Per-tool remembered settings — the last drawing of each type the user styled seeds the next. */
+    private readonly defaults = new Map<DrawingTypeKey, DrawingToolDefaults>();
+    /** Per-tool saved looks ("styles"), in the order they were saved. */
+    private templates = new Map<DrawingTypeKey, DrawingToolTemplate[]>();
+    private readonly subs: Unsubscribe[] = [];
+
+    constructor(
+        renderer: IChartRenderer,
+        private readonly events: TypedEventBus<VelaEventMap>,
+        option: DrawingsOption | undefined,
+        seriesGateway?: DrawingSeriesGateway,
+    ) {
+        this.enabled = !!renderer.capabilities.userDrawings && !!renderer.userDrawingsPort;
+        this.port = this.enabled ? renderer.userDrawingsPort! : null;
+        if (this.port) {
+            const { definition, visible } = buildToolbar(option);
+            this.port.setToolbar(definition);
+            this.port.showToolbar(visible);
+            if (seriesGateway) this.port.setSeriesGateway?.(seriesGateway);
+            this.subs.push(this.port.onDrawingIntent((i) => this.onIntent(i)));
+            this.subs.push(this.store.onChange(() => this.sync()));
+        }
+    }
+
+    /** Whether the active renderer supports interactive drawings. */
+    get supported(): boolean {
+        return this.enabled;
+    }
+
+    // ── tool / toolbar control ──
+    setTool(type: DrawingTypeKey | null): void {
+        if (!this.port) return;
+        const changed = type !== this.activeTool;
+        this.activeTool = type;
+        // Seed the renderer's placement preview with the tool's remembered settings so the
+        // ghost matches what will be committed (the `create` intent re-applies them too).
+        const defaults = type ? this.defaults.get(type) : undefined;
+        this.port.setActiveTool(type, defaults?.style as SerializedDrawing['style'] | undefined, defaults);
+        // Announce every ACTUAL change — arm, one-shot tool-finished, or programmatic —
+        // so external toolbars (a workspace's shared bar) reflect the armed tool.
+        if (changed) this.events.emit('drawing:tool', { type });
+    }
+
+    getTool(): DrawingTypeKey | null {
+        return this.activeTool;
+    }
+
+    // ── magnet + renderer-local modes (measure/eraser) ──
+    // The renderer owns the states and their mutual exclusion; the core holds a MIRROR
+    // driven from both ends: facade setters push port commands, in-chart toolbar clicks
+    // arrive as intents. Equal values no-op on either path, which keeps the
+    // command→intent echo loop convergent.
+    getSnapMode(): SnapMode {
+        return this.snapMode;
+    }
+
+    setSnapMode(mode: SnapMode): void {
+        if (!this.port || mode === this.snapMode) return;
+        this.snapMode = mode;
+        this.port.setSnapMode?.(mode);
+        this.events.emit('drawing:snap', { mode });
+    }
+
+    getStayMode(): boolean {
+        return this.stayInDrawingMode;
+    }
+
+    setStayMode(on: boolean): void {
+        if (!this.port || on === this.stayInDrawingMode) return;
+        this.stayInDrawingMode = on;
+        this.port.setStayMode?.(on);
+        this.events.emit('drawing:stay', { on });
+    }
+
+    getMode(): DrawingMode {
+        return this.mode;
+    }
+
+    setMode(mode: DrawingMode): void {
+        if (!this.port || mode === this.mode) return;
+        this.mode = mode;
+        this.port.setMode?.(mode);
+        this.events.emit('drawing:mode', { mode });
+    }
+
+    showToolbar(visible: boolean): void {
+        this.port?.showToolbar(visible);
+    }
+
+    /** The favorite tool types, in the order they were starred. */
+    favorites(): DrawingTypeKey[] {
+        return [...this.favs];
+    }
+
+    isFavorite(type: DrawingTypeKey): boolean {
+        return this.favs.has(type);
+    }
+
+    /** Star/unstar one tool. Unknown types are ignored; no-ops don't emit. */
+    setFavorite(type: DrawingTypeKey, on: boolean): void {
+        if (!getDrawingType(type)) return;
+        if (on === this.favs.has(type)) return;
+        if (on) this.favs.add(type);
+        else this.favs.delete(type);
+        this.pushFavorites();
+    }
+
+    /** Replace the whole favorite set (bulk restore) — unknown types are dropped. */
+    setFavorites(types: readonly DrawingTypeKey[]): void {
+        const next = types.filter((t) => getDrawingType(t) != null);
+        if (next.length === this.favs.size && next.every((t) => this.favs.has(t))) return;
+        this.favs = new Set(next);
+        this.pushFavorites();
+    }
+
+    private pushFavorites(): void {
+        const list = [...this.favs];
+        this.port?.setFavorites?.(list);
+        this.events.emit('drawing:favorites', { favorites: list });
+    }
+
+    /** Every tool's remembered settings, by type (plain JSON — persist it as-is). */
+    toolDefaults(): Partial<Record<DrawingTypeKey, DrawingToolDefaults>> {
+        const out: Partial<Record<DrawingTypeKey, DrawingToolDefaults>> = {};
+        for (const [type, d] of this.defaults) out[type] = clonePlain(d);
+        return out;
+    }
+
+    /** Replace every tool's remembered settings (restoring persisted prefs). Unknown types and
+     *  malformed entries are dropped; an unchanged set is a no-op and emits nothing. */
+    setToolDefaults(map: Readonly<Record<string, unknown>> | null | undefined): void {
+        const next = new Map<DrawingTypeKey, DrawingToolDefaults>();
+        for (const [type, raw] of Object.entries(map ?? {})) {
+            if (!getDrawingType(type)) continue;
+            const d = sanitizeToolDefaults(raw);
+            if (d) next.set(type as DrawingTypeKey, clonePlain(d));
+        }
+        const changed = new Set<DrawingTypeKey>([...this.defaults.keys(), ...next.keys()]);
+        for (const type of [...changed]) if (sameToolDefaults(this.defaults.get(type), next.get(type))) changed.delete(type);
+        if (changed.size === 0) return;
+        this.defaults.clear();
+        for (const [type, d] of next) this.defaults.set(type, d);
+        if (this.activeTool && changed.has(this.activeTool)) this.setTool(this.activeTool); // re-seed the placement preview
+        for (const type of changed) this.events.emit('drawing:defaults', { type });
+    }
+
+    /** Forget a tool's remembered settings (every tool's when `type` is omitted) — new drawings
+     *  start from the factory defaults again. */
+    resetToolDefaults(type?: DrawingTypeKey): void {
+        const types = type ? (this.defaults.has(type) ? [type] : []) : [...this.defaults.keys()];
+        for (const t of types) {
+            this.defaults.delete(t);
+            this.events.emit('drawing:defaults', { type: t });
+        }
+    }
+
+    /** Every tool's saved looks, by type (plain JSON — persist it as-is). */
+    toolTemplates(): Partial<Record<DrawingTypeKey, DrawingToolTemplate[]>> {
+        const out: Partial<Record<DrawingTypeKey, DrawingToolTemplate[]>> = {};
+        for (const [type, list] of this.templates) out[type] = clonePlain(list);
+        return out;
+    }
+
+    /** Replace every tool's saved looks (restoring persisted prefs). Unknown types and
+     *  malformed entries are dropped; an unchanged set is a no-op and emits nothing. */
+    setToolTemplates(map: Readonly<Record<string, unknown>> | null | undefined): void {
+        const next = new Map<DrawingTypeKey, DrawingToolTemplate[]>();
+        for (const [type, raw] of Object.entries(map ?? {})) {
+            if (!getDrawingType(type)) continue;
+            const list = sanitizeToolTemplates(raw);
+            if (list.length > 0) next.set(type as DrawingTypeKey, list);
+        }
+        const changed = [...new Set<DrawingTypeKey>([...this.templates.keys(), ...next.keys()])].filter(
+            (t) => JSON.stringify(this.templates.get(t) ?? []) !== JSON.stringify(next.get(t) ?? []),
+        );
+        if (changed.length === 0) return;
+        this.templates = next;
+        this.pushTemplates();
+        for (const type of changed) this.events.emit('drawing:templates', { type });
+    }
+
+    /** Save the given settings as a named look for a tool (a same-named one is replaced). */
+    saveToolTemplate(type: DrawingTypeKey, name: string, settings: DrawingToolDefaults): void {
+        if (!getDrawingType(type)) return;
+        const [entry] = sanitizeToolTemplates([{ name, settings }]);
+        if (!entry) return;
+        const list = (this.templates.get(type) ?? []).filter((t) => t.name !== entry.name);
+        this.templates.set(type, [...list, clonePlain(entry)]);
+        this.pushTemplates();
+        this.events.emit('drawing:templates', { type });
+    }
+
+    /** Delete a tool's saved look by name. */
+    removeToolTemplate(type: DrawingTypeKey, name: string): void {
+        const list = this.templates.get(type);
+        if (!list?.some((t) => t.name === name)) return;
+        const rest = list.filter((t) => t.name !== name);
+        if (rest.length > 0) this.templates.set(type, rest);
+        else this.templates.delete(type);
+        this.pushTemplates();
+        this.events.emit('drawing:templates', { type });
+    }
+
+    private pushTemplates(): void {
+        this.port?.setToolTemplates?.(this.toolTemplates());
+    }
+
+    setToolbar(option: DrawingsOption): void {
+        this.port?.setToolbar(buildToolbar(option).definition);
+    }
+
+    /** Display (or clear) another chart's in-progress placement as a ghost — silently
+     *  inert on a renderer without the optional `setExternalGhost` seam. */
+    setExternalGhost(doc: SerializedDrawing | null): void {
+        this.port?.setExternalGhost?.(doc);
+    }
+
+    /** Push per-tool shortcut hints (pre-formatted display strings) to the toolbar flyouts. */
+    setToolShortcuts(map: Readonly<Partial<Record<DrawingTypeKey, string>>>): void {
+        this.port?.setToolShortcuts?.(map);
+    }
+
+    // ── programmatic CRUD (facade-facing) ── each is one undo step
+    add(type: DrawingTypeKey, init: AddInit = {}): Drawing | null {
+        if (!this.enabled) return null;
+        const defaults = this.defaults.get(type);
+        const d = createDrawing(type, {
+            id: this.store.nextId(),
+            paneId: init.paneId ?? 'price',
+            anchors: init.anchors,
+            text: init.text,
+            zIndex: init.zIndex ?? this.startZ(type, init.paneId ?? 'price'),
+        });
+        if (!d) return null;
+        // The tool's remembered settings first, then whatever the caller passed explicitly.
+        applyToolDefaults(d, defaults);
+        if (init.style) d.style = { ...d.style, ...init.style };
+        if (init.text) d.text = { ...(d.text ?? init.text), ...init.text };
+        if (init.props) d.applyProps(init.props);
+        this.history.record(this.store.serialize());
+        this.store.add(d);
+        this.captureDefaults(d.id);
+        this.events.emit('drawing:created', { id: d.id });
+        return d;
+    }
+
+    remove(id: string): void {
+        this.deleteMany([id]);
+    }
+
+    /** Apply a partial record to a drawing (headless write-back from a custom UI). */
+    update(id: string, patch: Partial<SerializedDrawing>): void {
+        const before = this.store.serialize();
+        // Public callers may send a partial style; merge onto the live style so they
+        // don't wipe sibling keys. Edit intents write full `serialize()` style and go
+        // straight to the store (which replaces wholesale — needed for settings reset).
+        const cur = patch.style ? this.store.get(id) : undefined;
+        const resolved =
+            patch.style && cur ? { ...patch, style: { ...cur.style, ...patch.style } } : patch;
+        if (this.updateDrawing(id, resolved)) {
+            this.history.record(before);
+            this.events.emit('drawing:edited', { id });
+        }
+    }
+
+    /** Apply several partial records as ONE undo step (e.g. hiding/locking/reordering a group). */
+    updateMany(patches: ReadonlyArray<{ id: string; patch: Partial<SerializedDrawing> }>): void {
+        this.history.begin(this.store.serialize());
+        for (const { id, patch } of patches) {
+            if (this.updateDrawing(id, patch)) {
+                this.history.markDirty();
+                this.events.emit('drawing:edited', { id });
+            }
+        }
+        this.history.commit();
+    }
+
+    /** Delete several drawings as ONE undo step (the public face of {@link deleteMany}). */
+    removeMany(ids: readonly string[]): void {
+        this.deleteMany(ids);
+    }
+
+    setLocked(id: string, v: boolean): void {
+        const before = this.store.serialize();
+        this.history.record(before);
+        this.store.setLocked(id, v);
+        this.events.emit('drawing:edited', { id });
+    }
+
+    setVisible(id: string, v: boolean): void {
+        const before = this.store.serialize();
+        this.history.record(before);
+        this.store.setVisible(id, v);
+        this.events.emit('drawing:edited', { id });
+    }
+
+    bringToFront(id: string): void {
+        const before = this.store.serialize();
+        this.history.record(before);
+        this.store.bringToFront(id, this.seriesTopZ(this.store.get(id)?.paneId));
+        this.events.emit('drawing:edited', { id });
+    }
+
+    sendToBack(id: string): void {
+        const before = this.store.serialize();
+        this.history.record(before);
+        this.store.sendToBack(id, this.seriesBottomZ(this.store.get(id)?.paneId));
+        this.events.emit('drawing:edited', { id });
+    }
+
+    /** The top of the pane's series stack — what a front drawing has to clear. 0 when the
+     *  renderer keeps drawings on their own layer (no shared z space). */
+    private seriesTopZ(paneId: string | undefined): number {
+        return paneId !== undefined ? (this.port?.stackRange?.(paneId)?.front ?? 0) : 0;
+    }
+
+    /** The bottom of the pane's series stack — what a backmost drawing has to undercut. */
+    private seriesBottomZ(paneId: string | undefined): number {
+        return paneId !== undefined ? (this.port?.stackRange?.(paneId)?.back ?? 1) : 1;
+    }
+
+    /** Where a NEW drawing starts: just under the pane's price so the candles read on top of it
+     *  (falling back to just under the pane's top series where there is no price — a study
+     *  pane). Half a key down never ties a series; drawings tying each other paint in insertion
+     *  order, so consecutive new drawings still stack newest-in-front. Undefined without a
+     *  shared z space — the store then places it over the other drawings, its own layer's top.
+     *  A type that COVERS the series (an opaque inset, `coversSeries`) instead starts just
+     *  above the whole stack — under the candles its content would be buried. */
+    private startZ(type: DrawingTypeKey, paneId: string): number | undefined {
+        const range = this.port?.stackRange?.(paneId);
+        if (!range) return undefined;
+        if (getDrawingType(type)?.coversSeries) return range.front + 0.5;
+        return (range.price ?? range.front) - 0.5;
+    }
+
+    /** Programmatically select drawings (host UI → chart): shows the on-chart handles + toolbar.
+     *  `additive` toggles membership (matching shift-click) instead of replacing. */
+    select(ids: readonly string[], additive = false): void {
+        this.setSelection(ids, additive);
+    }
+
+    /** Open a drawing's on-chart settings popup (and select it) — a click on it, driven from a host UI. */
+    openSettings(id: string): void {
+        this.port?.openSettings(id);
+    }
+
+    // ── undo / redo (core-owned; works even without renderer support) ──
+    undo(): void {
+        const next = this.history.undo(this.store.serialize());
+        if (next) this.restoreSnapshot(next);
+    }
+
+    redo(): void {
+        const next = this.history.redo(this.store.serialize());
+        if (next) this.restoreSnapshot(next);
+    }
+
+    canUndo(): boolean {
+        return this.history.canUndo();
+    }
+
+    canRedo(): boolean {
+        return this.history.canRedo();
+    }
+
+    // ── clone / clipboard ──
+    /** Duplicate drawings in place (clones land on the source, auto-selected → "duplicate then drag"). */
+    duplicate(ids: readonly string[]): Drawing[] {
+        if (!this.enabled) return [];
+        const sources = this.resolve(ids);
+        if (sources.length === 0) return [];
+        return this.insertClones(sources.map((d) => d.serialize()));
+    }
+
+    clone(id: string): Drawing | null {
+        return this.duplicate([id])[0] ?? null;
+    }
+
+    /** Copy drawings into the in-memory clipboard (no model change, no event). */
+    copy(ids: readonly string[]): void {
+        const docs = this.resolve(ids).map((d) => clonePlain(d.serialize()));
+        if (docs.length) this.clipboard = docs;
+    }
+
+    paste(): Drawing[] {
+        if (!this.enabled || this.clipboard.length === 0) return [];
+        return this.insertClones(this.clipboard);
+    }
+
+    all(): SerializedDrawing[] {
+        return this.store.serialize().drawings;
+    }
+
+    // ── persistence (works regardless of renderer support) ──
+    toJSON(): DrawingsDocument {
+        return this.store.serialize();
+    }
+
+    fromJSON(doc: unknown): void {
+        this.history.clear(); // a new document is a context switch — don't undo into the old one
+        this.selectedIds = [];
+        this.store.load(doc); // load() emits change → sync() when enabled
+    }
+
+    destroy(): void {
+        for (const u of this.subs) u();
+        this.subs.length = 0;
+    }
+
+    // ── internals ──
+    /** Set/extend the selection. `additive` toggles membership (shift-click) vs replacing it. */
+    private setSelection(ids: readonly string[], additive = false): void {
+        let next: string[];
+        if (additive) {
+            next = [...this.selectedIds];
+            for (const id of ids) {
+                const at = next.indexOf(id);
+                if (at >= 0) next.splice(at, 1); // toggle off
+                else next.push(id); // toggle on
+            }
+        } else {
+            next = [...ids];
+        }
+        this.selectedIds = next.filter((id) => this.store.has(id));
+        this.announceSelection();
+    }
+
+    /** Push the selection to the renderer and announce it (primary + the full list). */
+    private announceSelection(): void {
+        this.port?.setSelection(this.selectedIds);
+        this.events.emit('drawing:selected', { id: this.selectedIds[0] ?? null, ids: [...this.selectedIds] });
+    }
+
+    /** Restore a history snapshot, reconciling selection against what survived. */
+    private restoreSnapshot(doc: DrawingsDocument): void {
+        this.store.load(doc); // fires onChange → sync() + autoscale
+        this.selectedIds = this.selectedIds.filter((id) => this.store.has(id));
+        this.announceSelection();
+    }
+
+    /** Delete drawings as one undo step; prune them from the selection. */
+    private deleteMany(ids: readonly string[]): void {
+        this.history.begin(this.store.serialize());
+        const removed: string[] = [];
+        for (const id of ids) {
+            if (this.store.remove(id)) removed.push(id);
+            this.history.markDirty();
+        }
+        this.history.commit();
+        if (removed.length === 0) return;
+        const survivors = this.selectedIds.filter((id) => this.store.has(id));
+        if (survivors.length !== this.selectedIds.length) this.setSelection(survivors);
+        for (const id of removed) this.events.emit('drawing:removed', { id });
+    }
+
+    /** Add clones (fresh ids, fresh mount-order z) as one undo step + select them. */
+    private insertClones(docs: readonly SerializedDrawing[]): Drawing[] {
+        this.history.begin(this.store.serialize());
+        const clones: Drawing[] = [];
+        for (const doc of docs) {
+            // A copy keeps its source's DEPTH: the clone lands at the same z and, tying it,
+            // paints just in front of it — "duplicate then drag" without a jump up the stack.
+            const d = deserializeDrawing({ ...doc, id: this.store.nextId() });
+            if (!d) continue;
+            this.store.add(d);
+            this.history.markDirty();
+            clones.push(d);
+        }
+        this.history.commit();
+        if (clones.length) {
+            this.setSelection(clones.map((c) => c.id));
+            for (const c of clones) this.events.emit('drawing:created', { id: c.id });
+        }
+        return clones;
+    }
+
+    private resolve(ids: readonly string[]): Drawing[] {
+        return ids.map((id) => this.store.get(id)).filter((d): d is Drawing => d != null);
+    }
+
+    /** `store.update` that remembers the drawing's settings only when the patch changed them:
+     *  moving an older drawing must not hand its look back to the tool. */
+    private updateDrawing(id: string, patch: Partial<SerializedDrawing>): boolean {
+        const cur = this.store.get(id);
+        const before = cur ? captureToolDefaults(cur) : undefined;
+        if (!this.store.update(id, patch)) return false;
+        const after = this.store.get(id);
+        if (after && !sameToolDefaults(before, captureToolDefaults(after))) this.captureDefaults(id);
+        return true;
+    }
+
+    /** Remember a drawing's settings as its tool's defaults (they seed the next one), and
+     *  announce a real change so a host can save it. */
+    private captureDefaults(id: string): void {
+        const d = this.store.get(id);
+        if (!d) return;
+        // A drawing still on its factory look sets nothing: factory settings are never frozen
+        // into the remembered set, so a later change to them still reaches the user.
+        const captured = captureToolDefaults(d);
+        const next = sameToolDefaults(captured, factoryDefaults(d)) ? undefined : captured;
+        if (sameToolDefaults(this.defaults.get(d.type), next)) return;
+        if (next) this.defaults.set(d.type, next);
+        else this.defaults.delete(d.type);
+        this.events.emit('drawing:defaults', { type: d.type });
+    }
+
+    private sync(): void {
+        this.port?.syncDrawings(this.store.serialize().drawings);
+    }
+
+    /** Renderer gesture → authoritative store mutation + event. */
+    private onIntent(i: DrawingIntent): void {
+        switch (i.kind) {
+            case 'arm':
+                this.setTool(i.type); // toolbar click → core-authoritative tool state
+                break;
+            case 'draft':
+                // Placement progress — transient, no store mutation. Re-emitted so a
+                // multi-chart host can mirror the ghost on linked charts live.
+                this.events.emit('drawing:draft', { doc: i.doc });
+                break;
+            case 'create': {
+                const before = this.store.serialize();
+                const d = deserializeDrawing({ ...i.doc, id: this.store.nextId() });
+                if (!d) return;
+                applyToolDefaults(d, this.defaults.get(d.type)); // a freshly drawn shape starts from its tool's remembered settings
+                if (!d.zIndex) d.zIndex = this.startZ(d.type, d.paneId) ?? 0; // a freshly placed drawing starts under the price (or over the stack when it covers the series)
+                this.history.record(before);
+                this.store.add(d);
+                this.captureDefaults(d.id);
+                this.events.emit('drawing:created', { id: d.id });
+                // No auto-select: selection (= the drawing being edited) is driven by the
+                // settings popup. A freshly drawn shape shows handles via hover instead.
+                break;
+            }
+            case 'edit': {
+                const before = this.store.serialize();
+                if (this.updateDrawing(i.doc.id, i.doc)) {
+                    this.history.record(before);
+                    this.events.emit('drawing:edited', { id: i.doc.id });
+                }
+                break;
+            }
+            case 'edit-many': {
+                this.history.begin(this.store.serialize());
+                for (const doc of i.docs) {
+                    if (this.updateDrawing(doc.id, doc)) {
+                        this.history.markDirty();
+                        this.events.emit('drawing:edited', { id: doc.id });
+                    }
+                }
+                this.history.commit();
+                break;
+            }
+            case 'select':
+                this.setSelection(i.ids, i.additive);
+                break;
+            case 'delete':
+                this.deleteMany(i.ids);
+                break;
+            case 'reorder':
+                if (i.to === 'front') this.bringToFront(i.id);
+                else this.sendToBack(i.id);
+                break;
+            case 'settings':
+                this.events.emit('drawing:settings', { id: i.id });
+                break;
+            case 'favorite':
+                this.setFavorite(i.type, i.on);
+                break;
+            case 'template-save':
+                this.saveToolTemplate(i.type, i.name, i.settings);
+                break;
+            case 'template-remove':
+                this.removeToolTemplate(i.type, i.name);
+                break;
+            case 'snap-mode':
+                // In-chart magnet click (already applied renderer-side) — mirror + announce.
+                if (i.mode !== this.snapMode) {
+                    this.snapMode = i.mode;
+                    this.events.emit('drawing:snap', { mode: i.mode });
+                }
+                break;
+            case 'stay-mode':
+                // In-chart stay-mode click (already applied renderer-side) — mirror + announce.
+                if (i.on !== this.stayInDrawingMode) {
+                    this.stayInDrawingMode = i.on;
+                    this.events.emit('drawing:stay', { on: i.on });
+                }
+                break;
+            case 'mode':
+                // Measure/eraser toggled in-chart, or exited as a mutual-exclusion side effect.
+                if (i.mode !== this.mode) {
+                    this.mode = i.mode;
+                    this.events.emit('drawing:mode', { mode: i.mode });
+                }
+                break;
+            case 'tool-finished':
+                // Most tools are one-shot (revert to the pointer once placed); brush-family tools
+                // always stay armed, and stay-in-drawing-mode keeps every tool armed.
+                if (!this.stayInDrawingMode && i.type !== 'freehand' && i.type !== 'highlighter') this.setTool(null);
+                break;
+            case 'undo':
+                this.undo();
+                break;
+            case 'redo':
+                this.redo();
+                break;
+            case 'duplicate':
+                this.duplicate(i.ids);
+                break;
+            case 'clone':
+                if (this.enabled && i.docs.length) this.insertClones(i.docs);
+                break;
+            case 'copy':
+                this.copy(i.ids);
+                break;
+            case 'paste':
+                this.paste();
+                break;
+        }
+    }
+}

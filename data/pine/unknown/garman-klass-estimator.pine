@@ -1,0 +1,195 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Garman-Klass Estimator", shorttitle = "Garman-Klass Estimator", overlay = false, format = format.percent, precision = 2)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+VOL_COLOR         = #787b86 // volatility line mid-percentile - blends toward the compressed and expanded colors
+COMPRESSED_COLOR  = #089981 // bottom of the percentile scale - compressed, the quiet stretch that precedes expansion
+EXPANDED_COLOR    = #f23645 // top of the percentile scale - expanded volatility
+ACCENT_COLOR      = #ff9800 // the one accent - the diagnostic pair flagging a divergence in the dashboard
+CC_COLOR          = #787b86 // close-to-close comparison line
+LEVEL_COLOR       = #787b86 // dotted percentile reference levels
+FILL_VALUE_TRANSP = 50      // gradient transparency at the volatility value
+FILL_ZERO_TRANSP  = 100     // gradient transparency at zero
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+MID_PERCENTILE = 50 // percentile rank at which the line is the neutral color
+
+GK_COEF = 2 * math.log(2) - 1 // Garman-Klass open-to-close coefficient (2 ln 2 - 1)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+lengthInput = input.int(20, "Window Length", minval = 2, group = "Calculation",
+     tooltip = "Number of bars the per-bar Garman-Klass variance is averaged over. Because the estimator is efficient, short windows of 10-30 bars already give usable readings where close-to-close volatility would still be noisy. Shorter windows react faster but swing more; longer windows suit regime comparisons. Match the window to the decision it feeds and keep it consistent across instruments.")
+
+annualizeInput = input.bool(true, "Annualize", group = "Calculation",
+     tooltip = "Scales the reading to annualized volatility - average per-bar variance times bars per year, square-rooted - so it can be compared across instruments and against options-style figures; a daily reading near 15 means roughly 15% annualized. Disable to read the raw per-bar volatility of the window instead.")
+
+barsPerYearInput = input.int(252, "Bars Per Year", minval = 1, group = "Calculation",
+     tooltip = "Annualization constant. Daily equity data conventionally uses 252; some futures and forex tools use 260 or 365. Intraday charts must count bars per year - bars per session times trading days. Annualization constants are a leading cause of cross-platform disagreements, so match this setting when reconciling readings.")
+
+showCcInput = input.bool(true, "Close-to-Close Comparison", group = "Close-to-Close Comparison",
+     tooltip = "Overlays close-to-close volatility on the same window and annualization - the estimator built from closes alone. Garman-Klass should track the same swells with visibly less bar-to-bar jitter, its efficiency signature: the intrabar range samples the whole price path, worth roughly seven times the efficiency of closes under the paper's idealized assumptions. The spread between the two lines is the diagnostic pair - Garman-Klass running well below close-to-close means movement is arriving as overnight gaps the formula cannot see; running above it means turbulent sessions whose closes mask the churn.")
+
+divergenceInput = input.float(25, "Divergence Alert Level %", minval = 5, maxval = 90, step = 5, group = "Close-to-Close Comparison",
+     tooltip = "How far Garman-Klass must run from same-length close-to-close volatility, as a percent of the close-to-close reading, before the divergence alerts fire. At 25, 'Gap Blind Spot' fires when Garman-Klass drops below 75% of close-to-close - volatility is arriving between the close and the next open, where the formula is blind - and 'Session Churn' fires above 125%, flagging turbulent intrabar trade that close-to-close understates.")
+
+percentileLengthInput = input.int(100, "Percentile Lookback", minval = 10, group = "Percentile Thresholds",
+     tooltip = "Bars used to rank the current reading against its own history. The percentile rank drives the expansion and compression alerts without an absolute cutoff, so squeeze screening stays comparable across instruments and annualization settings.")
+
+highPercentileInput = input.float(80, "High Percentile", minval = 50, maxval = 100, step = 1, inline = "percentile", group = "Percentile Thresholds",
+     tooltip = "Percentile rank above which volatility counts as expanded; crossing it fires the 'Volatility Expansion' alert.")
+
+lowPercentileInput = input.float(20, "Low Percentile", minval = 0, maxval = 50, step = 1, inline = "percentile", group = "Percentile Thresholds",
+     tooltip = "Percentile rank below which volatility counts as compressed - the statistics-first squeeze read, flagging the quiet stretches that often precede range expansion. Crossing under it fires the 'Volatility Compression' alert.")
+
+showLevelsInput = input.bool(false, "Show Percentile Levels", group = "Percentile Thresholds",
+     tooltip = "Plots the volatility values sitting at the high and low percentiles of the lookback as dotted reference levels, making threshold crossings visible in the pane. Off by default to keep the pane clean; the alerts fire either way.")
+
+showDashInput = input.bool(true, "Show Dashboard", group = "Dashboard",
+     tooltip = "Displays the current Garman-Klass reading, close-to-close volatility on the same settings, Garman-Klass as a percent of close-to-close - the diagnostic pair in numbers - and the percentile rank of the reading.")
+
+dashPosInput = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], inline = "dash", group = "Dashboard",
+     tooltip = "Corner of the pane the dashboard is anchored to.")
+
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], inline = "dash", group = "Dashboard",
+     tooltip = "Dashboard text size.")
+
+volColorInput = input.color(VOL_COLOR, "Garman-Klass Volatility", group = "Style",
+     tooltip = "Color of the Garman-Klass volatility line and its gradient fill at a mid percentile rank. The line blends toward the compressed color at low ranks and the expanded color at high ranks. The estimate measures movement size only and carries no directional information.")
+
+compressedColorInput = input.color(COMPRESSED_COLOR, "Compressed", inline = "rank", group = "Style",
+     tooltip = "Line and fill color at the bottom of the percentile scale.")
+
+expandedColorInput = input.color(EXPANDED_COLOR, "Expanded", inline = "rank", group = "Style",
+     tooltip = "Line and fill color at the top of the percentile scale.")
+
+ccColorInput = input.color(CC_COLOR, "Close-to-Close", group = "Style",
+     tooltip = "Color of the close-to-close comparison line.")
+
+levelColorInput = input.color(LEVEL_COLOR, "Percentile Levels", group = "Style",
+     tooltip = "Color of the dotted high and low percentile reference levels.")
+
+gradientInput = input.bool(true, "Gradient Fill", group = "Style",
+     tooltip = "Fills the area between zero and the volatility line with a vertical gradient - fully transparent at zero, strongest at the current value.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+getTablePosition(positionText) =>
+    switch positionText
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        => position.bottom_left
+
+getTextSize(sizeText) =>
+    switch sizeText
+        "Tiny"  => size.tiny
+        "Small" => size.small
+        => size.normal
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+// Log price relations - the estimator's building blocks. Guards keep degenerate bars
+// (missing or non-positive prices) from contaminating the window
+logHighLow   = high > 0 and low > 0 ? math.log(high / low) : na
+logCloseOpen = open > 0 and close > 0 ? math.log(close / open) : na
+logCloseWise = close > 0 and not na(close[1]) and close[1] > 0 ? math.log(close / close[1]) : na
+
+// Per-bar variance. Garman-Klass reads the whole intrabar path through the high-low range and
+// recenters it with the open-to-close leg: 0.5 ln(H/L)^2 - (2 ln 2 - 1) ln(C/O)^2. Nothing that
+// happens between one close and the next open enters the formula - the estimator's blind spot.
+// The squared close-to-close return builds the same-window benchmark it is diagnosed against
+gkVariance = 0.5 * logHighLow * logHighLow - GK_COEF * logCloseOpen * logCloseOpen
+ccVariance = logCloseWise * logCloseWise
+
+// Window means -> volatility: average the per-bar variance across the window, multiply by bars
+// per year, take the square root. Per-bar Garman-Klass terms can dip negative when the open-to-close
+// leg dominates the range, so the window mean is floored at zero before the root
+gkMeanVariance = ta.sma(gkVariance, lengthInput)
+ccMeanVariance = ta.sma(ccVariance, lengthInput)
+
+annualFactor = annualizeInput ? barsPerYearInput : 1
+gkVol = na(gkMeanVariance) ? na : math.sqrt(math.max(gkMeanVariance, 0) * annualFactor) * 100
+ccVol = na(ccMeanVariance) ? na : math.sqrt(math.max(ccMeanVariance, 0) * annualFactor) * 100
+
+// Diagnostic pair - Garman-Klass as a percent of close-to-close on identical settings. Well below
+// parity, movement is arriving as overnight gaps the formula cannot see; well above it, sessions
+// are churning more than their closes admit
+gkRatio = not na(gkVol) and not na(ccVol) and ccVol > 0 ? 100 * gkVol / ccVol : na
+
+// Percentile rank of the reading against its own history - compression screening and expansion
+// flagging without an absolute cutoff. The interpolated percentile values double as plottable levels
+volPercentile = ta.percentrank(gkVol, percentileLengthInput)
+highLevel     = ta.percentile_linear_interpolation(gkVol, percentileLengthInput, highPercentileInput)
+lowLevel      = ta.percentile_linear_interpolation(gkVol, percentileLengthInput, lowPercentileInput)
+
+// Threshold events
+expansionEvent   = ta.crossover(volPercentile, highPercentileInput)
+compressionEvent = ta.crossunder(volPercentile, lowPercentileInput)
+gapBlindEvent    = ta.crossunder(gkRatio, 100 - divergenceInput)
+churnEvent       = ta.crossover(gkRatio, 100 + divergenceInput)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+// State coloring by percentile rank - compressed at the bottom of the scale, neutral midway, expanded at the top
+volColor = na(volPercentile) ? volColorInput : volPercentile <= MID_PERCENTILE ? color.from_gradient(volPercentile, 0, MID_PERCENTILE, compressedColorInput, volColorInput) : color.from_gradient(volPercentile, MID_PERCENTILE, 100, volColorInput, expandedColorInput)
+
+fillTopColor    = gradientInput ? color.new(volColor, FILL_VALUE_TRANSP) : na
+fillBottomColor = gradientInput ? color.new(volColor, FILL_ZERO_TRANSP) : na
+
+gkPlotId   = plot(gkVol, "Garman-Klass Volatility", color = volColor, linewidth = 2)
+zeroPlotId = plot(0, "Zero Line", color = color.new(LEVEL_COLOR, 70), linewidth = 1)
+
+fill(gkPlotId, zeroPlotId, top_value = math.max(nz(gkVol), 0), bottom_value = 0, top_color = fillTopColor, bottom_color = fillBottomColor, title = "Volatility Gradient Fill")
+
+plot(showCcInput ? ccVol : na, "Close-to-Close Comparison", color = ccColorInput, linewidth = 1)
+
+plot(showLevelsInput ? highLevel : na, "High Percentile Level", color = color.new(levelColorInput, 30), linewidth = 1, style = plot.style_circles)
+plot(showLevelsInput ? lowLevel : na, "Low Percentile Level", color = color.new(levelColorInput, 30), linewidth = 1, style = plot.style_circles)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dashTable = na
+
+if barstate.isfirst and showDashInput
+    dashTable := table.new(getTablePosition(dashPosInput), 2, 4, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+if barstate.islast and showDashInput and not na(dashTable)
+    gkText     = na(gkVol) ? "-" : str.tostring(gkVol, "#.##") + "%"
+    ccText     = na(ccVol) ? "-" : str.tostring(ccVol, "#.##") + "%"
+    ratioText  = na(gkRatio) ? "-" : str.tostring(gkRatio, "#.#") + "%"
+    rankText   = na(volPercentile) ? "-" : str.tostring(volPercentile, "#")
+    ratioColor = not na(gkRatio) and (gkRatio < 100 - divergenceInput or gkRatio > 100 + divergenceInput) ? ACCENT_COLOR : DASH_TEXT
+    labelColor   = DASH_HEADER
+    dashTextSize = getTextSize(dashSizeInput)
+    table.cell(dashTable, 0, 0, "Garman-Klass", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 0, gkText, text_color = volColor, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 1, "Close-to-Close", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 1, ccText, text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 2, "GK / Close-to-Close", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 2, ratioText, text_color = ratioColor, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 3, "Percentile Rank", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 3, rankText, text_color = volColor, text_size = dashTextSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(expansionEvent, "Volatility Expansion", "Garman-Klass on {{ticker}} - annualized volatility crossed above its high percentile threshold, volatility expansion under way ({{interval}})")
+alertcondition(compressionEvent, "Volatility Compression", "Garman-Klass on {{ticker}} - annualized volatility fell below its low percentile threshold, a quiet stretch that often precedes range expansion ({{interval}})")
+alertcondition(gapBlindEvent, "Gap Blind Spot", "Garman-Klass on {{ticker}} - the estimate dropped well below same-length close-to-close volatility, movement is arriving as overnight gaps the formula cannot see ({{interval}})")
+alertcondition(churnEvent, "Session Churn", "Garman-Klass on {{ticker}} - the estimate rose well above same-length close-to-close volatility, turbulent sessions whose closes mask the churn ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

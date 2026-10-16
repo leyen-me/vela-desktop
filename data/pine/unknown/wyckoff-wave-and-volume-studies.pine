@@ -1,0 +1,451 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Wyckoff Wave & Volume Studies", shorttitle = "Wyckoff Wave & Volume Studies", overlay = false, format = format.volume, max_lines_count = 500, max_labels_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+//Reversal threshold measurement modes - the swing lens that defines what counts as a wave
+MODE_ATR     = "ATR Multiple"
+MODE_PERCENT = "Percentage"
+MODE_POINTS  = "Points"
+
+//Wave label detail levels
+DETAIL_VOLUME = "Volume"
+DETAIL_FULL   = "Volume + Progress + Duration"
+
+//Comparative reads of a wave against the prior wave in the same direction
+READ_NONE       = 0
+READ_OPPOSITION = 1 // more volume, less progress - effort meeting opposition / absorption
+READ_DRYING     = 2 // less volume, less progress - that side drying up
+READ_HARMONY    = 3 // more volume, more progress - effort and result in gear
+READ_EASE       = 4 // less volume, more progress - ground gained cheaply
+READ_INLINE     = 5 // within tolerance of the prior wave
+
+//Non-directional accent
+NEUTRAL_COLOR = #5b9cf6
+
+//Visual tuning
+COLUMN_FADE_TRANSPARENCY = 70 // column transparency for the lightest waves relative to recent ones
+PROVISIONAL_TRANSPARENCY = 30 // live wave label text transparency - the total is still growing
+WAVE_MEMORY              = 10 // completed waves kept for comparisons and column shading
+
+TXT_NA = "-"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+thresholdTypeInput = input.string(MODE_ATR, "Reversal Threshold", options = [MODE_ATR, MODE_PERCENT, MODE_POINTS], group = "Wave Detection",
+  tooltip = "How the reversal distance that ends one wave and starts the next is measured. ATR Multiple sizes the threshold to current volatility, Percentage stays constant relative to price, Points is an absolute distance for a single contract. The threshold is a lens, not a parameter with a correct value - size it so ordinary backing-and-filling does not register as a reversal, then hold it fixed, because wave comparisons are only meaningful under consistent settings.")
+
+atrMultInput = input.float(2.0, "ATR Multiple", minval = 0.1, step = 0.25, inline = "atr", group = "Wave Detection",
+  tooltip = "Reversal distance in ATR multiples, alongside the ATR averaging length. Raise the multiple if columns flip on every minor wiggle; lower it if whole trend legs merge into one wave.")
+
+atrLengthInput = input.int(14, "Length", minval = 1, inline = "atr", group = "Wave Detection",
+  tooltip = "Averaging length of the ATR used by the ATR Multiple threshold.")
+
+percentInput = input.float(1.0, "Reversal Percentage", minval = 0.01, step = 0.25, group = "Wave Detection",
+  tooltip = "Reversal distance as a percentage of the current wave extreme, used when the threshold type is Percentage.")
+
+pointsInput = input.float(10.0, "Reversal Points", minval = 0.0, group = "Wave Detection",
+  tooltip = "Reversal distance in absolute price points, used when the threshold type is Points. Retune it when switching symbols or after large price drift.")
+
+sourceInput = input.string("Wicks", "Wave Source", options = ["Wicks", "Close"], group = "Wave Detection",
+  tooltip = "Prices feeding the waves. Wicks uses each bar's high and low; Close ignores wicks so only closing prices can extend a wave or trigger a reversal.")
+
+toleranceInput = input.float(0.0, "Comparison Tolerance %", minval = 0, maxval = 50, step = 1, group = "Wave Comparison",
+  tooltip = "Changes in wave volume or progress smaller than this percentage count as similar rather than higher or lower. 0 follows the strict reading - any increase or decrease counts; raise it so only clearly notable divergences are tagged and alerted.")
+
+tagReadsInput = input.bool(true, "Tag Wave Reads", group = "Wave Comparison",
+  tooltip = "Append the comparative read to completed wave labels when it flags something: Opposition marks a wave carrying more volume for less progress than the prior same-direction wave, Drying up marks one carrying less volume for less progress.")
+
+showDashInput = input.bool(true, "Show Dashboard", group = "Dashboard",
+  tooltip = "Compact readout of the live wave - side, volume so far, progress and duration - compared with the prior wave on the same side and with the last opposing wave, plus the last completed wave and the active reversal threshold.")
+
+dashPosInput = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = "Dashboard",
+  tooltip = "Dashboard position on the pane.")
+
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = "Dashboard",
+  tooltip = "Dashboard text size.")
+
+showZigzagInput = input.bool(true, "Wave Zigzag on Chart", group = "Style",
+  tooltip = "Draw each completed wave as a zigzag leg on the price chart, connecting the swing extremes the waves run between.")
+
+zigzagWidthInput = input.int(2, "Zigzag Width", minval = 1, maxval = 5, group = "Style",
+  tooltip = "Width of completed zigzag legs. The provisional leg always draws thin and dotted so confirmed structure stays dominant.")
+
+showProvisionalInput = input.bool(true, "Show Provisional Wave", group = "Style",
+  tooltip = "Dotted leg and faded volume total for the wave still forming. Until price reverses by the full threshold the last wave keeps growing and can absorb what briefly looked like a new swing, so act on completed waves rather than the live one.")
+
+showLabelsInput = input.bool(true, "Wave Volume Labels", group = "Style",
+  tooltip = "Print each completed wave's cumulative volume at the swing extreme where the wave ended - one total per buying or selling wave, the tape compressed into comparable units.")
+
+labelDetailInput = input.string(DETAIL_VOLUME, "Label Detail", options = [DETAIL_VOLUME, DETAIL_FULL], group = "Style",
+  tooltip = "What each completed wave label reports. The full detail adds the wave's price progress in percent and its duration in bars, the three dimensions successive waves are compared on.")
+
+labelSizeInput = input.string("Small", "Label Size", options = ["Tiny", "Small", "Normal"], group = "Style",
+  tooltip = "Wave label text size.")
+
+bullColorInput = input.color(#089981, "Buying Waves", inline = "colors", group = "Style",
+  tooltip = "Colors of buying (up) and selling (down) waves - columns, zigzag legs, and labels.")
+
+bearColorInput = input.color(#f23645, "Selling Waves", inline = "colors", group = "Style")
+
+shadeColumnsInput = input.bool(true, "Shade Columns by Relative Volume", group = "Style",
+  tooltip = "Grade column intensity by each wave's volume against the heaviest of the last 10 completed waves, so heavy waves stand out at a glance. Disable for flat directional columns.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+//Reversal distance in price units measured off `referencePrice`
+thresholdFor(float referencePrice, float atrValue) =>
+    switch thresholdTypeInput
+        MODE_ATR     => atrValue * atrMultInput
+        MODE_PERCENT => referencePrice * percentInput / 100
+        =>              pointsInput
+
+//Compact human-readable amount, for wave volume totals
+formatAmount(float value) =>
+    float absValue = math.abs(value)
+    na(value) ? TXT_NA :
+      absValue >= 1e12 ? str.tostring(value / 1e12, "#.##") + "T" :
+      absValue >= 1e9 ? str.tostring(value / 1e9, "#.##") + "B" :
+      absValue >= 1e6 ? str.tostring(value / 1e6, "#.##") + "M" :
+      absValue >= 1e3 ? str.tostring(value / 1e3, "#.##") + "K" :
+      str.tostring(value, "#.##")
+
+//Signed percentage change
+formatChange(float pct) =>
+    na(pct) ? TXT_NA : (pct >= 0 ? "+" : "") + str.tostring(pct, "#.#") + "%"
+
+//Comparative read of a wave against the prior wave in the same direction
+readCodeOf(float volumeChangePct, float progressChangePct) =>
+    if na(volumeChangePct) or na(progressChangePct)
+        READ_NONE
+    else
+        bool volumeHigher   = volumeChangePct > toleranceInput
+        bool volumeLower    = volumeChangePct < -toleranceInput
+        bool progressHigher = progressChangePct > toleranceInput
+        bool progressLower  = progressChangePct < -toleranceInput
+        volumeHigher and progressLower ? READ_OPPOSITION :
+          volumeLower and progressLower ? READ_DRYING :
+          volumeHigher and progressHigher ? READ_HARMONY :
+          volumeLower and progressHigher ? READ_EASE :
+          READ_INLINE
+
+//Short tag for wave labels - only the two warning reads are tagged on the chart
+readTagOf(int readCode) =>
+    readCode == READ_OPPOSITION ? "Opposition" : readCode == READ_DRYING ? "Drying up" : ""
+
+//Dashboard wording of a read
+readTextOf(int readCode) =>
+    switch readCode
+        READ_OPPOSITION => "Opposition - more volume, less progress"
+        READ_DRYING     => "Drying up - less volume, less progress"
+        READ_HARMONY    => "Harmony - more volume, more progress"
+        READ_EASE       => "Ease - more progress on less volume"
+        READ_INLINE     => "In line with prior wave"
+        =>                 TXT_NA
+
+//Read color by implication: opposition or drying against a wave argues the other side, harmony or ease argues continuation
+readColorOf(int readCode, int direction) =>
+    readCode == READ_OPPOSITION or readCode == READ_DRYING ?
+      (direction == 1 ? bearColorInput : bullColorInput) :
+      readCode == READ_HARMONY or readCode == READ_EASE ?
+      (direction == 1 ? bullColorInput : bearColorInput) :
+      color.new(chart.fg_color, 30)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Wave Detection
+//---------------------------------------------------------------------------------------------------------------------{
+float barVolume        = nz(volume)
+float cumulativeVolume = ta.cum(barVolume)
+float atrValue         = ta.atr(atrLengthInput)
+
+if barstate.islast and cumulativeVolume == 0
+    runtime.error("No volume is available for this symbol. Wave volume studies require volume data.")
+
+float waveHighSource = sourceInput == "Wicks" ? high : close
+float waveLowSource  = sourceInput == "Wicks" ? low  : close
+
+//Wave state machine: the wave runs from the last confirmed pivot to its provisional extreme, while the
+//counter-move from that extreme is measured against the reversal threshold
+var int   waveDirection  = 0
+var float waveStartPrice = na
+var int   waveStartBar   = na
+var float extremePrice   = na
+var int   extremeBar     = na
+var float counterPrice   = na
+var int   counterBar     = na
+
+//Volume bookkeeping: `waveVolume` is attributed through the current extreme; volume printed after the
+//extreme is held aside so it can seed the next wave if the reversal confirms, or fold back in on extension
+var float waveVolume         = 0.0
+var float volumeSinceExtreme = 0.0
+var float volumeSinceCounter = 0.0
+
+//Completed-wave memory, newest last - waves strictly alternate, so the prior same-direction wave sits two
+//back and the opposing wave one back; feeds wave comparisons and column shading
+var waveVolumeArray   = array.new_float()
+var waveProgressArray = array.new_float()
+var waveDurationArray = array.new_int()
+
+//Last completed wave, feeding the dashboard
+var int   lastWaveDirection = 0
+var float lastWaveVolume    = na
+var int   lastWaveReadCode  = READ_NONE
+
+//Wave completion events, set on the bar the reversal threshold is met
+bool buyingWaveCompleted  = false
+bool sellingWaveCompleted = false
+bool buyingOpposition     = false
+bool sellingOpposition    = false
+bool buyingDrying         = false
+bool sellingDrying        = false
+
+if barstate.isconfirmed
+    if waveDirection == 0
+        //Seed the first wave once a valid threshold exists - early waves are warm-up until the first reversal
+        float seedThreshold = thresholdFor(close, atrValue)
+        if not na(seedThreshold) and seedThreshold > 0
+            waveDirection      := close >= open ? 1 : -1
+            waveStartPrice     := waveDirection == 1 ? waveLowSource : waveHighSource
+            waveStartBar       := bar_index
+            extremePrice       := waveDirection == 1 ? waveHighSource : waveLowSource
+            extremeBar         := bar_index
+            counterPrice       := waveDirection == 1 ? waveLowSource : waveHighSource
+            counterBar         := bar_index
+            waveVolume         := barVolume
+            volumeSinceExtreme := 0.0
+            volumeSinceCounter := 0.0
+    else
+        float extendSource  = waveDirection == 1 ? waveHighSource : waveLowSource
+        float counterSource = waveDirection == 1 ? waveLowSource  : waveHighSource
+
+        if (extendSource - extremePrice) * waveDirection > 0
+            //Extension: the wave absorbs everything printed since the old extreme, pullback bars included
+            extremePrice       := extendSource
+            extremeBar         := bar_index
+            waveVolume         += volumeSinceExtreme + barVolume
+            volumeSinceExtreme := 0.0
+            volumeSinceCounter := 0.0
+            counterPrice       := counterSource
+            counterBar         := bar_index
+        else
+            volumeSinceExtreme += barVolume
+            if (counterPrice - counterSource) * waveDirection > 0
+                counterPrice       := counterSource
+                counterBar         := bar_index
+                volumeSinceCounter := 0.0
+            else
+                volumeSinceCounter += barVolume
+
+        float thresholdNow = thresholdFor(extremePrice, atrValue)
+        if not na(thresholdNow) and thresholdNow > 0 and (extremePrice - counterPrice) * waveDirection >= thresholdNow
+            //Reversal confirmed - the wave completes at its extreme; measure effort, result, and time
+            float completedVolume   = waveVolume
+            float completedProgress = math.abs(extremePrice - waveStartPrice)
+            int   completedDuration = extremeBar - waveStartBar
+            int   completedDir      = waveDirection
+
+            int   storedCount       = array.size(waveVolumeArray)
+            float priorSameVolume   = storedCount >= 2 ? array.get(waveVolumeArray,   storedCount - 2) : na
+            float priorSameProgress = storedCount >= 2 ? array.get(waveProgressArray, storedCount - 2) : na
+
+            float volumeChangePct   = not na(priorSameVolume) and priorSameVolume > 0 ? (completedVolume / priorSameVolume - 1) * 100 : na
+            float progressChangePct = not na(priorSameProgress) and priorSameProgress > 0 ? (completedProgress / priorSameProgress - 1) * 100 : na
+            int   readCode          = readCodeOf(volumeChangePct, progressChangePct)
+
+            if completedDir == 1
+                buyingWaveCompleted := true
+                buyingOpposition    := readCode == READ_OPPOSITION
+                buyingDrying        := readCode == READ_DRYING
+            else
+                sellingWaveCompleted := true
+                sellingOpposition    := readCode == READ_OPPOSITION
+                sellingDrying        := readCode == READ_DRYING
+
+            color waveColor = completedDir == 1 ? bullColorInput : bearColorInput
+            if showZigzagInput
+                line.new(waveStartBar, waveStartPrice, extremeBar, extremePrice, color = waveColor, width = zigzagWidthInput, force_overlay = true)
+            if showLabelsInput
+                string labelText = formatAmount(completedVolume)
+                if labelDetailInput == DETAIL_FULL
+                    float progressPct = waveStartPrice > 0 ? (extremePrice - waveStartPrice) / waveStartPrice * 100 : na
+                    labelText += "\n" + formatChange(progressPct) + " · " + str.tostring(completedDuration) + " bars"
+                if tagReadsInput and (readCode == READ_OPPOSITION or readCode == READ_DRYING)
+                    labelText += "\n" + readTagOf(readCode)
+                label.new(extremeBar, extremePrice, labelText
+                  , style         = completedDir == 1 ? label.style_label_down : label.style_label_up
+                  , color         = #00000000
+                  , textcolor     = waveColor
+                  , size          = labelSizeInput == "Tiny" ? size.tiny : labelSizeInput == "Normal" ? size.normal : size.small
+                  , force_overlay = true)
+
+            array.push(waveVolumeArray, completedVolume)
+            array.push(waveProgressArray, completedProgress)
+            array.push(waveDurationArray, completedDuration)
+            if array.size(waveVolumeArray) > WAVE_MEMORY
+                array.shift(waveVolumeArray)
+                array.shift(waveProgressArray)
+                array.shift(waveDurationArray)
+
+            lastWaveDirection := completedDir
+            lastWaveVolume    := completedVolume
+            lastWaveReadCode  := readCode
+
+            //Flip: the new wave starts at the old extreme, its extreme so far is the tracked counter point,
+            //and the volume printed since that point carries over as the new wave's opening total
+            waveDirection      := -completedDir
+            waveStartPrice     := extremePrice
+            waveStartBar       := extremeBar
+            extremePrice       := counterPrice
+            extremeBar         := counterBar
+            waveVolume         := volumeSinceExtreme - volumeSinceCounter
+            volumeSinceExtreme := volumeSinceCounter
+            volumeSinceCounter := 0.0
+            counterPrice       := waveDirection == 1 ? waveLowSource : waveHighSource
+            counterBar         := bar_index
+
+//Live wave values - the forming bar's volume joins the total intrabar, before the state machine confirms it
+bool  waveActive      = waveDirection != 0
+float liveWaveVolume  = waveActive ? waveVolume + volumeSinceExtreme + (barstate.isconfirmed ? 0.0 : barVolume) : na
+float liveProgress    = waveActive ? math.abs(extremePrice - waveStartPrice) : na
+float liveProgressPct = waveActive and waveStartPrice > 0 ? (extremePrice - waveStartPrice) / waveStartPrice * 100 : na
+int   liveDuration    = waveActive ? extremeBar - waveStartBar : na
+float thresholdValue  = thresholdFor(waveActive ? extremePrice : close, atrValue)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+//Column intensity graded against the heaviest recent wave, so heavy effort stands out at a glance
+float referenceVolume = liveWaveVolume
+int   waveMemoryCount = array.size(waveVolumeArray)
+if waveMemoryCount > 0
+    for waveIndex = 0 to waveMemoryCount - 1
+        referenceVolume := math.max(nz(referenceVolume), array.get(waveVolumeArray, waveIndex))
+
+color waveBaseColor = waveDirection == 1 ? bullColorInput : bearColorInput
+color columnColor   = not waveActive ? na :
+  shadeColumnsInput and not na(referenceVolume) and referenceVolume > 0 ?
+  color.from_gradient(liveWaveVolume, 0, referenceVolume, color.new(waveBaseColor, COLUMN_FADE_TRANSPARENCY), waveBaseColor) :
+  waveBaseColor
+
+plot(liveWaveVolume, "Wave Volume", color = columnColor, style = plot.style_columns)
+
+plot(liveProgressPct, "Wave Progress %", color = NEUTRAL_COLOR, display = display.data_window)
+plot(liveDuration, "Wave Duration (bars)", color = NEUTRAL_COLOR, display = display.data_window)
+plot(thresholdValue, "Reversal Threshold", color = NEUTRAL_COLOR, display = display.data_window)
+
+//Provisional wave on the price chart - dotted leg and faded total, still growing until the reversal confirms
+var line  provisionalLine  = na
+var label provisionalLabel = na
+
+if showProvisionalInput and waveActive
+    if showZigzagInput
+        if na(provisionalLine)
+            provisionalLine := line.new(waveStartBar, waveStartPrice, extremeBar, extremePrice, style = line.style_dotted, width = 1, force_overlay = true)
+        line.set_xy1(provisionalLine, waveStartBar, waveStartPrice)
+        line.set_xy2(provisionalLine, extremeBar, extremePrice)
+        line.set_color(provisionalLine, waveBaseColor)
+    if showLabelsInput
+        if na(provisionalLabel)
+            provisionalLabel := label.new(extremeBar, extremePrice, "", color = #00000000, force_overlay = true)
+        label.set_xy(provisionalLabel, extremeBar, extremePrice)
+        label.set_text(provisionalLabel, formatAmount(liveWaveVolume))
+        label.set_textcolor(provisionalLabel, color.new(waveBaseColor, PROVISIONAL_TRANSPARENCY))
+        label.set_style(provisionalLabel, waveDirection == 1 ? label.style_label_down : label.style_label_up)
+        label.set_size(provisionalLabel, labelSizeInput == "Tiny" ? size.tiny : labelSizeInput == "Normal" ? size.normal : size.small)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+dashPosition = switch dashPosInput
+    "Top Left"     => position.top_left
+    "Bottom Right" => position.bottom_right
+    "Bottom Left"  => position.bottom_left
+    =>                position.top_right
+
+dashTextSize = switch dashSizeInput
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    =>          size.small
+
+var table dashTable = table.new(dashPosition, 2, 8
+  , bgcolor      = color.new(chart.bg_color, 20)
+  , frame_color  = color.new(chart.fg_color, 85)
+  , frame_width  = 1
+  , border_color = color.new(chart.fg_color, 90)
+  , border_width = 1)
+
+if barstate.islast and showDashInput
+    color labelColor = chart.fg_color
+    color valueColor = color.new(chart.fg_color, 30)
+
+    //Live wave compared with the prior wave on the same side (two back) and the last opposing wave (one back)
+    float priorSameVolume     = waveMemoryCount >= 2 ? array.get(waveVolumeArray,   waveMemoryCount - 2) : na
+    float priorSameProgress   = waveMemoryCount >= 2 ? array.get(waveProgressArray, waveMemoryCount - 2) : na
+    int   priorSameDuration   = waveMemoryCount >= 2 ? array.get(waveDurationArray, waveMemoryCount - 2) : na
+    float priorOppositeVolume = waveMemoryCount >= 1 ? array.get(waveVolumeArray,   waveMemoryCount - 1) : na
+
+    float liveVolumeChange   = not na(priorSameVolume) and priorSameVolume > 0 ? (liveWaveVolume / priorSameVolume - 1) * 100 : na
+    float liveProgressChange = not na(priorSameProgress) and priorSameProgress > 0 ? (liveProgress / priorSameProgress - 1) * 100 : na
+    float liveDurationChange = not na(priorSameDuration) and priorSameDuration > 0 ? 100.0 * liveDuration / priorSameDuration - 100 : na
+    int   liveReadCode       = readCodeOf(liveVolumeChange, liveProgressChange)
+    float oppositeRatio      = not na(priorOppositeVolume) and priorOppositeVolume > 0 ? liveWaveVolume / priorOppositeVolume : na
+
+    string liveSideText = waveDirection == 1 ? "Buying" : waveDirection == -1 ? "Selling" : TXT_NA
+    string sameSideText = waveDirection == 1 ? "Vs Prior Buying Wave" : "Vs Prior Selling Wave"
+    string oppositeText = waveDirection == 1 ? "Vs Last Selling Wave" : "Vs Last Buying Wave"
+
+    string thresholdModeText = switch thresholdTypeInput
+        MODE_ATR     => str.tostring(atrMultInput, "#.##") + " × ATR " + str.tostring(atrLengthInput)
+        MODE_PERCENT => str.tostring(percentInput, "#.##") + "%"
+        =>              str.tostring(pointsInput, format.mintick) + " pts"
+    string thresholdText = "Reversal " + thresholdModeText + (na(thresholdValue) ? "" : " ≈ " + str.tostring(thresholdValue, format.mintick))
+
+    string compareText = waveActive ?
+      "Vol " + formatChange(liveVolumeChange) + " / Prog " + formatChange(liveProgressChange) + " / Dur " + formatChange(liveDurationChange) : TXT_NA
+    string ratioText = na(oppositeRatio) ? TXT_NA : str.tostring(oppositeRatio, "#.##") + "× volume"
+
+    string lastWaveText = lastWaveDirection == 0 ? TXT_NA :
+      (lastWaveDirection == 1 ? "Buying · " : "Selling · ") + formatAmount(lastWaveVolume) +
+      (lastWaveReadCode == READ_OPPOSITION or lastWaveReadCode == READ_DRYING ? " · " + readTagOf(lastWaveReadCode) : "")
+    color lastWaveColor = lastWaveReadCode == READ_OPPOSITION or lastWaveReadCode == READ_DRYING ? readColorOf(lastWaveReadCode, lastWaveDirection) : valueColor
+
+    table.cell(dashTable, 0, 0, "Wave & Volume", text_color = chart.fg_color, text_halign = text.align_left, text_size = dashTextSize, bgcolor = color.new(NEUTRAL_COLOR, 85))
+    table.cell(dashTable, 1, 0, thresholdText, text_color = valueColor, text_halign = text.align_right, text_size = dashTextSize, bgcolor = color.new(NEUTRAL_COLOR, 85))
+
+    table.cell(dashTable, 0, 1, "Live Wave", text_color = labelColor, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 1, waveActive ? liveSideText + " · " + str.tostring(liveDuration) + " bars" : TXT_NA, text_color = waveActive ? waveBaseColor : valueColor, text_halign = text.align_right, text_size = dashTextSize)
+
+    table.cell(dashTable, 0, 2, "Volume (so far)", text_color = labelColor, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 2, formatAmount(liveWaveVolume), text_color = valueColor, text_halign = text.align_right, text_size = dashTextSize)
+
+    table.cell(dashTable, 0, 3, "Progress", text_color = labelColor, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 3, waveActive ? formatChange(liveProgressPct) + " (" + str.tostring(liveProgress, format.mintick) + ")" : TXT_NA, text_color = valueColor, text_halign = text.align_right, text_size = dashTextSize)
+
+    table.cell(dashTable, 0, 4, sameSideText, text_color = labelColor, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 4, compareText, text_color = valueColor, text_halign = text.align_right, text_size = dashTextSize)
+
+    table.cell(dashTable, 0, 5, oppositeText, text_color = labelColor, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 5, ratioText, text_color = valueColor, text_halign = text.align_right, text_size = dashTextSize)
+
+    table.cell(dashTable, 0, 6, "Live Read", text_color = labelColor, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 6, readTextOf(liveReadCode), text_color = readColorOf(liveReadCode, waveDirection), text_halign = text.align_right, text_size = dashTextSize)
+
+    table.cell(dashTable, 0, 7, "Last Wave", text_color = labelColor, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 7, lastWaveText, text_color = lastWaveColor, text_halign = text.align_right, text_size = dashTextSize)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(buyingWaveCompleted, "Buying Wave Completed", "Buying wave completed on {{ticker}} - compare its volume, progress, and duration with prior buying waves ({{interval}})")
+alertcondition(sellingWaveCompleted, "Selling Wave Completed", "Selling wave completed on {{ticker}} - compare its volume, progress, and duration with prior selling waves ({{interval}})")
+alertcondition(buyingOpposition, "Buying Wave Opposition", "Buying wave completed with more volume but less progress than the prior buying wave on {{ticker}} - demand meeting supply, absorption warning ({{interval}})")
+alertcondition(sellingOpposition, "Selling Wave Opposition", "Selling wave completed with more volume but less progress than the prior selling wave on {{ticker}} - supply meeting demand, absorption warning ({{interval}})")
+alertcondition(buyingDrying, "Buying Wave Drying Up", "Buying wave completed with less volume and less progress than the prior buying wave on {{ticker}} - buying pressure drying up ({{interval}})")
+alertcondition(sellingDrying, "Selling Wave Drying Up", "Selling wave completed with less volume and less progress than the prior selling wave on {{ticker}} - selling pressure drying up ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

@@ -1,0 +1,262 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Belt Hold"
+  , shorttitle       = "Belt Hold"
+  , overlay          = true
+  , format           = format.price
+  , max_lines_count  = 100
+  , max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+//Default palette
+color BULL_COLOR    = #089981
+color BEAR_COLOR    = #f23645
+color NEUTRAL_COLOR = #787b86
+color LABEL_BG      = #00000000
+
+//Transparency applied to an invalidation level once price has traded back through it
+int DEAD_LEVEL_TRANSP = 60
+
+string GROUP_DETECTION = "Belt Hold Detection"
+string GROUP_SIGNALS   = "Confirmation & Invalidation"
+string GROUP_STYLE     = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+trendLengthInput = input.int(14, "Trend Length"
+  , minval  = 2
+  , maxval  = 200
+  , group   = GROUP_DETECTION
+  , tooltip = "Bars in the moving average that establishes the preceding trend: a bullish belt hold requires the prior close below this average (a decline), the bearish one above it (an advance). Without a preceding trend the line is just a strong directional bar, and in the trend direction it is only a momentum bar - so the counter-trend context is required.")
+
+bodyLengthInput = input.int(14, "Body Average Length"
+  , minval  = 1
+  , maxval  = 100
+  , group   = GROUP_DETECTION
+  , tooltip = "Bars used to average the real body size of preceding candles. The belt hold must print a long real body relative to recent candles.")
+
+bodyMultInput = input.float(1.2, "Long Body Multiplier"
+  , minval  = 0.1
+  , maxval  = 5
+  , step    = 0.1
+  , group   = GROUP_DETECTION
+  , tooltip = "Minimum real body as a multiple of the recent average body. Raise it to demand a more dominant session.")
+
+openShadowInput = input.float(5, "Opening Shadow Tolerance %"
+  , minval  = 0
+  , maxval  = 25
+  , step    = 0.5
+  , group   = GROUP_DETECTION
+  , tooltip = "Largest shadow allowed on the opening side, as a percentage of the candle's range. The signature is a shaved open: the bullish belt hold opens at, or essentially at, the session low and the bearish one at the session high.")
+
+closeShadowInput = input.float(25, "Closing Shadow Tolerance %"
+  , minval  = 0
+  , maxval  = 50
+  , step    = 1
+  , group   = GROUP_DETECTION
+  , tooltip = "Largest shadow allowed at the closing end, as a percentage of the candle's range. The belt hold is an opening marubozu: shaved at the open, with tolerance for a small shadow at the closing end.")
+
+penetrationInput = input.float(50, "Prior Range Penetration %"
+  , minval  = 0
+  , maxval  = 100
+  , step    = 5
+  , group   = GROUP_DETECTION
+  , tooltip = "Minimum reach of the close into the previous candle's high-low range: 0% only requires touching it, 100% requires closing beyond it entirely. Enforces the close landing well into or beyond the prior candle's range.")
+
+gapInput = input.bool(false, "Require Gap Open"
+  , group   = GROUP_DETECTION
+  , tooltip = "Restrict detection to the ideal form, where the bullish belt hold opens below the prior close and the bearish one opens above it.")
+
+confirmInput = input.bool(false, "Next-Bar Confirmation"
+  , group   = GROUP_SIGNALS
+  , tooltip = "Only mark a belt hold once the following session closes in its direction. Single-candle lines carry modest forward evidence on their own, so common practice is to act on this follow-through. Marks then appear one bar after the pattern, on the candle that printed it.")
+
+showLevelsInput = input.bool(true, "Invalidation Levels"
+  , group   = GROUP_SIGNALS
+  , tooltip = "Extends the belt hold's opening extreme forward as its natural invalidation level: trade back through it means the rejection failed. Levels turn dotted and dim once crossed.")
+
+maxLevelsInput = input.int(8, "Show Last Levels"
+  , minval  = 1
+  , maxval  = 50
+  , group   = GROUP_SIGNALS
+  , tooltip = "Maximum number of opening-extreme levels kept on the chart; the oldest is dropped as newer belt holds print.")
+
+showLabelsInput = input.bool(true, "Show Pattern Labels"
+  , group   = GROUP_STYLE
+  , tooltip = "Labels each belt hold on the candle where it printed.")
+
+highlightInput = input.bool(false, "Highlight Pattern Candles"
+  , group   = GROUP_STYLE
+  , tooltip = "Colors the belt hold candle itself.")
+
+showBasisInput = input.bool(false, "Show Trend Basis"
+  , group   = GROUP_STYLE
+  , tooltip = "Plots the moving average used as the preceding-trend filter.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "patternColors", group = GROUP_STYLE)
+
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "patternColors", group = GROUP_STYLE)
+
+basisColorInput = input.color(NEUTRAL_COLOR, "Trend Basis", group = GROUP_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types
+//---------------------------------------------------------------------------------------------------------------------{
+
+//A tracked invalidation level: the belt hold's opening extreme, extended forward while price stays on the
+//pattern's side of it. 'dir' is 1 for a bullish belt hold, -1 for a bearish one
+type BeltLevel
+    line  levelLine
+    float price
+    int   dir
+    bool  active
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+
+float barRange   = high - low
+float bodySize   = math.abs(close - open)
+float bodyAvg    = ta.sma(bodySize, bodyLengthInput)
+float trendBasis = ta.sma(close, trendLengthInput)
+float priorRange = high[1] - low[1]
+
+//Context is measured on the bars preceding the line: the candle must print against an established move
+bool downtrend = close[1] < trendBasis[1]
+bool uptrend   = close[1] > trendBasis[1]
+
+//A long real body relative to recent candles (average of the bodies preceding the pattern candle)
+bool longBody = bodySize > bodyAvg[1] * bodyMultInput
+
+//Shadow tolerances as a share of the candle's full range
+float openTolerance  = barRange * openShadowInput  / 100
+float closeTolerance = barRange * closeShadowInput / 100
+
+//Bullish belt hold: after a decline, the session opens at (or essentially at) its low - ideally gapping
+//below the prior close - and buyers drive it higher from the first print, closing well into or beyond
+//the prior candle's range with no meaningful lower shadow
+bool bullShavedOpen = open - low   <= openTolerance
+bool bullSmallTip   = high - close <= closeTolerance
+bool bullReach      = close >= low[1] + priorRange * penetrationInput / 100
+bool bullGapOk      = not gapInput or open < close[1]
+
+bool bullBeltHold = barRange > 0 and downtrend and close > open and longBody and bullShavedOpen and bullSmallTip and bullReach and bullGapOk
+
+//Bearish belt hold: after an advance, the session opens at (or essentially at) its high - ideally gapping
+//above the prior close - and sellers drive it lower from the first print
+bool bearShavedOpen = high - open <= openTolerance
+bool bearSmallTip   = close - low <= closeTolerance
+bool bearReach      = close <= high[1] - priorRange * penetrationInput / 100
+bool bearGapOk      = not gapInput or open > close[1]
+
+bool bearBeltHold = barRange > 0 and uptrend and close < open and longBody and bearShavedOpen and bearSmallTip and bearReach and bearGapOk
+
+//Next-bar confirmation: the following session closes in the belt hold's direction
+bool bullConfirmed = bullBeltHold[1] and close > close[1]
+bool bearConfirmed = bearBeltHold[1] and close < close[1]
+
+//Marked signal: the raw line, or the confirmed one when follow-through is required (marked one bar later)
+bool bullSignal = confirmInput ? bullConfirmed : bullBeltHold
+bool bearSignal = confirmInput ? bearConfirmed : bearBeltHold
+
+int   signalOffset = confirmInput ? 1 : 0
+int   signalBar    = bar_index - signalOffset
+float signalOpen   = open[signalOffset]
+float signalLow    = low[signalOffset]
+float signalHigh   = high[signalOffset]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Pattern Marks & Invalidation Levels
+//---------------------------------------------------------------------------------------------------------------------{
+
+var array<BeltLevel> levelsArray = array.new<BeltLevel>()
+
+bool bullInvalidated = false
+bool bearInvalidated = false
+
+//Extend the active opening-extreme levels and retire any that price trades back through - the natural
+//stop is hit and the rejection has failed
+if array.size(levelsArray) > 0
+    for i = 0 to array.size(levelsArray) - 1
+        BeltLevel refLevel = array.get(levelsArray, i)
+        if refLevel.active
+            if not na(refLevel.levelLine)
+                line.set_x2(refLevel.levelLine, bar_index)
+            bool breached = refLevel.dir > 0 ? low < refLevel.price : high > refLevel.price
+            if breached
+                refLevel.active := false
+                if refLevel.dir > 0
+                    bullInvalidated := true
+                else
+                    bearInvalidated := true
+                if not na(refLevel.levelLine)
+                    line.set_style(refLevel.levelLine, line.style_dotted)
+                    line.set_color(refLevel.levelLine, color.new(refLevel.dir > 0 ? bullColorInput : bearColorInput, DEAD_LEVEL_TRANSP))
+
+//Mark a new bullish belt hold on the candle that printed it and log its opening low as the level whose
+//loss stands the rejection down
+if bullSignal
+    if showLabelsInput
+        label.new(signalBar, signalLow, "Belt Hold"
+          , style     = label.style_label_up
+          , color     = LABEL_BG
+          , textcolor = bullColorInput
+          , size      = size.small
+          , tooltip   = "Bullish belt hold: opened at (or essentially at) the session low after a decline and closed strongly higher - buyers controlled the session from the first print." + (confirmInput ? " The following session closed higher, confirming it." : " Common practice is to wait for the next session to close higher.") + " Invalidation on trade back below " + str.tostring(signalOpen, format.mintick) + ".")
+    line bullLevelLine = na
+    if showLevelsInput
+        bullLevelLine := line.new(signalBar, signalOpen, bar_index, signalOpen, color = bullColorInput, style = line.style_dashed, width = 1)
+    array.push(levelsArray, BeltLevel.new(bullLevelLine, signalOpen, 1, true))
+
+//Bearish mirror: the opening high is the natural invalidation level
+if bearSignal
+    if showLabelsInput
+        label.new(signalBar, signalHigh, "Belt Hold"
+          , style     = label.style_label_down
+          , color     = LABEL_BG
+          , textcolor = bearColorInput
+          , size      = size.small
+          , tooltip   = "Bearish belt hold: opened at (or essentially at) the session high after an advance and closed strongly lower - sellers controlled the session from the first print." + (confirmInput ? " The following session closed lower, confirming it." : " Common practice is to wait for the next session to close lower.") + " Invalidation on trade back above " + str.tostring(signalOpen, format.mintick) + ".")
+    line bearLevelLine = na
+    if showLevelsInput
+        bearLevelLine := line.new(signalBar, signalOpen, bar_index, signalOpen, color = bearColorInput, style = line.style_dashed, width = 1)
+    array.push(levelsArray, BeltLevel.new(bearLevelLine, signalOpen, -1, true))
+
+//Oldest levels beyond the cap are dropped
+while array.size(levelsArray) > maxLevelsInput
+    BeltLevel oldLevel = array.shift(levelsArray)
+    if not na(oldLevel.levelLine)
+        line.delete(oldLevel.levelLine)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+
+plot(trendBasis, "Trend Basis", showBasisInput ? basisColorInput : color(na), 1)
+
+barcolor(highlightInput and bullBeltHold ? bullColorInput : highlightInput and bearBeltHold ? bearColorInput : color(na), title = "Belt Hold Candles")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(bullBeltHold, "Bullish Belt Hold", "Bullish belt hold on {{ticker}} ({{interval}}) - after a decline the session opened at its low and closed strongly higher. An early reversal alert; common practice is to wait for the next session to close higher before acting")
+
+alertcondition(bearBeltHold, "Bearish Belt Hold", "Bearish belt hold on {{ticker}} ({{interval}}) - after an advance the session opened at its high and closed strongly lower. An early reversal alert; common practice is to wait for the next session to close lower before acting")
+
+alertcondition(bullConfirmed, "Bullish Belt Hold Confirmed", "The session following a bullish belt hold on {{ticker}} ({{interval}}) closed in its direction - the follow-through most practitioners require")
+
+alertcondition(bearConfirmed, "Bearish Belt Hold Confirmed", "The session following a bearish belt hold on {{ticker}} ({{interval}}) closed in its direction - the follow-through most practitioners require")
+
+alertcondition(bullInvalidated, "Bullish Belt Hold Invalidated", "Price on {{ticker}} ({{interval}}) traded back below a bullish belt hold's opening low - the rejection failed and the natural stop is hit")
+
+alertcondition(bearInvalidated, "Bearish Belt Hold Invalidated", "Price on {{ticker}} ({{interval}}) traded back above a bearish belt hold's opening high - the rejection failed and the natural stop is hit")
+
+//---------------------------------------------------------------------------------------------------------------------}

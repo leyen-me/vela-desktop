@@ -1,0 +1,574 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Markup & Markdown"
+  , shorttitle       = "Markup & Markdown"
+  , overlay          = true
+  , format           = format.price
+  , max_lines_count  = 500
+  , max_labels_count = 500
+  , max_boxes_count  = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+//The two trending phases of the Wyckoff cycle, plus the state between them
+int PH_NONE = 0
+int PH_UP   = 1
+int PH_DN   = -1
+
+color BULL_COLOR    = #089981
+color BEAR_COLOR    = #f23645
+color NEUTRAL_COLOR = #787b86 // undecided ranges and phase endings - structure, grey
+color WARN_COLOR    = #ff9800
+color TRANSP_COLOR  = #00000000
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+int BG_TRANSP           = 88
+int RANGE_BORDER_TRANSP = 60
+int RANGE_FILL_TRANSP   = 92
+int DONE_BORDER_TRANSP  = 45
+int DONE_FILL_TRANSP    = 90
+int STRIDE_TRANSP       = 30
+
+string GROUP_RANGE = "Range Detection"
+string GROUP_EXIT  = "Exit Confirmation"
+string GROUP_TRACK = "Stride & Character"
+string GROUP_DASH  = "Dashboard"
+string GROUP_STYLE = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+rangeLenInput = input.int(20, "Range Length"
+  , minval  = 5
+  , maxval  = 300
+  , group   = GROUP_RANGE
+  , tooltip = "Fewest consecutive bars price must spend inside a capped-height window before a sideways preparation range (a base or a pause) is locked in. Markup and markdown are only ever entered by leaving such a range - genuine trending phases do not start from nowhere.")
+
+atrLenInput = input.int(200, "Volatility Baseline Length"
+  , minval  = 10
+  , maxval  = 1000
+  , group   = GROUP_RANGE
+  , tooltip = "ATR length of the volatility baseline behind the range height cap (a cumulative average of true range fills in until enough history exists, so detection also works on short histories). A long baseline keeps range detection stable across a whole campaign.")
+
+widthMultInput = input.float(3.5, "Maximum Range Height (xATR)"
+  , minval  = 0.5
+  , maxval  = 20
+  , step    = 0.25
+  , group   = GROUP_RANGE
+  , tooltip = "Maximum height of the detection window, as a multiple of the volatility baseline, for its bars to count as sideways preparation rather than trending motion.")
+
+expansionLenInput = input.int(20, "Expansion Baseline Length"
+  , minval  = 2
+  , maxval  = 300
+  , group   = GROUP_EXIT
+  , tooltip = "Lookback averaging bar spread (high minus low) and volume. A range exit is measured against these baselines to detect the widening spread and expanding volume of a genuine sign of strength or weakness.")
+
+spreadMultInput = input.float(1.25, "Widening Spread Threshold"
+  , minval  = 0.5
+  , maxval  = 5
+  , step    = 0.05
+  , group   = GROUP_EXIT
+  , tooltip = "Multiple of the average spread the exit bar must exceed for the exit to count as leaving the range with widening spread.")
+
+volMultInput = input.float(1.25, "Expanding Volume Threshold"
+  , minval  = 0.5
+  , maxval  = 5
+  , step    = 0.05
+  , group   = GROUP_EXIT
+  , tooltip = "Multiple of the average volume the exit bar must exceed for the exit to count as leaving the range on expanding volume. Ignored on symbols that provide no volume data.")
+
+qualifiedOnlyInput = input.bool(true, "New Phases Need Expansion"
+  , group   = GROUP_EXIT
+  , tooltip = "When enabled, a NEW markup or markdown can only be confirmed from an exit that showed widening spread and expanding volume - the classic sign of strength / weakness. Pauses resolving in the direction of an already running phase are exempt, since consolidations that hold their gains and resolve with the trend confirm the phase on their own.")
+
+pivotLegInput = input.int(3, "Reaction Pivot Length"
+  , minval  = 1
+  , maxval  = 20
+  , group   = GROUP_EXIT
+  , tooltip = "Pivot legs used to detect the first reaction after an exit - the back-up toward old resistance (or the rally back toward old support) whose hold confirms the phase - and the higher-low / lower-high stride while it runs. Confirmation arrives this many bars after the reaction extreme, so phase labels settle with a lag, as they do in practice.")
+
+volCharLenInput = input.int(20, "Volume Character Window"
+  , minval  = 2
+  , maxval  = 300
+  , group   = GROUP_TRACK
+  , tooltip = "Window comparing volume traded on advancing bars against declining bars. Healthy markup expands volume on advances and contracts it on pullbacks (markdown mirrors); dominance flipping against the running phase is a character-shift warning.")
+
+strideEndInput = input.bool(true, "Stride Break Ends The Phase"
+  , group   = GROUP_TRACK
+  , tooltip = "Also end a phase when price closes through its latest stride step - the most recent rising support in markup, falling resistance in markdown - while no pause range is active. Disable to date phase endings strictly through a range resolving against the trend.")
+
+showDashInput = input.bool(true, "Show Dashboard"
+  , group   = GROUP_DASH
+  , tooltip = "Dashboard summarizing the current phase, its age, the stride it is leaving behind, the advance/decline volume character and the state of the active range - the phase context that conditions every other signal.")
+
+dashPosInput = input.string("Top Right", "Dashboard Position"
+  , options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"]
+  , group   = GROUP_DASH
+  , tooltip = "Chart corner the dashboard is anchored to.")
+
+showBgInput = input.bool(true, "Phase Background"
+  , group   = GROUP_STYLE
+  , tooltip = "Tints the chart background with the running phase - the markup / markdown timeline at a glance.")
+
+showBoxesInput = input.bool(true, "Preparation Ranges"
+  , group   = GROUP_STYLE
+  , tooltip = "Draws each detected sideways range. Neutral while undecided, tinted with its resolution direction once the exit is confirmed.")
+
+showStrideInput = input.bool(true, "Stride Steps"
+  , group   = GROUP_STYLE
+  , tooltip = "Draws the rising supports left by each reaction low during markup and the falling resistances left by each rally high during markdown - the stepping structure of the trending phases.")
+
+showPhaseLabelsInput = input.bool(true, "Phase Labels"
+  , group   = GROUP_STYLE
+  , tooltip = "Marks confirmed phase starts, and phase endings that leave no phase behind.")
+
+showExitMarksInput = input.bool(true, "SOS / SOW Markers"
+  , group   = GROUP_STYLE
+  , tooltip = "Marks qualified exits - closes out of a range on widening spread and expanding volume (sign of strength / sign of weakness).")
+
+showWarnInput = input.bool(true, "Character Warnings"
+  , group   = GROUP_STYLE
+  , tooltip = "Flags stride deterioration and volume character flipping against the running phase - the change of behavior that warns a phase may be ending.")
+
+showFailInput = input.bool(false, "Failed Exit Markers"
+  , group   = GROUP_STYLE
+  , tooltip = "Marks exits that closed back inside their range before the first reaction could confirm them.")
+
+bullColorInput = input.color(BULL_COLOR, "Markup", inline = "dir", group = GROUP_STYLE)
+
+bearColorInput = input.color(BEAR_COLOR, "Markdown", inline = "dir", group = GROUP_STYLE)
+
+rangeColorInput = input.color(NEUTRAL_COLOR, "Range", inline = "dir", group = GROUP_STYLE)
+
+warnColorInput = input.color(WARN_COLOR, "Warning", inline = "dir", group = GROUP_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+//Maps the dashboard position setting to a table anchor
+getTablePosition(string positionTxt) =>
+    switch positionTxt
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        => position.bottom_left
+
+//Starts a new stride step line at a confirmed reaction level
+strideStep(int stepBar, float stepLevel, color stepColor) =>
+    showStrideInput ? line.new(stepBar, stepLevel, bar_index, stepLevel, color = color.new(stepColor, STRIDE_TRANSP), style = line.style_dashed) : line(na)
+
+//Small unobtrusive text marker above or below the bar
+textMark(float yValue, string markText, bool above, color markColor, string markSize, string tipText) =>
+    label.new(bar_index, yValue, markText
+      , style     = above ? label.style_label_down : label.style_label_up
+      , color     = TRANSP_COLOR
+      , textcolor = markColor
+      , size      = markSize
+      , tooltip   = tipText)
+
+//Dashboard row: key cell on the left, value cell with tooltip on the right
+dashCell(table tb, int rowIdx, string keyTxt, string valTxt, string tipTxt, color valColor) =>
+    table.cell(tb, 0, rowIdx, keyTxt, text_color = DASH_HEADER, text_halign = text.align_left, text_size = size.small)
+    table.cell(tb, 1, rowIdx, valTxt, text_color = valColor, text_halign = text.align_right, text_size = size.small, tooltip = tipTxt)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Phase Engine
+//---------------------------------------------------------------------------------------------------------------------{
+
+//Volatility baseline with a cumulative true-range fallback so detection also works on short histories
+float atrRaw  = ta.atr(atrLenInput)
+float trValue = ta.tr(true)
+
+var float trSumTotal = 0.0
+trSumTotal += nz(trValue)
+
+float baseVol = na(atrRaw) ? trSumTotal / (bar_index + 1) : atrRaw
+
+//Detection window: the span the last rangeLenInput bars traded in
+float windowHi = ta.highest(high, rangeLenInput)
+float windowLo = ta.lowest(low, rangeLenInput)
+
+//Exit quality: widening spread and expanding volume against their recent baselines
+float barSpread = high - low
+float spreadAvg = ta.sma(barSpread, expansionLenInput)
+float volumeAvg = ta.sma(nz(volume), expansionLenInput)
+
+var bool volAvailable = false
+if nz(volume) > 0
+    volAvailable := true
+
+bool spreadWide    = not na(spreadAvg) and spreadAvg > 0 and barSpread > spreadAvg * spreadMultInput
+bool volumeWide    = volAvailable ? not na(volumeAvg) and volumeAvg > 0 and nz(volume) > volumeAvg * volMultInput : true
+bool exitQualified = spreadWide and volumeWide
+
+//Reaction pivots: the swings that settle back-ups, rally tests and the stride
+float pivLo  = ta.pivotlow(low, pivotLegInput, pivotLegInput)
+float pivHi  = ta.pivothigh(high, pivotLegInput, pivotLegInput)
+int   pivBar = bar_index - pivotLegInput
+
+//Volume character: volume traded on advances versus declines
+bool upBarNow = close > nz(close[1], close)
+bool dnBarNow = close < nz(close[1], close)
+
+float advVolume = math.sum(upBarNow ? nz(volume) : 0, volCharLenInput)
+float decVolume = math.sum(dnBarNow ? nz(volume) : 0, volCharLenInput)
+
+bool demandDominant = volAvailable and not na(advVolume) and not na(decVolume) and advVolume > decVolume
+bool supplyDominant = volAvailable and not na(advVolume) and not na(decVolume) and decVolume > advVolume
+
+//Campaign state
+var int phase      = PH_NONE
+var int phaseStart = na
+
+//Active (or re-activated) preparation range
+var bool  inRange      = false
+var float rangeTop     = na
+var float rangeBot     = na
+var box   rangeBoxId   = na
+var int   lastRangeEnd = -1
+
+//Exit under test: price left the range but the first reaction has not settled it yet
+var int  pending          = 0
+var int  pendingBar       = na
+var bool pendingQualified = false
+
+//Stride bookkeeping: the steps the phase leaves behind
+var line  strideLineId  = na
+var float strideLevel   = na
+var float lastPivLo     = na
+var float lastPivHi     = na
+var int   stepCount     = 0
+var bool  strideHealthy = true
+
+//Per-bar events
+bool breakUpEvent       = false
+bool breakDnEvent       = false
+bool markupBeginEvent   = false
+bool markdownBeginEvent = false
+bool markupEndEvent     = false
+bool markdownEndEvent   = false
+bool continueEvent      = false
+bool failedExitEvent    = false
+bool warnEvent          = false
+int  failDir            = 0
+int  warnDir            = 0
+bool pivLoUsed          = false
+bool pivHiUsed          = false
+
+string warnReason = ""
+string endReason  = ""
+
+//1 - Resolve an exit under test: it fails back inside the range, or the first reaction settles it
+if pending == PH_UP
+    if close < rangeTop
+        //Closed back inside: the upside exit failed and the range re-activates
+        failedExitEvent := true
+        failDir         := PH_UP
+        pending         := 0
+        inRange         := true
+    else if not na(pivLo) and pivBar > pendingBar
+        //The first reaction bottomed while price held above the old resistance - the back-up held
+        pending      := 0
+        pivLoUsed    := true
+        lastRangeEnd := bar_index
+        if not na(rangeBoxId)
+            box.set_border_color(rangeBoxId, color.new(bullColorInput, DONE_BORDER_TRANSP))
+            box.set_bgcolor(rangeBoxId, color.new(bullColorInput, DONE_FILL_TRANSP))
+        float backupLevel = math.min(pivLo, rangeTop)
+        if phase == PH_UP
+            //A pause held its gains and resolved with the markup - a fresh rising support
+            continueEvent := true
+            if not na(lastPivLo) and pivLo < lastPivLo
+                warnEvent     := true
+                warnDir       := PH_UP
+                warnReason    := warnReason == "" ? "a reaction bottomed below the prior low" : warnReason + "; a reaction bottomed below the prior low"
+                strideHealthy := false
+            else
+                strideHealthy := true
+                stepCount     += 1
+            lastPivLo    := pivLo
+            strideLevel  := backupLevel
+            strideLineId := strideStep(pivBar, backupLevel, bullColorInput)
+        else
+            if phase == PH_DN
+                markdownEndEvent := true
+                endReason        := "a subsequent range resolved upward against the decline"
+            if pendingQualified or not qualifiedOnlyInput
+                phase            := PH_UP
+                phaseStart       := pendingBar
+                markupBeginEvent := true
+                stepCount        := 1
+                strideHealthy    := true
+                lastPivLo        := pivLo
+                lastPivHi        := na
+                strideLevel      := backupLevel
+                strideLineId     := strideStep(pivBar, backupLevel, bullColorInput)
+            else
+                phase        := PH_NONE
+                strideLevel  := na
+                strideLineId := line(na)
+                lastPivLo    := na
+                lastPivHi    := na
+                stepCount    := 0
+else if pending == PH_DN
+    if close > rangeBot
+        //Closed back inside: the downside exit failed and the range re-activates
+        failedExitEvent := true
+        failDir         := PH_DN
+        pending         := 0
+        inRange         := true
+    else if not na(pivHi) and pivBar > pendingBar
+        //The first rally topped while price held below the old support - the test held
+        pending      := 0
+        pivHiUsed    := true
+        lastRangeEnd := bar_index
+        if not na(rangeBoxId)
+            box.set_border_color(rangeBoxId, color.new(bearColorInput, DONE_BORDER_TRANSP))
+            box.set_bgcolor(rangeBoxId, color.new(bearColorInput, DONE_FILL_TRANSP))
+        float ralleyLevel = math.max(pivHi, rangeBot)
+        if phase == PH_DN
+            //A pause resolved with the markdown - a fresh falling resistance
+            continueEvent := true
+            if not na(lastPivHi) and pivHi > lastPivHi
+                warnEvent     := true
+                warnDir       := PH_DN
+                warnReason    := warnReason == "" ? "a rally topped above the prior high" : warnReason + "; a rally topped above the prior high"
+                strideHealthy := false
+            else
+                strideHealthy := true
+                stepCount     += 1
+            lastPivHi    := pivHi
+            strideLevel  := ralleyLevel
+            strideLineId := strideStep(pivBar, ralleyLevel, bearColorInput)
+        else
+            if phase == PH_UP
+                markupEndEvent := true
+                endReason      := "a subsequent range resolved downward - distributional behavior"
+            if pendingQualified or not qualifiedOnlyInput
+                phase              := PH_DN
+                phaseStart         := pendingBar
+                markdownBeginEvent := true
+                stepCount          := 1
+                strideHealthy      := true
+                lastPivHi          := pivHi
+                lastPivLo          := na
+                strideLevel        := ralleyLevel
+                strideLineId       := strideStep(pivBar, ralleyLevel, bearColorInput)
+            else
+                phase        := PH_NONE
+                strideLevel  := na
+                strideLineId := line(na)
+                lastPivLo    := na
+                lastPivHi    := na
+                stepCount    := 0
+
+//2 - A close beyond the active range puts an exit under test
+if inRange and pending == 0
+    if close > rangeTop
+        breakUpEvent     := true
+        pending          := PH_UP
+        pendingBar       := bar_index
+        pendingQualified := exitQualified
+        inRange          := false
+    else if close < rangeBot
+        breakDnEvent     := true
+        pending          := PH_DN
+        pendingBar       := bar_index
+        pendingQualified := exitQualified
+        inRange          := false
+
+//3 - A close through the latest stride step outside a pause ends the phase
+if strideEndInput and pending == 0 and not inRange and not na(strideLevel) and not markupBeginEvent and not markdownBeginEvent and not continueEvent
+    if phase == PH_UP and close < strideLevel
+        phase          := PH_NONE
+        markupEndEvent := true
+        endReason      := "price closed below the latest rising support"
+        strideLevel    := na
+        strideLineId   := line(na)
+        lastPivLo      := na
+        lastPivHi      := na
+        stepCount      := 0
+        strideHealthy  := true
+    else if phase == PH_DN and close > strideLevel
+        phase            := PH_NONE
+        markdownEndEvent := true
+        endReason        := "price closed above the latest falling resistance"
+        strideLevel      := na
+        strideLineId     := line(na)
+        lastPivLo        := na
+        lastPivHi        := na
+        stepCount        := 0
+        strideHealthy    := true
+
+//4 - A capped-height window entirely after the last resolved range locks a new preparation range
+bool windowFree = bar_index - rangeLenInput + 1 > lastRangeEnd
+bool compressed = bar_index >= rangeLenInput and not na(windowHi) and not na(windowLo) and baseVol > 0 and windowHi - windowLo <= widthMultInput * baseVol
+
+if not inRange and pending == 0 and compressed and windowFree
+    inRange    := true
+    rangeTop   := windowHi
+    rangeBot   := windowLo
+    rangeBoxId := showBoxesInput ? box.new(bar_index - rangeLenInput + 1, windowHi, bar_index, windowLo
+      , border_color = color.new(rangeColorInput, RANGE_BORDER_TRANSP)
+      , border_style = line.style_dashed
+      , bgcolor      = color.new(rangeColorInput, RANGE_FILL_TRANSP)) : box(na)
+
+//5 - Extend the active range while price keeps trading inside it
+if inRange and not na(rangeBoxId)
+    box.set_right(rangeBoxId, bar_index)
+
+//6 - Reactions during the trending motion extend the stride
+if phase == PH_UP and pending == 0 and not inRange
+    if not na(pivLo) and not pivLoUsed
+        if not na(lastPivLo) and pivLo < lastPivLo
+            warnEvent     := true
+            warnDir       := PH_UP
+            warnReason    := warnReason == "" ? "a reaction bottomed below the prior low" : warnReason + "; a reaction bottomed below the prior low"
+            strideHealthy := false
+        else
+            strideHealthy := true
+            stepCount     += 1
+        lastPivLo    := pivLo
+        strideLevel  := pivLo
+        strideLineId := strideStep(pivBar, pivLo, bullColorInput)
+    if not na(pivHi)
+        if not na(lastPivHi) and pivHi < lastPivHi
+            warnEvent  := true
+            warnDir    := PH_UP
+            warnReason := warnReason == "" ? "a rally failed at a lower high" : warnReason + "; a rally failed at a lower high"
+        lastPivHi := pivHi
+else if phase == PH_DN and pending == 0 and not inRange
+    if not na(pivHi) and not pivHiUsed
+        if not na(lastPivHi) and pivHi > lastPivHi
+            warnEvent     := true
+            warnDir       := PH_DN
+            warnReason    := warnReason == "" ? "a rally topped above the prior high" : warnReason + "; a rally topped above the prior high"
+            strideHealthy := false
+        else
+            strideHealthy := true
+            stepCount     += 1
+        lastPivHi    := pivHi
+        strideLevel  := pivHi
+        strideLineId := strideStep(pivBar, pivHi, bearColorInput)
+    if not na(pivLo)
+        if not na(lastPivLo) and pivLo > lastPivLo
+            warnEvent  := true
+            warnDir    := PH_DN
+            warnReason := warnReason == "" ? "a reaction bottomed above the prior low" : warnReason + "; a reaction bottomed above the prior low"
+        lastPivLo := pivLo
+
+//7 - Volume character flipping against the running phase
+var bool supplyPrev = false
+var bool demandPrev = false
+
+if phase == PH_UP and supplyDominant and not supplyPrev
+    warnEvent  := true
+    warnDir    := PH_UP
+    warnReason := warnReason == "" ? "volume now runs heavier on declines than advances" : warnReason + "; volume now runs heavier on declines than advances"
+if phase == PH_DN and demandDominant and not demandPrev
+    warnEvent  := true
+    warnDir    := PH_DN
+    warnReason := warnReason == "" ? "volume now runs heavier on advances than declines" : warnReason + "; volume now runs heavier on advances than declines"
+
+supplyPrev := supplyDominant
+demandPrev := demandDominant
+
+//8 - Keep the latest stride step extended to the current bar
+if not na(strideLineId)
+    line.set_x2(strideLineId, bar_index)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+
+//Phase background: the markup / markdown timeline
+color bgColor = not showBgInput ? color(na) : phase == PH_UP ? color.new(bullColorInput, BG_TRANSP) : phase == PH_DN ? color.new(bearColorInput, BG_TRANSP) : color(na)
+
+bgcolor(bgColor, title = "Phase background")
+
+//Qualified exits: the classic sign of strength / weakness
+if showExitMarksInput and breakUpEvent and pendingQualified
+    textMark(low, "SOS", false, bullColorInput, size.tiny, "Sign of strength: price left the range with widening spread and expanding volume. Markup begins in earnest only if the first reaction holds above the old resistance - until that back-up holds, this can still be a failed breakout.")
+if showExitMarksInput and breakDnEvent and pendingQualified
+    textMark(high, "SOW", true, bearColorInput, size.tiny, "Sign of weakness: price left the range with widening spread and expanding volume. Markdown begins in earnest only if the first rally holds below the old support - until that test holds, this can still be a failed breakdown.")
+
+//Phase transitions
+if showPhaseLabelsInput and markupBeginEvent
+    textMark(low, "Markup", false, bullColorInput, size.small, "Markup confirmed: the exit from the range held above old resistance on its first reaction (the back-up). Demand is in control - reactions should bottom at higher lows, with volume expanding on advances and contracting on pullbacks. Pauses that hold their gains and resolve upward continue the phase.")
+if showPhaseLabelsInput and markdownBeginEvent
+    textMark(high, "Markdown", true, bearColorInput, size.small, "Markdown confirmed: the exit from the range held below old support on its first rally. Supply is in control - rallies should stall at lower highs on shrinking volume. Markdown often travels faster than markup, so distribution evidence is usually treated with more urgency.")
+if showPhaseLabelsInput and markupEndEvent and phase == PH_NONE
+    textMark(high, "Markup end", true, NEUTRAL_COLOR, size.tiny, "Markup ended: " + endReason + ". Phase boundaries settle in hindsight - the advance is dated as over where subsequent structure stopped confirming it, not at the price high.")
+if showPhaseLabelsInput and markdownEndEvent and phase == PH_NONE
+    textMark(low, "Markdown end", false, NEUTRAL_COLOR, size.tiny, "Markdown ended: " + endReason + ". Phase boundaries settle in hindsight - the decline is dated as over where subsequent structure stopped confirming it, not at the price low.")
+
+//Character-shift warnings
+if showWarnInput and warnEvent
+    textMark(warnDir == PH_UP ? high : low, "!", warnDir == PH_UP, warnColorInput, size.small, "Character shift during " + (warnDir == PH_UP ? "markup" : "markdown") + ": " + warnReason + ". Not an ending by itself - endings are settled by the next range - but this is the change of behavior that warns the phase may be maturing.")
+
+//Failed exits
+if showFailInput and failedExitEvent
+    textMark(failDir == PH_UP ? high : low, "x", failDir == PH_UP, NEUTRAL_COLOR, size.tiny, "Failed exit: price closed back inside the range before the first reaction could confirm the move. The range re-activates - an exit only becomes a phase once its retest holds.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+
+var table dashTable = showDashInput ? table.new(getTablePosition(dashPosInput), 2, 6, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1) : table(na)
+
+if barstate.islast and showDashInput
+    string phaseTxt   = phase == PH_UP ? "markup" : phase == PH_DN ? "markdown" : pending == PH_UP ? "testing an upward exit" : pending == PH_DN ? "testing a downward exit" : inRange ? "building a range" : "neutral"
+    color  phaseColor = phase == PH_UP ? bullColorInput : phase == PH_DN ? bearColorInput : pending != 0 or inRange ? rangeColorInput : DASH_HEADER
+
+    string ageTxt = phase != PH_NONE and not na(phaseStart) ? str.tostring(bar_index - phaseStart) + " bars" : "-"
+
+    string strideTxt   = phase == PH_UP ? (strideHealthy ? "higher lows x" + str.tostring(stepCount) : "lower low - at risk") : phase == PH_DN ? (strideHealthy ? "lower highs x" + str.tostring(stepCount) : "higher high - at risk") : "-"
+    color  strideColor = phase == PH_NONE ? DASH_HEADER : strideHealthy ? phaseColor : warnColorInput
+
+    string charTxt   = not volAvailable ? "no volume data" : demandDominant ? "demand dominant" : supplyDominant ? "supply dominant" : "balanced"
+    color  charColor = not volAvailable ? DASH_HEADER : demandDominant ? bullColorInput : supplyDominant ? bearColorInput : DASH_HEADER
+
+    string rangeTxt = inRange ? "active" : pending != 0 ? "exit under test" : "-"
+
+    table.cell(dashTable, 0, 0, "markup & markdown", text_color = DASH_TEXT, text_halign = text.align_left, text_size = size.small)
+    table.cell(dashTable, 1, 0, "")
+
+    dashCell(dashTable, 1, "phase", phaseTxt, "The current stage of the cycle as read from structure: markup or markdown while a confirmed trending phase runs, otherwise range-building, an exit under test, or neutral. Tactics differ radically by phase - continuation plays in trends, edge plays in ranges.", phaseColor)
+    dashCell(dashTable, 2, "phase age", ageTxt, "Bars since the exit that started the running phase. Phase labels confirm with a lag (the first reaction must hold), so the start is dated at the range exit.", DASH_TEXT)
+    dashCell(dashTable, 3, "stride", strideTxt, "The stepping structure of the running phase: how many stride steps it has printed (higher lows in markup, lower highs in markdown) and whether the latest reaction kept the sequence intact.", strideColor)
+    dashCell(dashTable, 4, "volume character", charTxt, "Volume on advancing bars versus declining bars over the character window. Markup should run on dominant demand volume, markdown on dominant supply volume - dominance flipping against the phase is a warning.", charColor)
+    dashCell(dashTable, 5, "range", rangeTxt, "State of the active preparation range: forming, or already left with the first reaction still deciding whether the exit holds. Ranges are where phases begin, pause and end.", DASH_TEXT)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(breakUpEvent, "Upward Range Exit", "markup & markdown: price closed above the range high on {{ticker}} ({{interval}}) - a potential sign of strength; markup begins in earnest only if the first reaction holds above the old resistance")
+
+alertcondition(breakDnEvent, "Downward Range Exit", "markup & markdown: price closed below the range low on {{ticker}} ({{interval}}) - a potential sign of weakness; markdown begins in earnest only if the first rally holds below the old support")
+
+alertcondition(markupBeginEvent, "Markup Confirmed", "markup & markdown: markup confirmed on {{ticker}} ({{interval}}) - the exit held above old resistance on its first reaction; demand is in control and pullbacks toward rising supports are the continuation play")
+
+alertcondition(markdownBeginEvent, "Markdown Confirmed", "markup & markdown: markdown confirmed on {{ticker}} ({{interval}}) - the exit held below old support on its first rally; supply is in control and failing rallies at lower highs are the continuation play")
+
+alertcondition(markupEndEvent, "Markup Ended", "markup & markdown: markup ended on {{ticker}} ({{interval}}) - structure resolved against the advance; endings are dated where subsequent structure turns distributional, not at the price high")
+
+alertcondition(markdownEndEvent, "Markdown Ended", "markup & markdown: markdown ended on {{ticker}} ({{interval}}) - structure resolved against the decline; endings are dated where subsequent structure turns accumulative, not at the price low")
+
+alertcondition(continueEvent, "Pause Resolved With Trend", "markup & markdown: a pause on {{ticker}} ({{interval}}) held its gains and resolved with the running phase - the consolidation confirms the trend rather than ending it")
+
+alertcondition(failedExitEvent, "Failed Range Exit", "markup & markdown: an exit on {{ticker}} ({{interval}}) closed back inside its range before the first reaction confirmed it - the range re-activates; failed exits are why confirmation waits for the hold")
+
+alertcondition(warnEvent, "Phase Character Warning", "markup & markdown: character shift on {{ticker}} ({{interval}}) - stride deterioration or volume flipping against the running phase; transitions are settled by the next range, but top-like or bottom-like behavior deserves urgency")
+
+//---------------------------------------------------------------------------------------------------------------------}

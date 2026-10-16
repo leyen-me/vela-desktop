@@ -1,0 +1,376 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator('Accumulation vs Distribution Ranges', 'Accumulation vs Distribution Ranges', overlay = true, max_boxes_count = 500, max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+int ACC  = 1
+int DIST = -1
+int NONE = 0
+
+GRP_DETECT = 'Range Detection'
+GRP_EVID   = 'Evidence'
+GRP_DASH   = 'Dashboard'
+GRP_STYLE  = 'Style'
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+lengthInput = input.int(20, 'Formation Length', minval = 5, maxval = 200, group = GRP_DETECT
+  , tooltip = 'Number of bars in the detection window. When the window height stays within the range height threshold, a consolidation range is confirmed and the window extremes become the range boundaries (the first major reaction high and low).')
+
+atrLenInput = input.int(200, 'ATR Length', minval = 10, maxval = 1000, group = GRP_DETECT
+  , tooltip = 'Lookback of the Average True Range used as the volatility baseline when testing whether the detection window is compressed enough to qualify as a consolidation range.')
+
+atrMultInput = input.float(2.0, 'Range Height Threshold', minval = 0.25, step = 0.25, group = GRP_DETECT
+  , tooltip = 'Maximum height of the detection window, expressed as a multiple of the ATR, for it to qualify as a consolidation range. Lower values demand tighter ranges.')
+
+confirmInput = input.int(2, 'Resolution Confirmation', minval = 1, maxval = 10, group = GRP_DETECT
+  , tooltip = 'Consecutive closes beyond a boundary required to resolve the range in that direction. Boundary violations that recover before confirmation are graded as springs (below support) or upthrusts (above resistance) instead.')
+
+ctxLenInput = input.int(50, 'Context Lookback', minval = 5, maxval = 500, group = GRP_EVID
+  , tooltip = 'Bars preceding the range used to measure the prior trend. A decline into the range counts toward accumulation, a rally into the range counts toward distribution.')
+
+edgeZoneInput = input.float(25, 'Edge Test Zone %', minval = 5, maxval = 50, step = 5, group = GRP_EVID
+  , tooltip = 'Depth of the zones below resistance and above support, as a percentage of range height, within which a bar counts as a boundary test. The volume of the tests on each side feeds the supply/demand drying evidence.')
+
+leanThreshInput = input.float(0.2, 'Lean Threshold', minval = 0.05, maxval = 0.95, step = 0.05, group = GRP_EVID
+  , tooltip = 'Minimum average evidence score (0 to 1) required to classify the range as accumulation or distribution. Below this threshold the range stays undecided.')
+
+showDashInput = input.bool(true, 'Show Evidence Dashboard', group = GRP_DASH
+  , tooltip = 'Display a dashboard summarizing each piece of accumulation/distribution evidence and the resulting lean for the most recent range.')
+
+dashLocInput = input.string('Top Right', 'Location', options = ['Top Right', 'Top Left', 'Bottom Right', 'Bottom Left'], group = GRP_DASH
+  , tooltip = 'Position of the evidence dashboard on the chart.')
+
+dashSizeInput = input.string('Small', 'Size', options = ['Tiny', 'Small', 'Normal'], group = GRP_DASH
+  , tooltip = 'Text size of the evidence dashboard.')
+
+accColorInput = input.color(#089981, 'Accumulation', group = GRP_STYLE
+  , tooltip = 'Color used for ranges leaning accumulation, spring probes, and upward resolutions.')
+
+distColorInput = input.color(#f23645, 'Distribution', group = GRP_STYLE
+  , tooltip = 'Color used for ranges leaning distribution, upthrust probes, and downward resolutions.')
+
+neutralColorInput = input.color(#787b86, 'Undecided', group = GRP_STYLE
+  , tooltip = 'Color used while the evidence does not favor accumulation or distribution.')
+
+showLabelInput = input.bool(true, 'Show Range Labels', group = GRP_STYLE
+  , tooltip = 'Display a label above each range showing the live classification and its strength, then the resolved regime once the range breaks out.')
+
+showProbesInput = input.bool(true, 'Mark Springs & Upthrusts', group = GRP_STYLE
+  , tooltip = 'Highlight graded edge events: springs (failed pushes below support) and upthrusts (failed probes above resistance). These are tallied as evidence, not standalone signals.')
+
+showResInput = input.bool(true, 'Mark Range Resolutions', group = GRP_STYLE
+  , tooltip = 'Highlight the bar where a range resolves, with a triangle in the breakout direction.')
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+clampScore(float x) =>
+    math.max(-1.0, math.min(1.0, x))
+
+stateColor(int s) =>
+    s == ACC ? accColorInput : s == DIST ? distColorInput : neutralColorInput
+
+scoreColor(float s) =>
+    s >= 0 ? color.from_gradient(s, 0, 1, neutralColorInput, accColorInput) : color.from_gradient(s, -1, 0, distColorInput, neutralColorInput)
+
+readingColor(float s) =>
+    s >= leanThreshInput ? accColorInput : s <= -leanThreshInput ? distColorInput : DASH_TEXT
+
+scoreText(float s) =>
+    (s > 0 ? '+' : '') + str.tostring(s, '0.00')
+
+dashLocation(string s) =>
+    switch s
+        'Top Right'    => position.top_right
+        'Top Left'     => position.top_left
+        'Bottom Right' => position.bottom_right
+        =>                position.bottom_left
+
+dashTextSize(string s) =>
+    switch s
+        'Tiny'   => size.tiny
+        'Normal' => size.normal
+        =>          size.small
+
+dashRow(table tbl, int rowIdx, string evName, string reading, float s, string txtSize) =>
+    color sCol = scoreColor(s)
+    table.cell(tbl, 0, rowIdx, evName, text_color = DASH_HEADER, text_size = txtSize, text_halign = text.align_left)
+    table.cell(tbl, 1, rowIdx, reading, text_color = readingColor(s), text_size = txtSize, text_halign = text.align_left)
+    table.cell(tbl, 2, rowIdx, scoreText(s), text_color = sCol, text_size = txtSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Range Detection & Evidence Tracking
+//---------------------------------------------------------------------------------------------------------------------{
+float atrVal   = ta.atr(atrLenInput)
+float formHigh = ta.highest(high, lengthInput)
+float formLow  = ta.lowest(low, lengthInput)
+float vol      = nz(volume)
+
+// static history references keep the seeding loop's dynamic offsets within the allocated buffers
+bool seedReady = not na(low[lengthInput - 1] + high[lengthInput - 1]) and nz(volume[lengthInput - 1]) >= 0
+
+var bool  rangeActive  = false
+var float rangeTop     = na
+var float rangeBot     = na
+var int   rangeStart   = na
+var int   lastRangeEnd = -1
+var box   rangeBox     = na
+var label rangeLbl     = na
+
+var float upVolSum     = 0.
+var int   upBarCnt     = 0
+var float dnVolSum     = 0.
+var int   dnBarCnt     = 0
+var float posSum       = 0.
+var int   posCnt       = 0
+var int   springCnt    = 0
+var int   upthrustCnt  = 0
+var float supVolSum    = 0.
+var int   supTestCnt   = 0
+var float resVolSum    = 0.
+var int   resTestCnt   = 0
+var float volSum       = 0.
+var int   barCnt       = 0
+var int   underCnt     = 0
+var int   overCnt      = 0
+
+var float ctxScore     = 0.
+var float volScore     = 0.
+var float closeScore   = 0.
+var float probeScore   = 0.
+var float testScore    = 0.
+var float leanScore    = 0.
+var int   leanState    = NONE
+var string statusTxt   = 'No range yet'
+
+bool newRangeEvt  = false
+bool resolveUpEvt = false
+bool resolveDnEvt = false
+bool springEvt    = false
+bool upthrustEvt  = false
+
+bool detectNow = not rangeActive and seedReady and not na(atrVal) and formHigh - formLow <= atrVal * atrMultInput and bar_index - lengthInput + 1 > lastRangeEnd
+
+if detectNow
+    rangeActive := true
+    rangeTop    := formHigh
+    rangeBot    := formLow
+    rangeStart  := bar_index - lengthInput + 1
+    upVolSum    := 0.
+    upBarCnt    := 0
+    dnVolSum    := 0.
+    dnBarCnt    := 0
+    posSum      := 0.
+    posCnt      := 0
+    springCnt   := 0
+    upthrustCnt := 0
+    supVolSum   := 0.
+    supTestCnt  := 0
+    resVolSum   := 0.
+    resTestCnt  := 0
+    volSum      := 0.
+    barCnt      := 0
+    underCnt    := 0
+    overCnt     := 0
+    leanState   := NONE
+    leanScore   := 0.
+
+    // seed the evidence with the formation window bars
+    float rangeW = rangeTop - rangeBot
+    float zoneW  = rangeW * edgeZoneInput / 100
+    for i = 0 to lengthInput - 1
+        float v = nz(volume[i])
+        volSum += v
+        barCnt += 1
+        float chg = close[i] - nz(close[i + 1], close[i])
+        if chg > 0
+            upVolSum += v
+            upBarCnt += 1
+        else if chg < 0
+            dnVolSum += v
+            dnBarCnt += 1
+        posSum += rangeW > 0 ? math.max(0., math.min(1., (close[i] - rangeBot) / rangeW)) : 0.5
+        posCnt += 1
+        if low[i] <= rangeBot + zoneW
+            supVolSum  += v
+            supTestCnt += 1
+        if high[i] >= rangeTop - zoneW
+            resVolSum  += v
+            resTestCnt += 1
+
+    // context: prior trend into the range, normalized by the random-walk scale ATR * sqrt(t)
+    int   ctxIdx     = lengthInput - 1 + ctxLenInput
+    float ctxAnchor  = close[ctxIdx]
+    float startClose = close[lengthInput - 1]
+    float ctxSigma   = atrVal * math.sqrt(ctxLenInput)
+    ctxScore := na(ctxAnchor) or na(startClose) or ctxSigma <= 0 ? 0. : clampScore((ctxAnchor - startClose) / ctxSigma)
+
+    rangeBox := box.new(rangeStart, rangeTop, bar_index, rangeBot, border_color = neutralColorInput, border_width = 1, border_style = line.style_dashed, bgcolor = color.new(neutralColorInput, 88))
+    if showLabelInput
+        rangeLbl := label.new((rangeStart + bar_index) / 2, rangeTop, 'Undecided', style = label.style_label_down, color = #00000000, textcolor = neutralColorInput, size = size.small)
+    else
+        rangeLbl := label(na)
+
+    statusTxt   := 'Forming · ' + str.tostring(lengthInput) + ' bars'
+    newRangeEvt := true
+
+else if rangeActive
+    int prevUnder = nz(underCnt[1])
+    int prevOver  = nz(overCnt[1])
+    underCnt := close < rangeBot ? underCnt + 1 : 0
+    overCnt  := close > rangeTop ? overCnt + 1 : 0
+    bool resolveDn = underCnt >= confirmInput
+    bool resolveUp = overCnt  >= confirmInput
+
+    if resolveDn or resolveUp
+        // the breakout is the verdict on the range
+        rangeActive  := false
+        lastRangeEnd := bar_index
+        resolveUpEvt := resolveUp
+        resolveDnEvt := resolveDn
+        color dirColor = resolveUp ? accColorInput : distColorInput
+        box.set_right(rangeBox, bar_index)
+        box.set_border_style(rangeBox, line.style_solid)
+        box.set_border_color(rangeBox, dirColor)
+        box.set_bgcolor(rangeBox, color.new(dirColor, 85))
+        if not na(rangeLbl)
+            string regime  = resolveUp ? (ctxScore <= -leanThreshInput ? 'Re-accumulation' : 'Accumulation') : (ctxScore >= leanThreshInput ? 'Re-distribution' : 'Distribution')
+            string verdict = leanState == NONE ? '' : resolveUp ? (leanState == ACC ? ' ✓' : ' ✗') : (leanState == DIST ? ' ✓' : ' ✗')
+            label.set_x(rangeLbl, (rangeStart + bar_index) / 2)
+            label.set_text(rangeLbl, regime + (resolveUp ? ' ▲' : ' ▼') + verdict)
+            label.set_textcolor(rangeLbl, dirColor)
+        statusTxt := resolveUp ? 'Resolved ▲' : 'Resolved ▼'
+        underCnt  := 0
+        overCnt   := 0
+    else
+        // grade the edge events: unconfirmed violations are springs / upthrusts
+        bool springNow   = close >= rangeBot and (prevUnder > 0 or low < rangeBot and nz(low[1], low) >= rangeBot)
+        bool upthrustNow = close <= rangeTop and (prevOver > 0 or high > rangeTop and nz(high[1], high) <= rangeTop)
+        if springNow
+            springCnt += 1
+            springEvt := true
+        if upthrustNow
+            upthrustCnt += 1
+            upthrustEvt := true
+
+        // in-range evidence: rally/decline volume, close location, boundary test volume
+        float rangeW = rangeTop - rangeBot
+        float zoneW  = rangeW * edgeZoneInput / 100
+        volSum += vol
+        barCnt += 1
+        float chg = close - nz(close[1], close)
+        if chg > 0
+            upVolSum += vol
+            upBarCnt += 1
+        else if chg < 0
+            dnVolSum += vol
+            dnBarCnt += 1
+        posSum += rangeW > 0 ? math.max(0., math.min(1., (close - rangeBot) / rangeW)) : 0.5
+        posCnt += 1
+        if low <= rangeBot + zoneW
+            supVolSum  += vol
+            supTestCnt += 1
+        if high >= rangeTop - zoneW
+            resVolSum  += vol
+            resTestCnt += 1
+        statusTxt := 'Forming · ' + str.tostring(bar_index - rangeStart + 1) + ' bars'
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Lean Scoring
+//---------------------------------------------------------------------------------------------------------------------{
+bool accFlipEvt  = false
+bool distFlipEvt = false
+
+if rangeActive
+    float avgUpVol = upBarCnt > 0 ? upVolSum / upBarCnt : na
+    float avgDnVol = dnBarCnt > 0 ? dnVolSum / dnBarCnt : na
+    volScore := na(avgUpVol) or na(avgDnVol) or avgUpVol + avgDnVol <= 0 ? 0. : clampScore((avgUpVol - avgDnVol) / (avgUpVol + avgDnVol))
+
+    closeScore := posCnt > 0 ? clampScore((posSum / posCnt - 0.5) * 2) : 0.
+
+    int probeTotal = springCnt + upthrustCnt
+    probeScore := probeTotal > 0 ? (springCnt - upthrustCnt) * 1.0 / probeTotal : 0.
+
+    float avgRangeVol = barCnt > 0 ? volSum / barCnt : 0.
+    float avgSupVol   = supTestCnt > 0 ? supVolSum / supTestCnt : avgRangeVol
+    float avgResVol   = resTestCnt > 0 ? resVolSum / resTestCnt : avgRangeVol
+    testScore := avgRangeVol > 0 ? clampScore((avgResVol - avgSupVol) / avgRangeVol) : 0.
+
+    leanScore := (ctxScore + volScore + closeScore + probeScore + testScore) / 5
+
+    int newLean = leanScore >= leanThreshInput ? ACC : leanScore <= -leanThreshInput ? DIST : NONE
+    accFlipEvt  := newLean == ACC  and leanState != ACC
+    distFlipEvt := newLean == DIST and leanState != DIST
+    leanState   := newLean
+
+    // live visuals follow the current lean
+    color leanColor = stateColor(leanState)
+    box.set_right(rangeBox, bar_index)
+    box.set_border_color(rangeBox, leanColor)
+    box.set_bgcolor(rangeBox, color.new(leanColor, 88))
+    if not na(rangeLbl)
+        string leanWord = leanState == ACC ? 'Accumulation' : leanState == DIST ? 'Distribution' : 'Undecided'
+        label.set_x(rangeLbl, (rangeStart + bar_index) / 2)
+        label.set_text(rangeLbl, leanWord + ' · ' + str.tostring(math.round(math.abs(leanScore) * 100)) + '%')
+        label.set_textcolor(rangeLbl, leanColor)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Edge Probe & Resolution Markers
+//---------------------------------------------------------------------------------------------------------------------{
+plotshape(showProbesInput and springEvt, 'Spring Probe', shape.circle, location.belowbar, accColorInput, size = size.tiny)
+plotshape(showProbesInput and upthrustEvt, 'Upthrust Probe', shape.circle, location.abovebar, distColorInput, size = size.tiny)
+plotshape(showResInput and resolveUpEvt, 'Upward Resolution', shape.triangleup, location.belowbar, accColorInput, size = size.tiny)
+plotshape(showResInput and resolveDnEvt, 'Downward Resolution', shape.triangledown, location.abovebar, distColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Evidence Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dashTable = na
+
+if showDashInput and na(dashTable)
+    dashTable := table.new(dashLocation(dashLocInput), 3, 8, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+if showDashInput and barstate.islast and not na(dashTable)
+    string txtSize    = dashTextSize(dashSizeInput)
+    color headerColor = DASH_HEADER
+    table.cell(dashTable, 0, 0, 'Evidence', text_color = headerColor, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 0, 'Reading', text_color = headerColor, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dashTable, 2, 0, 'Score', text_color = headerColor, text_size = txtSize, text_halign = text.align_right)
+
+    float avgClosePos = posCnt > 0 ? posSum / posCnt : 0.5
+    dashRow(dashTable, 1, 'Context', ctxScore >= leanThreshInput ? 'After decline' : ctxScore <= -leanThreshInput ? 'After rally' : 'Flat entry', ctxScore, txtSize)
+    dashRow(dashTable, 2, 'Volume balance', volScore >= leanThreshInput ? 'Declines drier' : volScore <= -leanThreshInput ? 'Rallies drier' : 'Balanced', volScore, txtSize)
+    dashRow(dashTable, 3, 'Close location', (closeScore >= leanThreshInput ? 'Upper half' : closeScore <= -leanThreshInput ? 'Lower half' : 'Midrange') + ' · ' + str.tostring(math.round(avgClosePos * 100)) + '%', closeScore, txtSize)
+    dashRow(dashTable, 4, 'Edge probes', str.tostring(springCnt) + ' spring · ' + str.tostring(upthrustCnt) + ' upthrust', probeScore, txtSize)
+    dashRow(dashTable, 5, 'Test volume', testScore >= leanThreshInput ? 'Supply drying' : testScore <= -leanThreshInput ? 'Demand drying' : 'Even tests', testScore, txtSize)
+
+    color leanColor  = stateColor(leanState)
+    string leanWord  = leanState == ACC ? 'ACCUMULATION' : leanState == DIST ? 'DISTRIBUTION' : 'UNDECIDED'
+    table.cell(dashTable, 0, 6, 'Lean', text_color = DASH_HEADER, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 6, leanWord + ' · ' + str.tostring(math.round(math.abs(leanScore) * 100)) + '%', text_color = leanColor, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dashTable, 2, 6, scoreText(leanScore), text_color = scoreColor(leanScore), text_size = txtSize, bgcolor = color.new(scoreColor(leanScore), 80), text_halign = text.align_right)
+    table.cell(dashTable, 0, 7, 'Status', text_color = DASH_HEADER, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 7, statusTxt, text_color = DASH_TEXT, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dashTable, 2, 7, '', text_size = txtSize)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(newRangeEvt, 'New Range Detected', 'Accumulation vs Distribution Ranges: new consolidation range detected — evidence tracking has started')
+alertcondition(accFlipEvt, 'Lean Flipped To Accumulation', 'Accumulation vs Distribution Ranges: the range evidence now leans accumulation')
+alertcondition(distFlipEvt, 'Lean Flipped To Distribution', 'Accumulation vs Distribution Ranges: the range evidence now leans distribution')
+alertcondition(resolveUpEvt, 'Range Resolved Upward', 'Accumulation vs Distribution Ranges: the range resolved upward into markup')
+alertcondition(resolveDnEvt, 'Range Resolved Downward', 'Accumulation vs Distribution Ranges: the range resolved downward into markdown')
+
+//---------------------------------------------------------------------------------------------------------------------}

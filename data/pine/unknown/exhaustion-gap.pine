@@ -1,0 +1,263 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Exhaustion Gap", "Exhaustion Gap", overlay = true, max_boxes_count = 500, max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+NEUTRAL_COLOR = #787b86
+MA_COLOR      = #787b86 // the trend average is structural context, not a signal
+
+ST_PENDING = 0
+ST_FILLED  = 1
+ST_ISLAND  = 2
+ST_EXPIRED = 3
+
+NUM_FORMAT = "#.##"
+
+GAP_GROUP    = "Gap Detection"
+TREND_GROUP  = "Trend Context"
+CLIMAX_GROUP = "Climactic Context"
+STYLE_GROUP  = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+minGapAtrInput     = input.float(0.0, "Minimum Gap Size (ATR)", minval = 0, step = 0.1, group = GAP_GROUP, tooltip = "Smallest gap height, as a multiple of the Average True Range, for a gap to be considered at all. At 0 every true gap qualifies, meaning the bar's low sits fully above the prior high (gap up) or its high fully below the prior low (gap down).")
+confirmWindowInput = input.int(5, "Confirmation Window (bars)", minval = 1, maxval = 250, group = GAP_GROUP, tooltip = "Number of bars after the gap during which a full fill, or an opposite gap stranding an island, confirms exhaustion. Classical treatments expect exhaustion gaps to fill within a few sessions; candidates still open after this window are re-labeled as continuation behavior.")
+atrLenInput        = input.int(14, "ATR Length", minval = 1, group = GAP_GROUP, tooltip = "Average True Range length used to normalize the gap size, bar range and stretch measurements.")
+
+maTypeInput        = input.string("SMA", "Trend MA Type", options = ["SMA", "EMA"], group = TREND_GROUP, tooltip = "Type of moving average used to define the trend that the gap may be exhausting.")
+maLenInput         = input.int(50, "Trend MA Length", minval = 2, group = TREND_GROUP, tooltip = "Length of the trend moving average. An exhaustion gap must print while price is extended from this average, after a sustained run on one side of it.")
+trendAgeInput      = input.int(20, "Minimum Trend Age (bars)", minval = 1, maxval = 500, group = TREND_GROUP, tooltip = "Minimum number of bars the close must have spent continuously on the trend side of the moving average before the gap, so the gap appears late in a mature trend rather than launching a new one.")
+stretchInput       = input.float(1.5, "Minimum Stretch From MA (ATR)", minval = 0, step = 0.25, group = TREND_GROUP, tooltip = "Minimum distance between the gap bar's close and the trend moving average, in ATR multiples. Captures the requirement that price is stretched far from its moving averages when the gap prints.")
+priorGapsInput     = input.int(0, "Minimum Prior Same-Direction Gaps", minval = 0, group = TREND_GROUP, tooltip = "Optional requirement for earlier same-direction gaps within the lookback below, since exhaustion gaps often arrive after one or more earlier gaps in the same move. 0 disables the check.")
+priorLookbackInput = input.int(50, "Prior Gaps Lookback (bars)", minval = 1, maxval = 500, group = TREND_GROUP, tooltip = "Number of bars scanned for earlier same-direction gaps when the filter above is enabled.")
+
+volumeFilterInput  = input.bool(true, "Require Volume Spike", group = CLIMAX_GROUP, tooltip = "Require unusually heavy volume on the gap bar, the crowd's final rush into the move. The check is skipped automatically on symbols without volume data.")
+volMultInput       = input.float(1.5, "Volume Spike Multiplier", minval = 0.5, step = 0.1, group = CLIMAX_GROUP, tooltip = "The gap bar's volume must reach this multiple of its average to count as climactic.")
+volLenInput        = input.int(20, "Volume Average Length", minval = 1, group = CLIMAX_GROUP, tooltip = "Length of the simple moving average of volume used as the baseline for the spike test.")
+wideRangeMultInput = input.float(1.25, "Minimum Bar Range (ATR)", minval = 0, step = 0.05, group = CLIMAX_GROUP, tooltip = "The gap bar's high-low range must reach this multiple of the ATR to count as a wide-range, climactic bar. 0 disables the check.")
+
+showZonesInput    = input.bool(true, "Gap Zones", group = STYLE_GROUP)
+showLabelsInput   = input.bool(true, "Pattern Labels", group = STYLE_GROUP)
+showTrendInput    = input.bool(false, "Trend MA", inline = "ma", group = STYLE_GROUP)
+maColorInput      = input.color(MA_COLOR, "", inline = "ma", group = STYLE_GROUP)
+bullColorInput    = input.color(BULL_COLOR, "Bullish", inline = "colors", group = STYLE_GROUP)
+bearColorInput    = input.color(BEAR_COLOR, "Bearish", inline = "colors", group = STYLE_GROUP)
+neutralColorInput = input.color(NEUTRAL_COLOR, "Unconfirmed", group = STYLE_GROUP, tooltip = "Color applied to candidates that stay unfilled through the confirmation window, the behavior of a continuation gap rather than exhaustion.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types
+//---------------------------------------------------------------------------------------------------------------------{
+type GapCandidate
+    float  top
+    float  bottom
+    int    dir
+    int    startBar
+    float  extreme
+    float  gapAtr
+    bool   reentered
+    int    status
+    float  maxProgress
+    string info
+    box    zoneBox
+    label  tagLabel
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+statusText(int statusId) =>
+    switch statusId
+        ST_FILLED  => "Exhaustion Gap ✓"
+        ST_ISLAND  => "Exhaustion Gap ✓ (island)"
+        ST_EXPIRED => "Exhaustion Gap ✗"
+        =>            "Exhaustion Gap?"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Gap & Trend Context
+//---------------------------------------------------------------------------------------------------------------------{
+atrValue = ta.atr(atrLenInput)
+baseAtr  = atrValue[1]
+
+smaValue = ta.sma(close, maLenInput)
+emaValue = ta.ema(close, maLenInput)
+trendMa  = maTypeInput == "EMA" ? emaValue : smaValue
+
+volSma      = ta.sma(nz(volume), volLenInput)
+baseVolume  = volSma[1]
+volumeRatio = baseVolume > 0 ? nz(volume) / baseVolume : na
+
+//bars spent continuously on one side of the trend average
+upTrendAge   = nz(ta.barssince(close < trendMa), bar_index)
+downTrendAge = nz(ta.barssince(close > trendMa), bar_index)
+
+//true gaps, the bar's range shares no overlap with the previous bar
+gapUpMove   = low - high[1]
+gapDownMove = low[1] - high
+minGapSize  = minGapAtrInput * baseAtr
+gapUp       = gapUpMove > 0 and gapUpMove >= minGapSize
+gapDown     = gapDownMove > 0 and gapDownMove >= minGapSize
+
+//earlier same-direction gaps within the lookback, excluding the current bar
+upGapSum       = math.sum(gapUp ? 1 : 0, priorLookbackInput)
+downGapSum     = math.sum(gapDown ? 1 : 0, priorLookbackInput)
+priorUpCount   = nz(upGapSum[1])
+priorDownCount = nz(downGapSum[1])
+
+//climactic context on the gap bar
+barRange     = high - low
+stretchUp    = (close - trendMa) / baseAtr
+stretchDown  = (trendMa - close) / baseAtr
+climaxVolume = not volumeFilterInput or na(volumeRatio) or nz(volumeRatio) >= volMultInput
+climaxRange  = wideRangeMultInput <= 0 or barRange >= wideRangeMultInput * baseAtr
+
+//the trend average must have existed through the whole maturity window
+dataReady = not na(trendMa[trendAgeInput]) and not na(baseAtr) and baseAtr > 0
+
+matureUpTrend   = dataReady and close > trendMa and upTrendAge >= trendAgeInput and stretchUp >= stretchInput
+matureDownTrend = dataReady and close < trendMa and downTrendAge >= trendAgeInput and stretchDown >= stretchInput
+
+priorOkUp   = priorGapsInput <= 0 or priorUpCount >= priorGapsInput
+priorOkDown = priorGapsInput <= 0 or priorDownCount >= priorGapsInput
+
+//an up gap late in a stretched uptrend carries a bearish implication, and vice versa
+newBearishGap = gapUp and matureUpTrend and climaxVolume and climaxRange and priorOkUp
+newBullishGap = gapDown and matureDownTrend and climaxVolume and climaxRange and priorOkDown
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Candidate Tracking
+//---------------------------------------------------------------------------------------------------------------------{
+var activeArray = array.new<GapCandidate>()
+
+bearReentry = false
+bullReentry = false
+bearFilled  = false
+bullFilled  = false
+bearIsland  = false
+bullIsland  = false
+anyExpired  = false
+
+int idx = array.size(activeArray) - 1
+while idx >= 0
+    GapCandidate cand = array.get(activeArray, idx)
+    bool isBearish = cand.dir == 1
+
+    //furthest follow-through beyond the gap bar's extreme, exhaustion should show little of it
+    cand.maxProgress := math.max(cand.maxProgress, isBearish ? high - cand.extreme : cand.extreme - low)
+
+    //opposite gap across the same zone strands the bars in between, the island reversal confirmation
+    bool islandGap = isBearish ? gapDownMove > 0 and high < cand.top and low[1] > cand.bottom : gapUpMove > 0 and high[1] < cand.top and low > cand.bottom
+
+    //full fill, price trades back through the entire gap
+    bool gapFilled = isBearish ? low <= cand.bottom : high >= cand.top
+
+    if islandGap
+        cand.status := ST_ISLAND
+        if isBearish
+            bearIsland := true
+        else
+            bullIsland := true
+    else if gapFilled
+        cand.status := ST_FILLED
+        if isBearish
+            bearFilled := true
+        else
+            bullFilled := true
+
+    //close back inside the gap zone, the early re-entry evidence
+    if cand.status == ST_PENDING and not cand.reentered and (isBearish ? close < cand.top : close > cand.bottom)
+        cand.reentered := true
+        if isBearish
+            bearReentry := true
+        else
+            bullReentry := true
+
+    //window expiry, a gap that holds behaves like a continuation gap
+    if cand.status == ST_PENDING and bar_index - cand.startBar >= confirmWindowInput
+        cand.status := ST_EXPIRED
+        anyExpired := true
+
+    if cand.status == ST_PENDING
+        if not na(cand.zoneBox)
+            box.set_right(cand.zoneBox, bar_index)
+    else
+        int barsHeld = bar_index - cand.startBar
+        color dirColor  = isBearish ? bearColorInput : bullColorInput
+        color mainColor = cand.status == ST_EXPIRED ? neutralColorInput : dirColor
+        string resolution = switch cand.status
+            ST_FILLED => "Filled in " + str.tostring(barsHeld) + " bar(s), exhaustion confirmed"
+            ST_ISLAND => "Opposite gap across the zone after " + str.tostring(barsHeld) + " bar(s), island reversal confirmation"
+            =>           "Unfilled after " + str.tostring(barsHeld) + " bar(s), continuation behavior"
+        string followThrough = cand.gapAtr > 0 ? "\nFollow-through beyond gap bar: " + str.tostring(math.max(cand.maxProgress, 0) / cand.gapAtr, NUM_FORMAT) + " ATR" : ""
+        if not na(cand.zoneBox)
+            box.set_right(cand.zoneBox, bar_index)
+            box.set_border_color(cand.zoneBox, color.new(mainColor, cand.status == ST_EXPIRED ? 60 : 25))
+            box.set_border_style(cand.zoneBox, cand.status == ST_EXPIRED ? line.style_dotted : line.style_solid)
+            box.set_bgcolor(cand.zoneBox, color.new(mainColor, cand.status == ST_EXPIRED ? 92 : 80))
+        if not na(cand.tagLabel)
+            label.set_text(cand.tagLabel, statusText(cand.status))
+            if cand.status == ST_EXPIRED
+                label.set_textcolor(cand.tagLabel, color.new(neutralColorInput, 30))
+            else
+                label.set_color(cand.tagLabel, dirColor)
+                label.set_textcolor(cand.tagLabel, chart.bg_color)
+            label.set_tooltip(cand.tagLabel, cand.info + "\n" + resolution + followThrough)
+        array.remove(activeArray, idx)
+    idx -= 1
+
+if newBearishGap
+    string details = "Up gap late in an extended uptrend, bearish exhaustion candidate"
+    details += "\nGap size: " + str.tostring(gapUpMove / baseAtr, NUM_FORMAT) + " ATR"
+    details += "\nGap bar range: " + str.tostring(barRange / baseAtr, NUM_FORMAT) + " ATR"
+    details += "\nVolume: " + (na(volumeRatio) ? "no data" : str.tostring(volumeRatio, NUM_FORMAT) + "x average")
+    details += "\nStretch above MA: " + str.tostring(stretchUp, NUM_FORMAT) + " ATR"
+    details += "\nBars since close below MA: " + str.tostring(upTrendAge)
+    details += "\nEarlier up gaps in lookback: " + str.tostring(priorUpCount, "#")
+    box newBox = na
+    label newLabel = na
+    if showZonesInput
+        newBox := box.new(bar_index - 1, low, bar_index, high[1], border_color = color.new(bearColorInput, 40), border_style = line.style_dashed, bgcolor = color.new(bearColorInput, 90))
+    if showLabelsInput
+        newLabel := label.new(bar_index, high, statusText(ST_PENDING), style = label.style_label_down, color = #00000000, textcolor = bearColorInput, size = size.small, tooltip = details)
+    array.push(activeArray, GapCandidate.new(top = low, bottom = high[1], dir = 1, startBar = bar_index, extreme = high, gapAtr = baseAtr, reentered = false, status = ST_PENDING, maxProgress = 0.0, info = details, zoneBox = newBox, tagLabel = newLabel))
+
+if newBullishGap
+    string details = "Down gap late in an extended downtrend, bullish exhaustion candidate"
+    details += "\nGap size: " + str.tostring(gapDownMove / baseAtr, NUM_FORMAT) + " ATR"
+    details += "\nGap bar range: " + str.tostring(barRange / baseAtr, NUM_FORMAT) + " ATR"
+    details += "\nVolume: " + (na(volumeRatio) ? "no data" : str.tostring(volumeRatio, NUM_FORMAT) + "x average")
+    details += "\nStretch below MA: " + str.tostring(stretchDown, NUM_FORMAT) + " ATR"
+    details += "\nBars since close above MA: " + str.tostring(downTrendAge)
+    details += "\nEarlier down gaps in lookback: " + str.tostring(priorDownCount, "#")
+    box newBox = na
+    label newLabel = na
+    if showZonesInput
+        newBox := box.new(bar_index - 1, low[1], bar_index, high, border_color = color.new(bullColorInput, 40), border_style = line.style_dashed, bgcolor = color.new(bullColorInput, 90))
+    if showLabelsInput
+        newLabel := label.new(bar_index, low, statusText(ST_PENDING), style = label.style_label_up, color = #00000000, textcolor = bullColorInput, size = size.small, tooltip = details)
+    array.push(activeArray, GapCandidate.new(top = low[1], bottom = high, dir = -1, startBar = bar_index, extreme = low, gapAtr = baseAtr, reentered = false, status = ST_PENDING, maxProgress = 0.0, info = details, zoneBox = newBox, tagLabel = newLabel))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visuals
+//---------------------------------------------------------------------------------------------------------------------{
+plot(showTrendInput ? trendMa : na, "Trend MA", maColorInput)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(newBearishGap, "Bearish Exhaustion Gap Candidate", "Up gap late in an extended uptrend with climactic context, potential bearish exhaustion gap. Watch for a quick fill.")
+alertcondition(newBullishGap, "Bullish Exhaustion Gap Candidate", "Down gap late in an extended downtrend with climactic context, potential bullish exhaustion gap. Watch for a quick fill.")
+alertcondition(bearReentry, "Bearish Exhaustion Re-Entry", "Price closed back inside a late-uptrend gap, exhaustion evidence building against the uptrend.")
+alertcondition(bullReentry, "Bullish Exhaustion Re-Entry", "Price closed back inside a late-downtrend gap, exhaustion evidence building against the downtrend.")
+alertcondition(bearFilled, "Bearish Exhaustion Gap Confirmed", "A late-uptrend gap filled within the confirmation window, exhaustion gap confirmed against the uptrend.")
+alertcondition(bullFilled, "Bullish Exhaustion Gap Confirmed", "A late-downtrend gap filled within the confirmation window, exhaustion gap confirmed against the downtrend.")
+alertcondition(bearIsland, "Bearish Island Confirmation", "Price gapped back down across a bearish exhaustion gap zone, stranding an island of bars at the top.")
+alertcondition(bullIsland, "Bullish Island Confirmation", "Price gapped back up across a bullish exhaustion gap zone, stranding an island of bars at the bottom.")
+alertcondition(anyExpired, "Exhaustion Candidate Expired", "An exhaustion gap candidate stayed unfilled through the confirmation window, behavior consistent with a continuation gap.")
+
+//---------------------------------------------------------------------------------------------------------------------}

@@ -1,0 +1,625 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator('Wyckoff Distribution Schematic', 'Wyckoff Distribution Schematic', overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+// state machine: scanning -> climax candidate (awaiting AR) -> phase A (awaiting ST) -> phase B -> phase C -> phase D
+int SCAN    = -1
+int WAIT_AR = 0
+int WAIT_ST = 1
+int PHASE_B = 2
+int PHASE_C = 3
+int PHASE_D = 4
+
+int MAX_PIVOT_MEMORY = 100
+
+GRP_STRUCT = 'Structure'
+GRP_SIG    = 'Volume & Spread Signatures'
+GRP_DASH   = 'Dashboard'
+GRP_STYLE  = 'Style'
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+swingInput = input.int(5, 'Swing Length', minval = 2, maxval = 20, group = GRP_STRUCT
+  , tooltip = 'Bars on each side required to confirm a swing high/low. Events defined by a reaction (AR, ST, tests, LPSY) are labeled only once the swing that defines them is complete, so labels appear this many bars after the pivot.')
+
+ctxLenInput = input.int(50, 'Uptrend Lookback', minval = 20, maxval = 300, group = GRP_STRUCT
+  , tooltip = 'Bars used to establish the prior uptrend. A buying climax is only considered when price has advanced over this window and is making the high of it — distribution must start from an established markup.')
+
+trendMultInput = input.float(1.0, 'Uptrend Strength', minval = 0.25, step = 0.25, group = GRP_STRUCT
+  , tooltip = 'Minimum advance over the lookback, normalized by ATR x sqrt(bars). Higher values demand a steeper markup before a climax candidate is accepted.')
+
+arWindowInput = input.int(20, 'Automatic Reaction Window', minval = 5, maxval = 100, group = GRP_STRUCT
+  , tooltip = 'Maximum bars after the buying climax candidate for the automatic reaction to complete. If no qualifying break swing forms in time, the candidate is dropped and scanning resumes.')
+
+arMultInput = input.float(2.0, 'AR Reaction Depth (ATR)', minval = 0.5, step = 0.25, group = GRP_STRUCT
+  , tooltip = 'Minimum depth of the automatic reaction below the climax high, in ATR multiples. The AR must be a sharp break — its low sets range support (the ice) while the BC high sets range resistance.')
+
+minBInput = input.int(10, 'Minimum Phase B Bars', minval = 0, maxval = 100, group = GRP_STRUCT
+  , tooltip = 'Bars phase B must last before a phase C event (UTAD or lower-high test) is accepted. Failed pushes above resistance before this point are labeled UT — the ordinary phase B upthrusts. The cause needs time to build; Wyckoff treats phase B as open-ended.')
+
+recoverInput = input.int(5, 'Upthrust Fallback / Breakout Grace (bars)', minval = 1, maxval = 20, group = GRP_STRUCT
+  , tooltip = 'Maximum consecutive closes above resistance tolerated as an upthrust overshoot. A close back inside within this window grades the probe as a UT or UTAD; closes persisting beyond it invalidate the schematic (the markup resumed).')
+
+confirmInput = input.int(2, 'Markdown Confirmation Closes', minval = 1, maxval = 10, group = GRP_STRUCT
+  , tooltip = 'Consecutive closes below range support required to confirm markdown (phase E). Until markdown confirms, every label on the structure remains provisional.')
+
+zonePctInput = input.float(25, 'Boundary Zone %', minval = 5, maxval = 50, step = 5, group = GRP_STRUCT
+  , tooltip = 'Depth of the tolerance zones around resistance and support, as a percentage of range height. Secondary tests and phase C tests must print inside the resistance zone; a sign of weakness must press into the support zone or beyond.')
+
+psyLookInput = input.int(30, 'Preliminary Supply Lookback', minval = 5, maxval = 200, group = GRP_STRUCT
+  , tooltip = 'Bars before the buying climax scanned for preliminary supply: the most recent swing high holding below the climax high on above-average volume. If none is found the PSY label is skipped — real ranges may blur or skip events.')
+
+volLenInput = input.int(20, 'Volume / Spread Baseline', minval = 5, maxval = 200, group = GRP_SIG
+  , tooltip = 'Length of the moving averages used as the reference for relative volume and relative spread (bar range). Climactic, expanding and dull readings are all measured against these baselines.')
+
+atrLenInput = input.int(14, 'ATR Length', minval = 5, maxval = 100, group = GRP_SIG
+  , tooltip = 'Average True Range length used to normalize the uptrend strength test and the automatic reaction depth.')
+
+climaxMultInput = input.float(2.0, 'Climactic Volume x', minval = 1.0, step = 0.25, group = GRP_SIG
+  , tooltip = 'Volume multiple of the baseline that qualifies as climactic. Used for the buying climax and to separate light-volume UTADs (labeled immediately) from heavy-volume overshoots (which must pass a weak test before earning the UTAD label).')
+
+wideMultInput = input.float(1.5, 'Wide Spread x', minval = 1.0, step = 0.25, group = GRP_SIG
+  , tooltip = 'Bar-range multiple of the baseline that qualifies as wide spread. The buying climax needs a wide surge; a sign of weakness needs expanding spread on the break.')
+
+sowVolMultInput = input.float(1.5, 'SOW Volume x', minval = 1.0, step = 0.25, group = GRP_SIG
+  , tooltip = 'Minimum relative volume for a sign of weakness — the phase D break pressing or cracking range support must travel on expanding volume.')
+
+lowVolMultInput = input.float(0.8, 'Dull Volume x', minval = 0.1, maxval = 1.5, step = 0.05, group = GRP_SIG
+  , tooltip = 'Maximum relative volume for dull events: phase C tests and last points of supply. Rallies that keep shrinking relative to the baseline are the bearish tell of distribution.')
+
+showDashInput = input.bool(true, 'Show Phase Dashboard', group = GRP_DASH
+  , tooltip = 'Display a dashboard with the current phase, the event checklist (PSY, BC, AR, ST, UT, UTAD/Test, SOW, LPSY), the schematic variant, demand evidence, and the sequencing caveats.')
+
+dashLocInput = input.string('Top Right', 'Location', options = ['Top Right', 'Top Left', 'Bottom Right', 'Bottom Left'], group = GRP_DASH
+  , tooltip = 'Position of the phase dashboard on the chart.')
+
+dashSizeInput = input.string('Small', 'Size', options = ['Tiny', 'Small', 'Normal'], group = GRP_DASH
+  , tooltip = 'Text size of the phase dashboard.')
+
+bearColorInput = input.color(#f23645, 'Bearish Events', group = GRP_STYLE
+  , tooltip = 'Color for events confirming supply: UTAD, tests, signs of weakness, LPSY, markdown, and the later phase zones.')
+
+bullColorInput = input.color(#089981, 'Climactic / Bullish', group = GRP_STYLE
+  , tooltip = 'Color for the buying climax, the early phase zones, and an invalidated structure resolving upward (re-accumulation).')
+
+neutralColorInput = input.color(#787b86, 'Structural / Neutral', group = GRP_STYLE
+  , tooltip = 'Color for structural events (PSY, AR, ST, UT) and for faded structures whose labels no longer apply.')
+
+showZonesInput = input.bool(true, 'Phase Zones', group = GRP_STYLE
+  , tooltip = 'Shade the range with one zone per phase (A through D), lettered as the schematic unfolds. Zone tint graduates from the climactic side toward the markdown side.')
+
+showEventsInput = input.bool(true, 'Event Labels', group = GRP_STYLE
+  , tooltip = 'Label the schematic events on the chart: PSY, BC, AR, ST, UT, UTAD, Test, SOW, LPSY and markdown. Labels are placed only after the reaction that defines them is complete.')
+
+showRangeInput = input.bool(true, 'Range Boundaries', group = GRP_STYLE
+  , tooltip = 'Draw resistance (BC high) and support (AR low — the ice) as the range boundaries. Dashed while the structure is provisional, solid once markdown confirms it.')
+
+showTargetInput = input.bool(true, 'Markdown Target Projection', group = GRP_STYLE
+  , tooltip = 'Once markdown confirms, project a rough objective one range-height below support — a simple proxy for the traditional point-and-figure count across the cause, to be treated as an estimate rather than a promise.')
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+phaseColor(int idx) =>
+    color.from_gradient(idx, 0, 4, bullColorInput, bearColorInput)
+
+mark(bool done) =>
+    done ? '✓' : '—'
+
+dashLocation(string s) =>
+    switch s
+        'Top Right'    => position.top_right
+        'Top Left'     => position.top_left
+        'Bottom Right' => position.bottom_right
+        =>                position.bottom_left
+
+dashTextSize(string s) =>
+    switch s
+        'Tiny'   => size.tiny
+        'Normal' => size.normal
+        =>          size.small
+
+addEventLabel(array<label> arr, int b, float y, string txt, color col, bool up, string tip) =>
+    if showEventsInput
+        label l = label.new(b, y, txt, style = up ? label.style_label_up : label.style_label_down, color = #00000000, textcolor = col, size = size.small, tooltip = tip)
+        array.push(arr, l)
+
+startZone(array<box> arr, box prevBox, int leftBar, float top, float bot, int idx, string letter) =>
+    box result = prevBox
+    if showZonesInput
+        if not na(prevBox)
+            box.set_right(prevBox, leftBar)
+        color pc = phaseColor(idx)
+        result := box.new(leftBar, top, bar_index, bot, border_color = color.new(pc, 100), bgcolor = color.new(pc, 92), text = letter, text_size = size.small, text_color = color.new(pc, 25), text_halign = text.align_center, text_valign = text.align_top)
+        array.push(arr, result)
+    result
+
+fadeStructure(array<label> lbls, array<box> bxs, array<line> lns) =>
+    if array.size(lbls) > 0
+        for i = 0 to array.size(lbls) - 1
+            label.set_textcolor(array.get(lbls, i), color.new(neutralColorInput, 40))
+    if array.size(bxs) > 0
+        for i = 0 to array.size(bxs) - 1
+            box b = array.get(bxs, i)
+            box.set_bgcolor(b, color.new(neutralColorInput, 95))
+            box.set_text_color(b, color.new(neutralColorInput, 55))
+    if array.size(lns) > 0
+        for i = 0 to array.size(lns) - 1
+            line l = array.get(lns, i)
+            line.set_color(l, color.new(neutralColorInput, 55))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Baselines & Pivot Memory
+//---------------------------------------------------------------------------------------------------------------------{
+float vol        = nz(volume)
+float avgVol     = ta.sma(vol, volLenInput)
+float avgSpread  = ta.sma(high - low, volLenInput)
+float atrVal     = ta.atr(atrLenInput)
+float highestCtx = ta.highest(high, ctxLenInput)
+float cumVol     = ta.cum(vol)
+float plPrice    = ta.pivotlow(low, swingInput, swingInput)
+float phPrice    = ta.pivothigh(high, swingInput, swingInput)
+
+bool  hasVol    = cumVol > 0
+float relVol    = hasVol and avgVol > 0 ? vol / avgVol : 1.0
+float relSpread = avgSpread > 0 ? (high - low) / avgSpread : 1.0
+
+float ctxAnchor   = close[ctxLenInput]
+float advanceNorm = na(ctxAnchor) or na(atrVal) or atrVal <= 0 ? 0.0 : (close - ctxAnchor) / (atrVal * math.sqrt(ctxLenInput))
+bool  uptrendOk   = advanceNorm >= trendMultInput
+
+// pivot-bar readings (offset by the confirmation lag)
+float phVolAbs = nz(volume[swingInput])
+float phAvgVol = avgVol[swingInput]
+float phRvol   = hasVol and phAvgVol > 0 ? phVolAbs / phAvgVol : 1.0
+
+// rolling memory of confirmed swing highs, used to locate preliminary supply behind the climax
+var array<int>   phBars  = array.new<int>()
+var array<float> phHighs = array.new<float>()
+var array<float> phRvols = array.new<float>()
+
+if not na(phPrice)
+    array.push(phBars, bar_index - swingInput)
+    array.push(phHighs, phPrice)
+    array.push(phRvols, phRvol)
+    if array.size(phBars) > MAX_PIVOT_MEMORY
+        array.shift(phBars)
+        array.shift(phHighs)
+        array.shift(phRvols)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Structure State
+//---------------------------------------------------------------------------------------------------------------------{
+var int    phase        = SCAN
+var int    bcBar        = na
+var float  bcHigh       = na
+var float  bcVol        = na
+var float  bcRelVol     = na
+var int    arBar        = na
+var float  rangeTop     = na
+var float  rangeBot     = na
+var int    bStartBar    = na
+var int    lastPhBar    = na
+var bool   psyFound     = false
+var bool   upthrusted   = false
+var bool   utadLabeled  = false
+var bool   utadPending  = false
+var float  utadHigh     = na
+var int    utadBar      = na
+var bool   overshootLive = false
+var float  utCandHigh   = na
+var int    utCandBar    = na
+var float  utCandRelVol = na
+var float  phaseCHigh   = na
+var int    stCount      = 0
+var int    testCount    = 0
+var int    utCount      = 0
+var int    sowCount     = 0
+var int    lpsyCount    = 0
+var int    iceLpsyCount = 0
+var bool   cSkipped     = false
+var bool   sowArmed     = true
+var bool   fellThroughIce = false
+var int    variantNum   = 0
+var int    aboveCnt     = 0
+var int    belowCnt     = 0
+var float  lastTestRelVol = na
+var float  lastResistHigh = na
+var string statusTxt    = 'Scanning for a buying climax'
+var string phaseTxt     = 'Scanning'
+var int    phaseIdxDisp = -1
+
+var box  zoneBox = na
+var line supLine = na
+var line resLine = na
+var array<label> structLabels = array.new<label>()
+var array<box>   structBoxes  = array.new<box>()
+var array<line>  structLines  = array.new<line>()
+
+float rangeH = not na(rangeTop) and not na(rangeBot) ? rangeTop - rangeBot : na
+float zoneW  = not na(rangeH) ? rangeH * zonePctInput / 100 : na
+
+// per-bar event flags
+bool bcCandEvt   = false
+bool rangeEvt    = false
+bool stEvt       = false
+bool utEvt       = false
+bool utadEvt     = false
+bool testEvt     = false
+bool sowEvt      = false
+bool lpsyEvt     = false
+bool markdownEvt = false
+bool failEvt     = false
+bool doReset     = false
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Schematic State Machine
+//---------------------------------------------------------------------------------------------------------------------{
+if phase == SCAN
+    // 1. a mature uptrend surging into new highs on wide spread and climactic volume — BC candidate
+    bool bcSig = uptrendOk and high >= highestCtx and relSpread >= wideMultInput and (not hasVol or relVol >= climaxMultInput) and close > nz(close[1], close)
+    if bcSig
+        phase        := WAIT_AR
+        bcBar        := bar_index
+        bcHigh       := high
+        bcVol        := vol
+        bcRelVol     := relVol
+        bcCandEvt    := true
+        phaseTxt     := 'A? — climax candidate'
+        phaseIdxDisp := 0
+        statusTxt    := 'Climax candidate — awaiting the automatic reaction'
+
+else if phase == WAIT_AR
+    // the high may still shift while the surge completes
+    if high > bcHigh
+        bcHigh := high
+        if relSpread >= wideMultInput and (not hasVol or relVol >= climaxMultInput)
+            bcBar    := bar_index
+            bcVol    := vol
+            bcRelVol := relVol
+    // 2. the automatic reaction: first confirmed swing low breaking sharply off the climax high
+    if not na(plPrice) and bar_index - swingInput > bcBar and bcHigh - plPrice >= arMultInput * atrVal
+        rangeTop := bcHigh
+        rangeBot := plPrice
+        arBar    := bar_index - swingInput
+        phase    := WAIT_ST
+        rangeEvt := true
+        // locate preliminary supply behind the climax: nearest swing high below the BC high on above-average volume
+        int   psyBar  = -1
+        float psyHigh = na
+        if array.size(phBars) > 0
+            for i = 0 to array.size(phBars) - 1
+                int pvB = array.get(phBars, i)
+                if pvB < bcBar and bcBar - pvB <= psyLookInput
+                    float pvH = array.get(phHighs, i)
+                    if pvH < bcHigh and array.get(phRvols, i) >= 1.0
+                        psyBar  := pvB
+                        psyHigh := pvH
+        psyFound := psyBar >= 0
+        // phase A events are labeled now that the reaction defining them (the AR) is complete
+        if psyFound
+            addEventLabel(structLabels, psyBar, psyHigh, 'PSY', neutralColorInput, false, 'Preliminary supply — the first heavy selling checking the advance, ahead of the climax.')
+        addEventLabel(structLabels, bcBar, bcHigh, 'BC', bullColorInput, false, 'Buying climax — wide-spread, climactic-volume surge ending the markup. Its high sets range resistance.')
+        addEventLabel(structLabels, arBar, rangeBot, 'AR', neutralColorInput, true, 'Automatic reaction — the sharp break off the climax. Its low sets range support: the ice.')
+        if showRangeInput
+            supLine := line.new(arBar, rangeBot, bar_index, rangeBot, color = bullColorInput, style = line.style_dashed)
+            resLine := line.new(bcBar, rangeTop, bar_index, rangeTop, color = bearColorInput, style = line.style_dashed)
+            array.push(structLines, supLine)
+            array.push(structLines, resLine)
+        zoneBox      := startZone(structBoxes, zoneBox, psyFound ? psyBar : bcBar, rangeTop, rangeBot, 0, 'A')
+        phaseTxt     := 'A — stopping the advance'
+        phaseIdxDisp := 0
+        statusTxt    := 'Range defined — awaiting the secondary test'
+    else if bar_index - bcBar > arWindowInput
+        // no sharp break in time: not a climax that mattered
+        doReset   := true
+        phaseTxt  := 'Scanning'
+        phaseIdxDisp := -1
+        statusTxt := 'Climax candidate expired without an automatic reaction'
+
+else if phase == WAIT_ST
+    // 3. the secondary test: a lighter-volume retest of the climax high completes phase A
+    if not na(phPrice)
+        int stBar = bar_index - swingInput
+        if stBar > arBar and phPrice >= rangeTop - zoneW and phPrice <= rangeTop + zoneW and close <= rangeTop and (not hasVol or phVolAbs < bcVol)
+            addEventLabel(structLabels, stBar, phPrice, 'ST', neutralColorInput, false, 'Secondary test — retest of the climax high on narrower spread and volume below the BC. Completes phase A; phase B builds the cause.')
+            lastPhBar      := stBar
+            lastResistHigh := phPrice
+            lastTestRelVol := phRvol
+            stCount        := 1
+            phase          := PHASE_B
+            bStartBar      := stBar
+            stEvt          := true
+            zoneBox        := startZone(structBoxes, zoneBox, stBar, rangeTop, rangeBot, 1, 'B')
+            phaseTxt       := 'B — building cause'
+            phaseIdxDisp   := 1
+            statusTxt      := 'Phase B — tracking failing rallies while the cause builds'
+
+else
+    // active range: phases B, C, D
+    int barsInB = bar_index - bStartBar
+
+    // upthrust tracking — an overshoot of resistance that must fall back quickly (phases B and C):
+    // before the cause is built it is an ordinary phase B upthrust (UT); after it, the terminal UTAD
+    if phase <= PHASE_C and not upthrusted
+        if high > rangeTop
+            if not overshootLive
+                overshootLive := true
+                utCandHigh    := high
+                utCandBar     := bar_index
+                utCandRelVol  := relVol
+            else if high > utCandHigh
+                utCandHigh   := high
+                utCandBar    := bar_index
+                utCandRelVol := math.max(utCandRelVol, relVol)
+        if overshootLive and close <= rangeTop
+            overshootLive := false
+            if barsInB >= minBInput
+                upthrusted := true
+                utadHigh   := utCandHigh
+                utadBar    := utCandBar
+                phaseCHigh := utadHigh
+                variantNum := 1
+                bool lightVol = not hasVol or utCandRelVol <= climaxMultInput
+                if lightVol
+                    utadLabeled := true
+                    utadEvt     := true
+                    addEventLabel(structLabels, utadBar, utadHigh, 'UTAD', bearColorInput, false, 'Upthrust after distribution — the final probe above range resistance failing back inside on modest demand: the phase C test (schematic #1).')
+                else
+                    utadPending := true
+                if phase == PHASE_B
+                    phase        := PHASE_C
+                    zoneBox      := startZone(structBoxes, zoneBox, utCandBar, rangeTop, rangeBot, 2, 'C')
+                    phaseTxt     := 'C — testing demand'
+                    phaseIdxDisp := 2
+                statusTxt := utadPending ? 'Heavy-volume overshoot — needs a weak test to earn the UTAD label' : 'UTAD failed back inside — watch for the test and signs of weakness'
+            else
+                utCount += 1
+                utEvt   := true
+                addEventLabel(structLabels, utCandBar, utCandHigh, 'UT', neutralColorInput, false, 'Upthrust — a failed push above range resistance in phase B, closing back inside. Repeated failures at the highs are the phase B signature of distribution.')
+                utCandHigh   := na
+                utCandBar    := na
+                utCandRelVol := na
+                statusTxt    := 'Upthrust failed at the highs — supply evidence building'
+
+    // confirmed swing highs: secondary tests (B), phase C tests, LPSY (D)
+    if not na(phPrice) and (na(lastPhBar) or bar_index - swingInput > lastPhBar)
+        int   pb = bar_index - swingInput
+        float ph = phPrice
+        bool  dullVol = not hasVol or phRvol <= lowVolMultInput
+        if phase == PHASE_B
+            bool lowerHigh = not na(lastResistHigh) and ph < lastResistHigh
+            if barsInB >= minBInput and lowerHigh and ph <= rangeTop and ph >= rangeTop - zoneW and dullVol
+                // lower-high test that never reaches resistance: phase C without a UTAD (schematic #2)
+                phase          := PHASE_C
+                phaseCHigh     := ph
+                variantNum     := 2
+                testCount      += 1
+                lastPhBar      := pb
+                lastTestRelVol := phRvol
+                testEvt        := true
+                addEventLabel(structLabels, pb, ph, 'Test', bearColorInput, false, 'Phase C test — a lower high on dull volume that never reaches resistance (schematic #2): demand is not on offer at the highs.')
+                zoneBox      := startZone(structBoxes, zoneBox, pb, rangeTop, rangeBot, 2, 'C')
+                phaseTxt     := 'C — testing demand'
+                phaseIdxDisp := 2
+                statusTxt    := 'Phase C test stalled — watch for signs of weakness'
+            else if ph >= rangeTop - zoneW and ph <= rangeTop + zoneW and (not hasVol or phVolAbs < bcVol)
+                stCount        += 1
+                lastPhBar      := pb
+                lastResistHigh := ph
+                lastTestRelVol := phRvol
+                addEventLabel(structLabels, pb, ph, 'ST', neutralColorInput, false, 'Secondary test in phase B — another resistance retest on volume below the climax. Rallies shrinking in volume are the bearish tell.')
+        else if phase == PHASE_C
+            float cCeil = upthrusted and not na(utadHigh) ? utadHigh : rangeTop + zoneW
+            if ph >= rangeTop - zoneW and ph <= cCeil and dullVol
+                testCount      += 1
+                lastPhBar      := pb
+                lastTestRelVol := phRvol
+                testEvt        := true
+                addEventLabel(structLabels, pb, ph, 'Test', bearColorInput, false, 'Dull-volume test stalling below the phase C high — demand judged exhausted.')
+                if utadPending
+                    utadPending := false
+                    utadLabeled := true
+                    utadEvt     := true
+                    addEventLabel(structLabels, utadBar, utadHigh, 'UTAD', bearColorInput, false, 'Upthrust after distribution — heavy-volume probe that earned its label after a weak test back inside the range.')
+                statusTxt := 'Phase C test stalled — watch for signs of weakness'
+        else if phase == PHASE_D
+            float cCeil = nz(phaseCHigh, rangeTop)
+            if ph < cCeil and dullVol
+                bool isIce = fellThroughIce and ph <= rangeBot
+                lastPhBar := pb
+                lpsyEvt   := true
+                if isIce
+                    iceLpsyCount += 1
+                    addEventLabel(structLabels, pb, ph, 'LPSY', bearColorInput, false, 'Last point of supply at the ice — after falling through range support, the feeble rally stalls at its underside on dull volume: the textbook prelude to markdown.')
+                else
+                    lpsyCount += 1
+                    addEventLabel(structLabels, pb, ph, 'LPSY', bearColorInput, false, 'Last point of supply — a weak rally stalling below broken levels on dull volume after a sign of weakness; the classic phase D entry area.')
+                sowArmed  := true
+                statusTxt := 'Phase D — rallies stalling on dull volume; markdown pending confirmation'
+
+    // 4. sign of weakness: expanding spread and volume pressing or breaking range support — the ice
+    bool sowSig = relSpread >= wideMultInput and (not hasVol or relVol >= sowVolMultInput) and close < open and close < nz(close[1], close) and (close < rangeBot or (low <= rangeBot + zoneW and close <= rangeBot + zoneW))
+    if sowSig and (phase <= PHASE_C or (phase == PHASE_D and sowArmed))
+        if phase != PHASE_D
+            cSkipped     := phase == PHASE_B
+            phase        := PHASE_D
+            zoneBox      := startZone(structBoxes, zoneBox, bar_index, rangeTop, rangeBot, 3, 'D')
+            phaseTxt     := 'D — showing weakness'
+            phaseIdxDisp := 3
+        sowCount += 1
+        sowArmed := false
+        sowEvt   := true
+        addEventLabel(structLabels, bar_index, low, 'SOW', bearColorInput, true, 'Sign of weakness — break on expanding spread and volume pressing or cracking range support (the ice).')
+        statusTxt := 'Phase D — weakness shown; watch for an LPSY rally'
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Confirmation, Invalidation & Reset
+//---------------------------------------------------------------------------------------------------------------------{
+if phase >= WAIT_ST
+    belowCnt := close < rangeBot ? belowCnt + 1 : 0
+    float effRes = upthrusted and not na(utadHigh) ? math.max(rangeTop, utadHigh) : rangeTop
+    aboveCnt := close > effRes ? aboveCnt + 1 : 0
+    if phase >= PHASE_B and close < rangeBot
+        fellThroughIce := true
+
+    if aboveCnt > recoverInput
+        // the mirror scenario won: sustained closes above resistance — bearish labels do not apply
+        fadeStructure(structLabels, structBoxes, structLines)
+        if showEventsInput
+            label.new(bar_index, high, 'Failed', style = label.style_label_down, color = #00000000, textcolor = bullColorInput, size = size.small, tooltip = 'Resistance broke and held broken — the range resolved upward (re-accumulation), so the distribution labels do not apply. Cross-check the accumulation schematic.')
+        failEvt      := true
+        doReset      := true
+        phaseTxt     := 'Failed'
+        phaseIdxDisp := -2
+        statusTxt    := 'Invalidated — resistance broke; distribution labels do not apply'
+    else if phase == WAIT_ST and belowCnt >= confirmInput
+        // collapsed before any secondary test: a V-reversal, not a schematic
+        fadeStructure(structLabels, structBoxes, structLines)
+        doReset      := true
+        phaseTxt     := 'Scanning'
+        phaseIdxDisp := -1
+        statusTxt    := 'Broke down without a secondary test — no schematic developed'
+    else if phase >= PHASE_B and belowCnt >= confirmInput
+        // 5. markdown: the trend leaves the range — the schematic is confirmed
+        if utadPending
+            utadPending := false
+            utadLabeled := true
+            utadEvt     := true
+            addEventLabel(structLabels, utadBar, utadHigh, 'UTAD', bearColorInput, false, 'Upthrust after distribution — heavy-volume probe validated by the markdown that followed.')
+        addEventLabel(structLabels, bar_index, low, 'E — Markdown', bearColorInput, true, 'Phase E — price leaves the range on confirmed closes below support. The provisional labels are now confirmed.')
+        if not na(supLine)
+            line.set_style(supLine, line.style_solid)
+            line.set_x2(supLine, bar_index)
+        if not na(resLine)
+            line.set_style(resLine, line.style_solid)
+            line.set_x2(resLine, bar_index)
+        if not na(zoneBox)
+            box.set_right(zoneBox, bar_index)
+        if showTargetInput and not na(rangeH)
+            float targetPrice = rangeBot - rangeH
+            line.new(bar_index, targetPrice, bar_index + arWindowInput, targetPrice, color = bearColorInput, style = line.style_dotted)
+            label.new(bar_index, targetPrice, 'Target 1:1', style = label.style_label_left, color = #00000000, textcolor = color.new(bearColorInput, 25), size = size.tiny, tooltip = 'One range-height below support — a rough proxy for the traditional point-and-figure count across the cause. An estimate, not a promise.')
+        markdownEvt  := true
+        doReset      := true
+        phaseTxt     := 'E — markdown'
+        phaseIdxDisp := 4
+        statusTxt    := 'Markdown confirmed — schematic complete (' + (variantNum == 2 ? 'schematic #2, no UTAD' : variantNum == 1 ? 'schematic #1, UTAD' : 'phase C blurred') + ')'
+
+if doReset
+    phase          := SCAN
+    bcBar          := na
+    bcHigh         := na
+    bcVol          := na
+    bcRelVol       := na
+    arBar          := na
+    rangeTop       := na
+    rangeBot       := na
+    bStartBar      := na
+    lastPhBar      := na
+    psyFound       := false
+    upthrusted     := false
+    utadLabeled    := false
+    utadPending    := false
+    utadHigh       := na
+    utadBar        := na
+    overshootLive  := false
+    utCandHigh     := na
+    utCandBar      := na
+    utCandRelVol   := na
+    phaseCHigh     := na
+    stCount        := 0
+    testCount      := 0
+    utCount        := 0
+    sowCount       := 0
+    lpsyCount      := 0
+    iceLpsyCount   := 0
+    cSkipped       := false
+    sowArmed       := true
+    fellThroughIce := false
+    variantNum     := 0
+    aboveCnt       := 0
+    belowCnt       := 0
+    lastTestRelVol := na
+    lastResistHigh := na
+    zoneBox        := box(na)
+    supLine        := line(na)
+    resLine        := line(na)
+    array.clear(structLabels)
+    array.clear(structBoxes)
+    array.clear(structLines)
+
+// extend the live structure to the current bar
+if phase >= WAIT_ST
+    if not na(zoneBox)
+        box.set_right(zoneBox, bar_index)
+    if not na(supLine)
+        line.set_x2(supLine, bar_index)
+    if not na(resLine)
+        line.set_x2(resLine, bar_index)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Phase Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dashTable = na
+
+if showDashInput and na(dashTable)
+    dashTable := table.new(dashLocation(dashLocInput), 2, 9, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+if showDashInput and barstate.islast and not na(dashTable)
+    string txtSize   = dashTextSize(dashSizeInput)
+    color  hdrColor  = DASH_HEADER
+    color  phCol     = phaseIdxDisp >= 0 ? phaseColor(phaseIdxDisp) : phaseIdxDisp == -2 ? bullColorInput : neutralColorInput
+    bool   rangeSet  = not na(rangeBot)
+
+    string phaseARow = 'PSY ' + mark(psyFound) + ' · BC ' + mark(rangeSet) + ' · AR ' + mark(rangeSet) + ' · ST ' + mark(stCount > 0) + (stCount > 1 ? ' ×' + str.tostring(stCount) : '') + ' · UT ' + (utCount > 0 ? '✓ ×' + str.tostring(utCount) : '—')
+    string phaseCRow = cSkipped and not upthrusted and testCount == 0 ? 'skipped — weakness arrived first' : phase >= PHASE_C or upthrusted or testCount > 0 ? (variantNum == 1 ? (utadLabeled ? 'UTAD ✓' : 'UTAD … pending test') : 'UTAD —') + ' · Test ' + (testCount > 0 ? '✓ ×' + str.tostring(testCount) : '—') : '—'
+    string phaseDRow = phase == PHASE_D or sowCount > 0 ? 'SOW ' + mark(sowCount > 0) + (sowCount > 1 ? ' ×' + str.tostring(sowCount) : '') + ' · LPSY ' + (lpsyCount > 0 ? '✓ ×' + str.tostring(lpsyCount) : '—') + ' · Ice ' + mark(iceLpsyCount > 0) : '—'
+    string demandRow = not na(lastTestRelVol) and not na(bcRelVol) ? 'Last rally ' + str.tostring(lastTestRelVol, '0.0') + '× avg vs BC ' + str.tostring(bcRelVol, '0.0') + '×' : '—'
+    string noteRow   = not hasVol ? 'No volume data — spread-only signatures' : phaseIdxDisp == 4 ? 'Confirmed by markdown' : phaseIdxDisp == -2 ? 'See the accumulation mirror' : rangeSet ? 'Provisional — mid-range this could be re-accumulation' : 'Sequence is a vocabulary, not a template'
+
+    table.cell(dashTable, 0, 0, 'Phase', text_color = hdrColor, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 0, phaseTxt, text_color = phCol, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dashTable, 0, 1, 'Range', text_color = hdrColor, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 1, rangeSet ? str.tostring(rangeBot, format.mintick) + ' — ' + str.tostring(rangeTop, format.mintick) : '—', text_color = DASH_TEXT, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dashTable, 0, 2, 'Phase A/B', text_color = hdrColor, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 2, rangeSet ? phaseARow : '—', text_color = DASH_TEXT, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dashTable, 0, 3, 'Phase C', text_color = hdrColor, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 3, phaseCRow, text_color = DASH_TEXT, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dashTable, 0, 4, 'Phase D', text_color = hdrColor, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 4, phaseDRow, text_color = DASH_TEXT, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dashTable, 0, 5, 'Variant', text_color = hdrColor, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 5, variantNum == 1 ? '#1 — UTAD' : variantNum == 2 ? '#2 — no UTAD' : '—', text_color = DASH_TEXT, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dashTable, 0, 6, 'Demand', text_color = hdrColor, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 6, demandRow, text_color = DASH_TEXT, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dashTable, 0, 7, 'Status', text_color = hdrColor, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 7, statusTxt, text_color = DASH_TEXT, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dashTable, 0, 8, 'Note', text_color = hdrColor, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 8, noteRow, text_color = DASH_HEADER, text_size = txtSize, text_halign = text.align_left)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(bcCandEvt, 'Buying Climax (candidate)', 'Wyckoff Distribution Schematic: possible buying climax — climactic volume and wide spread into new highs; awaiting the automatic reaction')
+alertcondition(rangeEvt, 'Phase A — Range Defined', 'Wyckoff Distribution Schematic: BC and AR confirmed — range resistance and support are set; awaiting the secondary test')
+alertcondition(stEvt, 'Secondary Test — Phase B', 'Wyckoff Distribution Schematic: secondary test complete — phase A done, phase B building the cause')
+alertcondition(utEvt, 'Upthrust — Phase B', 'Wyckoff Distribution Schematic: upthrust — a push above range resistance failed back inside; supply evidence at the highs')
+alertcondition(utadEvt, 'UTAD — Phase C', 'Wyckoff Distribution Schematic: upthrust after distribution — the final probe above resistance failed; phase C test of demand (schematic #1)')
+alertcondition(testEvt, 'Phase C Test', 'Wyckoff Distribution Schematic: phase C test stalled on dull volume')
+alertcondition(sowEvt, 'Sign of Weakness — Phase D', 'Wyckoff Distribution Schematic: sign of weakness — expanding spread and volume pressing/breaking range support (the ice)')
+alertcondition(lpsyEvt, 'LPSY', 'Wyckoff Distribution Schematic: last point of supply — a weak rally stalling on dull volume; classic phase D entry area')
+alertcondition(markdownEvt, 'Markdown — Phase E', 'Wyckoff Distribution Schematic: markdown confirmed — the schematic is complete and its labels confirmed')
+alertcondition(failEvt, 'Schematic Invalidated', 'Wyckoff Distribution Schematic: resistance broke upward — distribution labels do not apply; cross-check the accumulation schematic')
+
+//---------------------------------------------------------------------------------------------------------------------}

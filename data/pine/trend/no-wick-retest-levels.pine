@@ -1,0 +1,218 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/ MPL-2.0
+//@version=6
+indicator("No-Wick Retest Levels", shorttitle = "No-Wick Retests", overlay = true, max_lines_count = 500, max_boxes_count = 500, max_labels_count = 500, calc_bars_count = 5000)
+
+// --- Constants ---
+const string WICK_GROUP = "No-Wick Levels"
+const string TREND_GROUP = "1-Minute Trend Filter"
+const string RISK_GROUP = "ATR Targets"
+const string STYLE_GROUP = "Style"
+const string WICK_TOLERANCE_TOOLTIP = "Maximum distance, in minimum ticks, allowed between the candle body and its high or low. Use 0 for an exact no-wick candle."
+const string MAX_LEVELS_TOOLTIP = "Number of the most recent untapped levels shown across both directions. Older untapped levels are removed first."
+const string FAST_EMA_TOOLTIP = "Fast EMA length used to classify the current 1-minute trend."
+const string SLOW_EMA_TOOLTIP = "Slow EMA length used to classify the current 1-minute trend."
+const string PRICE_FILTER_TOOLTIP = "When enabled, the 1-minute close must also be above the fast EMA for longs or below it for shorts."
+const string ATR_LENGTH_TOOLTIP = "ATR length calculated on the chart timeframe when a level is tapped."
+const string TP_ATR_TOOLTIP = "Take-profit distance from entry as a multiple of ATR."
+const string SL_ATR_TOOLTIP = "Stop-loss distance from entry as a multiple of ATR."
+const string HISTORY_TOOLTIP = "Number of completed or active trade drawings retained on the chart."
+
+// --- Inputs ---
+int wickToleranceTicksInput = input.int(0, "Wick tolerance (ticks)", minval = 0, group = WICK_GROUP, tooltip = WICK_TOLERANCE_TOOLTIP)
+int maxUntappedLevelsInput = input.int(3, "Recent untapped levels shown", minval = 1, maxval = 50, group = WICK_GROUP, tooltip = MAX_LEVELS_TOOLTIP)
+bool showUntappedArrowsInput = input.bool(true, "Show yellow level triangles", group = WICK_GROUP, tooltip = "Displays a directional triangle at the origin of every untapped no-wick level.")
+bool showSetupMarkersInput = input.bool(false, "Show setup markers", group = WICK_GROUP, tooltip = "Marks qualifying no-upper-wick and no-lower-wick candles.")
+
+int fastEmaLengthInput = input.int(20, "Fast EMA length", minval = 1, group = TREND_GROUP, tooltip = FAST_EMA_TOOLTIP)
+int slowEmaLengthInput = input.int(50, "Slow EMA length", minval = 2, group = TREND_GROUP, tooltip = SLOW_EMA_TOOLTIP)
+bool requirePricePositionInput = input.bool(true, "Require close on trend side", group = TREND_GROUP, tooltip = PRICE_FILTER_TOOLTIP)
+
+int atrLengthInput = input.int(14, "ATR length", minval = 1, group = RISK_GROUP, tooltip = ATR_LENGTH_TOOLTIP)
+float takeProfitAtrInput = input.float(2.0, "Take profit (ATR)", minval = 0.1, step = 0.1, group = RISK_GROUP, tooltip = TP_ATR_TOOLTIP)
+float stopLossAtrInput = input.float(1.0, "Stop loss (ATR)", minval = 0.1, step = 0.1, group = RISK_GROUP, tooltip = SL_ATR_TOOLTIP)
+int tradeHistoryInput = input.int(30, "Trade drawings retained", minval = 1, maxval = 100, group = RISK_GROUP, tooltip = HISTORY_TOOLTIP)
+
+color longLevelColorInput = input.color(#089981, "Long level", group = STYLE_GROUP, tooltip = "Color of untapped no-lower-wick levels.")
+color shortLevelColorInput = input.color(#f23645, "Short level", group = STYLE_GROUP, tooltip = "Color of untapped no-upper-wick levels.")
+color entryColorInput = input.color(#f5d547, "Tapped entry", group = STYLE_GROUP, tooltip = "Color of a level that triggers a trade.")
+color levelArrowColorInput = input.color(#f5d547, "Level triangles", group = STYLE_GROUP, tooltip = "Color of the triangles marking untapped no-wick levels.")
+color targetColorInput = input.color(#089981, "Take-profit box", group = STYLE_GROUP, tooltip = "Color of take-profit zones.")
+color stopColorInput = input.color(#f23645, "Stop-loss box", group = STYLE_GROUP, tooltip = "Color of stop-loss zones.")
+
+// --- Persistent Storage ---
+var array<line> levelLinesArray = array.new<line>()
+var array<label> levelArrowsArray = array.new<label>()
+var array<float> levelPricesArray = array.new<float>()
+var array<int> levelDirectionsArray = array.new<int>()
+var array<int> levelOriginBarsArray = array.new<int>()
+
+var array<box> tradeTargetBoxesArray = array.new<box>()
+var array<box> tradeStopBoxesArray = array.new<box>()
+var array<line> tradeEntryLinesArray = array.new<line>()
+
+var bool tradeActive = false
+var int activeTradeDirection = 0
+var int activeTradeEntryBar = na
+var float activeTradeEntry = na
+var float activeTradeTarget = na
+var float activeTradeStop = na
+var box activeTargetBox = na
+var box activeStopBox = na
+
+// --- 1-Minute Trend ---
+[oneMinuteClose, oneMinuteFastEma, oneMinuteSlowEma] = request.security(syminfo.tickerid, "1", [close, ta.ema(close, fastEmaLengthInput), ta.ema(close, slowEmaLengthInput)], gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+
+bool bullishOneMinuteTrend = oneMinuteFastEma > oneMinuteSlowEma and (not requirePricePositionInput or oneMinuteClose > oneMinuteFastEma)
+bool bearishOneMinuteTrend = oneMinuteFastEma < oneMinuteSlowEma and (not requirePricePositionInput or oneMinuteClose < oneMinuteFastEma)
+float currentAtr = ta.atr(atrLengthInput)
+
+// --- Event State ---
+bool longEntryEvent = false
+bool shortEntryEvent = false
+bool takeProfitEvent = false
+bool stopLossEvent = false
+bool tradeWasActiveAtBarStart = tradeActive
+
+// --- Manage Active Trade ---
+if tradeActive
+    box.set_right(activeTargetBox, math.max(bar_index, activeTradeEntryBar + 1))
+    box.set_right(activeStopBox, math.max(bar_index, activeTradeEntryBar + 1))
+
+    if bar_index > activeTradeEntryBar
+        bool stopWasHit = activeTradeDirection == 1 ? low <= activeTradeStop : high >= activeTradeStop
+        bool targetWasHit = activeTradeDirection == 1 ? high >= activeTradeTarget : low <= activeTradeTarget
+
+        // If both levels occur in the same chart bar, the stop is assumed to occur first.
+        if stopWasHit
+            tradeActive := false
+            stopLossEvent := true
+        else if targetWasHit
+            tradeActive := false
+            takeProfitEvent := true
+
+// --- Find the Best Eligible Tapped Level ---
+int selectedLevelIndex = na
+float selectedLevelPrice = na
+int selectedLevelDirection = 0
+float selectedDistance = na
+int existingLevelCount = array.size(levelLinesArray)
+
+if existingLevelCount > 0
+    for offset = 0 to existingLevelCount - 1
+        int levelIndex = existingLevelCount - 1 - offset
+        float levelPrice = array.get(levelPricesArray, levelIndex)
+        int levelDirection = array.get(levelDirectionsArray, levelIndex)
+        int originBar = array.get(levelOriginBarsArray, levelIndex)
+        bool levelWasTapped = bar_index > originBar and low <= levelPrice and high >= levelPrice
+        bool trendAllowsTrade = levelDirection == 1 ? bullishOneMinuteTrend : bearishOneMinuteTrend
+        bool canSelectTrade = levelWasTapped and not tradeWasActiveAtBarStart and not tradeActive and trendAllowsTrade and not na(currentAtr)
+
+        if canSelectTrade
+            float distanceFromOpen = math.abs(open - levelPrice)
+            if na(selectedDistance) or distanceFromOpen < selectedDistance
+                selectedLevelIndex := levelIndex
+                selectedLevelPrice := levelPrice
+                selectedLevelDirection := levelDirection
+                selectedDistance := distanceFromOpen
+
+// --- Consume All Tapped Levels ---
+line selectedEntryLine = na
+int levelsBeforeRemoval = array.size(levelLinesArray)
+
+if levelsBeforeRemoval > 0
+    for offset = 0 to levelsBeforeRemoval - 1
+        int levelIndex = levelsBeforeRemoval - 1 - offset
+        float levelPrice = array.get(levelPricesArray, levelIndex)
+        int originBar = array.get(levelOriginBarsArray, levelIndex)
+        bool levelWasTapped = bar_index > originBar and low <= levelPrice and high >= levelPrice
+
+        if levelWasTapped
+            line levelLineId = array.get(levelLinesArray, levelIndex)
+            label levelArrowId = array.get(levelArrowsArray, levelIndex)
+            label.delete(levelArrowId)
+
+            if levelIndex == selectedLevelIndex
+                line.set_extend(levelLineId, extend.none)
+                line.set_x2(levelLineId, bar_index)
+                line.set_color(levelLineId, entryColorInput)
+                line.set_width(levelLineId, 2)
+                selectedEntryLine := levelLineId
+            else
+                line.delete(levelLineId)
+
+            array.remove(levelLinesArray, levelIndex)
+            array.remove(levelArrowsArray, levelIndex)
+            array.remove(levelPricesArray, levelIndex)
+            array.remove(levelDirectionsArray, levelIndex)
+            array.remove(levelOriginBarsArray, levelIndex)
+
+// --- Open One ATR-Based Trade ---
+if not na(selectedLevelIndex) and not na(selectedEntryLine)
+    float riskDistance = currentAtr * stopLossAtrInput
+    float rewardDistance = currentAtr * takeProfitAtrInput
+    float targetPrice = selectedLevelDirection == 1 ? selectedLevelPrice + rewardDistance : selectedLevelPrice - rewardDistance
+    float stopPrice = selectedLevelDirection == 1 ? selectedLevelPrice - riskDistance : selectedLevelPrice + riskDistance
+    float targetTop = math.max(selectedLevelPrice, targetPrice)
+    float targetBottom = math.min(selectedLevelPrice, targetPrice)
+    float stopTop = math.max(selectedLevelPrice, stopPrice)
+    float stopBottom = math.min(selectedLevelPrice, stopPrice)
+
+    activeTargetBox := box.new(left = bar_index, top = targetTop, right = bar_index + 1, bottom = targetBottom, xloc = xloc.bar_index, border_color = color.new(targetColorInput, 15), bgcolor = color.new(targetColorInput, 72))
+    activeStopBox := box.new(left = bar_index, top = stopTop, right = bar_index + 1, bottom = stopBottom, xloc = xloc.bar_index, border_color = color.new(stopColorInput, 15), bgcolor = color.new(stopColorInput, 72))
+
+    tradeActive := true
+    activeTradeDirection := selectedLevelDirection
+    activeTradeEntryBar := bar_index
+    activeTradeEntry := selectedLevelPrice
+    activeTradeTarget := targetPrice
+    activeTradeStop := stopPrice
+    longEntryEvent := selectedLevelDirection == 1
+    shortEntryEvent := selectedLevelDirection == -1
+
+    array.push(tradeTargetBoxesArray, activeTargetBox)
+    array.push(tradeStopBoxesArray, activeStopBox)
+    array.push(tradeEntryLinesArray, selectedEntryLine)
+
+    if array.size(tradeEntryLinesArray) > tradeHistoryInput
+        box.delete(array.shift(tradeTargetBoxesArray))
+        box.delete(array.shift(tradeStopBoxesArray))
+        line.delete(array.shift(tradeEntryLinesArray))
+
+// --- Detect Confirmed No-Wick Candles ---
+float wickTolerance = syminfo.mintick * wickToleranceTicksInput
+float bodyTop = math.max(open, close)
+float bodyBottom = math.min(open, close)
+bool noUpperWickSetup = barstate.isconfirmed and close < open and high - bodyTop <= wickTolerance
+bool noLowerWickSetup = barstate.isconfirmed and close > open and bodyBottom - low <= wickTolerance
+
+if noUpperWickSetup or noLowerWickSetup
+    int newDirection = noLowerWickSetup ? 1 : -1
+    float newLevelPrice = noLowerWickSetup ? low : high
+    color newLevelColor = newDirection == 1 ? longLevelColorInput : shortLevelColorInput
+    line newLevelLine = line.new(x1 = bar_index, y1 = newLevelPrice, x2 = bar_index + 1, y2 = newLevelPrice, xloc = xloc.bar_index, extend = extend.right, color = newLevelColor, style = line.style_solid, width = 1)
+    label newLevelArrow = showUntappedArrowsInput ? label.new(x = bar_index, y = newLevelPrice, text = "", xloc = xloc.bar_index, yloc = yloc.price, color = levelArrowColorInput, style = newDirection == 1 ? label.style_triangleup : label.style_triangledown, size = size.small) : na
+
+    array.push(levelLinesArray, newLevelLine)
+    array.push(levelArrowsArray, newLevelArrow)
+    array.push(levelPricesArray, newLevelPrice)
+    array.push(levelDirectionsArray, newDirection)
+    array.push(levelOriginBarsArray, bar_index)
+
+    if array.size(levelLinesArray) > maxUntappedLevelsInput
+        line.delete(array.shift(levelLinesArray))
+        label.delete(array.shift(levelArrowsArray))
+        array.shift(levelPricesArray)
+        array.shift(levelDirectionsArray)
+        array.shift(levelOriginBarsArray)
+
+// --- Visuals ---
+plotshape(showSetupMarkersInput and noLowerWickSetup, title = "No Lower Wick", style = shape.triangleup, location = location.belowbar, color = longLevelColorInput, size = size.tiny)
+plotshape(showSetupMarkersInput and noUpperWickSetup, title = "No Upper Wick", style = shape.triangledown, location = location.abovebar, color = shortLevelColorInput, size = size.tiny)
+plotshape(longEntryEvent, title = "Long Entry", style = shape.triangleup, location = location.belowbar, color = #089981, size = size.small, text = "L", textcolor = chart.fg_color)
+plotshape(shortEntryEvent, title = "Short Entry", style = shape.triangledown, location = location.abovebar, color = #f23645, size = size.small, text = "S", textcolor = chart.fg_color)
+
+// --- Alerts ---
+alertcondition(longEntryEvent, "No-Wick Long Entry", "A no-lower-wick level was tapped while the 1-minute trend was bullish.")
+alertcondition(shortEntryEvent, "No-Wick Short Entry", "A no-upper-wick level was tapped while the 1-minute trend was bearish.")
+alertcondition(takeProfitEvent, "No-Wick Take Profit", "The active no-wick trade reached its ATR take-profit level.")
+alertcondition(stopLossEvent, "No-Wick Stop Loss", "The active no-wick trade reached its ATR stop-loss level.")

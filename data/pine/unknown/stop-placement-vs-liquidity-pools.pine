@@ -1,0 +1,518 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Stop Placement vs Liquidity Pools"
+  , shorttitle       = "Stop Placement vs Liquidity Pools"
+  , overlay          = true
+  , max_boxes_count  = 500
+  , max_lines_count  = 500
+  , max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BUYSIDE_COLOR  = #f23645 // resting buy stops above highs - sweeps here mark short-term tops
+SELLSIDE_COLOR = #089981 // resting sell stops below lows - sweeps here mark short-term bottoms
+NEUTRAL_COLOR  = #787b86 // structure - round numbers, acceptance breaks, the audited stop
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+SIDE_BUY  =  1
+SIDE_SELL = -1
+
+STATE_ACTIVE = 0
+STATE_SWEPT  = 1
+STATE_BROKEN = 2
+
+MAX_POOL_HISTORY = 100
+GUIDE_SPAN       = 8
+
+POOL_FILL_TRANSPARENCY    = 85
+POOL_BORDER_TRANSPARENCY  = 45
+DONE_FILL_TRANSPARENCY    = 92
+DONE_BORDER_TRANSPARENCY  = 70
+LINE_TRANSPARENCY         = 30
+
+SIZE_TINY   = "Tiny"
+SIZE_SMALL  = "Small"
+SIZE_NORMAL = "Normal"
+
+TOP_RIGHT    = "Top Right"
+TOP_LEFT     = "Top Left"
+BOTTOM_RIGHT = "Bottom Right"
+BOTTOM_LEFT  = "Bottom Left"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+POOLS_GROUP  = "Liquidity Pools"
+LEVELS_GROUP = "Session Extremes & Round Numbers"
+STOP_GROUP   = "Stop Placement"
+SWEEP_GROUP  = "Sweep Classification"
+STYLE_GROUP  = "Style"
+
+swingLengthInput = input.int(10, "Swing Length", minval = 2, maxval = 50, group = POOLS_GROUP
+  , tooltip = "Bars required on each side to confirm a swing high or swing low. Confirmed swings are the standard stop-parking spots: buy stops collect a few ticks beyond swing highs, sell stops beyond swing lows, so each confirmed swing is mapped as a liquidity pool.")
+
+pocketDepthInput = input.float(0.25, "Pocket Depth", minval = 0.05, maxval = 5, step = 0.05, group = POOLS_GROUP
+  , tooltip = "Assumed depth of the stop pocket resting beyond each marked level, as an ATR fraction. A buyside pool spans from a swing high up to this depth; a sellside pool mirrors it below a swing low. A protective stop parked inside this span sits inside the pool itself.")
+
+eqTolInput = input.float(0.25, "Equal Level Tolerance", minval = 0, maxval = 5, step = 0.05, group = POOLS_GROUP
+  , tooltip = "Two swings within this ATR fraction of each other are treated as equal highs or equal lows and merged into a single pool - equal extremes stack more stops behind one line. Merged pools get a thicker border and report their touch count in the dashboard.")
+
+maxPoolsInput = input.int(5, "Active Pools per Side", minval = 1, maxval = 15, group = POOLS_GROUP
+  , tooltip = "Maximum number of untapped pools kept per side. When a new pool confirms beyond the cap the oldest active one is dropped; swept and broken pools remain on the chart as history.")
+
+atrLengthInput = input.int(14, "ATR Length", minval = 1, group = POOLS_GROUP
+  , tooltip = "Average True Range length used to scale the pocket depth, the equal-level tolerance, the stop buffer and the approach distance, so every distance adapts to current volatility.")
+
+showDayInput = input.bool(true, "Prior Day High/Low", group = LEVELS_GROUP
+  , tooltip = "Map the prior session extremes as stop-parking levels: buy stops are assumed just above the prior day high, sell stops just below the prior day low. Ignored on timeframes above daily.")
+
+showWeekInput = input.bool(true, "Prior Week High/Low", group = LEVELS_GROUP
+  , tooltip = "Map the prior week extremes as stop-parking levels, drawn solid as the more significant pair. Buy stops are assumed just above the prior week high, sell stops just below the prior week low.")
+
+showRoundInput = input.bool(true, "Round Numbers", inline = "round", group = LEVELS_GROUP)
+
+roundStepInput = input.float(0.0, "Step", minval = 0, inline = "round", group = LEVELS_GROUP
+  , tooltip = "Distance between round numbers, in price units. 0 = automatic: multiples of a power of ten scaled to the symbol's price, the first-significant-digit grid. The nearest round number above and below price is drawn and audited, since stop-losses bunch just beyond round numbers.")
+
+stopBufferInput = input.float(0.5, "Stop Buffer", minval = 0.05, maxval = 5, step = 0.05, group = STOP_GROUP
+  , tooltip = "Volatility buffer added beyond a pool when suggesting a safer stop: level plus this many ATRs, never closer than one tick beyond the mapped pocket. The wider placement lowers sweep risk but widens the stop distance - resize the position for the new distance rather than keeping size fixed.")
+
+showGuidesInput = input.bool(true, "Safer Stop Guides", group = STOP_GROUP
+  , tooltip = "Dashed guides beyond the nearest buyside and sellside pools marking the closest suggested protective-stop level: above the pool plus buffer for shorts, below the pool minus buffer for longs.")
+
+auditStopInput = input.bool(false, "Audit Intended Stop", inline = "audit", group = STOP_GROUP)
+
+stopPriceInput = input.price(0.0, "Price", inline = "audit", group = STOP_GROUP
+  , tooltip = "Intended protective stop to audit before entry. Enable the toggle, then type or drag the price. A level above price is treated as a short stop and checked against buyside pockets; below price as a long stop against sellside pockets. If it sits inside a mapped pocket, the audit shows the relocated level beyond the pool plus buffer.")
+
+showEventLabelsInput = input.bool(true, "Sweep / Break Labels", group = SWEEP_GROUP
+  , tooltip = "Label the classification whenever price trades beyond a mapped swing pool: 'Sweep' when the pierce closes back inside the level - a stop-driven run that often marks a short-term extreme; 'Break' when the close holds beyond it - acceptance, suggesting initiative trade rather than a stop run.")
+
+approachMultInput = input.float(1.0, "Approach Distance", minval = 0.1, maxval = 10, step = 0.1, group = SWEEP_GROUP
+  , tooltip = "ATR multiple defining when price counts as approaching the nearest pool, used by the approach alerts. Liquidity-based frameworks treat the nearest untapped pool as a draw and expect acceleration into the pocket, placing targets just in front of it.")
+
+buysideColorInput = input.color(BUYSIDE_COLOR, "Buyside Pools", group = STYLE_GROUP
+  , tooltip = "Color of buyside pools - resting buy stops above swing highs, equal highs and prior extremes. Sweeps of buyside pools often mark short-term tops.")
+
+sellsideColorInput = input.color(SELLSIDE_COLOR, "Sellside Pools", group = STYLE_GROUP
+  , tooltip = "Color of sellside pools - resting sell stops below swing lows, equal lows and prior extremes. Sweeps of sellside pools often mark short-term bottoms.")
+
+roundColorInput = input.color(NEUTRAL_COLOR, "Round Numbers", group = STYLE_GROUP
+  , tooltip = "Color of the round-number reference lines above and below price.")
+
+showPanelInput = input.bool(true, "Dashboard", inline = "panel", group = STYLE_GROUP)
+
+panelPositionInput = input.string(TOP_RIGHT, "", options = [TOP_RIGHT, TOP_LEFT, BOTTOM_RIGHT, BOTTOM_LEFT], inline = "panel", group = STYLE_GROUP
+  , tooltip = "Dashboard summarizing the nearest pool on each side, the suggested safer stop beyond it, the current ATR buffer and the stop-audit verdict.")
+
+textSizeInput = input.string(SIZE_SMALL, "Text Size", options = [SIZE_TINY, SIZE_SMALL, SIZE_NORMAL], group = STYLE_GROUP
+  , tooltip = "Size of the on-chart labels and of the dashboard text.")
+
+textSize = switch textSizeInput
+    SIZE_TINY  => size.tiny
+    SIZE_SMALL => size.small
+    => size.normal
+
+panelPosition = switch panelPositionInput
+    TOP_RIGHT    => position.top_right
+    TOP_LEFT     => position.top_left
+    BOTTOM_RIGHT => position.bottom_right
+    => position.bottom_left
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types & Data
+//---------------------------------------------------------------------------------------------------------------------{
+type LiquidityPool
+    float level
+    float outer
+    int   side
+    int   touches
+    int   state
+    box   zoneBox
+
+var array<LiquidityPool> poolsArray = array.new<LiquidityPool>()
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+//Register a confirmed swing as a pool: merge it into an equal-level neighbor or create a new zone, then enforce caps
+registerPool(float levelPrice, int poolSide, float depthValue, float toleranceValue) =>
+    bool merged = false
+    for pool in poolsArray
+        if not merged and pool.state == STATE_ACTIVE and pool.side == poolSide and math.abs(levelPrice - pool.level) <= toleranceValue
+            //Equal highs rest stops above the higher of the pair, equal lows below the lower one
+            float mergedLevel = poolSide == SIDE_BUY ? math.max(pool.level, levelPrice) : math.min(pool.level, levelPrice)
+            pool.level   := mergedLevel
+            pool.outer   := mergedLevel + poolSide * depthValue
+            pool.touches := pool.touches + 1
+            box.set_top(pool.zoneBox, math.max(pool.level, pool.outer))
+            box.set_bottom(pool.zoneBox, math.min(pool.level, pool.outer))
+            box.set_border_width(pool.zoneBox, 2)
+            merged := true
+    if not merged
+        color poolColor = poolSide == SIDE_BUY ? buysideColorInput : sellsideColorInput
+        float outerEdge = levelPrice + poolSide * depthValue
+        box zoneBox = box.new(bar_index - swingLengthInput, math.max(levelPrice, outerEdge), bar_index, math.min(levelPrice, outerEdge)
+          , border_color = color.new(poolColor, POOL_BORDER_TRANSPARENCY), border_width = 1, border_style = line.style_dashed
+          , extend = extend.right, bgcolor = color.new(poolColor, POOL_FILL_TRANSPARENCY))
+        array.push(poolsArray, LiquidityPool.new(level = levelPrice, outer = outerEdge, side = poolSide, touches = 1, state = STATE_ACTIVE, zoneBox = zoneBox))
+        //Cap the number of untapped pools on this side, dropping the oldest first
+        activeIndexArray = array.new_int()
+        for [poolIndex, pool] in poolsArray
+            if pool.state == STATE_ACTIVE and pool.side == poolSide
+                array.push(activeIndexArray, poolIndex)
+        int removeIndex = array.size(activeIndexArray) - maxPoolsInput - 1
+        while removeIndex >= 0
+            int targetIndex = array.get(activeIndexArray, removeIndex)
+            LiquidityPool removedPool = array.get(poolsArray, targetIndex)
+            box.delete(removedPool.zoneBox)
+            array.remove(poolsArray, targetIndex)
+            removeIndex -= 1
+        //Cap the total stored history
+        while array.size(poolsArray) > MAX_POOL_HISTORY
+            LiquidityPool oldestPool = array.shift(poolsArray)
+            box.delete(oldestPool.zoneBox)
+
+//Check an intended stop against one pocket and return the relocated placement beyond it
+pocketCheck(float stopPrice, float levelPrice, float outerEdge, bool shortSide, float bufferValue) =>
+    bool insidePocket = shortSide ? stopPrice >= levelPrice and stopPrice <= outerEdge : stopPrice <= levelPrice and stopPrice >= outerEdge
+    float relocated = shortSide ? math.max(levelPrice + bufferValue, outerEdge + syminfo.mintick) : math.min(levelPrice - bufferValue, outerEdge - syminfo.mintick)
+    [insidePocket, relocated]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Swing Liquidity Pools
+//---------------------------------------------------------------------------------------------------------------------{
+float atrValue    = nz(ta.atr(atrLengthInput), high - low)
+float pocketDepth = pocketDepthInput * atrValue
+float eqTolerance = eqTolInput * atrValue
+float stopBuffer  = stopBufferInput * atrValue
+
+float pivotHighPrice = ta.pivothigh(swingLengthInput, swingLengthInput)
+float pivotLowPrice  = ta.pivotlow(swingLengthInput, swingLengthInput)
+
+//Register confirmed swings on closed bars only, so mapped pools never repaint
+if barstate.isconfirmed and not na(pivotHighPrice)
+    registerPool(pivotHighPrice, SIDE_BUY, pocketDepth, eqTolerance)
+if barstate.isconfirmed and not na(pivotLowPrice)
+    registerPool(pivotLowPrice, SIDE_SELL, pocketDepth, eqTolerance)
+
+//Classify any trade beyond an active pool: a close back inside the level is a stop-driven sweep, a close beyond it is acceptance
+bool poolBuySweepEvent  = false
+bool poolBuyBreakEvent  = false
+bool poolSellSweepEvent = false
+bool poolSellBreakEvent = false
+
+if barstate.isconfirmed
+    for pool in poolsArray
+        if pool.state == STATE_ACTIVE
+            if pool.side == SIDE_BUY and high > pool.level
+                bool sweptBack = close <= pool.level
+                pool.state := sweptBack ? STATE_SWEPT : STATE_BROKEN
+                box.set_extend(pool.zoneBox, extend.none)
+                box.set_right(pool.zoneBox, bar_index)
+                box.set_bgcolor(pool.zoneBox, color.new(buysideColorInput, DONE_FILL_TRANSPARENCY))
+                box.set_border_color(pool.zoneBox, color.new(sweptBack ? buysideColorInput : NEUTRAL_COLOR, DONE_BORDER_TRANSPARENCY))
+                if showEventLabelsInput
+                    label.new(bar_index, high, sweptBack ? "Sweep" : "Break", style = label.style_label_down, color = #00000000
+                      , textcolor = sweptBack ? buysideColorInput : NEUTRAL_COLOR, size = textSize)
+                if sweptBack
+                    poolBuySweepEvent := true
+                else
+                    poolBuyBreakEvent := true
+            if pool.side == SIDE_SELL and low < pool.level
+                bool sweptBack = close >= pool.level
+                pool.state := sweptBack ? STATE_SWEPT : STATE_BROKEN
+                box.set_extend(pool.zoneBox, extend.none)
+                box.set_right(pool.zoneBox, bar_index)
+                box.set_bgcolor(pool.zoneBox, color.new(sellsideColorInput, DONE_FILL_TRANSPARENCY))
+                box.set_border_color(pool.zoneBox, color.new(sweptBack ? sellsideColorInput : NEUTRAL_COLOR, DONE_BORDER_TRANSPARENCY))
+                if showEventLabelsInput
+                    label.new(bar_index, low, sweptBack ? "Sweep" : "Break", style = label.style_label_up, color = #00000000
+                      , textcolor = sweptBack ? sellsideColorInput : NEUTRAL_COLOR, size = textSize)
+                if sweptBack
+                    poolSellSweepEvent := true
+                else
+                    poolSellBreakEvent := true
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Session Extremes & Round Numbers
+//---------------------------------------------------------------------------------------------------------------------{
+[priorDayHigh, priorDayLow]   = request.security(syminfo.tickerid, "D", [high[1], low[1]], lookahead = barmerge.lookahead_on)
+[priorWeekHigh, priorWeekLow] = request.security(syminfo.tickerid, "W", [high[1], low[1]], lookahead = barmerge.lookahead_on)
+
+bool newDay  = timeframe.change("D")
+bool newWeek = timeframe.change("W")
+
+bool dayLevelsOk  = showDayInput and timeframe.in_seconds() <= timeframe.in_seconds("D") and not na(priorDayHigh) and not na(priorDayLow)
+bool weekLevelsOk = showWeekInput and timeframe.in_seconds() <= timeframe.in_seconds("W") and not na(priorWeekHigh) and not na(priorWeekLow)
+
+//Nearest round numbers, on the first-significant-digit grid unless a custom step is set
+float roundStep  = roundStepInput > 0 ? roundStepInput : math.pow(10, math.floor(math.log10(math.max(close, syminfo.mintick))) - 1)
+float roundAbove = showRoundInput ? math.ceil(close / roundStep) * roundStep : na
+float roundBelow = showRoundInput ? math.floor(close / roundStep) * roundStep : na
+
+//Sweep and acceptance reads on the session extremes, using the close-back-inside tell
+bool pdhSweepRaw = dayLevelsOk and high > priorDayHigh and close < priorDayHigh
+bool pdlSweepRaw = dayLevelsOk and low < priorDayLow and close > priorDayLow
+bool pwhSweepRaw = weekLevelsOk and high > priorWeekHigh and close < priorWeekHigh
+bool pwlSweepRaw = weekLevelsOk and low < priorWeekLow and close > priorWeekLow
+
+bool pdhBreakRaw = dayLevelsOk and close > priorDayHigh
+bool pdlBreakRaw = dayLevelsOk and close < priorDayLow
+bool pwhBreakRaw = weekLevelsOk and close > priorWeekHigh
+bool pwlBreakRaw = weekLevelsOk and close < priorWeekLow
+
+bool buysideSweepEvent  = poolBuySweepEvent or (pdhSweepRaw and not pdhSweepRaw[1]) or (pwhSweepRaw and not pwhSweepRaw[1])
+bool sellsideSweepEvent = poolSellSweepEvent or (pdlSweepRaw and not pdlSweepRaw[1]) or (pwlSweepRaw and not pwlSweepRaw[1])
+bool buysideBreakEvent  = poolBuyBreakEvent or (pdhBreakRaw and not pdhBreakRaw[1]) or (pwhBreakRaw and not pwhBreakRaw[1])
+bool sellsideBreakEvent = poolSellBreakEvent or (pdlBreakRaw and not pdlBreakRaw[1]) or (pwlBreakRaw and not pwlBreakRaw[1])
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Stop Guidance
+//---------------------------------------------------------------------------------------------------------------------{
+//Nearest untapped pocket on each side of price, across swings, session extremes and round numbers
+float nearestAboveLevel   = na
+float nearestAboveOuter   = na
+int   nearestAboveTouches = 0
+float nearestBelowLevel   = na
+float nearestBelowOuter   = na
+int   nearestBelowTouches = 0
+
+for pool in poolsArray
+    if pool.state == STATE_ACTIVE
+        if pool.side == SIDE_BUY and pool.level >= close and (na(nearestAboveLevel) or pool.level < nearestAboveLevel)
+            nearestAboveLevel   := pool.level
+            nearestAboveOuter   := pool.outer
+            nearestAboveTouches := pool.touches
+        if pool.side == SIDE_SELL and pool.level <= close and (na(nearestBelowLevel) or pool.level > nearestBelowLevel)
+            nearestBelowLevel   := pool.level
+            nearestBelowOuter   := pool.outer
+            nearestBelowTouches := pool.touches
+
+if dayLevelsOk and priorDayHigh > close and (na(nearestAboveLevel) or priorDayHigh < nearestAboveLevel)
+    nearestAboveLevel   := priorDayHigh
+    nearestAboveOuter   := priorDayHigh + pocketDepth
+    nearestAboveTouches := 1
+if weekLevelsOk and priorWeekHigh > close and (na(nearestAboveLevel) or priorWeekHigh < nearestAboveLevel)
+    nearestAboveLevel   := priorWeekHigh
+    nearestAboveOuter   := priorWeekHigh + pocketDepth
+    nearestAboveTouches := 1
+if showRoundInput and not na(roundAbove) and roundAbove > close and (na(nearestAboveLevel) or roundAbove < nearestAboveLevel)
+    nearestAboveLevel   := roundAbove
+    nearestAboveOuter   := roundAbove + pocketDepth
+    nearestAboveTouches := 1
+
+if dayLevelsOk and priorDayLow < close and (na(nearestBelowLevel) or priorDayLow > nearestBelowLevel)
+    nearestBelowLevel   := priorDayLow
+    nearestBelowOuter   := priorDayLow - pocketDepth
+    nearestBelowTouches := 1
+if weekLevelsOk and priorWeekLow < close and (na(nearestBelowLevel) or priorWeekLow > nearestBelowLevel)
+    nearestBelowLevel   := priorWeekLow
+    nearestBelowOuter   := priorWeekLow - pocketDepth
+    nearestBelowTouches := 1
+if showRoundInput and not na(roundBelow) and roundBelow < close and (na(nearestBelowLevel) or roundBelow > nearestBelowLevel)
+    nearestBelowLevel   := roundBelow
+    nearestBelowOuter   := roundBelow - pocketDepth
+    nearestBelowTouches := 1
+
+//Safer stop placement: structure plus the ATR buffer, floored one tick beyond the mapped pocket
+float safeShortStop = na(nearestAboveLevel) ? na : math.max(nearestAboveLevel + stopBuffer, nearestAboveOuter + syminfo.mintick)
+float safeLongStop  = na(nearestBelowLevel) ? na : math.min(nearestBelowLevel - stopBuffer, nearestBelowOuter - syminfo.mintick)
+
+//Price drawing toward the nearest pocket
+bool nearBuysideRaw  = not na(nearestAboveLevel) and nearestAboveLevel - close <= approachMultInput * atrValue
+bool nearSellsideRaw = not na(nearestBelowLevel) and close - nearestBelowLevel <= approachMultInput * atrValue
+
+bool approachBuysideEvent  = nearBuysideRaw and not nearBuysideRaw[1]
+bool approachSellsideEvent = nearSellsideRaw and not nearSellsideRaw[1]
+
+//Audit the intended stop against every mapped pocket on its side
+bool  auditActive    = auditStopInput and stopPriceInput > 0
+bool  stopShortSide  = stopPriceInput > close
+bool  stopInsidePool = false
+float relocatedStop  = na
+
+if auditActive
+    for pool in poolsArray
+        if pool.state == STATE_ACTIVE and pool.side == (stopShortSide ? SIDE_BUY : SIDE_SELL)
+            [insidePocket, relocated] = pocketCheck(stopPriceInput, pool.level, pool.outer, stopShortSide, stopBuffer)
+            if insidePocket
+                stopInsidePool := true
+                relocatedStop  := na(relocatedStop) ? relocated : stopShortSide ? math.max(relocatedStop, relocated) : math.min(relocatedStop, relocated)
+    levelCandidateArray = array.new_float()
+    if dayLevelsOk
+        array.push(levelCandidateArray, stopShortSide ? priorDayHigh : priorDayLow)
+    if weekLevelsOk
+        array.push(levelCandidateArray, stopShortSide ? priorWeekHigh : priorWeekLow)
+    if showRoundInput and not na(stopShortSide ? roundAbove : roundBelow)
+        array.push(levelCandidateArray, stopShortSide ? roundAbove : roundBelow)
+    for candidateLevel in levelCandidateArray
+        float outerEdge = candidateLevel + (stopShortSide ? pocketDepth : -pocketDepth)
+        [insidePocket, relocated] = pocketCheck(stopPriceInput, candidateLevel, outerEdge, stopShortSide, stopBuffer)
+        if insidePocket
+            stopInsidePool := true
+            relocatedStop  := na(relocatedStop) ? relocated : stopShortSide ? math.max(relocatedStop, relocated) : math.min(relocatedStop, relocated)
+
+bool stopAuditEvent = stopInsidePool and not stopInsidePool[1]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visuals
+//---------------------------------------------------------------------------------------------------------------------{
+//Prior session and week extremes, one segment per period
+var line  priorDayHighLine  = na
+var line  priorDayLowLine   = na
+var line  priorWeekHighLine = na
+var line  priorWeekLowLine  = na
+var label priorDayHighLabel  = na
+var label priorDayLowLabel   = na
+var label priorWeekHighLabel = na
+var label priorWeekLowLabel  = na
+
+if dayLevelsOk
+    if newDay or na(priorDayHighLine)
+        priorDayHighLine := line.new(bar_index, priorDayHigh, bar_index, priorDayHigh, color = color.new(buysideColorInput, LINE_TRANSPARENCY), style = line.style_dashed, width = 1)
+        priorDayLowLine  := line.new(bar_index, priorDayLow, bar_index, priorDayLow, color = color.new(sellsideColorInput, LINE_TRANSPARENCY), style = line.style_dashed, width = 1)
+    if na(priorDayHighLabel)
+        priorDayHighLabel := label.new(bar_index, priorDayHigh, "PDH", style = label.style_label_left, color = #00000000, textcolor = color.new(buysideColorInput, LINE_TRANSPARENCY), size = textSize)
+        priorDayLowLabel  := label.new(bar_index, priorDayLow, "PDL", style = label.style_label_left, color = #00000000, textcolor = color.new(sellsideColorInput, LINE_TRANSPARENCY), size = textSize)
+    line.set_x2(priorDayHighLine, bar_index)
+    line.set_y1(priorDayHighLine, priorDayHigh)
+    line.set_y2(priorDayHighLine, priorDayHigh)
+    line.set_x2(priorDayLowLine, bar_index)
+    line.set_y1(priorDayLowLine, priorDayLow)
+    line.set_y2(priorDayLowLine, priorDayLow)
+    label.set_xy(priorDayHighLabel, bar_index, priorDayHigh)
+    label.set_xy(priorDayLowLabel, bar_index, priorDayLow)
+
+if weekLevelsOk
+    if newWeek or na(priorWeekHighLine)
+        priorWeekHighLine := line.new(bar_index, priorWeekHigh, bar_index, priorWeekHigh, color = color.new(buysideColorInput, LINE_TRANSPARENCY), style = line.style_solid, width = 1)
+        priorWeekLowLine  := line.new(bar_index, priorWeekLow, bar_index, priorWeekLow, color = color.new(sellsideColorInput, LINE_TRANSPARENCY), style = line.style_solid, width = 1)
+    if na(priorWeekHighLabel)
+        priorWeekHighLabel := label.new(bar_index, priorWeekHigh, "PWH", style = label.style_label_left, color = #00000000, textcolor = color.new(buysideColorInput, LINE_TRANSPARENCY), size = textSize)
+        priorWeekLowLabel  := label.new(bar_index, priorWeekLow, "PWL", style = label.style_label_left, color = #00000000, textcolor = color.new(sellsideColorInput, LINE_TRANSPARENCY), size = textSize)
+    line.set_x2(priorWeekHighLine, bar_index)
+    line.set_y1(priorWeekHighLine, priorWeekHigh)
+    line.set_y2(priorWeekHighLine, priorWeekHigh)
+    line.set_x2(priorWeekLowLine, bar_index)
+    line.set_y1(priorWeekLowLine, priorWeekLow)
+    line.set_y2(priorWeekLowLine, priorWeekLow)
+    label.set_xy(priorWeekHighLabel, bar_index, priorWeekHigh)
+    label.set_xy(priorWeekLowLabel, bar_index, priorWeekLow)
+
+//Nearest round numbers, dotted reference lines
+var line  roundAboveLine  = na
+var line  roundBelowLine  = na
+var label roundAboveLabel = na
+var label roundBelowLabel = na
+
+if showRoundInput
+    if na(roundAboveLine)
+        roundAboveLine  := line.new(bar_index, close, bar_index + GUIDE_SPAN, close, color = color.new(roundColorInput, LINE_TRANSPARENCY), style = line.style_dotted, width = 1)
+        roundBelowLine  := line.new(bar_index, close, bar_index + GUIDE_SPAN, close, color = color.new(roundColorInput, LINE_TRANSPARENCY), style = line.style_dotted, width = 1)
+        roundAboveLabel := label.new(bar_index + GUIDE_SPAN, close, "Round", style = label.style_label_left, color = #00000000, textcolor = color.new(roundColorInput, LINE_TRANSPARENCY), size = textSize)
+        roundBelowLabel := label.new(bar_index + GUIDE_SPAN, close, "Round", style = label.style_label_left, color = #00000000, textcolor = color.new(roundColorInput, LINE_TRANSPARENCY), size = textSize)
+    line.set_xy1(roundAboveLine, bar_index - GUIDE_SPAN, roundAbove)
+    line.set_xy2(roundAboveLine, bar_index + GUIDE_SPAN, roundAbove)
+    line.set_xy1(roundBelowLine, bar_index - GUIDE_SPAN, roundBelow)
+    line.set_xy2(roundBelowLine, bar_index + GUIDE_SPAN, roundBelow)
+    label.set_xy(roundAboveLabel, bar_index + GUIDE_SPAN, roundAbove)
+    label.set_xy(roundBelowLabel, bar_index + GUIDE_SPAN, roundBelow)
+
+//Safer stop guides beyond the nearest pocket on each side
+var line  safeShortLine  = na
+var line  safeLongLine   = na
+var label safeShortLabel = na
+var label safeLongLabel  = na
+
+if showGuidesInput
+    if na(safeShortLine)
+        safeShortLine  := line.new(bar_index, close, bar_index + GUIDE_SPAN, close, color = buysideColorInput, style = line.style_dashed, width = 1)
+        safeLongLine   := line.new(bar_index, close, bar_index + GUIDE_SPAN, close, color = sellsideColorInput, style = line.style_dashed, width = 1)
+        safeShortLabel := label.new(bar_index + GUIDE_SPAN, close, "", style = label.style_label_left, color = #00000000, textcolor = buysideColorInput, size = textSize)
+        safeLongLabel  := label.new(bar_index + GUIDE_SPAN, close, "", style = label.style_label_left, color = #00000000, textcolor = sellsideColorInput, size = textSize)
+    bool showShortGuide = not na(safeShortStop)
+    bool showLongGuide  = not na(safeLongStop)
+    float shortGuideLevel = showShortGuide ? safeShortStop : close
+    float longGuideLevel  = showLongGuide ? safeLongStop : close
+    line.set_xy1(safeShortLine, bar_index, shortGuideLevel)
+    line.set_xy2(safeShortLine, bar_index + GUIDE_SPAN, shortGuideLevel)
+    line.set_color(safeShortLine, color.new(buysideColorInput, showShortGuide ? 0 : 100))
+    label.set_xy(safeShortLabel, bar_index + GUIDE_SPAN, shortGuideLevel)
+    label.set_text(safeShortLabel, showShortGuide ? "Short stop ≥ " + str.tostring(safeShortStop, format.mintick) : "")
+    label.set_textcolor(safeShortLabel, color.new(buysideColorInput, showShortGuide ? 0 : 100))
+    line.set_xy1(safeLongLine, bar_index, longGuideLevel)
+    line.set_xy2(safeLongLine, bar_index + GUIDE_SPAN, longGuideLevel)
+    line.set_color(safeLongLine, color.new(sellsideColorInput, showLongGuide ? 0 : 100))
+    label.set_xy(safeLongLabel, bar_index + GUIDE_SPAN, longGuideLevel)
+    label.set_text(safeLongLabel, showLongGuide ? "Long stop ≤ " + str.tostring(safeLongStop, format.mintick) : "")
+    label.set_textcolor(safeLongLabel, color.new(sellsideColorInput, showLongGuide ? 0 : 100))
+
+//Intended stop audit line and verdict
+var line  auditLine  = na
+var label auditLabel = na
+
+if auditActive
+    if na(auditLine)
+        auditLine  := line.new(bar_index - GUIDE_SPAN, stopPriceInput, bar_index + GUIDE_SPAN, stopPriceInput, color = NEUTRAL_COLOR, style = line.style_dotted, width = 1)
+        auditLabel := label.new(bar_index + GUIDE_SPAN, stopPriceInput, "", style = label.style_label_left, color = #00000000, textcolor = NEUTRAL_COLOR, size = textSize)
+    color auditColor = stopInsidePool ? (stopShortSide ? buysideColorInput : sellsideColorInput) : NEUTRAL_COLOR
+    line.set_xy1(auditLine, bar_index - GUIDE_SPAN, stopPriceInput)
+    line.set_xy2(auditLine, bar_index + GUIDE_SPAN, stopPriceInput)
+    line.set_color(auditLine, auditColor)
+    label.set_xy(auditLabel, bar_index + GUIDE_SPAN, stopPriceInput)
+    label.set_textcolor(auditLabel, auditColor)
+    label.set_text(auditLabel, stopInsidePool ? "Stop inside pool " + (stopShortSide ? "→ ≥ " : "→ ≤ ") + str.tostring(relocatedStop, format.mintick) : "Stop clear of mapped pools")
+
+//Dashboard
+var table panelTable = na
+
+if showPanelInput and barstate.islast
+    if na(panelTable)
+        panelTable := table.new(panelPosition, 2, 7, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+        table.cell(panelTable, 0, 0, "Stop Placement", text_color = DASH_TEXT, text_size = textSize, text_halign = text.align_center)
+        table.merge_cells(panelTable, 0, 0, 1, 0)
+    string buysideText  = na(nearestAboveLevel) ? "—" : str.tostring(nearestAboveLevel, format.mintick) + (nearestAboveTouches > 1 ? " ×" + str.tostring(nearestAboveTouches) : "")
+    string sellsideText = na(nearestBelowLevel) ? "—" : str.tostring(nearestBelowLevel, format.mintick) + (nearestBelowTouches > 1 ? " ×" + str.tostring(nearestBelowTouches) : "")
+    string safeShortText = na(safeShortStop) ? "—" : str.tostring(safeShortStop, format.mintick)
+    string safeLongText  = na(safeLongStop) ? "—" : str.tostring(safeLongStop, format.mintick)
+    string auditText = not auditActive ? "—" : stopInsidePool ? "Inside pool" : "Clear"
+    color  auditTextColor = not auditActive ? DASH_HEADER : stopInsidePool ? (stopShortSide ? buysideColorInput : sellsideColorInput) : sellsideColorInput
+    table.cell(panelTable, 0, 1, "Buyside pool", text_color = DASH_HEADER, text_size = textSize, text_halign = text.align_left)
+    table.cell(panelTable, 1, 1, buysideText, text_color = buysideColorInput, text_size = textSize, text_halign = text.align_right)
+    table.cell(panelTable, 0, 2, "Short stop ≥", text_color = DASH_HEADER, text_size = textSize, text_halign = text.align_left)
+    table.cell(panelTable, 1, 2, safeShortText, text_color = buysideColorInput, text_size = textSize, text_halign = text.align_right)
+    table.cell(panelTable, 0, 3, "Sellside pool", text_color = DASH_HEADER, text_size = textSize, text_halign = text.align_left)
+    table.cell(panelTable, 1, 3, sellsideText, text_color = sellsideColorInput, text_size = textSize, text_halign = text.align_right)
+    table.cell(panelTable, 0, 4, "Long stop ≤", text_color = DASH_HEADER, text_size = textSize, text_halign = text.align_left)
+    table.cell(panelTable, 1, 4, safeLongText, text_color = sellsideColorInput, text_size = textSize, text_halign = text.align_right)
+    table.cell(panelTable, 0, 5, "ATR buffer", text_color = DASH_HEADER, text_size = textSize, text_halign = text.align_left)
+    table.cell(panelTable, 1, 5, str.tostring(stopBuffer, format.mintick), text_color = DASH_TEXT, text_size = textSize, text_halign = text.align_right)
+    table.cell(panelTable, 0, 6, "Stop audit", text_color = DASH_HEADER, text_size = textSize, text_halign = text.align_left)
+    table.cell(panelTable, 1, 6, auditText, text_color = auditTextColor, text_size = textSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Plots
+//---------------------------------------------------------------------------------------------------------------------{
+plot(safeShortStop, "Safe Short Stop", color = buysideColorInput, display = display.data_window)
+plot(safeLongStop, "Safe Long Stop", color = sellsideColorInput, display = display.data_window)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(approachBuysideEvent, "Buyside Pool Approached", "Price moved within the approach distance of the nearest buyside liquidity pool - expect a draw into the resting buy stops; audit any short stop parked inside the pocket.")
+alertcondition(approachSellsideEvent, "Sellside Pool Approached", "Price moved within the approach distance of the nearest sellside liquidity pool - expect a draw into the resting sell stops; audit any long stop parked inside the pocket.")
+alertcondition(buysideSweepEvent, "Buyside Pool Swept", "Price pierced a buyside liquidity pool and closed back inside the level - a stop-driven sweep rather than initiative trade, often marking a short-term top.")
+alertcondition(sellsideSweepEvent, "Sellside Pool Swept", "Price pierced a sellside liquidity pool and closed back inside the level - a stop-driven sweep rather than initiative trade, often marking a short-term bottom.")
+alertcondition(buysideBreakEvent, "Acceptance Above Buyside Pool", "Price closed beyond a buyside liquidity pool - acceptance above the level reads as initiative trade rather than a stop run.")
+alertcondition(sellsideBreakEvent, "Acceptance Below Sellside Pool", "Price closed beyond a sellside liquidity pool - acceptance below the level reads as initiative trade rather than a stop run.")
+alertcondition(stopAuditEvent, "Intended Stop Inside Pool", "The audited stop price now sits inside a mapped liquidity pocket - relocate it beyond the pool plus the ATR buffer and resize, or skip the trade.")
+
+//---------------------------------------------------------------------------------------------------------------------}

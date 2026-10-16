@@ -1,0 +1,350 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Hilbert Transform", shorttitle = "Hilbert Transform", overlay = false, format = format.price, precision = 2, max_bars_back = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR    = #089981 // lead sinewave above the sinewave - rising half of the cycle
+BEAR_COLOR    = #f23645 // lead sinewave below the sinewave - falling half of the cycle
+NEUTRAL_COLOR = #787b86 // non-directional period output, lead line, zero line, clamps
+LEAD_COLOR    = #787b86 // lead sinewave / reference elements
+TREND_COLOR   = #ff9800 // trend-mode accent - the one highlight of the script
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+FILL_VALUE_TRANSP = 50  // gradient transparency at the output value
+FILL_ZERO_TRANSP  = 100 // gradient transparency at the zero line
+DIM_FILL_TRANSP   = 85  // gradient transparency at the value while the SNR gate reads noise
+DIM_LINE_TRANSP   = 78  // line transparency while the SNR gate reads noise
+
+// Ehlers' published discrete Hilbert transform FIR coefficient pair
+HT_COEF_A = 0.0962
+HT_COEF_B = 0.5769
+
+SINE_VIEW   = "Sinewave"
+PERIOD_VIEW = "Dominant Cycle Period"
+
+TOP_RIGHT    = "Top Right"
+TOP_LEFT     = "Top Left"
+BOTTOM_RIGHT = "Bottom Right"
+BOTTOM_LEFT  = "Bottom Left"
+
+TINY_SIZE   = "Tiny"
+SMALL_SIZE  = "Small"
+NORMAL_SIZE = "Normal"
+
+EPSILON = 1e-10
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+srcInput       = input.source(hl2, "Source", group = "Cycle Measurement",
+     tooltip = "Price series fed to the analyzer. Ehlers' published designs work on the bar midpoint hl2 = (high + low) / 2.")
+
+minPeriodInput = input.int(6, "Min Period", minval = 4, maxval = 20, group = "Cycle Measurement",
+     tooltip = "Lower clamp of the measured dominant cycle period, in bars. Below roughly 6 bars a cycle is sampled by too few points for the short quadrature filters to resolve its phase - 6 is Ehlers' published bound.")
+
+maxPeriodInput = input.int(50, "Max Period", minval = 10, maxval = 200, group = "Cycle Measurement",
+     tooltip = "Upper clamp of the measured dominant cycle period, in bars. Beyond roughly 50 bars the short filter approximation loses accuracy and the estimate drifts - 50 is Ehlers' published bound. Longer rhythms are better measured on a higher timeframe than by stretching this clamp.")
+
+snrGateInput   = input.bool(true, "Dim Output Below SNR Threshold", group = "Signal-to-Noise",
+     tooltip = "Ehlers' amplitude gate: when the measured cycle amplitude is small relative to the average bar range, phase readings are noise and cycle tools should stand down. While the smoothed SNR sits below the threshold the pane output is dimmed. The SNR alerts fire whether or not dimming is enabled.")
+
+snrThreshInput = input.float(6.0, "SNR Threshold (dB)", minval = 0, maxval = 30, step = 0.5, group = "Signal-to-Noise",
+     tooltip = "Signal-to-noise level, in decibels, separating a tradable cycle from noise. Ehlers' published guidance is 6 dB - the cycle swing should be at least twice the noise.")
+
+viewInput      = input.string(SINE_VIEW, "Pane Output", options = [SINE_VIEW, PERIOD_VIEW], group = "Display",
+     tooltip = "Sinewave plots the position within the measured cycle (sine of the dominant cycle phase) together with a 45-degree lead line that anticipates turns. Dominant Cycle Period plots the homodyne period estimate in bars - the value adaptive lookbacks would inherit.")
+
+markersInput   = input.bool(false, "Cycle Turn Markers", group = "Display",
+     tooltip = "Displays a small circle where the lead sinewave crosses the sinewave - the anticipated cycle turn. Off by default to keep the pane clean; the crossing alerts work regardless.")
+
+modeBgInput    = input.bool(true, "Highlight Trend Mode", group = "Display",
+     tooltip = "Shades the pane background while the measured phase has stopped advancing at the expected cycle rate - trend mode, when DSP practice switches from cycle tactics to trend tactics and sinewave crossings should be ignored.")
+
+showDashInput  = input.bool(true, "Show Dashboard", group = "Dashboard",
+     tooltip = "Displays a summary panel with the dominant cycle period, the instantaneous phase and amplitude, the signal-to-noise ratio and the market mode classification.")
+
+dashLocInput   = input.string(TOP_RIGHT, "Location", options = [TOP_RIGHT, TOP_LEFT, BOTTOM_RIGHT, BOTTOM_LEFT], inline = "dash", group = "Dashboard",
+     tooltip = "Position of the dashboard on the pane.")
+
+dashSizeInput  = input.string(SMALL_SIZE, "Size", options = [TINY_SIZE, SMALL_SIZE, NORMAL_SIZE], inline = "dash", group = "Dashboard",
+     tooltip = "Text size of the dashboard.")
+
+mainColorInput = input.color(NEUTRAL_COLOR, "Cycle Output", group = "Style",
+     tooltip = "Color of the dominant cycle period plot and of its gradient fill. The sinewave itself is colored by its half-cycle - Turn Up while the lead sinewave runs above it, Turn Down while below.")
+
+leadColorInput = input.color(LEAD_COLOR, "Lead Sinewave", group = "Style",
+     tooltip = "Color of the anticipatory lead line, the sinewave advanced by 45 degrees of cycle phase.")
+
+gradientInput  = input.bool(true, "Gradient Fill", group = "Style",
+     tooltip = "Fills the span between zero and the pane output with a vertical gradient, fully transparent at zero and strongest at the current value.")
+
+turnUpColorInput   = input.color(BULL_COLOR, "Turn Up", inline = "turn", group = "Style",
+     tooltip = "Marker color where the lead sinewave crosses above the sinewave - an anticipated cycle trough.")
+
+turnDownColorInput = input.color(BEAR_COLOR, "Turn Down", inline = "turn", group = "Style",
+     tooltip = "Marker color where the lead sinewave crosses under the sinewave - an anticipated cycle crest.")
+
+trendBgInput   = input.color(color.new(TREND_COLOR, 88), "Trend Mode Background", group = "Style",
+     tooltip = "Background shade applied while the market is classified as trending rather than cycling.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// One-sided discrete Hilbert transform approximation - Ehlers' published 0.0962 / 0.5769 FIR pair
+// spanning 7 bars, scaled by the period-adaptive amplitude correction. Approximates a 90-degree
+// phase shift of the input over the measurable 6-50 bar cycle band; na-propagates until history exists.
+hilbertFir(float x, float gain) =>
+    (HT_COEF_A * x + HT_COEF_B * x[2] - HT_COEF_B * x[4] - HT_COEF_A * x[6]) * gain
+
+// Dashboard corner from the position option
+tableLocation(string positionText) =>
+    switch
+        positionText == TOP_RIGHT    => position.top_right
+        positionText == TOP_LEFT     => position.top_left
+        positionText == BOTTOM_RIGHT => position.bottom_right
+        => position.bottom_left
+
+// Dashboard text size from the size option
+tableTextSize(string sizeText) =>
+    switch
+        sizeText == TINY_SIZE  => size.tiny
+        sizeText == SMALL_SIZE => size.small
+        => size.normal
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dominant Cycle Measurement - homodyne discriminator
+//---------------------------------------------------------------------------------------------------------------------{
+// na-proof source - the recursive filter chain must never ingest na
+float src = nz(srcInput, close)
+
+// 4-bar weighted smoothing of the source, Ehlers' published front-end low-pass
+float smoothPrice = (4 * src + 3 * src[1] + 2 * src[2] + src[3]) / 10
+
+float minPeriod = float(minPeriodInput)
+float maxPeriod = math.max(float(maxPeriodInput), minPeriod)
+
+// recursive series - declared na and seeded from their first valid value
+float period       = na
+float smoothPeriod = na
+float i2           = na
+float q2           = na
+float re           = na
+float im           = na
+
+float prevPeriodVal = period[1]
+
+// amplitude-correction coefficient, driven by the previous bar's measured period
+float gain = 0.075 * nz(prevPeriodVal) + 0.54
+
+// detrend the smoothed price, then read the analytic pair: in-phase (I1) is the detrended
+// series delayed to the filter center, quadrature (Q1) its 90-degree-shifted copy
+float detrender = hilbertFir(smoothPrice, gain)
+float q1        = hilbertFir(detrender, gain)
+float i1        = detrender[3]
+
+// advance the phase of I1 and Q1 by 90 degrees
+float jI = hilbertFir(i1, gain)
+float jQ = hilbertFir(q1, gain)
+
+// phasor addition for 3-bar averaging, then the published 0.2 / 0.8 component smoothing
+float i2Raw = i1 - jQ
+float q2Raw = q1 + jI
+i2 := na(i2Raw) ? na : 0.2 * i2Raw + 0.8 * nz(i2[1], i2Raw)
+q2 := na(q2Raw) ? na : 0.2 * q2Raw + 0.8 * nz(q2[1], q2Raw)
+
+// homodyne discriminator - the phasor is multiplied by its conjugate one bar back, so the
+// angle of (Re, Im) is the per-bar phase advance of the dominant cycle
+float reRaw = i2 * i2[1] + q2 * q2[1]
+float imRaw = i2 * q2[1] - q2 * i2[1]
+re := na(reRaw) ? na : 0.2 * reRaw + 0.8 * nz(re[1], reRaw)
+im := na(imRaw) ? na : 0.2 * imRaw + 0.8 * nz(im[1], imRaw)
+
+// dominant cycle period - 360 degrees over the per-bar phase advance, step-limited to
+// 0.67x-1.5x per bar, clamped to the measurable band, then smoothed (published constants)
+if not na(re) and not na(im)
+    float rawPeriod = nz(prevPeriodVal)
+    if re != 0 and im != 0
+        float angleDeg = math.todegrees(math.atan(im / re))
+        if angleDeg != 0
+            rawPeriod := 360 / angleDeg
+    if not na(prevPeriodVal)
+        rawPeriod := math.max(math.min(rawPeriod, 1.5 * prevPeriodVal), 0.67 * prevPeriodVal)
+    rawPeriod := math.min(math.max(rawPeriod, minPeriod), maxPeriod)
+    period := na(prevPeriodVal) ? rawPeriod : 0.2 * rawPeriod + 0.8 * prevPeriodVal
+
+smoothPeriod := na(period) ? na : na(smoothPeriod[1]) ? period : 0.33 * period + 0.67 * smoothPeriod[1]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Cycle Phase, Sinewave & Market Mode
+//---------------------------------------------------------------------------------------------------------------------{
+// dominant cycle phase - correlate the smoothed price against one full cycle of sine and cosine
+// over the measured period, then apply Ehlers' published quadrant and lag corrections
+float dcPhase  = na
+float sineWave = na
+float leadSine = na
+
+if not na(smoothPeriod)
+    int dcPeriodBars = int(smoothPeriod + 0.5)
+    if dcPeriodBars > 0 and bar_index >= dcPeriodBars + 3
+        float realPart = 0.0
+        float imagPart = 0.0
+        for count = 0 to dcPeriodBars - 1
+            float tap = smoothPrice[count]
+            if not na(tap)
+                float angle = math.toradians(360.0 * count / dcPeriodBars)
+                realPart += math.sin(angle) * tap
+                imagPart += math.cos(angle) * tap
+        dcPhase := math.abs(imagPart) > 0.001 ? math.todegrees(math.atan(realPart / imagPart)) : 90 * math.sign(realPart)
+        dcPhase += 90
+        // compensate for the one bar lag of the weighted moving average
+        if smoothPeriod != 0
+            dcPhase += 360.0 / smoothPeriod
+        if imagPart < 0
+            dcPhase += 180
+        if dcPhase > 315
+            dcPhase -= 360
+        sineWave := math.sin(math.toradians(dcPhase))
+        leadSine := math.sin(math.toradians(dcPhase + 45))
+
+float deltaPhase = dcPhase - dcPhase[1]
+
+// lead line crossings anticipate cycle turns - the lead runs 45 degrees ahead of the cycle
+bool turnUp   = ta.crossover(leadSine, sineWave)
+bool turnDown = ta.crossunder(leadSine, sineWave)
+bool anyCross = turnUp or turnDown
+
+var int barsSinceCross = 0
+barsSinceCross := (anyCross ? 0 : barsSinceCross) + 1
+
+// market mode - cycle while the phase keeps advancing at the expected 360/period rate or a
+// sinewave crossing occurred within the last half cycle; trend once the phase advance stalls
+bool modeValid = not na(smoothPeriod) and not na(deltaPhase)
+bool trendMode = true
+if anyCross
+    trendMode := false
+if not na(smoothPeriod) and barsSinceCross < 0.5 * smoothPeriod
+    trendMode := false
+if modeValid and smoothPeriod != 0 and deltaPhase > 0.67 * 360 / smoothPeriod and deltaPhase < 1.5 * 360 / smoothPeriod
+    trendMode := false
+
+bool trendShift = modeValid and modeValid[1] and trendMode and not trendMode[1]
+bool cycleShift = modeValid and modeValid[1] and not trendMode and trendMode[1]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Signal-to-Noise Ratio
+//---------------------------------------------------------------------------------------------------------------------{
+// noise reference - smoothed bar range (published 0.1 / 0.9 smoothing)
+float noiseRange = na
+noiseRange := high != low ? 0.1 * (high - low) + 0.9 * nz(noiseRange[1], high - low) : noiseRange[1]
+
+// instantaneous cycle amplitude from the analytic pair - the length of the (I1, Q1) vector
+float signalPower = i1 * i1 + q1 * q1
+float amplitude   = math.sqrt(signalPower)
+
+// smoothed SNR in decibels; +6 dB compensates the measured amplitude being half the peak-to-peak swing
+float snr = na
+if not na(signalPower) and not na(noiseRange) and noiseRange > 0
+    float snrRaw = 10 * math.log10(math.max(signalPower, EPSILON) / (noiseRange * noiseRange)) + 6
+    snr := na(snr[1]) ? snrRaw : 0.25 * snrRaw + 0.75 * snr[1]
+else
+    snr := snr[1]
+
+bool lowSnr  = not na(snr) and snr < snrThreshInput
+bool snrRise = ta.crossover(snr, snrThreshInput)
+bool snrFall = ta.crossunder(snr, snrThreshInput)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+bool sineView = viewInput == SINE_VIEW
+
+float sineDisplay   = sineView ? sineWave : na
+float leadDisplay   = sineView ? leadSine : na
+float periodDisplay = sineView ? na : smoothPeriod
+
+bool dimmed = snrGateInput and lowSnr
+
+// sinewave state - the lead runs 45 degrees ahead, so lead above sine is the rising half of the cycle
+color sineStateColor = nz(leadSine) >= nz(sineWave) ? turnUpColorInput : turnDownColorInput
+
+color sineLineColor   = dimmed ? color.new(sineStateColor, DIM_LINE_TRANSP) : sineStateColor
+color periodLineColor = dimmed ? color.new(mainColorInput, DIM_LINE_TRANSP) : mainColorInput
+color leadLineColor   = dimmed ? color.new(leadColorInput, DIM_LINE_TRANSP) : leadColorInput
+
+bool sinePositive = nz(sineDisplay) >= 0
+
+color sineFillColor       = gradientInput ? color.new(sineStateColor, dimmed ? DIM_FILL_TRANSP : FILL_VALUE_TRANSP) : na
+color sineZeroFillColor   = gradientInput ? color.new(sineStateColor, FILL_ZERO_TRANSP) : na
+color periodFillColor     = gradientInput ? color.new(mainColorInput, dimmed ? DIM_FILL_TRANSP : FILL_VALUE_TRANSP) : na
+color periodZeroFillColor = gradientInput ? color.new(mainColorInput, FILL_ZERO_TRANSP) : na
+
+sinePlotId   = plot(sineDisplay, "Sinewave", color = sineLineColor, linewidth = 2)
+leadPlotId   = plot(leadDisplay, "Lead Sinewave", color = leadLineColor, linewidth = 1)
+periodPlotId = plot(periodDisplay, "Dominant Cycle Period", color = periodLineColor, linewidth = 2)
+zeroPlotId   = plot(0, "Zero Line", color = color.new(NEUTRAL_COLOR, 50), linewidth = 1)
+
+plot(sineView ? na : minPeriod, "Min Period Clamp", color = color.new(NEUTRAL_COLOR, 60), linewidth = 1, style = plot.style_circles)
+plot(sineView ? na : maxPeriod, "Max Period Clamp", color = color.new(NEUTRAL_COLOR, 60), linewidth = 1, style = plot.style_circles)
+
+fill(sinePlotId, zeroPlotId, top_value = math.max(sineDisplay, 0), bottom_value = math.min(sineDisplay, 0), top_color = sinePositive ? sineFillColor : sineZeroFillColor, bottom_color = sinePositive ? sineZeroFillColor : sineFillColor, title = "Sinewave Gradient Fill")
+fill(periodPlotId, zeroPlotId, top_value = periodDisplay, bottom_value = 0, top_color = periodFillColor, bottom_color = periodZeroFillColor, title = "Period Gradient Fill")
+
+bgcolor(modeBgInput and modeValid and trendMode ? trendBgInput : na, title = "Trend Mode Background")
+
+plotshape(markersInput and sineView and turnUp ? leadSine : na, "Cycle Turn Up", shape.circle, location.absolute, color = turnUpColorInput, size = size.tiny)
+plotshape(markersInput and sineView and turnDown ? leadSine : na, "Cycle Turn Down", shape.circle, location.absolute, color = turnDownColorInput, size = size.tiny)
+
+plot(dcPhase, "Phase (degrees)", color = NEUTRAL_COLOR, display = display.data_window)
+plot(snr, "SNR (dB)", color = NEUTRAL_COLOR, display = display.data_window)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dashboardTable = na
+
+if barstate.islast and showDashInput
+    if na(dashboardTable)
+        dashboardTable := table.new(tableLocation(dashLocInput), 2, 5, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+    string textSize  = tableTextSize(dashSizeInput)
+    color labelColor = DASH_HEADER
+    color valueColor = DASH_TEXT
+
+    string periodText = na(smoothPeriod) ? "n/a" : str.tostring(smoothPeriod, "#.#") + " bars"
+    string phaseText  = na(dcPhase) ? "n/a" : str.tostring(dcPhase, "#") + "°"
+    string ampText    = na(amplitude) ? "n/a" : str.tostring(amplitude, format.mintick)
+    string snrText    = na(snr) ? "n/a" : str.tostring(snr, "#.#") + " dB"
+    string modeText   = modeValid ? (trendMode ? "Trend" : "Cycle") : "n/a"
+
+    color snrColor  = na(snr) ? labelColor : lowSnr ? BEAR_COLOR : BULL_COLOR
+    color modeColor = modeValid ? (trendMode ? TREND_COLOR : BULL_COLOR) : labelColor
+
+    table.cell(dashboardTable, 0, 0, "Dominant Cycle", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 0, periodText, text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 1, "Phase", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 1, phaseText, text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 2, "Amplitude", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 2, ampText, text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 3, "SNR", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 3, snrText, text_color = snrColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 4, "Mode", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 4, modeText, text_color = modeColor, text_size = textSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(turnUp, "Cycle Turn Up", "Hilbert Transform on {{ticker}}: lead sinewave crossed above the sinewave - cycle trough anticipated ({{interval}})")
+alertcondition(turnDown, "Cycle Turn Down", "Hilbert Transform on {{ticker}}: lead sinewave crossed under the sinewave - cycle crest anticipated ({{interval}})")
+alertcondition(trendShift, "Trend Mode", "Hilbert Transform on {{ticker}}: measured phase stopped advancing at the cycle rate - trend mode, cycle tactics stand down ({{interval}})")
+alertcondition(cycleShift, "Cycle Mode", "Hilbert Transform on {{ticker}}: measured phase is advancing at the expected cycle rate - cycle mode active ({{interval}})")
+alertcondition(snrRise, "SNR Above Threshold", "Hilbert Transform on {{ticker}}: signal-to-noise ratio rose above the threshold - cycle amplitude is large enough to act on ({{interval}})")
+alertcondition(snrFall, "SNR Below Threshold", "Hilbert Transform on {{ticker}}: signal-to-noise ratio fell below the threshold - cycle readings are noise, cycle tools stand down ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

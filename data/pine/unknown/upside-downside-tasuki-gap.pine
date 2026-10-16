@@ -1,0 +1,254 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Upside/downside Tasuki Gap", shorttitle = "Upside/downside Tasuki Gap", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+NEUTRAL_COLOR = #787b86
+TREND_COLOR   = #787b86
+
+ZONE_FILL_TRANSP    = 90
+ZONE_BORDER_TRANSP  = 50
+INVALID_LINE_TRANSP = 40
+
+GAP_BODIES = "Candle Bodies"
+GAP_RANGE  = "Full Range (Wicks)"
+
+CONF_HL    = "High/Low"
+CONF_CLOSE = "Close"
+
+G_DETECTION = "Detection"
+G_TREND     = "Trend Filter"
+G_ZONES     = "Gap Zones & Confirmation"
+G_STYLE     = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+showUpInput = input.bool(true, "Upside Tasuki Gaps", group = G_DETECTION, tooltip = "Detect the bullish form: in an advance, a white candle, a second white candle gapping higher, then a black candle opening within the second candle's body and closing into the gap without filling it.")
+
+showDnInput = input.bool(true, "Downside Tasuki Gaps", group = G_DETECTION, tooltip = "Detect the bearish mirror: in a decline, a black candle, a second black candle gapping lower, then a white candle opening within the second candle's body and closing into the gap without filling it.")
+
+gapBasisInput = input.string(GAP_BODIES, "Gap Basis", options = [GAP_BODIES, GAP_RANGE], group = G_DETECTION, tooltip = "How the gap separating the first two candles is measured. 'Candle Bodies' follows the classical definition - a real gap between the two real bodies. 'Full Range (Wicks)' is stricter and also requires the candles' shadows not to overlap.")
+
+volumeFilterInput = input.bool(false, "Elevated Gap Volume", group = G_DETECTION, tooltip = "Prefer gaps printed on elevated volume: requires the gapping (second) candle's volume to exceed its average benchmark, consistent with genuine initiative rather than thin-market noise. A practitioner preference, not part of the classical price-only definition. Ignored when the symbol provides no volume data.")
+
+volumeLengthInput = input.int(20, "Volume Average Length", minval = 1, group = G_DETECTION, tooltip = "Number of bars used to compute the average volume benchmark for the elevated-volume preference.")
+
+volumeMultInput = input.float(1, "Volume Multiplier", minval = 0.1, step = 0.1, group = G_DETECTION, tooltip = "Required multiple of average volume on the gapping candle; 1 demands simply above-average volume.")
+
+trendTypeInput = input.string("SMA", "Trend Filter", options = ["SMA", "EMA", "None"], group = G_TREND, tooltip = "Continuation context: upside tasuki gaps are only sought in advances and downside ones in declines. The first pattern candle must close above this moving average for the upside form and below it for the downside form. 'None' removes the trend requirement.")
+
+trendLengthInput = input.int(50, "Trend Length", minval = 1, group = G_TREND, tooltip = "Length of the trend filter moving average.")
+
+confirmBasisInput = input.string(CONF_HL, "Confirmation Basis", options = [CONF_HL, CONF_CLOSE], group = G_ZONES, tooltip = "Continuation is treated as confirmed once price moves beyond the second candle's extreme in the trend direction. 'High/Low' confirms on any trade beyond it; 'Close' waits for a close beyond it.")
+
+showZonesInput = input.bool(true, "Show Gap Zones", group = G_ZONES, tooltip = "Draw each unfilled gap as a zone extending to the right - the reference area traders watch on later pullbacks, expecting defense on first touch. The zone is greyed out once a close through its far side fills the gap and voids the pattern.")
+
+showTriggerInput = input.bool(true, "Show Confirmation Levels", group = G_ZONES, tooltip = "Draw a dotted line at the second candle's extreme; price moving beyond it in the trend direction confirms the continuation. The line stops extending once continuation is confirmed.")
+
+zoneMaxBarsInput = input.int(250, "Zone Extension Limit", minval = 1, maxval = 5000, group = G_ZONES, tooltip = "Maximum number of bars a gap zone extends and is monitored for confirmation, retests and filling after the pattern completes.")
+
+showLabelsInput = input.bool(true, "Show Pattern Labels", group = G_STYLE, tooltip = "Display a label on the third candle of each detected tasuki gap.")
+
+showConfirmInput = input.bool(true, "Confirmation Markers", group = G_STYLE, tooltip = "Mark the bar where price moves beyond the second candle's extreme, confirming the continuation.")
+
+showRetestInput = input.bool(true, "Retest Markers", group = G_STYLE, tooltip = "Mark the first pullback into an unfilled gap zone after price has left it in the trend direction.")
+
+showFillInput = input.bool(true, "Invalidation Markers", group = G_STYLE, tooltip = "Mark the bar where a close through the far side of a gap fills it completely and voids the pattern.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "colors", group = G_STYLE, tooltip = "Colors of bullish and bearish tasuki gap labels, zones, levels and markers.")
+
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "colors", group = G_STYLE, tooltip = "Colors of bullish and bearish tasuki gap labels, zones, levels and markers.")
+
+invalidColorInput = input.color(NEUTRAL_COLOR, "Filled Gap", group = G_STYLE, tooltip = "Color applied to a gap zone and its pending confirmation level once a close through the far side has filled the gap.")
+
+showTrendInput = input.bool(false, "Show Trend MA", inline = "trend", group = G_STYLE, tooltip = "Plot the moving average used by the trend filter.")
+
+trendColorInput = input.color(TREND_COLOR, "", inline = "trend", group = G_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types
+//---------------------------------------------------------------------------------------------------------------------{
+type TasukiGap
+    box   zoneBox
+    line  triggerLine
+    float zoneTop
+    float zoneBottom
+    float trigger
+    int   dir
+    int   startIndex
+    bool  confirmed = false
+    bool  exited    = false
+    bool  tested    = false
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Pattern Detection
+//---------------------------------------------------------------------------------------------------------------------{
+float bodyHi = math.max(open, close)
+float bodyLo = math.min(open, close)
+
+bool whiteBody = close > open
+bool darkBody  = close < open
+
+// Trend context, referenced at the bar where the first candle prints
+float smaTrend = ta.sma(close, trendLengthInput)
+float emaTrend = ta.ema(close, trendLengthInput)
+float trendMa  = trendTypeInput == "EMA" ? emaTrend : smaTrend
+
+bool upContext   = trendTypeInput == "None" or (not na(trendMa) and close > trendMa)
+bool downContext = trendTypeInput == "None" or (not na(trendMa) and close < trendMa)
+
+// Optional volume preference on the gapping (second) candle (passes when the symbol has no volume data)
+float avgVolume  = ta.sma(volume, volumeLengthInput)
+bool gapVolumeOk = not volumeFilterInput or na(avgVolume[1]) or volume[1] > avgVolume[1] * volumeMultInput
+
+// Candle roles at evaluation time: first candle = [2], gapping candle = [1], countertrend test candle = [0]
+bool useBodiesGap = gapBasisInput == GAP_BODIES
+
+// The gap zone between the first two candles: for the upside form its bottom is the far edge, for the downside its top
+float upGapTop    = useBodiesGap ? bodyLo[1] : low[1]
+float upGapBottom = useBodiesGap ? bodyHi[2] : high[2]
+bool  upGapOk     = upGapTop > upGapBottom
+
+float dnGapTop    = useBodiesGap ? bodyLo[2] : low[2]
+float dnGapBottom = useBodiesGap ? bodyHi[1] : high[1]
+bool  dnGapOk     = dnGapTop > dnGapBottom
+
+// Third candle: opposite color, opens within the second candle's real body, closes inside the gap without filling it
+bool openInSecondBody = open >= bodyLo[1] and open <= bodyHi[1]
+
+bool upTasuki = showUpInput and upContext[2] and whiteBody[2] and whiteBody[1] and upGapOk and darkBody and openInSecondBody and close < upGapTop and close > upGapBottom and gapVolumeOk
+
+bool dnTasuki = showDnInput and downContext[2] and darkBody[2] and darkBody[1] and dnGapOk and whiteBody and openInSecondBody and close > dnGapBottom and close < dnGapTop and gapVolumeOk
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Gap Zones, Events & Pattern Visuals
+//---------------------------------------------------------------------------------------------------------------------{
+var array<TasukiGap> gapsArray = array.new<TasukiGap>()
+
+bool bullConfirmed = false
+bool bearConfirmed = false
+bool bullRetest    = false
+bool bearRetest    = false
+bool bullFilled    = false
+bool bearFilled    = false
+
+// Extend active gap zones and monitor them: confirmation beyond the second candle's extreme,
+// first pullback into the unfilled gap, and the complete fill that voids the pattern
+if array.size(gapsArray) > 0
+    for i = array.size(gapsArray) - 1 to 0
+        TasukiGap gapObj = array.get(gapsArray, i)
+        int rightLimit = math.min(bar_index, gapObj.startIndex + zoneMaxBarsInput)
+
+        if not na(gapObj.zoneBox)
+            box.set_right(gapObj.zoneBox, rightLimit)
+
+        if not gapObj.confirmed and not na(gapObj.triggerLine)
+            line.set_x2(gapObj.triggerLine, rightLimit)
+
+        if barstate.isconfirmed
+            bool isBull    = gapObj.dir == 1
+            bool filledNow = isBull ? close < gapObj.zoneBottom : close > gapObj.zoneTop
+
+            if filledNow
+                if not na(gapObj.zoneBox)
+                    box.set_border_color(gapObj.zoneBox, color.new(invalidColorInput, ZONE_BORDER_TRANSP))
+                    box.set_bgcolor(gapObj.zoneBox, color.new(invalidColorInput, ZONE_FILL_TRANSP))
+                    box.set_border_style(gapObj.zoneBox, line.style_dotted)
+                if not gapObj.confirmed and not na(gapObj.triggerLine)
+                    line.set_color(gapObj.triggerLine, color.new(invalidColorInput, INVALID_LINE_TRANSP))
+                if isBull
+                    bullFilled := true
+                else
+                    bearFilled := true
+                array.remove(gapsArray, i)
+            else
+                // First pullback into the zone after price previously left it in the trend direction
+                bool touchNow = isBull ? low <= gapObj.zoneTop : high >= gapObj.zoneBottom
+                if gapObj.exited and not gapObj.tested and touchNow
+                    gapObj.tested := true
+                    if isBull
+                        bullRetest := true
+                    else
+                        bearRetest := true
+
+                bool exitNow = isBull ? close > gapObj.zoneTop : close < gapObj.zoneBottom
+                if not gapObj.exited and exitNow
+                    gapObj.exited := true
+
+                if not gapObj.confirmed
+                    float confirmPrice = confirmBasisInput == CONF_CLOSE ? close : isBull ? high : low
+                    bool confirmNow    = isBull ? confirmPrice > gapObj.trigger : confirmPrice < gapObj.trigger
+                    if confirmNow
+                        gapObj.confirmed := true
+                        if isBull
+                            bullConfirmed := true
+                        else
+                            bearConfirmed := true
+
+                if bar_index >= gapObj.startIndex + zoneMaxBarsInput
+                    array.remove(gapsArray, i)
+
+// Register a completed pattern once the third candle is confirmed
+if (upTasuki or dnTasuki) and barstate.isconfirmed
+    bool  isBull     = upTasuki
+    int   patternDir = isBull ? 1 : -1
+    float zoneTop    = isBull ? upGapTop : dnGapTop
+    float zoneBottom = isBull ? upGapBottom : dnGapBottom
+    float triggerLvl = isBull ? high[1] : low[1]
+    color dirColor   = isBull ? bullColorInput : bearColorInput
+
+    box zoneBoxId = na
+    if showZonesInput
+        zoneBoxId := box.new(bar_index - 2, zoneTop, bar_index, zoneBottom, border_color = color.new(dirColor, ZONE_BORDER_TRANSP), bgcolor = color.new(dirColor, ZONE_FILL_TRANSP))
+
+    line triggerLineId = na
+    if showTriggerInput
+        triggerLineId := line.new(bar_index - 1, triggerLvl, bar_index, triggerLvl, color = dirColor, style = line.style_dotted)
+
+    array.push(gapsArray, TasukiGap.new(zoneBoxId, triggerLineId, zoneTop, zoneBottom, triggerLvl, patternDir, bar_index))
+
+    if showLabelsInput
+        if isBull
+            string tipText = "Upside Tasuki Gap\nGap zone: " + str.tostring(zoneBottom, format.mintick) + " - " + str.tostring(zoneTop, format.mintick) + "\nContinuation confirms beyond " + str.tostring(triggerLvl, format.mintick) + "\nA close below " + str.tostring(zoneBottom, format.mintick) + " fills the gap and voids the pattern"
+            label.new(bar_index, low, "Tasuki Gap", style = label.style_label_up, color = color.new(dirColor, 0), textcolor = chart.bg_color, size = size.small, tooltip = tipText)
+        else
+            string tipText = "Downside Tasuki Gap\nGap zone: " + str.tostring(zoneBottom, format.mintick) + " - " + str.tostring(zoneTop, format.mintick) + "\nContinuation confirms beyond " + str.tostring(triggerLvl, format.mintick) + "\nA close above " + str.tostring(zoneTop, format.mintick) + " fills the gap and voids the pattern"
+            label.new(bar_index, high, "Tasuki Gap", style = label.style_label_down, color = color.new(dirColor, 0), textcolor = chart.bg_color, size = size.small, tooltip = tipText)
+
+// Trend filter context
+plot(showTrendInput and trendTypeInput != "None" ? trendMa : na, "Trend MA", color = trendColorInput, linewidth = 1)
+
+// Event markers
+plotshape(showConfirmInput and bullConfirmed, "Bullish Continuation Confirmed", shape.triangleup, location.belowbar, color.new(bullColorInput, 0), size = size.tiny)
+plotshape(showConfirmInput and bearConfirmed, "Bearish Continuation Confirmed", shape.triangledown, location.abovebar, color.new(bearColorInput, 0), size = size.tiny)
+plotshape(showRetestInput and bullRetest, "Upside Gap Retest", shape.circle, location.belowbar, color.new(bullColorInput, 0), size = size.tiny)
+plotshape(showRetestInput and bearRetest, "Downside Gap Retest", shape.circle, location.abovebar, color.new(bearColorInput, 0), size = size.tiny)
+plotshape(showFillInput and bullFilled, "Upside Gap Filled", shape.xcross, location.belowbar, color.new(invalidColorInput, 0), size = size.tiny)
+plotshape(showFillInput and bearFilled, "Downside Gap Filled", shape.xcross, location.abovebar, color.new(invalidColorInput, 0), size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(upTasuki and barstate.isconfirmed, "Upside Tasuki Gap", "Upside Tasuki Gap on {{ticker}} ({{interval}}): the black third candle pressed into the gap without filling it - gap defended, bullish continuation expected")
+
+alertcondition(dnTasuki and barstate.isconfirmed, "Downside Tasuki Gap", "Downside Tasuki Gap on {{ticker}} ({{interval}}): the white third candle pressed into the gap without filling it - gap defended, bearish continuation expected")
+
+alertcondition(bullConfirmed, "Bullish Continuation Confirmed", "Upside Tasuki Gap on {{ticker}} ({{interval}}): price moved beyond the second candle's high - continuation confirmed")
+
+alertcondition(bearConfirmed, "Bearish Continuation Confirmed", "Downside Tasuki Gap on {{ticker}} ({{interval}}): price moved beyond the second candle's low - continuation confirmed")
+
+alertcondition(bullRetest, "Upside Gap Retested", "Upside Tasuki Gap on {{ticker}} ({{interval}}): first pullback into the unfilled gap - defense expected on first touch")
+
+alertcondition(bearRetest, "Downside Gap Retested", "Downside Tasuki Gap on {{ticker}} ({{interval}}): first bounce into the unfilled gap - defense expected on first touch")
+
+alertcondition(bullFilled, "Upside Gap Filled", "Upside Tasuki Gap on {{ticker}} ({{interval}}): a close below the gap filled it completely - pattern invalidated, character change")
+
+alertcondition(bearFilled, "Downside Gap Filled", "Downside Tasuki Gap on {{ticker}} ({{interval}}): a close above the gap filled it completely - pattern invalidated, character change")
+
+//---------------------------------------------------------------------------------------------------------------------}

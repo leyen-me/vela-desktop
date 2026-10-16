@@ -1,0 +1,192 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Volatility Ratio", shorttitle = "Volatility Ratio", overlay = false, format = format.price, precision = 2)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+RATIO_COLOR       = #787b86 // calm readings - the ratio well below its threshold
+HEAT_COLOR        = #f23645 // hot readings - the ratio at and above its threshold (expansion, wide-range bars)
+EVENT_COLOR       = #ff9800 // the one accent - wide-range event-bar diamonds
+THRESHOLD_COLOR   = #787b86 // dashed threshold line
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+FILL_VALUE_TRANSP = 50      // gradient transparency at the ratio value
+FILL_ZERO_TRANSP  = 100     // gradient transparency at zero
+
+MODE_WRB = "Wide-Range Bar (Schwager)"
+MODE_SVL = "Short vs Long Volatility"
+
+BASE_ATR  = "Average True Range"
+BASE_SPAN = "Window Span"
+
+BASIS_ATR   = "ATR"
+BASIS_STDEV = "Standard Deviation"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+modeInput = input.string(MODE_WRB, "Ratio Mode", options = [MODE_WRB, MODE_SVL], group = "Volatility Ratio",
+     tooltip = "Construction of the ratio. 'Wide-Range Bar (Schwager)' divides the current bar's true range by the trailing window's volatility baseline, flagging bars that cover an outsized share of recent movement. 'Short vs Long Volatility' divides short-lookback volatility by long-lookback volatility - above 1 the market runs hotter than its own norm (expansion), below 1 it is cooling (contraction).")
+
+baselineLengthInput = input.int(14, "Baseline Length", minval = 1, group = MODE_WRB,
+     tooltip = "Trailing lookback the current bar is measured against - the commonly used span is 10-15 bars, roughly two to three weeks on daily charts. The baseline is taken on the prior bar, so a bar is never compared against itself. Longer baselines are steadier but slower to accept a new volatility level as normal.")
+
+baselineTypeInput = input.string(BASE_ATR, "Baseline Type", options = [BASE_ATR, BASE_SPAN], group = MODE_WRB,
+     tooltip = "Denominator of the ratio. 'Average True Range' divides today's true range by the window's ATR - with this baseline the cited wide-ranging-day convention is a reading near 2. 'Window Span' divides by the full true span of the trailing window, gap-adjusted highest high to lowest low, which runs on a smaller scale and needs lower cutoffs.")
+
+eventThresholdInput = input.float(2.0, "Event Threshold", minval = 0, step = 0.1, group = MODE_WRB,
+     tooltip = "Ratio level above which a bar is flagged as a wide-range volatility event. Near 2 - a bar roughly double the recent typical bar - is the commonly cited convention with the Average True Range baseline. It is a convention rather than a law, so calibrate against the symbol's own history and use lower cutoffs with the Window Span baseline.")
+
+showEventsInput = input.bool(true, "Mark Event Bars", group = MODE_WRB,
+     tooltip = "Draws a diamond at the top of the pane on wide-range event bars (Wide-Range Bar mode only). Such bars often coincide with news, breakouts, or capitulation; the ratio measures size only, so read the bar's close location and surrounding structure for the directional hint.")
+
+shortLengthInput = input.int(5, "Short Length", minval = 1, group = MODE_SVL,
+     tooltip = "Fast volatility lookback - the numerator of the short-over-long ratio. Pairs with a long window several times its size, such as 5 against 20.")
+
+longLengthInput = input.int(20, "Long Length", minval = 2, group = MODE_SVL,
+     tooltip = "Slow baseline lookback - the denominator of the short-over-long ratio. Longer baselines are steadier but slower to accept a new volatility level as normal.")
+
+basisInput = input.string(BASIS_ATR, "Volatility Basis", options = [BASIS_ATR, BASIS_STDEV], group = MODE_SVL,
+     tooltip = "Volatility measure used on both sides of the short-over-long ratio: ATR, true-range based so opening gaps count toward bar size, or the Standard Deviation of the selected source.")
+
+sourceInput = input.source(close, "Stdev Source", group = MODE_SVL,
+     tooltip = "Price series the Standard Deviation basis is computed on. Ignored when the basis is ATR.")
+
+showDashInput = input.bool(true, "Show Dashboard", group = "Dashboard",
+     tooltip = "Displays the current ratio, its state against the active threshold, and where the current bar closed within its range - the ratio says something unusual happened, the close supplies the directional hint.")
+
+dashPosInput = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], inline = "dash", group = "Dashboard",
+     tooltip = "Corner of the pane the dashboard is anchored to.")
+
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], inline = "dash", group = "Dashboard",
+     tooltip = "Dashboard text size.")
+
+ratioColorInput = input.color(RATIO_COLOR, "Ratio", inline = "ratio", group = "Style",
+     tooltip = "Color of the ratio line and its gradient fill while readings sit well below the threshold. The measure is built entirely from range sizes and carries no directional information.")
+
+heatColorInput = input.color(HEAT_COLOR, "Hot", inline = "ratio", group = "Style",
+     tooltip = "Color the line and fill blend into as the ratio approaches and exceeds the active threshold - the Event Threshold in Wide-Range Bar mode, the 1 line in Short vs Long mode.")
+
+eventColorInput = input.color(EVENT_COLOR, "Event Bars", group = "Style",
+     tooltip = "Color of the wide-range event-bar diamonds at the top of the pane.")
+
+thresholdColorInput = input.color(THRESHOLD_COLOR, "Threshold", group = "Style",
+     tooltip = "Color of the dashed threshold line - the Event Threshold in Wide-Range Bar mode, the 1 line in Short vs Long mode.")
+
+gradientInput = input.bool(true, "Gradient Fill", group = "Style",
+     tooltip = "Fills the area between zero and the ratio with a vertical gradient - fully transparent at zero, strongest at the current value.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+getTablePosition(positionText) =>
+    switch positionText
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        => position.bottom_left
+
+getTextSize(sizeText) =>
+    switch sizeText
+        "Tiny"  => size.tiny
+        "Small" => size.small
+        => size.normal
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+isWrbMode = modeInput == MODE_WRB
+
+// Current bar true range - preferred over the plain high-low span so opening gaps count toward bar size
+trueRange = ta.tr(true)
+
+// Wide-range-bar baselines, both measured on the prior bar so a bar never inflates its own reference.
+// 'Window Span' is the true span of the trailing window - highest high to lowest low, extended to the
+// close preceding the window so gaps into the window count
+atrBaseline    = ta.atr(baselineLengthInput)
+windowHigh     = ta.highest(high, baselineLengthInput)[1]
+windowLow      = ta.lowest(low, baselineLengthInput)[1]
+preWindowClose = close[baselineLengthInput + 1]
+spanTop        = na(preWindowClose) ? windowHigh : math.max(windowHigh, preWindowClose)
+spanBottom     = na(preWindowClose) ? windowLow  : math.min(windowLow,  preWindowClose)
+windowSpan     = spanTop - spanBottom
+
+wrbBaseline = baselineTypeInput == BASE_ATR ? atrBaseline[1] : windowSpan
+wrbRatio    = not na(wrbBaseline) and wrbBaseline > 0 ? trueRange / wrbBaseline : na
+
+// Short-over-long construction - the same volatility measure on both sides keeps the ratio dimensionless,
+// so readings are comparable across symbols
+shortAtr   = ta.atr(shortLengthInput)
+longAtr    = ta.atr(longLengthInput)
+shortStdev = ta.stdev(sourceInput, shortLengthInput)
+longStdev  = ta.stdev(sourceInput, longLengthInput)
+
+shortVol = basisInput == BASIS_ATR ? shortAtr : shortStdev
+longVol  = basisInput == BASIS_ATR ? longAtr  : longStdev
+slRatio  = not na(longVol) and longVol > 0 ? shortVol / longVol : na
+
+// Active ratio for the pane - the short-over-long form's natural threshold is the 1 line
+ratio = isWrbMode ? wrbRatio : slRatio
+
+// Events - wide-range bars exceed the event threshold; short-over-long regime flips cross the 1 line
+wideRangeBar = not na(wrbRatio) and wrbRatio > eventThresholdInput
+slCrossAbove = ta.crossover(slRatio, 1)
+slCrossBelow = ta.crossunder(slRatio, 1)
+
+// Close location within the bar's range - the ratio measures size only, the close supplies the directional hint
+closeInRange = high != low ? (close - low) / (high - low) * 100 : na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+// State coloring - calm color well below the active threshold, blending into the hot color from half the threshold up
+activeThreshold = isWrbMode ? eventThresholdInput : 1.0
+ratioColor      = na(ratio) ? ratioColorInput : color.from_gradient(ratio, activeThreshold * 0.5, activeThreshold, ratioColorInput, heatColorInput)
+
+fillTopColor    = gradientInput ? color.new(ratioColor, FILL_VALUE_TRANSP) : na
+fillBottomColor = gradientInput ? color.new(ratioColor, FILL_ZERO_TRANSP) : na
+
+ratioPlotId = plot(ratio, "Volatility Ratio", color = ratioColor, linewidth = 1)
+zeroPlotId  = plot(0, "Zero Line", color = color.new(THRESHOLD_COLOR, 70), linewidth = 1)
+
+fill(ratioPlotId, zeroPlotId, top_value = math.max(nz(ratio), 0), bottom_value = 0, top_color = fillTopColor, bottom_color = fillBottomColor, title = "Ratio Gradient Fill")
+
+hline(isWrbMode ? eventThresholdInput : 1.0, "Threshold", color = thresholdColorInput, linestyle = hline.style_dashed)
+
+plotshape(showEventsInput and isWrbMode and wideRangeBar, "Event Bars", shape.diamond, location.top, eventColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dashTable = na
+
+if barstate.isfirst and showDashInput
+    dashTable := table.new(getTablePosition(dashPosInput), 2, 3, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+if barstate.islast and showDashInput and not na(dashTable)
+    ratioText  = na(ratio) ? "-" : str.tostring(ratio, "#.##")
+    stateText  = na(ratio) ? "-" : isWrbMode ? (wideRangeBar ? "Wide-Range Event" : "Normal") : (ratio > 1 ? "Expansion (> 1)" : "Contraction (< 1)")
+    stateColor = na(ratio) ? DASH_TEXT : isWrbMode ? (wideRangeBar ? eventColorInput : DASH_TEXT) : (ratio > 1 ? heatColorInput : ratioColorInput)
+    closeText  = na(closeInRange) ? "-" : str.tostring(closeInRange, "#") + "%"
+    labelColor   = DASH_HEADER
+    dashTextSize = getTextSize(dashSizeInput)
+    table.cell(dashTable, 0, 0, "Ratio", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 0, ratioText, text_color = ratioColor, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 1, "State", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 1, stateText, text_color = stateColor, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 2, "Close in Range", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 2, closeText, text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(wideRangeBar, "Wide-Range Bar", "Wide-range volatility event on {{ticker}} - the bar's true range exceeded the event threshold against its trailing baseline ({{interval}})")
+alertcondition(slCrossAbove, "Expansion - Ratio Crossed Above 1", "Volatility Ratio on {{ticker}} - short-window volatility crossed above its long baseline, expansion under way ({{interval}})")
+alertcondition(slCrossBelow, "Contraction - Ratio Crossed Below 1", "Volatility Ratio on {{ticker}} - short-window volatility crossed back below its long baseline, conditions cooling ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

@@ -1,0 +1,330 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Effort vs Result", shorttitle = "Effort vs Result", overlay = false, format = format.price, precision = 2)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+EFFORT_DIV_COLOR = #f23645 // effort exceeding result - absorption warning, heavy volume going unrewarded
+EASE_DIV_COLOR   = #089981 // result exceeding effort - ease of movement, price covering ground efficiently
+EFFORT_COLOR     = #787b86 // effort component plot
+RESULT_COLOR     = #ff9800 // result component plot - the one accent
+NEUTRAL_COLOR    = #787b86 // harmony baseline
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+FILL_VALUE_TRANSP = 50  // gradient transparency at the balance value
+FILL_ZERO_TRANSP  = 100 // gradient transparency at the harmony line
+
+BASIS_BOTH     = "Range + Net Progress"
+BASIS_PROGRESS = "Net Progress"
+BASIS_RANGE    = "Bar Range"
+
+TXT_NA = "-"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+normLengthInput = input.int(20, "Normalization Length", minval = 2, group = "Effort vs Result",
+     tooltip = "Window defining what is average. Effort is volume measured against its simple moving average, result is the bar's true range measured against ATR and its net progress measured against its own average, all over this window.")
+
+resultBasisInput = input.string(BASIS_BOTH, "Result Basis", options = [BASIS_BOTH, BASIS_PROGRESS, BASIS_RANGE], group = "Effort vs Result",
+     tooltip = "What counts as a bar's result. 'Net Progress' uses the close-to-close change, 'Bar Range' uses the true range, and 'Range + Net Progress' averages the two, so a wide bar that closes back where it started still shows little result.")
+
+highMultInput = input.float(1.5, "High Threshold", minval = 1, step = 0.1, group = "Effort vs Result",
+     tooltip = "Multiple of its average above which a bar's effort or result counts as high. With the default a bar needs volume or movement at least one and a half times its average.")
+
+lowMultInput = input.float(0.5, "Low Threshold", minval = 0, maxval = 1, step = 0.1, group = "Effort vs Result",
+     tooltip = "Multiple of its average below which a bar's effort or result counts as lacking.")
+
+showFlagsInput = input.bool(true, "Flag Effort/Result Divergences", group = "Bar Flags",
+     tooltip = "Marks strongly divergent bars on the price chart. A diamond flags effort without result - a high-volume bar with a narrow spread and little net progress, an absorption warning. A circle flags result without effort - price covering ground on very thin volume, ease of movement. Markers sit on the side the bar was heading.")
+
+pivotLengthInput = input.int(5, "Swing Detection Length", minval = 1, group = "Swing Legs",
+     tooltip = "Pivot length used to detect swing legs. Each completed leg's total volume (effort) is compared with the ground it covered in ATR units (result) against the previous leg in the same direction. A leg is confirmed this many bars after its pivot.")
+
+showDashInput = input.bool(true, "Show Dashboard", group = "Dashboard",
+     tooltip = "Summarizes the latest bar-level read and the effort versus result of the most recent completed swing leg.")
+
+dashPosInput = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = "Dashboard",
+     tooltip = "Dashboard position on the pane.")
+
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = "Dashboard",
+     tooltip = "Dashboard text size.")
+
+effortDivColorInput = input.color(EFFORT_DIV_COLOR, "Effort > Result", group = "Style",
+     tooltip = "Color used when effort exceeds result - heavy volume producing little price progress, an absorption warning.")
+
+easeDivColorInput = input.color(EASE_DIV_COLOR, "Result > Effort", group = "Style",
+     tooltip = "Color used when result exceeds effort - price traveling far on thin volume, ease of movement.")
+
+showComponentsInput = input.bool(false, "Show Effort & Result Components", group = "Style",
+     tooltip = "Plots the normalized effort (volume over its average) and result (movement over its average) series individually, both expressed as multiples of their own averages.")
+
+effortColorInput = input.color(EFFORT_COLOR, "Effort", inline = "components", group = "Style",
+     tooltip = "Colors of the effort and result component plots.")
+
+resultColorInput = input.color(RESULT_COLOR, "Result", inline = "components", group = "Style")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+//Compact human-readable amount, for leg volume totals
+formatAmount(float value) =>
+    float absValue = math.abs(value)
+    absValue >= 1e12 ? str.tostring(value / 1e12, "#.##") + "T" :
+      absValue >= 1e9 ? str.tostring(value / 1e9, "#.##") + "B" :
+      absValue >= 1e6 ? str.tostring(value / 1e6, "#.##") + "M" :
+      absValue >= 1e3 ? str.tostring(value / 1e3, "#.##") + "K" :
+      str.tostring(value, "#.##")
+
+//Signed percentage change
+formatChange(float pct) =>
+    na(pct) ? TXT_NA : (pct >= 0 ? "+" : "") + str.tostring(pct, "#.#") + "%"
+
+//Share of a reference value
+formatShare(float pct) =>
+    na(pct) ? TXT_NA : str.tostring(pct, "#") + "%"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Effort & Result Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+float cumulativeVolume = ta.cum(nz(volume))
+
+if barstate.islast and cumulativeVolume == 0
+    runtime.error("No volume is available for this symbol. Effort vs result requires volume data.")
+
+//Effort - volume measured against its average
+float averageVolume = ta.sma(nz(volume), normLengthInput)
+float effortRel     = averageVolume > 0 ? nz(volume) / averageVolume : na
+
+//Result - the bar's price movement measured against its average
+float trueRangeValue  = ta.tr(true)
+float atrValue        = ta.atr(normLengthInput)
+float netProgress     = math.abs(close - nz(close[1], close))
+float averageProgress = ta.sma(netProgress, normLengthInput)
+
+float rangeRel    = atrValue > 0 ? trueRangeValue / atrValue : na
+float progressRel = averageProgress > 0 ? netProgress / averageProgress : na
+
+float resultRel = switch resultBasisInput
+    BASIS_PROGRESS => progressRel
+    BASIS_RANGE    => rangeRel
+    =>                math.avg(rangeRel, progressRel)
+
+//Balance - negative when heavy effort goes unrewarded, positive when price travels with little effort behind it
+float balance = resultRel - effortRel
+
+//Bar-level reads - direction is the side the bar was attempting
+float closeDelta = nz(close - close[1])
+bool  upEffort   = closeDelta > 0 or (closeDelta == 0 and close >= open)
+
+bool readOk         = not na(effortRel) and not na(resultRel)
+bool effortNoResult = readOk and effortRel >= highMultInput and resultRel <= lowMultInput
+bool resultNoEffort = readOk and resultRel >= highMultInput and effortRel <= lowMultInput
+bool strongHarmony  = readOk and effortRel >= highMultInput and resultRel >= highMultInput
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Swing Legs - effort against ground covered
+//---------------------------------------------------------------------------------------------------------------------{
+float pivotHighPrice = ta.pivothigh(pivotLengthInput, pivotLengthInput)
+float pivotLowPrice  = ta.pivotlow(pivotLengthInput, pivotLengthInput)
+
+int   pivotBar = bar_index - pivotLengthInput
+float pivotCum = cumulativeVolume[pivotLengthInput]
+float pivotAtr = atrValue[pivotLengthInput]
+
+//Forming leg state - the anchor is the confirmed pivot the current leg started from
+var int   legDir      = 0
+var float anchorPrice = na
+var float anchorCum   = na
+var int   anchorBar   = na
+
+//Previous completed leg statistics, per direction and overall
+var float prevUpVolume   = na
+var float prevUpGround   = na
+var float prevDownVolume = na
+var float prevDownGround = na
+var float prevLegVolume  = na
+var float prevLegGround  = na
+
+//Latest completed leg, feeding the dashboard
+var int   lastLegDir         = 0
+var float lastLegVolume      = na
+var float lastLegGround      = na
+var float lastLegVolumeChg   = na
+var float lastLegGroundChg   = na
+var float lastLegVolumeShare = na
+var float lastLegGroundShare = na
+var int   swingReadCode      = 0
+
+bool swingDivergenceUp   = false
+bool swingDivergenceDown = false
+
+if not na(pivotHighPrice)
+    if legDir == 1 and pivotBar > anchorBar
+        //A pivot high completes the up leg that started at the anchored low
+        float legVolume = pivotCum - anchorCum
+        float legGround = pivotAtr > 0 ? (pivotHighPrice - anchorPrice) / pivotAtr : na
+
+        swingDivergenceUp  := not na(prevUpVolume) and not na(prevUpGround) and not na(legGround) and legVolume > prevUpVolume and legGround < prevUpGround
+        lastLegDir         := 1
+        lastLegVolume      := legVolume
+        lastLegGround      := legGround
+        lastLegVolumeChg   := prevUpVolume > 0 ? (legVolume / prevUpVolume - 1) * 100 : na
+        lastLegGroundChg   := prevUpGround > 0 and not na(legGround) ? (legGround / prevUpGround - 1) * 100 : na
+        lastLegVolumeShare := prevLegVolume > 0 ? legVolume / prevLegVolume * 100 : na
+        lastLegGroundShare := prevLegGround > 0 and not na(legGround) ? legGround / prevLegGround * 100 : na
+        swingReadCode      := not na(lastLegVolumeChg) and not na(lastLegGroundChg) ? (lastLegVolumeChg > 0 and lastLegGroundChg < 0 ? 1 : lastLegVolumeChg < 0 and lastLegGroundChg > 0 ? 2 : 3) : 0
+        prevUpVolume       := legVolume
+        prevUpGround       := legGround
+        prevLegVolume      := legVolume
+        prevLegGround      := legGround
+        legDir             := -1
+        anchorPrice        := pivotHighPrice
+        anchorCum          := pivotCum
+        anchorBar          := pivotBar
+    else if legDir == -1 and pivotHighPrice > anchorPrice
+        //Consecutive swing high - the forming down leg restarts from the higher high
+        anchorPrice := pivotHighPrice
+        anchorCum   := pivotCum
+        anchorBar   := pivotBar
+    else if legDir == 0
+        legDir      := -1
+        anchorPrice := pivotHighPrice
+        anchorCum   := pivotCum
+        anchorBar   := pivotBar
+
+if not na(pivotLowPrice)
+    if legDir == -1 and pivotBar > anchorBar
+        //A pivot low completes the down leg that started at the anchored high
+        float legVolume = pivotCum - anchorCum
+        float legGround = pivotAtr > 0 ? (anchorPrice - pivotLowPrice) / pivotAtr : na
+
+        swingDivergenceDown := not na(prevDownVolume) and not na(prevDownGround) and not na(legGround) and legVolume > prevDownVolume and legGround < prevDownGround
+        lastLegDir          := -1
+        lastLegVolume       := legVolume
+        lastLegGround       := legGround
+        lastLegVolumeChg    := prevDownVolume > 0 ? (legVolume / prevDownVolume - 1) * 100 : na
+        lastLegGroundChg    := prevDownGround > 0 and not na(legGround) ? (legGround / prevDownGround - 1) * 100 : na
+        lastLegVolumeShare  := prevLegVolume > 0 ? legVolume / prevLegVolume * 100 : na
+        lastLegGroundShare  := prevLegGround > 0 and not na(legGround) ? legGround / prevLegGround * 100 : na
+        swingReadCode       := not na(lastLegVolumeChg) and not na(lastLegGroundChg) ? (lastLegVolumeChg > 0 and lastLegGroundChg < 0 ? 1 : lastLegVolumeChg < 0 and lastLegGroundChg > 0 ? 2 : 3) : 0
+        prevDownVolume      := legVolume
+        prevDownGround      := legGround
+        prevLegVolume       := legVolume
+        prevLegGround       := legGround
+        legDir              := 1
+        anchorPrice         := pivotLowPrice
+        anchorCum           := pivotCum
+        anchorBar           := pivotBar
+    else if legDir == 1 and pivotLowPrice < anchorPrice
+        //Consecutive swing low - the forming up leg restarts from the lower low
+        anchorPrice := pivotLowPrice
+        anchorCum   := pivotCum
+        anchorBar   := pivotBar
+    else if legDir == 0
+        legDir      := 1
+        anchorPrice := pivotLowPrice
+        anchorCum   := pivotCum
+        anchorBar   := pivotBar
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+color balanceColor = balance >= 0 ? easeDivColorInput : effortDivColorInput
+
+balancePlotId = plot(balance, "Effort/Result Balance", color = balanceColor, linewidth = 1)
+anchorPlotId  = plot(0, "Harmony Baseline", color = color.new(NEUTRAL_COLOR, 50), linewidth = 1)
+
+fill(balancePlotId, anchorPlotId, top_value = math.max(balance, 0), bottom_value = math.min(balance, 0), top_color = balance >= 0 ? color.new(easeDivColorInput, FILL_VALUE_TRANSP) : color.new(effortDivColorInput, FILL_ZERO_TRANSP), bottom_color = balance >= 0 ? color.new(easeDivColorInput, FILL_ZERO_TRANSP) : color.new(effortDivColorInput, FILL_VALUE_TRANSP), title = "Balance Gradient Fill")
+
+plot(showComponentsInput ? effortRel : na, "Effort (× Average)", color = effortColorInput, linewidth = 1)
+plot(showComponentsInput ? resultRel : na, "Result (× Average)", color = resultColorInput, linewidth = 1)
+
+plotshape(showFlagsInput and effortNoResult and upEffort, "Effort Without Result (Up)", shape.diamond, location.abovebar, color = effortDivColorInput, size = size.tiny, force_overlay = true)
+plotshape(showFlagsInput and effortNoResult and not upEffort, "Effort Without Result (Down)", shape.diamond, location.belowbar, color = effortDivColorInput, size = size.tiny, force_overlay = true)
+plotshape(showFlagsInput and resultNoEffort and upEffort, "Result Without Effort (Up)", shape.circle, location.abovebar, color = easeDivColorInput, size = size.tiny, force_overlay = true)
+plotshape(showFlagsInput and resultNoEffort and not upEffort, "Result Without Effort (Down)", shape.circle, location.belowbar, color = easeDivColorInput, size = size.tiny, force_overlay = true)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+dashPosition = switch dashPosInput
+    "Top Left"     => position.top_left
+    "Bottom Right" => position.bottom_right
+    "Bottom Left"  => position.bottom_left
+    =>                position.top_right
+
+dashTextSize = switch dashSizeInput
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    =>          size.small
+
+var table dashTable = table.new(dashPosition, 2, 8
+  , bgcolor      = DASH_BG
+  , frame_color  = DASH_FRAME
+  , frame_width  = 1
+  , border_width = 0)
+
+if barstate.islast and showDashInput
+    color labelColor = DASH_HEADER
+    color valueColor = DASH_TEXT
+
+    string barReadText = effortNoResult ? "Effort > result, absorption warning" :
+      resultNoEffort ? "Result > effort, ease of movement" :
+      strongHarmony ? "Harmony, strong effort & result" :
+      readOk ? "Harmony, effort matches result" : TXT_NA
+    color barReadColor = effortNoResult ? effortDivColorInput : resultNoEffort ? easeDivColorInput : valueColor
+
+    string legText = lastLegDir == 0 ? TXT_NA :
+      (lastLegDir == 1 ? "Up / " : "Down / ") + formatAmount(lastLegVolume) + " vol / " +
+      (na(lastLegGround) ? TXT_NA : str.tostring(lastLegGround, "#.##") + " ATR")
+
+    string sameLegLabel = lastLegDir == -1 ? "Vs Prior Down Leg" : "Vs Prior Up Leg"
+    string sameLegText  = lastLegDir == 0 ? TXT_NA : formatChange(lastLegVolumeChg) + " effort / " + formatChange(lastLegGroundChg) + " ground"
+    string priorLegText = lastLegDir == 0 ? TXT_NA : formatShare(lastLegVolumeShare) + " effort / " + formatShare(lastLegGroundShare) + " ground"
+
+    string swingReadText = swingReadCode == 1 ? "More effort, less ground" :
+      swingReadCode == 2 ? "Less effort, more ground" :
+      swingReadCode == 3 ? "Effort and result in gear" : TXT_NA
+    color swingReadColor = swingReadCode == 1 ? effortDivColorInput : swingReadCode == 2 ? easeDivColorInput : valueColor
+
+    table.cell(dashTable, 0, 0, "Effort vs Result", text_color = DASH_TEXT, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 0, "vs " + str.tostring(normLengthInput) + "-bar avg", text_color = DASH_HEADER, text_halign = text.align_right, text_size = dashTextSize)
+
+    table.cell(dashTable, 0, 1, "Bar Effort", text_color = labelColor, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 1, readOk ? str.tostring(effortRel, "#.##") + "× avg" : TXT_NA, text_color = valueColor, text_halign = text.align_right, text_size = dashTextSize)
+
+    table.cell(dashTable, 0, 2, "Bar Result", text_color = labelColor, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 2, readOk ? str.tostring(resultRel, "#.##") + "× avg" : TXT_NA, text_color = valueColor, text_halign = text.align_right, text_size = dashTextSize)
+
+    table.cell(dashTable, 0, 3, "Bar Read", text_color = labelColor, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 3, barReadText, text_color = barReadColor, text_halign = text.align_right, text_size = dashTextSize)
+
+    table.cell(dashTable, 0, 4, "Last Leg", text_color = labelColor, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 4, legText, text_color = valueColor, text_halign = text.align_right, text_size = dashTextSize)
+
+    table.cell(dashTable, 0, 5, sameLegLabel, text_color = labelColor, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 5, sameLegText, text_color = valueColor, text_halign = text.align_right, text_size = dashTextSize)
+
+    table.cell(dashTable, 0, 6, "Vs Prior Leg", text_color = labelColor, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 6, priorLegText, text_color = valueColor, text_halign = text.align_right, text_size = dashTextSize)
+
+    table.cell(dashTable, 0, 7, "Swing Read", text_color = labelColor, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 7, swingReadText, text_color = swingReadColor, text_halign = text.align_right, text_size = dashTextSize)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(effortNoResult and upEffort, "Effort Without Result (Up)", "Heavy upward effort with little result on {{ticker}} - possible supply absorbing the advance ({{interval}})")
+alertcondition(effortNoResult and not upEffort, "Effort Without Result (Down)", "Heavy downward effort with little result on {{ticker}} - possible demand absorbing the decline ({{interval}})")
+alertcondition(resultNoEffort, "Result Without Effort", "Price covered unusual ground on thin volume on {{ticker}} - ease of movement, the move may be fragile ({{interval}})")
+alertcondition(swingDivergenceUp, "Swing Effort/Result Divergence (Up Legs)", "Up leg needed more volume to cover less ground than the prior up leg on {{ticker}} - trend exhaustion warning ({{interval}})")
+alertcondition(swingDivergenceDown, "Swing Effort/Result Divergence (Down Legs)", "Down leg needed more volume to cover less ground than the prior down leg on {{ticker}} - trend exhaustion warning ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

@@ -1,0 +1,567 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Profile Shape Taxonomy", "Profile Shape Taxonomy", overlay = true
+  , max_labels_count = 100
+  , max_boxes_count  = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+int SHAPE_NONE = 0
+int SHAPE_D    = 1
+int SHAPE_P    = 2
+int SHAPE_B    = 3
+int SHAPE_DD   = 4
+
+int RECENT_SHAPES_MAX = 8
+
+color COLOR_HIDDEN = #00000000
+
+string GRP_PRO = "Profile"
+string GRP_CLS = "Classification"
+string GRP_DSP = "Display"
+string GRP_STL = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Inputs
+//---------------------------------------------------------------------------------------------------------------------{
+anchorInput = input.string("Day", "Profile Anchor", options = ["Day", "Week", "Month"], group = GRP_PRO
+  , tooltip = "Period each profile covers. The classic shape labels (D, P, b, double distribution) describe a single session, so 'Day' on an intraday chart is the canonical setting. Weekly/monthly anchors apply the same taxonomy to composite profiles.")
+
+rowsInput = input.int(25, "Profile Rows", minval = 10, maxval = 50, group = GRP_PRO
+  , tooltip = "Number of price rows the session range is split into when building the profile. More rows resolve finer structure but need more bars per session to fill in.")
+
+weightInput = input.string("Volume", "Row Weighting", options = ["Volume", "Time (TPO-style)"], group = GRP_PRO
+  , tooltip = "Weight each row by traded volume (volume profile) or by time spent, one unit per bar (TPO-style). The taxonomy originated in TPO work but both weightings usually produce very similar silhouettes; use Time on symbols without volume data.")
+
+acceptPctInput = input.float(40, "Acceptance Threshold (% of POC row)", minval = 15, maxval = 90, step = 5, group = GRP_CLS
+  , tooltip = "Rows holding at least this percentage of the point-of-control row count as fat: prices where the market spent time and attracted two-sided trade. Contiguous fat rows form the profile's bulges (acceptance zones).")
+
+thinPctInput = input.float(20, "Thin Threshold (% of POC row)", minval = 5, maxval = 50, step = 5, group = GRP_CLS
+  , tooltip = "Rows below this percentage of the point-of-control row count as thin, single-print-like rejection. The band between two candidate distributions must average below it to qualify as a double-distribution neck.")
+
+upperPctInput = input.float(60, "Upper/Lower Portion Boundary (%)", minval = 50, maxval = 90, step = 5, group = GRP_CLS
+  , tooltip = "Where the bulge's volume centroid must sit, as a percentage of the session range measured from the low, for a P-shape (at or above this) or a b-shape (at or below the mirrored level). A centroid in between grades as a D-shape.")
+
+tailPctInput = input.float(20, "Min Tail Span (% of range)", minval = 5, maxval = 45, step = 5, group = GRP_CLS
+  , tooltip = "Minimum span of the thin tail (below a P bulge / above a b bulge) as a percentage of the session range. Without a meaningful rejected tail the profile grades as a D-shape.")
+
+ddSharePctInput = input.float(20, "Min Distribution Share (%)", minval = 5, maxval = 45, step = 5, group = GRP_CLS
+  , tooltip = "Each of the two bulges of a double distribution must hold at least this percentage of total session volume, so minor shelves do not read as a second distribution.")
+
+neckPctInput = input.float(8, "Min Neck Span (% of range)", minval = 4, maxval = 40, step = 2, group = GRP_CLS
+  , tooltip = "Minimum span of the thin neck separating two distributions, as a percentage of the session range, for a double-distribution read.")
+
+minBarsInput = input.int(10, "Min Bars To Classify", minval = 3, maxval = 100, group = GRP_CLS
+  , tooltip = "Bars a session must accumulate before any shape is assigned; earlier the profile is too immature to read.")
+
+firmPctInput = input.float(75, "Firm After Session Progress (%)", minval = 50, maxval = 95, step = 5, group = GRP_CLS
+  , tooltip = "The label stays tentative until the session has completed this percentage of its typical length (average bar count of prior sessions): an early P regularly matures into a D as rotations fill in. The first session on the chart stays tentative until it closes.")
+
+showDevInput = input.bool(true, "Developing Profile", group = GRP_DSP
+  , tooltip = "Draw the live profile of the active session with its tentative/firm shape letter. Intraday reads are provisional by nature - profiles mutate as rotations fill in.")
+
+keepInput = input.int(3, "Completed Profiles Shown", minval = 0, maxval = 8, group = GRP_DSP
+  , tooltip = "Number of most recent completed session profiles kept on the chart, each stamped with its final shape letter.")
+
+extendThinInput = input.bool(true, "Extend Latest Thin Zone", group = GRP_DSP
+  , tooltip = "Extend the rejected band left by the most recent completed session (double-distribution neck, or the thin tail of a P/b day) to the right. Revisits into it tend to move fast, so it is watched as a low-friction zone rather than support.")
+
+showTableInput = input.bool(true, "Dashboard", group = GRP_DSP
+  , tooltip = "Dashboard with the developing shape and its status, the session progress, the acceptance-zone position, the previous session's shape, and the recent shape sequence - a sequence of balance days stacking against a trend helps judge whether the market is preparing to re-price.")
+
+tablePosInput = input.string("Top Right", "Dashboard Position", group = GRP_DSP
+  , options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left", "Middle Right", "Middle Left"]
+  , tooltip = "Position of the dashboard on the chart.")
+
+tableSizeInput = input.string("Small", "Dashboard Size", group = GRP_DSP
+  , options = ["Tiny", "Small", "Normal"]
+  , tooltip = "Text size of the dashboard.")
+
+widthPctInput = input.int(40, "Profile Width (% of session)", minval = 10, maxval = 100, group = GRP_STL
+  , tooltip = "Horizontal width of the point-of-control row as a percentage of the session's bar span; other rows scale proportionally.")
+
+profileColorInput = input.color(#5b9cf6, "Profile", group = GRP_STL, inline = "c1")
+thinColorInput    = input.color(#787b86, "Thin Zone", group = GRP_STL, inline = "c1")
+dColorInput       = input.color(#5b9cf6, "D", group = GRP_STL, inline = "c2")
+pColorInput       = input.color(#089981, "P", group = GRP_STL, inline = "c2")
+bColorInput       = input.color(#f23645, "b", group = GRP_STL, inline = "c3")
+ddColorInput      = input.color(#ff9800, "Double Dist.", group = GRP_STL, inline = "c3")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Human-readable name of a profile shape
+shapeName(int shapeId) =>
+    switch shapeId
+        SHAPE_D  => "D-shape (balance)"
+        SHAPE_P  => "P-shape (acceptance high)"
+        SHAPE_B  => "b-shape (acceptance low)"
+        SHAPE_DD => "Double distribution"
+        => "-"
+
+// Mnemonic letter of a profile shape
+shapeLetter(int shapeId) =>
+    switch shapeId
+        SHAPE_D  => "D"
+        SHAPE_P  => "P"
+        SHAPE_B  => "b"
+        SHAPE_DD => "DD"
+        => "-"
+
+// Auction story behind a profile shape, used in tooltips
+shapeStory(int shapeId) =>
+    switch shapeId
+        SHAPE_D  => "Symmetric bulge in the middle with tapering tails: a balanced, rotational session. Suggests continued balance and responsive trade around value next session."
+        SHAPE_P  => "Fat top, thin lower tail: a fast drive up off the lows that found acceptance high. In a downtrend classically read as short covering rather than fresh buying. The thin tail marks rejected prices."
+        SHAPE_B  => "Fat bottom, thin upper tail: long liquidation early that stabilized and found acceptance low. In an uptrend the mirrored short-covering caution applies. The thin tail marks rejected prices."
+        SHAPE_DD => "Two accepted areas joined by a thin neck of single prints: the auction traded one balance, re-priced quickly, and built a second balance. The neck is a fast-move reference on retest."
+        => "-"
+
+// Accent color of a profile shape
+shapeColor(int shapeId) =>
+    switch shapeId
+        SHAPE_D  => dColorInput
+        SHAPE_P  => pColorInput
+        SHAPE_B  => bColorInput
+        SHAPE_DD => ddColorInput
+        => profileColorInput
+
+// Row index of a price on the current profile grid
+binIdx(float price, float gridLoIn, float rowHIn, int rowsN) =>
+    rowHIn <= 0 ? 0 : math.min(math.max(math.floor((price - gridLoIn) / rowHIn), 0), rowsN - 1)
+
+// Distribute one bar's weight across the rows its range overlaps, proportionally to the overlap
+histAdd(array<float> histArray, float barHi, float barLo, float barW, float gridLoIn, float rowHIn, int rowsN) =>
+    if barW > 0 and rowHIn > 0
+        int r0 = binIdx(barLo, gridLoIn, rowHIn, rowsN)
+        int r1 = binIdx(barHi, gridLoIn, rowHIn, rowsN)
+        if r1 <= r0 or barHi <= barLo
+            array.set(histArray, r0, array.get(histArray, r0) + barW)
+        else
+            float barSpan = barHi - barLo
+            for r = r0 to r1
+                float rowTop    = gridLoIn + (r + 1) * rowHIn
+                float rowBottom = gridLoIn + r * rowHIn
+                float overlap   = math.min(barHi, rowTop) - math.max(barLo, rowBottom)
+                if overlap > 0
+                    array.set(histArray, r, array.get(histArray, r) + barW * overlap / barSpan)
+
+// Rebuild the whole histogram from the stored session bars (grid expanded)
+histRebuild(array<float> histArray, array<float> hiArray, array<float> loArray, array<float> wArray, float gridLoIn, float rowHIn, int rowsN) =>
+    array.fill(histArray, 0.)
+    int n = array.size(hiArray)
+    if n > 0
+        for i = 0 to n - 1
+            histAdd(histArray, array.get(hiArray, i), array.get(loArray, i), array.get(wArray, i), gridLoIn, rowHIn, rowsN)
+
+// Classify a profile silhouette
+// Returns [shape, mainStart, mainEnd, secondStart, secondEnd, neckStart, neckEnd, centroidPos]
+// with row bounds of the bulge(s) and neck (-1 when absent) and the bulge volume centroid as a 0-1 position in the range
+classifyProfile(array<float> histArray, int rowsN) =>
+    int   shapeOut = SHAPE_NONE
+    int   mainS    = -1
+    int   mainE    = -1
+    int   secS     = -1
+    int   secE     = -1
+    int   neckS    = -1
+    int   neckE    = -1
+    float cpos     = na
+    float pocVol   = array.max(histArray)
+    float totVol   = array.sum(histArray)
+    if pocVol > 0 and totVol > 0
+        int   pocRow    = array.indexof(histArray, pocVol)
+        float acceptLvl = acceptPctInput / 100 * pocVol
+        float thinLvl   = thinPctInput / 100 * pocVol
+        int   minNeck   = math.max(1, math.round(neckPctInput / 100 * rowsN))
+        int   minTail   = math.max(1, math.round(tailPctInput / 100 * rowsN))
+        // contiguous runs of fat rows = bulges (acceptance zones)
+        array<int>   startArray = array.new_int()
+        array<int>   endArray   = array.new_int()
+        array<float> volArray   = array.new_float()
+        bool fatRun = false
+        for r = 0 to rowsN - 1
+            float v = array.get(histArray, r)
+            if v >= acceptLvl
+                if not fatRun
+                    array.push(startArray, r)
+                    array.push(endArray, r)
+                    array.push(volArray, 0.)
+                    fatRun := true
+                array.set(endArray, array.size(endArray) - 1, r)
+                array.set(volArray, array.size(volArray) - 1, array.get(volArray, array.size(volArray) - 1) + v)
+            else
+                fatRun := false
+        int clusterCount = array.size(startArray)
+        // two most voluminous bulges holding a significant share of the session
+        int k1 = -1
+        int k2 = -1
+        if clusterCount > 0
+            for k = 0 to clusterCount - 1
+                if array.get(volArray, k) >= ddSharePctInput / 100 * totVol
+                    if k1 == -1 or array.get(volArray, k) > array.get(volArray, k1)
+                        k2 := k1
+                        k1 := k
+                    else if k2 == -1 or array.get(volArray, k) > array.get(volArray, k2)
+                        k2 := k
+        // double distribution: two significant bulges separated by a thin neck
+        if k1 != -1 and k2 != -1
+            int loK  = array.get(startArray, k1) < array.get(startArray, k2) ? k1 : k2
+            int hiK  = loK == k1 ? k2 : k1
+            int gapS = array.get(endArray, loK) + 1
+            int gapE = array.get(startArray, hiK) - 1
+            int gapN = gapE - gapS + 1
+            if gapN >= minNeck
+                float gapSum = 0.
+                for r = gapS to gapE
+                    gapSum += array.get(histArray, r)
+                if gapSum / gapN <= thinLvl
+                    shapeOut := SHAPE_DD
+                    mainS := array.get(startArray, loK)
+                    mainE := array.get(endArray, loK)
+                    secS  := array.get(startArray, hiK)
+                    secE  := array.get(endArray, hiK)
+                    neckS := gapS
+                    neckE := gapE
+                    float wSumAll = 0.
+                    for r = 0 to rowsN - 1
+                        wSumAll += (r + 0.5) * array.get(histArray, r)
+                    cpos := wSumAll / totVol / rowsN
+        // single-bulge taxonomy: D / P / b by where the acceptance zone around the POC sits
+        if shapeOut == SHAPE_NONE and clusterCount > 0
+            int mainK = 0
+            for k = 0 to clusterCount - 1
+                if pocRow >= array.get(startArray, k) and pocRow <= array.get(endArray, k)
+                    mainK := k
+            mainS := array.get(startArray, mainK)
+            mainE := array.get(endArray, mainK)
+            // a tail is only thin if no other acceptance cluster sits inside it
+            bool fatBelow = false
+            bool fatAbove = false
+            for k = 0 to clusterCount - 1
+                if k != mainK
+                    fatBelow := fatBelow or array.get(endArray, k) < mainS
+                    fatAbove := fatAbove or array.get(startArray, k) > mainE
+            float wSum = 0.
+            float vSum = 0.
+            for r = mainS to mainE
+                float v = array.get(histArray, r)
+                wSum += (r + 0.5) * v
+                vSum += v
+            if vSum > 0
+                cpos := wSum / vSum / rowsN
+                int loTailRows = mainS
+                int upTailRows = rowsN - 1 - mainE
+                if cpos * 100 >= upperPctInput and loTailRows >= minTail and not fatBelow
+                    shapeOut := SHAPE_P
+                else if cpos * 100 <= 100 - upperPctInput and upTailRows >= minTail and not fatAbove
+                    shapeOut := SHAPE_B
+                else
+                    shapeOut := SHAPE_D
+    [shapeOut, mainS, mainE, secS, secE, neckS, neckE, cpos]
+
+// Draw a profile as one box per row, appending the boxes to targetArray
+drawProfile(array<box> targetArray, array<float> histArray, int startIdx, int spanBars, float gridLoIn, float rowHIn, int rowsN, int shapeId, int mainS, int mainE, int secS, int secE, int neckS, int neckE) =>
+    float pocVol = array.max(histArray)
+    if rowHIn > 0 and pocVol > 0
+        color accentColor = shapeColor(shapeId)
+        int   maxW = math.max(2, math.round(spanBars * widthPctInput / 100.0))
+        for r = 0 to rowsN - 1
+            float v = array.get(histArray, r)
+            if v > 0
+                int  w = math.max(1, math.round(maxW * v / pocVol))
+                bool inBulge = (r >= mainS and r <= mainE) or (secS >= 0 and r >= secS and r <= secE)
+                bool inThinZone = switch shapeId
+                    SHAPE_DD => r >= neckS and r <= neckE
+                    SHAPE_P  => r < mainS
+                    SHAPE_B  => r > mainE
+                    => false
+                color baseColor = inBulge ? accentColor : profileColorInput
+                color rowColor  = inThinZone ? color.new(thinColorInput, 45)
+                  : color.from_gradient(v, 0, pocVol, color.new(baseColor, 92), color.new(baseColor, 25))
+                array.push(targetArray, box.new(startIdx, gridLoIn + (r + 1) * rowHIn, startIdx + w, gridLoIn + r * rowHIn
+                  , border_color = COLOR_HIDDEN, bgcolor = rowColor))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+string anchorTf = switch anchorInput
+    "Week"  => "W"
+    "Month" => "M"
+    => "D"
+
+int anchorSeconds = switch anchorInput
+    "Week"  => 604800
+    "Month" => 2592000
+    => 86400
+
+bool tfWarn     = timeframe.in_seconds(timeframe.period) >= anchorSeconds
+bool newSession = timeframe.change(anchorTf)
+
+// session state
+var int   sessStartIdx = 0
+var float sessHigh     = na
+var float sessLow      = na
+var float gridHi       = na
+var float gridLo       = na
+var float rowHeight    = na
+var float avgSessBars  = na
+var int   prevShape    = SHAPE_NONE
+
+// last computed classification of the active session (used to finalize it)
+var int curShape = SHAPE_NONE
+var int curMainS = -1
+var int curMainE = -1
+var int curSecS  = -1
+var int curSecE  = -1
+var int curNeckS = -1
+var int curNeckE = -1
+
+// thin (rejected) reference zone left by the most recent completed session
+var float zoneTop    = na
+var float zoneBottom = na
+var box   zoneBox    = na
+
+var array<float> profileArray = array.new_float(rowsInput, 0.)
+var array<float> barHiArray   = array.new_float()
+var array<float> barLoArray   = array.new_float()
+var array<float> barWArray    = array.new_float()
+var array<int>   recentArray  = array.new_int()
+
+var array<box>   devBoxArray     = array.new<box>()
+var label        devLabel        = na
+var array<box>   finalBoxArray   = array.new<box>()
+var array<int>   finalCountArray = array.new_int()
+var array<label> finalLabelArray = array.new<label>()
+
+// per-bar output for the session-close alerts
+int finalizedShape = SHAPE_NONE
+
+// finalize the session that just ended
+if newSession and array.size(barHiArray) > 0
+    int spanBars = array.size(barHiArray)
+    finalizedShape := curShape
+    // clear any developing drawings left from the closed session
+    if array.size(devBoxArray) > 0
+        for i = 0 to array.size(devBoxArray) - 1
+            box.delete(array.get(devBoxArray, i))
+        array.clear(devBoxArray)
+    label.delete(devLabel)
+    devLabel := na
+    // stamp the completed profile and its final shape
+    if keepInput > 0
+        int boxesBefore = array.size(finalBoxArray)
+        drawProfile(finalBoxArray, profileArray, sessStartIdx, spanBars, gridLo, rowHeight, rowsInput, curShape
+          , curMainS, curMainE, curSecS, curSecE, curNeckS, curNeckE)
+        array.push(finalCountArray, array.size(finalBoxArray) - boxesBefore)
+        label finalLabelId = na
+        if curShape != SHAPE_NONE and not na(gridHi)
+            float labelPad = math.max((gridHi - gridLo) * 0.08, syminfo.mintick * 2)
+            finalLabelId := label.new(sessStartIdx + math.max(1, math.round(spanBars / 2.0)), gridHi + labelPad
+              , shapeLetter(curShape), xloc = xloc.bar_index, yloc = yloc.price, color = COLOR_HIDDEN
+              , style = label.style_label_down, textcolor = shapeColor(curShape), size = size.small
+              , tooltip = shapeName(curShape) + "\n" + shapeStory(curShape))
+        array.push(finalLabelArray, finalLabelId)
+    while array.size(finalCountArray) > keepInput
+        int nDel = array.shift(finalCountArray)
+        if nDel > 0
+            for i = 1 to nDel
+                box.delete(array.shift(finalBoxArray))
+    while array.size(finalLabelArray) > keepInput
+        label.delete(array.shift(finalLabelArray))
+    // thin (rejected) reference zone: DD neck, or the thin tail of a P/b day
+    box.delete(zoneBox)
+    zoneBox    := na
+    zoneTop    := na
+    zoneBottom := na
+    int zS = -1
+    int zE = -1
+    if curShape == SHAPE_DD
+        zS := curNeckS
+        zE := curNeckE
+    else if curShape == SHAPE_P and curMainS > 0
+        zS := 0
+        zE := curMainS - 1
+    else if curShape == SHAPE_B and curMainE >= 0 and curMainE < rowsInput - 1
+        zS := curMainE + 1
+        zE := rowsInput - 1
+    if zS >= 0 and nz(rowHeight) > 0
+        zoneBottom := gridLo + zS * rowHeight
+        zoneTop    := gridLo + (zE + 1) * rowHeight
+        if extendThinInput
+            zoneBox := box.new(bar_index - 1, zoneTop, bar_index, zoneBottom, border_color = color.new(thinColorInput, 55)
+              , border_style = line.style_dashed, bgcolor = color.new(thinColorInput, 88), extend = extend.right)
+    // shape sequence and typical session length
+    if curShape != SHAPE_NONE
+        array.push(recentArray, curShape)
+        while array.size(recentArray) > RECENT_SHAPES_MAX
+            array.shift(recentArray)
+    avgSessBars := na(avgSessBars) ? spanBars : 0.75 * avgSessBars + 0.25 * spanBars
+    prevShape   := curShape
+    // reset for the new session
+    array.clear(barHiArray)
+    array.clear(barLoArray)
+    array.clear(barWArray)
+    gridHi    := na
+    gridLo    := na
+    rowHeight := na
+
+// accumulate the current bar into the active session
+if array.size(barHiArray) == 0
+    sessStartIdx := bar_index
+    sessHigh     := high
+    sessLow      := low
+else
+    sessHigh := math.max(sessHigh, high)
+    sessLow  := math.min(sessLow, low)
+
+float barWeight = weightInput == "Volume" ? nz(volume) : 1.0
+array.push(barHiArray, high)
+array.push(barLoArray, low)
+array.push(barWArray, barWeight)
+
+if na(gridHi) or sessHigh > gridHi or sessLow < gridLo
+    gridHi    := sessHigh
+    gridLo    := sessLow
+    rowHeight := (gridHi - gridLo) / rowsInput
+    histRebuild(profileArray, barHiArray, barLoArray, barWArray, gridLo, rowHeight, rowsInput)
+else
+    histAdd(profileArray, high, low, barWeight, gridLo, rowHeight, rowsInput)
+
+// classification of the developing profile
+int barCount = array.size(barHiArray)
+bool canClassify = barCount >= minBarsInput and nz(rowHeight) > 0
+
+[shapeCalc, mainSCalc, mainECalc, secSCalc, secECalc, neckSCalc, neckECalc, cposCalc] = classifyProfile(profileArray, rowsInput)
+
+int   shapeNow = canClassify ? shapeCalc : SHAPE_NONE
+int   mainSNow = canClassify ? mainSCalc : -1
+int   mainENow = canClassify ? mainECalc : -1
+int   secSNow  = canClassify ? secSCalc : -1
+int   secENow  = canClassify ? secECalc : -1
+int   neckSNow = canClassify ? neckSCalc : -1
+int   neckENow = canClassify ? neckECalc : -1
+float cposNow  = canClassify ? cposCalc : na
+
+curShape := shapeNow
+curMainS := mainSNow
+curMainE := mainENow
+curSecS  := secSNow
+curSecE  := secENow
+curNeckS := neckSNow
+curNeckE := neckENow
+
+// tentative before midday, firm only late in the session
+float progress   = na(avgSessBars) or avgSessBars <= 0 ? na : math.min(barCount / avgSessBars, 1.0)
+bool  firmActive = shapeNow != SHAPE_NONE and not na(progress) and progress >= firmPctInput / 100
+
+// first-occurrence firm classifications and mid-session mutations
+bool firmDEvent  = firmActive and shapeNow == SHAPE_D  and not (firmActive[1] and shapeNow[1] == SHAPE_D)
+bool firmPEvent  = firmActive and shapeNow == SHAPE_P  and not (firmActive[1] and shapeNow[1] == SHAPE_P)
+bool firmBEvent  = firmActive and shapeNow == SHAPE_B  and not (firmActive[1] and shapeNow[1] == SHAPE_B)
+bool firmDdEvent = firmActive and shapeNow == SHAPE_DD and not (firmActive[1] and shapeNow[1] == SHAPE_DD)
+bool shapeChangeEvent = shapeNow != SHAPE_NONE and shapeNow[1] != SHAPE_NONE and shapeNow != shapeNow[1]
+
+// revisit of the rejected thin zone left by the last completed session
+bool inZone = not na(zoneTop) and close <= zoneTop and close >= zoneBottom
+bool zoneRevisitEvent = inZone and not inZone[1]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+if barstate.islast
+    if array.size(devBoxArray) > 0
+        for i = 0 to array.size(devBoxArray) - 1
+            box.delete(array.get(devBoxArray, i))
+        array.clear(devBoxArray)
+    label.delete(devLabel)
+    devLabel := na
+    if showDevInput and barCount > 0 and nz(rowHeight) > 0
+        drawProfile(devBoxArray, profileArray, sessStartIdx, barCount, gridLo, rowHeight, rowsInput, shapeNow
+          , mainSNow, mainENow, secSNow, secENow, neckSNow, neckENow)
+        string devText = shapeNow == SHAPE_NONE ? "..." : shapeLetter(shapeNow) + (firmActive ? "" : "?")
+        string devStatus = shapeNow == SHAPE_NONE ? "Collecting (" + str.tostring(barCount) + "/" + str.tostring(minBarsInput) + " bars)"
+          : firmActive ? "Firm" : "Tentative - profiles mutate as rotations fill in"
+        string devProgress = na(progress) ? "n/a (first session)" : str.tostring(progress * 100, "0") + "% of typical session"
+        color devColor = shapeNow == SHAPE_NONE ? color.new(chart.fg_color, 40) : shapeColor(shapeNow)
+        float devPad = math.max((gridHi - gridLo) * 0.08, syminfo.mintick * 2)
+        devLabel := label.new(sessStartIdx + math.max(1, math.round(barCount / 2.0)), gridHi + devPad, devText
+          , xloc = xloc.bar_index, yloc = yloc.price, color = COLOR_HIDDEN, style = label.style_label_down
+          , textcolor = devColor, size = size.small
+          , tooltip = shapeName(shapeNow) + "\nStatus: " + devStatus + "\nProgress: " + devProgress)
+
+// data window readouts
+plot(shapeNow == SHAPE_NONE ? na : shapeNow, "Shape (1=D, 2=P, 3=b, 4=DD)", profileColorInput, 1, display = display.data_window)
+plot(na(progress) ? na : progress * 100, "Session Progress %", profileColorInput, 1, display = display.data_window)
+plot(na(cposNow) ? na : cposNow * 100, "Acceptance Centroid (% of range)", profileColorInput, 1, display = display.data_window)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+string tablePos = switch tablePosInput
+    "Top Right"    => position.top_right
+    "Top Left"     => position.top_left
+    "Bottom Right" => position.bottom_right
+    "Bottom Left"  => position.bottom_left
+    "Middle Right" => position.middle_right
+    => position.middle_left
+
+string tableTextSize = switch tableSizeInput
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    => size.small
+
+if barstate.islast and showTableInput
+    var table dashTable = table.new(tablePos, 2, 8, bgcolor = color.new(chart.bg_color, 20)
+      , frame_color = color.new(chart.fg_color, 80), frame_width = 1
+      , border_color = color.new(chart.fg_color, 90), border_width = 1)
+    color dimColor = color.new(chart.fg_color, 30)
+    table.cell(dashTable, 0, 0, "Profile Shape Taxonomy", text_color = chart.fg_color, text_size = tableTextSize, text_halign = text.align_center)
+    string devCellText = shapeNow == SHAPE_NONE ? (barCount > 0 ? "collecting (" + str.tostring(barCount) + "/" + str.tostring(minBarsInput) + " bars)" : "waiting for session") : shapeName(shapeNow)
+    color devCellColor = shapeNow == SHAPE_NONE ? chart.fg_color : shapeColor(shapeNow)
+    table.cell(dashTable, 0, 1, "Developing", text_color = dimColor, text_size = tableTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 1, devCellText, text_color = devCellColor, text_size = tableTextSize, text_halign = text.align_right)
+    string statusText = shapeNow == SHAPE_NONE ? "-" : firmActive ? "firm" : "tentative"
+    table.cell(dashTable, 0, 2, "Status", text_color = dimColor, text_size = tableTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 2, statusText, text_color = chart.fg_color, text_size = tableTextSize, text_halign = text.align_right)
+    string progressText = na(progress) ? "n/a (first session)" : str.tostring(progress * 100, "0") + "% of typical"
+    table.cell(dashTable, 0, 3, "Progress", text_color = dimColor, text_size = tableTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 3, progressText, text_color = chart.fg_color, text_size = tableTextSize, text_halign = text.align_right)
+    string cposText = na(cposNow) ? "-" : str.tostring(cposNow * 100, "0") + "% of range"
+    table.cell(dashTable, 0, 4, "Acceptance Pos", text_color = dimColor, text_size = tableTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 4, cposText, text_color = chart.fg_color, text_size = tableTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 5, "Prev Session", text_color = dimColor, text_size = tableTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 5, shapeName(prevShape), text_color = prevShape == SHAPE_NONE ? chart.fg_color : shapeColor(prevShape)
+      , text_size = tableTextSize, text_halign = text.align_right)
+    string recentText = ""
+    if array.size(recentArray) > 0
+        for i = 0 to array.size(recentArray) - 1
+            recentText := recentText + (i > 0 ? " " : "") + shapeLetter(array.get(recentArray, i))
+    table.cell(dashTable, 0, 6, "Recent", text_color = dimColor, text_size = tableTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 6, recentText == "" ? "-" : recentText, text_color = chart.fg_color, text_size = tableTextSize, text_halign = text.align_right)
+    bool volWarn = weightInput == "Volume" and barCount >= minBarsInput and nz(rowHeight) > 0 and array.sum(profileArray) <= 0
+    string warnText = tfWarn ? "Chart timeframe must be below the anchor period" : volWarn ? "No volume data - switch weighting to Time (TPO-style)" : ""
+    table.cell(dashTable, 0, 7, warnText, text_color = #f23645, text_size = tableTextSize, text_halign = text.align_center)
+    var bool dashMerged = false
+    if not dashMerged
+        table.merge_cells(dashTable, 0, 0, 1, 0)
+        table.merge_cells(dashTable, 0, 7, 1, 7)
+        dashMerged := true
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(firmDEvent, "D-shape Firmed Up", "Developing session profile firmed up as a D-shape - symmetric balance, favors responsive trading around value")
+alertcondition(firmPEvent, "P-shape Firmed Up", "Developing session profile firmed up as a P-shape - acceptance high over a thin lower tail (short-covering caution in downtrends)")
+alertcondition(firmBEvent, "b-shape Firmed Up", "Developing session profile firmed up as a b-shape - acceptance low under a thin upper tail (long-liquidation read, mirrored caution in uptrends)")
+alertcondition(firmDdEvent, "Double Distribution Firmed Up", "Developing session profile firmed up as a double distribution - two accepted areas joined by a thin neck of single prints")
+alertcondition(shapeChangeEvent, "Session Shape Changed", "The developing session profile switched shape class - early reads regularly mutate as rotations fill in")
+alertcondition(finalizedShape == SHAPE_D, "Session Closed - D-shape", "Completed session classified as a D-shape - balanced rotational auction, suggests continued balance next session")
+alertcondition(finalizedShape == SHAPE_P, "Session Closed - P-shape", "Completed session classified as a P-shape - acceptance formed high after a thin lower tail; in a downtrend classically short covering")
+alertcondition(finalizedShape == SHAPE_B, "Session Closed - b-shape", "Completed session classified as a b-shape - acceptance formed low under a thin upper tail; long liquidation that stabilized")
+alertcondition(finalizedShape == SHAPE_DD, "Session Closed - Double Distribution", "Completed session classified as a double distribution - the thin neck of single prints is a reference on retest")
+alertcondition(zoneRevisitEvent, "Thin Zone Revisit", "Price re-entered the rejected thin zone left by the last completed session (double-distribution neck or P/b tail) - a low-friction area where moves tend to be fast")
+
+//---------------------------------------------------------------------------------------------------------------------}

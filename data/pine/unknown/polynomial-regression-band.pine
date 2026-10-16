@@ -1,0 +1,262 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Polynomial Regression Band", shorttitle = "Polynomial Regression Band", overlay = true, format = format.price, max_lines_count = 500, max_polylines_count = 100)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULLISH_COLOR = #089981
+BEARISH_COLOR = #f23645
+NEUTRAL_COLOR = #787b86
+
+RISING  =  1 // end-point line sloping upward - the causal fit is rising
+FALLING = -1 // end-point line sloping downward - the causal fit is falling
+FLAT    =  0 // slope not yet defined - the fit window is still warming up
+
+BAND_LINE_TRANSP  = 40  // transparency of the end-point band lines
+BAND_EDGE_TRANSP  = 88  // gradient transparency at the bands (strongest shading)
+BAND_MID_TRANSP   = 100 // gradient transparency at the fitted line (fully transparent)
+CURVE_FILL_TRANSP = 92  // flat shading of the current-window curved channel
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+srcInput = input.source(close, "Source"
+  , group   = "Settings"
+  , tooltip = "Price series the polynomial is fitted to by least squares. Closing prices are the standard choice.")
+
+lengthInput = input.int(100, "Length", minval = 20, maxval = 500
+  , group   = "Settings"
+  , tooltip = "Number of bars in the rolling fit window. The polynomial is re-fitted over the most recent window on every bar - shorter windows hug recent swings, longer windows smooth them out and take longer to accept that a trend has curved.")
+
+degreeInput = input.int(2, "Degree", minval = 2, maxval = 8
+  , group   = "Settings"
+  , tooltip = "Polynomial degree of the fit. Degree two or three covers most charting uses - enough curvature to follow rounded trends and turns without wild oscillation. Higher degrees track price more tightly but start fitting the window's noise and swing sharply near its edges, which destabilizes both the curve and its bands, so keep it low unless the data clearly bends more. Degree one would be a straight line - that is the linear-regression channel, a separate tool.")
+
+multInput = input.float(2.0, "Band Multiplier", minval = 0, step = 0.1
+  , group   = "Settings"
+  , tooltip = "Half-width of the channel as a multiple of the fit's residual standard deviation - the root-mean-square error of the fit over the window. 2 is the conventional envelope; the band width then scales with how loosely price sits around the curve.")
+
+showEndpointInput = input.bool(true, "End-Point Band"
+  , group   = "Display"
+  , tooltip = "The causal version of the band: each bar keeps only the newest fitted value of its own window - the same idea behind the LSMA - so the line and its bands never redraw. This is the form to test rules on, and the series every alert is evaluated against. The line's color follows its slope, a direction filter that picks up curvature sooner than a straight regression line.")
+
+showCurveInput = input.bool(true, "Fitted Curve (Repaints)"
+  , group   = "Display"
+  , tooltip = "The full-curve version of the band: the current window's fitted polynomial, offset above and below into a curved channel across the whole lookback. Every new bar re-fits it, so the drawn segment shifts as data arrives - a context view, honest about repainting, not something to test rules on. The curve is deliberately not extended past the last bar: extrapolating a polynomial beyond its window is unreliable.")
+
+bullColorInput = input.color(BULLISH_COLOR, "Rising Fit"
+  , group   = "Style"
+  , tooltip = "Color of the fitted line - the end-point series and the current-window curve - while the end-point line slopes upward.")
+
+bearColorInput = input.color(BEARISH_COLOR, "Falling Fit"
+  , group   = "Style"
+  , tooltip = "Color of the fitted line - the end-point series and the current-window curve - while the end-point line slopes downward.")
+
+upperBandColorInput = input.color(BEARISH_COLOR, "Upper Band", inline = "bands"
+  , group   = "Style"
+  , tooltip = "Color of the upper band and of the gradient fill between the fit and the upper band - the resistance side of the channel.")
+
+lowerBandColorInput = input.color(BULLISH_COLOR, "Lower Band", inline = "bands"
+  , group   = "Style"
+  , tooltip = "Color of the lower band and of the gradient fill between the fit and the lower band - the support side of the channel. The current window's curved channel shading follows the fit's slope color.")
+
+showFillInput = input.bool(true, "Gradient Fill"
+  , group   = "Style"
+  , tooltip = "Shades the channel from the fitted line out to each band - fully transparent at the fit, strongest at the bands - so the curved envelope reads at a glance. Purely visual, with no effect on values or alerts.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// User-Defined Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Bar position mapped onto [-1, 1]. Normalizing the time axis keeps the normal equations well conditioned at higher
+// degrees, and places the newest bar of every window at exactly +1 - where the end-point value is read
+normalizedTime(int barPosition, int windowSize) =>
+    windowSize <= 1 ? 0.0 : 2.0 * barPosition / (windowSize - 1) - 1.0
+
+// Polynomial value at x from its coefficient vector, constant term first
+evalPolynomial(array<float> coefficients, float x) =>
+    float value  = 0.0
+    float xPower = 1.0
+    if coefficients.size() > 0
+        for k = 0 to coefficients.size() - 1
+            value  += coefficients.get(k) * xPower
+            xPower *= x
+    value
+
+// Inverse of the least-squares normal matrix X'X, whose entries are sums of powers of the fixed time grid. The grid
+// depends only on the window and degree, so the inverse is computed once. Guards: the determinant is checked first,
+// and the Moore-Penrose pseudoinverse is the fallback should the matrix ever be numerically singular
+buildNormalInverse(int windowSize, int polyDegree) =>
+    int terms = polyDegree + 1
+    powerSums = array.new<float>(2 * polyDegree + 1, 0.0)
+    for i = 0 to windowSize - 1
+        float t      = normalizedTime(i, windowSize)
+        float tPower = 1.0
+        for k = 0 to 2 * polyDegree
+            powerSums.set(k, powerSums.get(k) + tPower)
+            tPower *= t
+    normalMatrix = matrix.new<float>(terms, terms, 0.0)
+    for r = 0 to terms - 1
+        for c = 0 to terms - 1
+            normalMatrix.set(r, c, powerSums.get(r + c))
+    float normalDet = normalMatrix.det()
+    na(normalDet) or normalDet == 0.0 ? normalMatrix.pinv() : normalMatrix.inv()
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Rolling Polynomial Fit
+//---------------------------------------------------------------------------------------------------------------------{
+// Least squares of the source on powers of normalized time over the last `length` bars, solved through the normal
+// equations beta = (X'X)^-1 X'y. X'X is fixed per window/degree and pre-inverted once, so each bar only accumulates
+// the moment vector X'y. The residual dispersion follows from SSE = y'y - beta.(X'y), floored at zero against
+// floating-point cancellation; its root-mean-square doubles as the residual standard deviation, since least-squares
+// residuals average zero whenever the fit carries an intercept term
+var matrix<float> normalInverse = buildNormalInverse(lengthInput, degreeInput)
+
+var yWindow = array.new<float>()
+yWindow.push(srcInput)
+if yWindow.size() > lengthInput
+    yWindow.shift()
+
+int termCount = degreeInput + 1
+momentVector  = array.new<float>(termCount, 0.0)
+coeffArray    = array.new<float>(termCount, 0.0)
+
+float sumSquaredY = 0.0
+bool  windowClean = yWindow.size() == lengthInput
+
+if windowClean
+    for i = 0 to lengthInput - 1
+        float y = yWindow.get(i)
+        if na(y)
+            windowClean := false
+        else
+            float t      = normalizedTime(i, lengthInput)
+            float tPower = 1.0
+            for k = 0 to degreeInput
+                momentVector.set(k, momentVector.get(k) + tPower * y)
+                tPower *= t
+            sumSquaredY += y * y
+
+float endpointFit = na
+float bandOffset  = na
+if windowClean
+    for r = 0 to termCount - 1
+        float rowValue = 0.0
+        for c = 0 to termCount - 1
+            rowValue += normalInverse.get(r, c) * momentVector.get(c)
+        coeffArray.set(r, rowValue)
+    float explainedDot = 0.0
+    float endpointSum  = 0.0
+    for k = 0 to termCount - 1
+        explainedDot += coeffArray.get(k) * momentVector.get(k)
+        endpointSum  += coeffArray.get(k)
+    bandOffset  := multInput * math.sqrt(math.max(sumSquaredY - explainedDot, 0.0) / lengthInput)
+    endpointFit := endpointSum
+
+float endpointUpper = endpointFit + bandOffset
+float endpointLower = endpointFit - bandOffset
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Band Events
+//---------------------------------------------------------------------------------------------------------------------{
+// Direction of the causal end-point line - the smoother trend proxy; unchanged bars inherit the previous direction
+var int endpointSlope = FLAT
+endpointSlope := na(endpointFit) or na(endpointFit[1]) ? FLAT : endpointFit > endpointFit[1] ? RISING : endpointFit < endpointFit[1] ? FALLING : endpointSlope
+
+slopeTurnedUp   = endpointSlope == RISING  and endpointSlope[1] == FALLING
+slopeTurnedDown = endpointSlope == FALLING and endpointSlope[1] == RISING
+
+// Touches and exits are read against the end-point band - the non-repainting series - so an alert seen live matches
+// what the plotted history shows. Closes crossing a band mark extension and re-entry; wicks reaching the band against
+// the slope mark the pullbacks watched as curved dynamic support and resistance
+closedAboveUpper    = ta.crossover(close, endpointUpper)
+closedBackBelowUpper = ta.crossunder(close, endpointUpper)
+closedBelowLower    = ta.crossunder(close, endpointLower)
+closedBackAboveLower = ta.crossover(close, endpointLower)
+
+lowerBandTouch = ta.crossunder(low, endpointLower)
+upperBandTouch = ta.crossover(high, endpointUpper)
+
+pullbackToLower = endpointSlope == RISING  and lowerBandTouch
+pullbackToUpper = endpointSlope == FALLING and upperBandTouch
+
+//---------------------------------------------------------------------------------------------------------------------}
+// End-Point Band
+//---------------------------------------------------------------------------------------------------------------------{
+color trendColor = endpointSlope == FALLING ? bearColorInput : bullColorInput
+epDisplay = showEndpointInput ? display.all : display.none
+
+midPlotId   = plot(endpointFit, "End-Point Fit", color = trendColor, linewidth = 1, display = epDisplay)
+upperPlotId = plot(endpointUpper, "Upper Band", color = color.new(upperBandColorInput, BAND_LINE_TRANSP), linewidth = 1, display = epDisplay)
+lowerPlotId = plot(endpointLower, "Lower Band", color = color.new(lowerBandColorInput, BAND_LINE_TRANSP), linewidth = 1, display = epDisplay)
+
+fill(midPlotId, upperPlotId
+  , top_value    = endpointUpper
+  , bottom_value = endpointFit
+  , top_color    = showEndpointInput and showFillInput ? color.new(upperBandColorInput, BAND_EDGE_TRANSP) : na
+  , bottom_color = showEndpointInput and showFillInput ? color.new(upperBandColorInput, BAND_MID_TRANSP) : na
+  , title        = "Upper Gradient Fill")
+
+fill(midPlotId, lowerPlotId
+  , top_value    = endpointFit
+  , bottom_value = endpointLower
+  , top_color    = showEndpointInput and showFillInput ? color.new(lowerBandColorInput, BAND_MID_TRANSP) : na
+  , bottom_color = showEndpointInput and showFillInput ? color.new(lowerBandColorInput, BAND_EDGE_TRANSP) : na
+  , title        = "Lower Gradient Fill")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Fitted Curve (Current Window)
+//---------------------------------------------------------------------------------------------------------------------{
+// The full-curve form of the band, honestly repainting: on the last bar the current window's polynomial and its
+// parallel bands are rebuilt from scratch, so the drawn segment shifts as every new bar re-fits it. No forward
+// extension is drawn - extrapolating the fit past the window is unreliable, especially at higher degrees
+var polyline curveMidLine   = na
+var polyline curveUpperLine = na
+var polyline curveLowerLine = na
+var polyline curveRibbon    = na
+
+if barstate.islast
+    if not na(curveMidLine)
+        polyline.delete(curveMidLine)
+    if not na(curveUpperLine)
+        polyline.delete(curveUpperLine)
+    if not na(curveLowerLine)
+        polyline.delete(curveLowerLine)
+    if not na(curveRibbon)
+        polyline.delete(curveRibbon)
+    if showCurveInput and windowClean
+        midPoints    = array.new<chart.point>()
+        upperPoints  = array.new<chart.point>()
+        lowerPoints  = array.new<chart.point>()
+        ribbonPoints = array.new<chart.point>()
+        int startIndex = bar_index - lengthInput + 1
+        for i = 0 to lengthInput - 1
+            float fitted = evalPolynomial(coeffArray, normalizedTime(i, lengthInput))
+            midPoints.push(chart.point.from_index(startIndex + i, fitted))
+            upperPoints.push(chart.point.from_index(startIndex + i, fitted + bandOffset))
+            lowerPoints.push(chart.point.from_index(startIndex + i, fitted - bandOffset))
+        // the channel ribbon walks the upper curve left to right, then the lower curve back right to left
+        for i = 0 to lengthInput - 1
+            ribbonPoints.push(upperPoints.get(i))
+        for i = 0 to lengthInput - 1
+            ribbonPoints.push(lowerPoints.get(lengthInput - 1 - i))
+        if showFillInput
+            curveRibbon := polyline.new(ribbonPoints, curved = false, closed = true, xloc = xloc.bar_index, line_color = na, fill_color = color.new(trendColor, CURVE_FILL_TRANSP))
+        curveUpperLine := polyline.new(upperPoints, curved = false, closed = false, xloc = xloc.bar_index, line_color = upperBandColorInput, line_width = 1)
+        curveLowerLine := polyline.new(lowerPoints, curved = false, closed = false, xloc = xloc.bar_index, line_color = lowerBandColorInput, line_width = 1)
+        curveMidLine   := polyline.new(midPoints, curved = false, closed = false, xloc = xloc.bar_index, line_color = trendColor, line_width = 2)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(closedAboveUpper, "Price Crossed Above Upper Band", "Polynomial Regression Band: {{ticker}} closed above the upper band - price is stretched above the fitted curve; extension is a context read rather than a standalone signal, and strong trends can ride a band for many bars ({{interval}})")
+alertcondition(closedBackBelowUpper, "Price Back Below Upper Band", "Polynomial Regression Band: {{ticker}} closed back below the upper band - re-entering the channel after an upside stretch, mean reversion toward the fitted curve is the frame ({{interval}})")
+alertcondition(closedBelowLower, "Price Crossed Below Lower Band", "Polynomial Regression Band: {{ticker}} closed below the lower band - price is stretched below the fitted curve; extension is a context read rather than a standalone signal, and strong trends can ride a band for many bars ({{interval}})")
+alertcondition(closedBackAboveLower, "Price Back Above Lower Band", "Polynomial Regression Band: {{ticker}} closed back above the lower band - re-entering the channel after a downside stretch, mean reversion toward the fitted curve is the frame ({{interval}})")
+alertcondition(pullbackToLower, "Pullback To Lower Band (Rising Fit)", "Polynomial Regression Band: {{ticker}} pulled back to the lower band while the end-point line is rising - curved dynamic support watched for a reaction ({{interval}})")
+alertcondition(pullbackToUpper, "Pullback To Upper Band (Falling Fit)", "Polynomial Regression Band: {{ticker}} pulled back to the upper band while the end-point line is falling - curved dynamic resistance watched for a reaction ({{interval}})")
+alertcondition(slopeTurnedUp, "End-Point Slope Turned Up", "Polynomial Regression Band: the end-point line on {{ticker}} turned upward - the causal fit is now rising, a direction filter that picks up curvature sooner than a straight regression line ({{interval}})")
+alertcondition(slopeTurnedDown, "End-Point Slope Turned Down", "Polynomial Regression Band: the end-point line on {{ticker}} turned downward - the causal fit is now falling, a direction filter that picks up curvature sooner than a straight regression line ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

@@ -1,0 +1,356 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Market Structure & Scatter Dashboard", "MS Scatter", overlay=true, max_labels_count=500, max_lines_count=500, max_boxes_count=50)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+color NEUTRAL_BG = color.new(#161616, 20)
+color BORDER_COL = color.new(#2E2E2E, 20)
+color TEXT_COLOR = color.new(#808080, 40)
+
+int MAX_HISTORY = 100
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Inputs
+//---------------------------------------------------------------------------------------------------------------------{
+int pivotLengthInput = input.int(10, "Pivot Length", tooltip="Length used to calculate swings for structure.")
+bool heatmapInput    = input.bool(true, "Color Candles via Scatter Heatmap", tooltip="Colors the chart candles based on the live impulse/pullback relation in the scatter plot.")
+string heatmapModeInput = input.string("Pullback", "Heatmap Mode", options=["Combined", "Impulse", "Pullback"], tooltip="Choose whether to color candles based on the combined score, just the impulse magnitude, or just the pullback magnitude.")
+
+color BULL_COLOR = input.color(#009688, "Bullish Color", group="Style")
+color BEAR_COLOR = input.color(#ff9800, "Bearish Color", group="Style")
+
+string dashVPosInput = input.string("Bottom", "Dashboard Vertical Position", options=["Top", "Middle", "Bottom"], group="Dashboard", tooltip="Anchors the dashboard to the highest, lowest, or middle price of the recent chart.")
+int dashOffsetInput  = input.int(70, "Dashboard Time Offset", tooltip="How many bars into the future to project the dashboard.", group="Dashboard")
+float dashScaleInput = input.float(1.5, "Dashboard Size Scale", step=0.1, group="Dashboard", tooltip="Scales the size of the dashboard background.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Variables
+//---------------------------------------------------------------------------------------------------------------------{
+// Market Structure Variables
+var float top_y = na
+var int   top_x = na
+var bool  top_cross = true
+
+var float btm_y = na
+var int   btm_x = na
+var bool  btm_cross = true
+
+var int trend = 0
+
+// Arrays to hold historical lines/labels for cleanup
+var line[]  smcLines  = array.new_line()
+var label[] smcLabels = array.new_label()
+
+// Scatter Variables (Alternating swing points)
+var float[] altPrices = array.new_float()
+var int[]   altTypes  = array.new_int()
+
+// Arrays for dashboard cleanup
+var box[]   dashBoxes  = array.new_box()
+var line[]  dashLines  = array.new_line()
+var label[] dashLabels = array.new_label()
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic: SMC Structure Breakouts
+//---------------------------------------------------------------------------------------------------------------------{
+float ph = ta.pivothigh(high, pivotLengthInput, pivotLengthInput)
+float pl = ta.pivotlow(low, pivotLengthInput, pivotLengthInput)
+int eventIndex = bar_index[pivotLengthInput]
+
+// Register Swing Highs
+if not na(ph)
+    top_y := ph
+    top_x := eventIndex
+    top_cross := false
+    
+    if array.size(altTypes) == 0 or array.last(altTypes) == -1
+        array.push(altPrices, ph)
+        array.push(altTypes, 1)
+        if array.size(altPrices) > MAX_HISTORY
+            array.shift(altPrices)
+            array.shift(altTypes)
+    else if array.last(altTypes) == 1
+        if ph > array.last(altPrices)
+            array.set(altPrices, array.size(altPrices)-1, ph)
+
+// Register Swing Lows
+if not na(pl)
+    btm_y := pl
+    btm_x := eventIndex
+    btm_cross := false
+    
+    if array.size(altTypes) == 0 or array.last(altTypes) == 1
+        array.push(altPrices, pl)
+        array.push(altTypes, -1)
+        if array.size(altPrices) > MAX_HISTORY
+            array.shift(altPrices)
+            array.shift(altTypes)
+    else if array.last(altTypes) == -1
+        if pl < array.last(altPrices)
+            array.set(altPrices, array.size(altPrices)-1, pl)
+
+// Detect Breakouts (BOS / CHoCH)
+if close > top_y and not top_cross
+    top_cross := true
+    bool isChoch = trend <= 0
+    trend := 1
+    string txt = isChoch ? "CHoCH" : "BOS"
+    
+    line l = line.new(top_x, top_y, bar_index, top_y, color=BULL_COLOR, style=line.style_dashed, width=1)
+    label lbl = label.new(int(math.avg(top_x, bar_index)), top_y, txt, color=na, style=label.style_label_down, textcolor=BULL_COLOR, size=size.small)
+    
+    array.push(smcLines, l)
+    array.push(smcLabels, lbl)
+
+if close < btm_y and not btm_cross
+    btm_cross := true
+    bool isChoch = trend >= 0
+    trend := -1
+    string txt = isChoch ? "CHoCH" : "BOS"
+    
+    line l = line.new(btm_x, btm_y, bar_index, btm_y, color=BEAR_COLOR, style=line.style_dashed, width=1)
+    label lbl = label.new(int(math.avg(btm_x, bar_index)), btm_y, txt, color=na, style=label.style_label_up, textcolor=BEAR_COLOR, size=size.small)
+    
+    array.push(smcLines, l)
+    array.push(smcLabels, lbl)
+
+// Cleanup old structure lines
+if array.size(smcLines) > MAX_HISTORY
+    line.delete(array.shift(smcLines))
+    label.delete(array.shift(smcLabels))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Candle Heatmap
+//---------------------------------------------------------------------------------------------------------------------{
+var color lastCandleColor = na
+
+if array.size(altPrices) >= 2
+    float currMaxX = 1.0
+    float currMaxY = 1.0
+    
+    if array.size(altPrices) >= 3
+        for i = 2 to array.size(altPrices) - 1
+            float sp0 = array.get(altPrices, i - 2)
+            float sp1 = array.get(altPrices, i - 1)
+            float sp2 = array.get(altPrices, i)
+            int   st2 = array.get(altTypes, i)
+            
+            float simp = 0.0
+            float spull = 0.0
+    
+            if st2 == 1
+                simp  := (sp0 - sp1) / sp0 * 100
+                spull := (sp2 - sp1) / sp1 * 100
+                if simp > 0 and spull > 0
+                    currMaxX := math.max(currMaxX, simp)
+                    currMaxY := math.max(currMaxY, spull)
+            else if st2 == -1
+                simp  := (sp1 - sp0) / sp0 * 100
+                spull := (sp1 - sp2) / sp1 * 100
+                if simp > 0 and spull > 0
+                    currMaxX := math.max(currMaxX, simp)
+                    currMaxY := math.max(currMaxY, spull)
+
+    float p0 = array.get(altPrices, array.size(altPrices) - 2)
+    float p1 = array.last(altPrices)
+    float p2 = close
+    int   t2 = -array.last(altTypes)
+    
+    float impulse = 0.0
+    float pullback = 0.0
+    float px = 0.0
+    float py = 0.0
+    bool  valid = false
+
+    if t2 == 1
+        impulse  := (p0 - p1) / p0 * 100
+        pullback := (p2 - p1) / p1 * 100
+        if impulse > 0 and pullback > 0
+            px := -impulse
+            py := -pullback
+            valid := true
+            currMaxX := math.max(currMaxX, impulse)
+            currMaxY := math.max(currMaxY, pullback)
+    else if t2 == -1
+        impulse  := (p1 - p0) / p0 * 100
+        pullback := (p1 - p2) / p1 * 100
+        if impulse > 0 and pullback > 0
+            px := impulse
+            py := pullback
+            valid := true
+            currMaxX := math.max(currMaxX, impulse)
+            currMaxY := math.max(currMaxY, pullback)
+
+    if valid
+        float score = 0.0
+        float minScore = 0.0
+        float maxScore = 0.0
+        
+        if heatmapModeInput == "Combined"
+            score    := (px + py)
+            minScore := -currMaxX - currMaxY
+            maxScore := currMaxX + currMaxY
+        else if heatmapModeInput == "Impulse"
+            score    := px
+            minScore := -currMaxX
+            maxScore := currMaxX
+        else if heatmapModeInput == "Pullback"
+            score    := py
+            minScore := -currMaxY
+            maxScore := currMaxY
+
+        lastCandleColor := color.from_gradient(score, minScore, maxScore, BEAR_COLOR, BULL_COLOR)
+
+barcolor(heatmapInput ? lastCandleColor : na)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard / Scatter Plot Visuals
+//---------------------------------------------------------------------------------------------------------------------{
+float chartTop = ta.highest(high, 150)
+float chartBot = ta.lowest(low, 150)
+
+if barstate.islast
+    // Clear previous dashboard elements
+    for b in dashBoxes
+        box.delete(b)
+    for l in dashLines
+        line.delete(l)
+    for lbl in dashLabels
+        label.delete(lbl)
+    
+    array.clear(dashBoxes)
+    array.clear(dashLines)
+    array.clear(dashLabels)
+
+    // Collect Scatter Data
+    var float[] scatterX = array.new_float()
+    var float[] scatterY = array.new_float()
+    
+    array.clear(scatterX)
+    array.clear(scatterY)
+    
+    float maxX = 0.0
+    float maxY = 0.0
+
+    if array.size(altPrices) >= 3
+        for i = 2 to array.size(altPrices) - 1
+            float p0 = array.get(altPrices, i - 2)
+            float p1 = array.get(altPrices, i - 1)
+            float p2 = array.get(altPrices, i)
+            int   t2 = array.get(altTypes, i)
+            
+            float impulse = 0.0
+            float pullback = 0.0
+
+            if t2 == 1 // High0 -> Low1 -> High2 (Bearish sequence)
+                impulse  := (p0 - p1) / p0 * 100
+                pullback := (p2 - p1) / p1 * 100
+                if impulse > 0 and pullback > 0
+                    array.push(scatterX, -impulse) // map to left
+                    array.push(scatterY, -pullback) // map to bottom
+                    maxX := math.max(maxX, impulse)
+                    maxY := math.max(maxY, pullback)
+            else if t2 == -1 // Low0 -> High1 -> Low2 (Bullish sequence)
+                impulse  := (p1 - p0) / p0 * 100
+                pullback := (p1 - p2) / p1 * 100
+                if impulse > 0 and pullback > 0
+                    array.push(scatterX, impulse) // map to right
+                    array.push(scatterY, pullback) // map to top
+                    maxX := math.max(maxX, impulse)
+                    maxY := math.max(maxY, pullback)
+
+    if maxX == 0
+        maxX := 1.0
+    if maxY == 0
+        maxY := 1.0
+
+    // Dashboard Positioning (Scaled properly to recent price action)
+    float safeTimeStep = nz(time - time[10]) / 10
+    if safeTimeStep == 0
+        safeTimeStep := 1000 * 60 * 60 // 1 hour fallback
+
+    int   dashHalfW   = int(safeTimeStep * 35 * dashScaleInput)
+    float dashHalfH   = (chartTop - chartBot) * 0.25 * dashScaleInput
+
+    float chartMid = math.avg(chartTop, chartBot)
+    
+    float centerPrice = chartMid
+    if dashVPosInput == "Top"
+        centerPrice := chartTop - dashHalfH
+    else if dashVPosInput == "Bottom"
+        centerPrice := chartBot + dashHalfH
+
+    int   centerTime  = int(time + safeTimeStep * dashOffsetInput)
+    
+    int   dashLeft    = centerTime - dashHalfW
+    int   dashRight   = centerTime + dashHalfW
+    float dashTop     = centerPrice + dashHalfH
+    float dashBot     = centerPrice - dashHalfH
+
+    // 1. Draw Background Boxes (Concentric with precise borders)
+    dashBoxes.push(box.new(left=dashLeft, top=dashTop, right=dashRight, bottom=dashBot, xloc=xloc.bar_time, bgcolor=NEUTRAL_BG, border_color=color.new(#505050, 20), border_width=2))
+    dashBoxes.push(box.new(left=centerTime - int(dashHalfW*0.6), top=centerPrice + dashHalfH*0.6, right=centerTime + int(dashHalfW*0.6), bottom=centerPrice - dashHalfH*0.6, xloc=xloc.bar_time, bgcolor=color.new(#161616, 50), border_color=color.new(#505050, 50), border_width=1))
+
+    // 2. Draw Axes
+    dashLines.push(line.new(dashLeft, centerPrice, dashRight, centerPrice, xloc=xloc.bar_time, color=color.new(#808080, 20)))
+    dashLines.push(line.new(centerTime, dashBot, centerTime, dashTop, xloc=xloc.bar_time, color=color.new(#808080, 20)))
+
+    float yOffset = dashHalfH * 0.1
+    int xOffset = int(dashHalfW * 0.15)
+
+    // 2.5 Draw Grid & Values
+    int gridSteps = 4
+    for i = 1 to gridSteps - 1
+        float frac = i / gridSteps
+        
+        // Vertical grids
+        int xRight = centerTime + int(dashHalfW * frac)
+        int xLeft  = centerTime - int(dashHalfW * frac)
+        dashLines.push(line.new(xRight, dashBot, xRight, dashTop, xloc=xloc.bar_time, color=color.new(BORDER_COL, 50), style=line.style_dotted))
+        dashLines.push(line.new(xLeft, dashBot, xLeft, dashTop, xloc=xloc.bar_time, color=color.new(BORDER_COL, 50), style=line.style_dotted))
+        
+        // Horizontal grids
+        float yTopGrid = centerPrice + dashHalfH * frac
+        float yBotGrid = centerPrice - dashHalfH * frac
+        dashLines.push(line.new(dashLeft, yTopGrid, dashRight, yTopGrid, xloc=xloc.bar_time, color=color.new(BORDER_COL, 50), style=line.style_dotted))
+        dashLines.push(line.new(dashLeft, yBotGrid, dashRight, yBotGrid, xloc=xloc.bar_time, color=color.new(BORDER_COL, 50), style=line.style_dotted))
+        
+        // Grid Values (placed on the outside borders to prevent overlapping dots)
+        float valX = maxX * frac
+        float valY = maxY * frac
+        dashLabels.push(label.new(xRight, dashBot, str.tostring(valX, "#.#") + "%", xloc=xloc.bar_time, color=na, style=label.style_label_up, textcolor=color.new(#808080, 50), size=size.tiny))
+        dashLabels.push(label.new(xLeft, dashBot, "-" + str.tostring(valX, "#.#") + "%", xloc=xloc.bar_time, color=na, style=label.style_label_up, textcolor=color.new(#808080, 50), size=size.tiny))
+        
+        dashLabels.push(label.new(dashLeft, yTopGrid, str.tostring(valY, "#.#") + "%", xloc=xloc.bar_time, color=na, style=label.style_label_right, textcolor=color.new(#808080, 50), size=size.tiny))
+        dashLabels.push(label.new(dashLeft, yBotGrid, "-" + str.tostring(valY, "#.#") + "%", xloc=xloc.bar_time, color=na, style=label.style_label_right, textcolor=color.new(#808080, 50), size=size.tiny))
+
+    // 3. Draw Axis Labels (Pushed completely outside the box to prevent overlapping)
+    dashLabels.push(label.new(centerTime, dashTop, "Pullback (+)", xloc=xloc.bar_time, color=na, style=label.style_label_down, textcolor=color.gray, size=size.small))
+    dashLabels.push(label.new(centerTime, dashBot, "Pullback (-)", xloc=xloc.bar_time, color=na, style=label.style_label_up, textcolor=color.gray, size=size.small))
+    dashLabels.push(label.new(dashRight, centerPrice, "Impulse (+)", xloc=xloc.bar_time, color=na, style=label.style_label_left, textcolor=color.gray, size=size.small))
+    dashLabels.push(label.new(dashLeft, centerPrice, "Impulse (-)", xloc=xloc.bar_time, color=na, style=label.style_label_right, textcolor=color.gray, size=size.small))
+
+    // 4. Plot Scatter Points
+    if array.size(scatterX) > 0
+        for i = 0 to array.size(scatterX) - 1
+            float px = array.get(scatterX, i)
+            float py = array.get(scatterY, i)
+
+            int   ptTime  = centerTime + int((px / maxX) * dashHalfW * 0.85) // 0.85 to keep dots inside padding
+            float ptPrice = centerPrice + (py / maxY) * dashHalfH * 0.85
+
+            // Gradient Logic (LuxAlgo Blue to Green)
+            float score    = (px + py)
+            float minScore = -maxX - maxY
+            float maxScore = maxX + maxY
+            color ptColor  = color.from_gradient(score, minScore, maxScore, BEAR_COLOR, BULL_COLOR)
+
+            string tip = "Impulse: " + str.tostring(math.abs(px), "#.##") + "%\nPullback: " + str.tostring(math.abs(py), "#.##") + "%"
+            
+            dashLabels.push(label.new(ptTime, ptPrice, "●", xloc=xloc.bar_time, style=label.style_none, textcolor=ptColor, size=size.normal, tooltip=tip))
+
+//---------------------------------------------------------------------------------------------------------------------}

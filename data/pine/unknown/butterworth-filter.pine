@@ -1,0 +1,117 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Butterworth Filter", "Butterworth Filter", overlay = true)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+NEUTRAL_COLOR = #787b86
+
+TWO_POLE    = "Two-pole"
+THREE_POLE  = "Three-pole"
+MODE_SLOPE  = "Slope"
+MODE_SINGLE = "Single"
+
+GRP_FILTER = "Filter"
+GRP_TOL    = "Touch Tolerance"
+GRP_STYLE  = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+srcInput    = input.source(close, "Source", group = GRP_FILTER, tooltip = "Series fed to the filter. Close is the usual choice; the filter can serve as the smoothing stage for any other series the same way.")
+periodInput = input.int(20, "Cutoff Period", minval = 4, group = GRP_FILTER, tooltip = "Cutoff period P in bars — a cutoff, not a lookback. Swings with wavelengths shorter than roughly P bars are strongly attenuated; longer swings pass mostly intact at close to their true amplitude. Lag grows with the cutoff period.")
+polesInput  = input.string(TWO_POLE, "Poles", options = [TWO_POLE, THREE_POLE], group = GRP_FILTER, tooltip = "Two-pole is the common default: adequate smoothing and less lag. Three-pole rolls off harder and suits noisy intraday data, at the cost of a slower response to real turns.")
+firInput    = input.bool(true, "Input FIR Average", group = GRP_FILTER, tooltip = "Feed the recursion a short FIR average of the source (1-2-1 weights for two-pole, 1-3-3-1 for three-pole), as in Ehlers' published form. Disable to feed the raw source instead.")
+
+showToleranceInput = input.bool(false, "Show Tolerance Band", group = GRP_TOL, tooltip = "Draw a touch-tolerance buffer around the filter line. The design's small step-response overshoot can push the line slightly past where price settles after a shock bar, so exact-touch rules against the line should carry tolerance.")
+toleranceMultInput = input.float(0.5, "Band Width (ATR Multiple)", minval = 0, step = 0.1, group = GRP_TOL, tooltip = "Half-width of the tolerance band, expressed as a multiple of the Average True Range.")
+toleranceAtrInput  = input.int(14, "ATR Length", minval = 1, group = GRP_TOL, tooltip = "Length of the Average True Range used to scale the tolerance band.")
+
+colorModeInput = input.string(MODE_SLOPE, "Coloration", options = [MODE_SLOPE, MODE_SINGLE], group = GRP_STYLE, tooltip = "Slope colors the line by its direction — rising bullish, falling bearish — matching the slope rules that transfer directly from moving averages. Single keeps one neutral color.")
+lineWidthInput = input.int(2, "Line Width", minval = 1, maxval = 5, group = GRP_STYLE, tooltip = "Width of the filter line.")
+
+bullColorInput   = input.color(BULL_COLOR, "Bullish", inline = "colors", group = GRP_STYLE)
+bearColorInput   = input.color(BEAR_COLOR, "Bearish", inline = "colors", group = GRP_STYLE)
+singleColorInput = input.color(NEUTRAL_COLOR, "Single", inline = "colors", group = GRP_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Butterworth Filter
+//---------------------------------------------------------------------------------------------------------------------{
+threePole  = polesInput == THREE_POLE
+warmupBars = threePole ? 3 : 2
+
+// Recursion coefficients derived from the cutoff period (Ehlers' published two-pole and three-pole forms)
+// Two-pole: a = exp(-1.414*pi/P), b = 2*a*cos(1.414*pi/P), c2 = b, c3 = -a^2
+alphaTwo = math.exp(-1.414 * math.pi / periodInput)
+betaTwo  = 2 * alphaTwo * math.cos(1.414 * math.pi / periodInput)
+
+// Three-pole: a = exp(-pi/P), b = 2*a*cos(1.738*pi/P), g = a^2, c2 = b + g, c3 = -(g + b*g), c4 = g^2
+alphaThree = math.exp(-math.pi / periodInput)
+betaThree  = 2 * alphaThree * math.cos(1.738 * math.pi / periodInput)
+gammaThree = alphaThree * alphaThree
+
+coef2 = threePole ? betaThree + gammaThree : betaTwo
+coef3 = threePole ? -(gammaThree + betaThree * gammaThree) : -alphaTwo * alphaTwo
+coef4 = threePole ? gammaThree * gammaThree : 0.0
+
+// c1 normalizes for unity gain at zero frequency, folding in the FIR stage's 1/4 (two-pole) or 1/8 (three-pole) weight sum
+dcGain = 1 - coef2 - coef3 - coef4
+coef1  = firInput ? dcGain / (threePole ? 8 : 4) : dcGain
+
+// Input stage: short FIR average of the source as in the published form, or the raw source
+x0 = srcInput
+x1 = nz(srcInput[1], x0)
+x2 = nz(srcInput[2], x0)
+x3 = nz(srcInput[3], x0)
+xin = firInput ? (threePole ? x0 + 3 * x1 + 3 * x2 + x3 : x0 + 2 * x1 + x2) : x0
+
+// Second/third-order recursion, seeded by setting the first outputs equal to price
+float butter = na
+y1 = nz(butter[1], x0)
+y2 = nz(butter[2], x0)
+y3 = nz(butter[3], x0)
+butter := bar_index < warmupBars ? x0 : coef1 * xin + coef2 * y1 + coef3 * y2 + coef4 * y3
+
+// Slope state and filter events
+slope = butter - y1
+slopeTurnedUp   = slope > 0 and nz(slope[1]) <= 0
+slopeTurnedDown = slope < 0 and nz(slope[1]) >= 0
+
+crossAboveFilter = ta.crossover(close, butter)
+crossBelowFilter = ta.crossunder(close, butter)
+
+var bool isRising = true
+isRising := slope > 0 ? true : slope < 0 ? false : isRising
+
+// Touch-tolerance band scaled by the Average True Range (overshoot buffer)
+tolerance = ta.atr(toleranceAtrInput) * toleranceMultInput
+upperBand = showToleranceInput ? butter + tolerance : na
+lowerBand = showToleranceInput ? butter - tolerance : na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Plots
+//---------------------------------------------------------------------------------------------------------------------{
+lineColor = colorModeInput == MODE_SLOPE ? (isRising ? bullColorInput : bearColorInput) : singleColorInput
+bandColor = color.new(lineColor, 65)
+
+butterPlotId = plot(butter, "Butterworth Filter", lineColor, lineWidthInput)
+upperPlotId  = plot(upperBand, "Upper Tolerance", bandColor, 1, plot.style_linebr)
+lowerPlotId  = plot(lowerBand, "Lower Tolerance", bandColor, 1, plot.style_linebr)
+
+fill(butterPlotId, upperPlotId, upperBand, butter, color.new(lineColor, 80), color.new(lineColor, 100), title = "Upper Tolerance Gradient")
+fill(butterPlotId, lowerPlotId, butter, lowerBand, color.new(lineColor, 100), color.new(lineColor, 80), title = "Lower Tolerance Gradient")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(slopeTurnedUp,   "Slope Turned Up",   "Butterworth filter: slope turned up on {{ticker}} {{interval}}")
+alertcondition(slopeTurnedDown, "Slope Turned Down", "Butterworth filter: slope turned down on {{ticker}} {{interval}}")
+alertcondition(crossAboveFilter, "Price Crossed Above Filter", "Butterworth filter: price crossed above the filter line on {{ticker}} {{interval}}")
+alertcondition(crossBelowFilter, "Price Crossed Below Filter", "Butterworth filter: price crossed below the filter line on {{ticker}} {{interval}}")
+
+//---------------------------------------------------------------------------------------------------------------------}

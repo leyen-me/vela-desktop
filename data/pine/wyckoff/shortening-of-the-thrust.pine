@@ -1,0 +1,372 @@
+// This work is licensed under Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Shortening of the Thrust", shorttitle = "Shortening of the Thrust", overlay = true, max_lines_count = 500, max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+color BULL_COLOR    = #089981
+color BEAR_COLOR    = #f23645
+color NEUTRAL_COLOR = #787b86
+color HIDDEN_COLOR  = #00000000
+
+int MAX_SWINGS = 80
+
+string DETECT_GROUP = 'Thrust Detection'
+string CHOCH_GROUP  = 'Change of Character'
+string TRADE_GROUP  = 'Trade Levels'
+string STYLE_GROUP  = 'Style'
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+swingLengthInput = input.int(5, 'Swing Length', minval = 2, maxval = 50, group = DETECT_GROUP, tooltip = 'Bars to the left and right a high or low must dominate to count as a push. A push is known only this many bars after it prints, so shortening is read on confirmed extremes and never repaints.')
+
+minPushesInput = input.int(3, 'Minimum Pushes', minval = 3, maxval = 8, group = DETECT_GROUP, tooltip = 'Consecutive pushes to new extremes the sequence needs. Three pushes give two gains to compare, the minimum for a sequence; a single smaller push is ordinary variation, not shortening.')
+
+shrinkInput = input.float(0.8, 'Shrink Factor', minval = 0.1, maxval = 1, step = 0.05, group = DETECT_GROUP, tooltip = 'Each gain beyond the prior extreme must be at most this fraction of the gain before it, so the latest push is the smallest. 1 accepts any smaller gain; lower values demand clearer shortening.')
+
+minFirstInput = input.float(0.5, 'Minimum First Gain (ATR)', minval = 0, maxval = 20, step = 0.1, group = DETECT_GROUP, tooltip = 'The first measured gain must clear the prior extreme by at least this many ATRs, so the sequence starts from a real thrust rather than a sideways drift.')
+
+atrLengthInput = input.int(14, 'ATR Length', minval = 1, maxval = 200, group = DETECT_GROUP)
+
+volChochInput = input.bool(true, 'Require Expanding Volume', group = CHOCH_GROUP, tooltip = 'Shortening describes deceleration, not reversal, so the build waits for a change of character: a close back through the reaction extreme between the last two pushes. With this on, that close must also come on volume above its average, the forceful move on expanding volume practitioners look for. Ignored on symbols without volume.')
+
+volLengthInput = input.int(20, 'Volume Average Length', minval = 2, maxval = 200, group = CHOCH_GROUP)
+
+windowInput = input.int(30, 'Change of Character Window (bars)', minval = 3, maxval = 300, group = CHOCH_GROUP, tooltip = 'Bars after the last push is confirmed within which the change of character must arrive. A close beyond the last push first means the trend resumed.')
+
+stopBufferInput = input.float(0.25, 'Stop Buffer (ATR)', minval = 0, maxval = 5, step = 0.05, group = TRADE_GROUP, tooltip = 'The stop sits this far beyond the last push, the extreme the shortening trend could not extend by much.')
+
+watchInput = input.int(40, 'Trade Watch (bars)', minval = 5, maxval = 500, group = TRADE_GROUP, tooltip = 'Bars the target and stop are tracked after the change of character. The target is the earliest reaction extreme inside the sequence, where the last measured pushes began.')
+
+showUpInput     = input.bool(true, 'Rising Thrusts', inline = 'show', group = STYLE_GROUP, tooltip = 'Shortening of the upward thrust in an advance (bearish change of character).')
+showDownInput   = input.bool(true, 'Falling Thrusts', inline = 'show', group = STYLE_GROUP, tooltip = 'Shortening of the downward thrust in a decline (bullish change of character).')
+bullColorInput  = input.color(BULL_COLOR, 'Bullish', inline = 'colors', group = STYLE_GROUP)
+bearColorInput  = input.color(BEAR_COLOR, 'Bearish', inline = 'colors', group = STYLE_GROUP)
+neutralColorInput = input.color(NEUTRAL_COLOR, 'Neutral', inline = 'colors', group = STYLE_GROUP)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types
+//---------------------------------------------------------------------------------------------------------------------{
+
+// side 1 = rising thrusts shortening (bearish read), -1 = falling thrusts shortening (bullish read)
+type Sequence
+    int    side
+    int    firstBar
+    int    lastBar
+    float  lastPush
+    int    reactBar
+    float  react
+    float  target
+    float  stop
+    int    pushes
+    string summary
+    int    state     = 0
+    int    trigBar   = 0
+    array<line>  lines
+    array<label> labels
+    line   reactLn
+    line   targetLn
+    label  targetLb
+    line   stopLn
+    label  stopLb
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Variables
+//---------------------------------------------------------------------------------------------------------------------{
+
+var array<float> zzPrice = array.new<float>()
+var array<int>   zzBar   = array.new<int>()
+var array<int>   zzDir   = array.new<int>()
+var array<float> cumVolArr = array.new<float>()
+
+var Sequence upPending   = na
+var Sequence downPending = na
+var Sequence upActive    = na
+var Sequence downActive  = na
+var Sequence upLapsed    = na
+var Sequence downLapsed  = na
+
+float atrValue  = ta.atr(atrLengthInput)
+float volAvg    = ta.sma(nz(volume), volLengthInput)
+float pivotHigh = ta.pivothigh(high, swingLengthInput, swingLengthInput)
+float pivotLow  = ta.pivotlow(low, swingLengthInput, swingLengthInput)
+
+var float cumVol = 0.0
+cumVol += nz(volume)
+array.push(cumVolArr, cumVol)
+
+var bool volumeSeen = false
+if nz(volume) > 0
+    volumeSeen := true
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions & Methods
+//---------------------------------------------------------------------------------------------------------------------{
+
+method sideColor(Sequence this) =>
+    this.side == 1 ? bearColorInput : bullColorInput
+
+method erase(Sequence this) =>
+    int nl = array.size(this.lines)
+    if nl > 0
+        for i = 0 to nl - 1
+            line.delete(array.get(this.lines, i))
+    int nb = array.size(this.labels)
+    if nb > 0
+        for i = 0 to nb - 1
+            label.delete(array.get(this.labels, i))
+    line.delete(this.reactLn)
+
+avgVolume(int fromBar, int toBar) =>
+    toBar > fromBar ? (array.get(cumVolArr, toBar) - array.get(cumVolArr, fromBar)) / (toBar - fromBar) : na
+
+pushSwing(float price, int swingBar, int swingDir) =>
+    bool changed = false
+    int  n       = array.size(zzPrice)
+    if n > 0 and array.get(zzDir, n - 1) == swingDir
+        if (swingDir == 1 and price >= array.get(zzPrice, n - 1)) or (swingDir == -1 and price <= array.get(zzPrice, n - 1))
+            array.set(zzPrice, n - 1, price)
+            array.set(zzBar, n - 1, swingBar)
+            changed := true
+    else
+        array.push(zzPrice, price)
+        array.push(zzBar, swingBar)
+        array.push(zzDir, swingDir)
+        if array.size(zzPrice) > MAX_SWINGS
+            array.shift(zzPrice)
+            array.shift(zzBar)
+            array.shift(zzDir)
+        changed := true
+    changed
+
+// Read the run of consecutive pushes ending at the latest swing of this side and test it for shortening
+tryDetect(int side) =>
+    Sequence result = na
+    int n = array.size(zzPrice)
+    if n >= 5 and array.get(zzDir, n - 1) == side and atrValue > 0
+        // walk back over same-side swings (every second swing) while each one extends beyond the one before
+        array<int> idx = array.new<int>()
+        array.push(idx, n - 1)
+        int k = n - 3
+        while k >= 0
+            int   ni    = array.get(idx, 0)
+            float newer = array.get(zzPrice, ni)
+            float older = array.get(zzPrice, k)
+            // a push must extend beyond the older one, and the reaction before it must hold above (below)
+            // the reaction before the older one: a deeper reaction ends the trend sequence
+            bool structureOk = k == 0 or side * (array.get(zzPrice, ni - 1) - array.get(zzPrice, k - 1)) > 0
+            if side * (newer - older) > 0 and structureOk
+                array.unshift(idx, k)
+                k -= 2
+            else
+                break
+        int m = array.size(idx)
+        if m >= minPushesInput
+            // gains beyond the prior extreme, oldest first
+            array<float> gains = array.new<float>()
+            for j = 1 to m - 1
+                array.push(gains, side * (array.get(zzPrice, array.get(idx, j)) - array.get(zzPrice, array.get(idx, j - 1))))
+            // the shortening tail: latest gains, each at most shrink x the one before
+            int g    = array.size(gains)
+            int tail = 1
+            while tail < g
+                float later   = array.get(gains, g - tail)
+                float earlier = array.get(gains, g - tail - 1)
+                if later <= earlier * shrinkInput
+                    tail += 1
+                else
+                    break
+            float firstGain = array.get(gains, g - tail)
+            if tail + 1 >= minPushesInput and firstGain >= minFirstInput * atrValue
+                int first = m - 1 - tail // index into idx of the reference push
+                int lastI = array.get(idx, m - 1)
+                Sequence active = side == 1 ? upActive : downActive
+                if na(active) or active.lastBar != array.get(zzBar, lastI)
+                    color col = side == 1 ? bearColorInput : bullColorInput
+                    result := Sequence.new(side = side, lastBar = array.get(zzBar, lastI), lastPush = array.get(zzPrice, lastI), reactBar = array.get(zzBar, lastI - 1), react = array.get(zzPrice, lastI - 1), pushes = tail + 1, lines = array.new<line>(), labels = array.new<label>())
+                    // target: the reaction extreme where the first measured push began
+                    result.target := array.get(zzPrice, array.get(idx, first + 1) - 1)
+                    result.stop   := result.lastPush + side * stopBufferInput * atrValue
+                    float v0 = na
+                    float vN = na
+                    string gainsTxt = ''
+                    for j = first + 1 to m - 1
+                        int   cur  = array.get(idx, j)
+                        int   prv  = array.get(idx, j - 1)
+                        float pc   = array.get(zzPrice, cur)
+                        float pp   = array.get(zzPrice, prv)
+                        int   bc   = array.get(zzBar, cur)
+                        int   bp   = array.get(zzBar, prv)
+                        float gain = side * (pc - pp)
+                        float v    = avgVolume(array.get(zzBar, cur - 1), bc)
+                        v0 := na(v0) ? v : v0
+                        vN := v
+                        bool  isLast = j == m - 1
+                        // the prior extreme each push had to clear, and the push itself
+                        array.push(result.lines, line.new(bp, pp, bc, pp, color = color.new(col, 30), style = line.style_dotted))
+                        array.push(result.lines, line.new(bp, pp, bc, pc, color = color.new(col, 10), width = 2))
+                        string gt = (side == 1 ? '+' : '-') + str.tostring(gain / pp * 100, '0.0') + '%'
+                        gainsTxt += (gainsTxt == '' ? '' : ' > ') + gt
+                        string tip = 'Push ' + str.tostring(j - first + 1) + ': ' + str.tostring(gain, format.mintick) + ' beyond the prior extreme (' + str.tostring(gain / atrValue, '#.##') + ' ATR)' + (volumeSeen and not na(v) and v0 > 0 ? '\nVolume of the push leg: ' + str.tostring(v / v0, '#.##') + 'x the first measured push' : '')
+                        array.push(result.labels, label.new(bc, pc, isLast ? gt + ' · SOT' : gt, style = side == 1 ? label.style_label_down : label.style_label_up, color = HIDDEN_COLOR, textcolor = col, size = size.small, tooltip = tip))
+                    // the first push of the sequence: the reference extreme
+                    int b0 = array.get(zzBar, array.get(idx, first))
+                    result.firstBar := b0
+                    float p0 = array.get(zzPrice, array.get(idx, first))
+                    array.push(result.labels, label.new(b0, p0, 'Push 1', style = side == 1 ? label.style_label_down : label.style_label_up, color = HIDDEN_COLOR, textcolor = color.new(col, 30), size = size.small))
+                    string effort = not volumeSeen or na(v0) or na(vN) or v0 <= 0 ? 'volume n/a' : vN >= v0 * 1.1 ? 'on heavier volume: effort buying little progress, the other side absorbing' : vN <= v0 * 0.9 ? 'on lighter volume: the trend\'s own participants withdrawing' : 'on steady volume'
+                    result.summary := str.tostring(tail + 1) + ' pushes, gains ' + gainsTxt + ', latest ' + effort
+                    label.set_tooltip(array.get(result.labels, array.size(result.labels) - 2), 'Shortening of the thrust: ' + result.summary + '\nWaiting for a change of character through ' + str.tostring(result.react, format.mintick))
+                    result.reactLn := line.new(result.reactBar, result.react, bar_index, result.react, color = color.new(col, 20), style = line.style_dashed)
+    result
+
+// Pending sequence: 0 = waiting, 1 = change of character, 2 = trend resumed or expired
+trackPending(Sequence s) =>
+    int evt = 0
+    line.set_x2(s.reactLn, bar_index)
+    bool resumed = s.side == 1 ? close > s.lastPush : close < s.lastPush
+    bool through = s.side == 1 ? close < s.react : close > s.react
+    bool volOk   = not volChochInput or not volumeSeen or nz(volume) > volAvg
+    if resumed or bar_index - s.lastBar > windowInput + swingLengthInput
+        // shortening that did not turn: kept, dimmed
+        line.delete(s.reactLn)
+        int nb = array.size(s.labels)
+        if nb > 0
+            for i = 0 to nb - 1
+                label.set_textcolor(array.get(s.labels, i), color.new(neutralColorInput, 30))
+        int nl = array.size(s.lines)
+        if nl > 0
+            for i = 0 to nl - 1
+                line.set_color(array.get(s.lines, i), color.new(neutralColorInput, 50))
+        evt := 2
+    else if through and volOk
+        color col = s.sideColor()
+        s.state   := 1
+        s.trigBar := bar_index
+        line.set_style(s.reactLn, line.style_solid)
+        string tip = 'Change of character: close ' + (s.side == 1 ? 'below' : 'above') + ' the reaction extreme ' + str.tostring(s.react, format.mintick) + (volumeSeen ? ' on ' + str.tostring(nz(volume) / volAvg, '#.##') + 'x average volume' : '') + '\n' + s.summary
+        label.new(bar_index, s.side == 1 ? math.max(high, high[1], high[2]) : math.min(low, low[1], low[2]), 'CHoCH', style = s.side == 1 ? label.style_label_down : label.style_label_up, color = col, textcolor = color.white, size = size.small, tooltip = tip)
+        bool targetValid = s.side * (close - s.target) > 0
+        if targetValid
+            s.targetLn := line.new(bar_index, s.target, bar_index, s.target, color = col, style = line.style_dashed)
+            s.targetLb := label.new(bar_index, s.target, 'Target ' + str.tostring(s.target, format.mintick), style = label.style_label_right, color = HIDDEN_COLOR, textcolor = col, size = size.small, tooltip = 'The reaction extreme where the first measured push began. A planning reference, not a promise.')
+        s.stopLn := line.new(bar_index, s.stop, bar_index, s.stop, color = neutralColorInput, style = line.style_dotted)
+        s.stopLb := label.new(bar_index, s.stop, 'Stop ' + str.tostring(s.stop, format.mintick), style = label.style_label_right, color = HIDDEN_COLOR, textcolor = neutralColorInput, size = size.small, tooltip = 'Beyond the last push')
+        evt := 1
+    evt
+
+// Triggered sequence: 0 = tracking, 1 = target, 2 = stop, 3 = watch over
+trackActive(Sequence s) =>
+    int evt = 0
+    line.set_x2(s.stopLn, bar_index)
+    if not na(s.targetLn)
+        line.set_x2(s.targetLn, bar_index)
+    bool targetHit = not na(s.targetLn) and (s.side == 1 ? low <= s.target : high >= s.target)
+    bool stopHit   = s.side == 1 ? close > s.stop : close < s.stop
+    if targetHit
+        line.set_style(s.targetLn, line.style_solid)
+        label.set_text(s.targetLb, 'Target ' + str.tostring(s.target, format.mintick) + ' reached')
+        evt := 1
+    else if stopHit
+        line.set_style(s.stopLn, line.style_solid)
+        label.set_text(s.stopLb, 'Stopped ' + str.tostring(s.stop, format.mintick))
+        if not na(s.targetLn)
+            line.delete(s.targetLn)
+            label.delete(s.targetLb)
+        evt := 2
+    else if bar_index - s.trigBar >= watchInput
+        evt := 3
+    evt
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Detection
+//---------------------------------------------------------------------------------------------------------------------{
+
+bool upSotAlert     = false
+bool downSotAlert   = false
+bool upChochAlert   = false
+bool downChochAlert = false
+bool upTargetAlert  = false
+bool downTargetAlert = false
+bool upStopAlert    = false
+bool downStopAlert  = false
+
+if barstate.isconfirmed
+    if not na(pivotHigh)
+        if pushSwing(pivotHigh, bar_index - swingLengthInput, 1) and showUpInput
+            Sequence cand = tryDetect(1)
+            if not na(cand)
+                if not na(upPending)
+                    upPending.erase()
+                // a lapsed sequence that shares pushes with the new one is redrawn by it
+                if not na(upLapsed) and upLapsed.lastBar >= cand.firstBar
+                    upLapsed.erase()
+                    upLapsed := na
+                upPending  := cand
+                upSotAlert := true
+    if not na(pivotLow)
+        if pushSwing(pivotLow, bar_index - swingLengthInput, -1) and showDownInput
+            Sequence cand = tryDetect(-1)
+            if not na(cand)
+                if not na(downPending)
+                    downPending.erase()
+                if not na(downLapsed) and downLapsed.lastBar >= cand.firstBar
+                    downLapsed.erase()
+                    downLapsed := na
+                downPending  := cand
+                downSotAlert := true
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Tracking
+//---------------------------------------------------------------------------------------------------------------------{
+
+if barstate.isconfirmed
+    if not na(upActive)
+        int evt = trackActive(upActive)
+        upTargetAlert := evt == 1
+        upStopAlert   := evt == 2
+        if evt != 0
+            upActive := na
+    if not na(downActive)
+        int evt = trackActive(downActive)
+        downTargetAlert := evt == 1
+        downStopAlert   := evt == 2
+        if evt != 0
+            downActive := na
+    if not na(upPending)
+        int evt = trackPending(upPending)
+        if evt == 1
+            upChochAlert := true
+            upActive     := upPending
+            upPending    := na
+        else if evt == 2
+            upLapsed  := upPending
+            upPending := na
+    if not na(downPending)
+        int evt = trackPending(downPending)
+        if evt == 1
+            downChochAlert := true
+            downActive     := downPending
+            downPending    := na
+        else if evt == 2
+            downLapsed  := downPending
+            downPending := na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(upSotAlert, 'Rising Thrust Shortening', 'Shortening of the thrust: each push to a new high is gaining less ground')
+alertcondition(downSotAlert, 'Falling Thrust Shortening', 'Shortening of the thrust: each push to a new low is gaining less ground')
+alertcondition(upChochAlert, 'Bearish Change of Character', 'Shortening of the thrust: close below the reaction low between the last two pushes after a shortening advance')
+alertcondition(downChochAlert, 'Bullish Change of Character', 'Shortening of the thrust: close above the reaction high between the last two pushes after a shortening decline')
+alertcondition(upTargetAlert or downTargetAlert, 'Target Reached', 'Shortening of the thrust: target reached after the change of character')
+alertcondition(upStopAlert or downStopAlert, 'Stopped', 'Shortening of the thrust: stop beyond the last push hit')
+
+//---------------------------------------------------------------------------------------------------------------------}

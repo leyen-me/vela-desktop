@@ -1,0 +1,114 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Trend Magic", shorttitle = "Trend Magic", overlay = true)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+TREND_UP   =  1
+TREND_DOWN = -1
+TREND_NONE =  0
+
+BULL_COLOR = #089981
+BEAR_COLOR = #f23645
+
+FILL_PRICE_TRANSP = 50  // gradient transparency at the price end of the fill
+FILL_STOP_TRANSP  = 100 // gradient transparency at the trailing-line end of the fill
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+cciLengthInput = input.int(20, "CCI Length", minval = 1, group = "Settings",
+     tooltip = "Lookback of the Commodity Channel Index that steers the regime. The line trails below price while the CCI holds at or above zero and jumps above price when it drops below zero — shorter lengths flip sooner and whipsaw more, longer lengths lag turns.")
+
+cciSourceInput = input.source(hlc3, "CCI Source", group = "Settings",
+     tooltip = "Price series fed to the CCI. Typical price — (high + low + close) / 3 — matches the classic CCI construction.")
+
+atrLengthInput = input.int(5, "ATR Length", minval = 1, group = "Settings",
+     tooltip = "Averaging window of the ATR that sizes the line's offset from price. ATR only sets the distance — the flip itself is decided by the CCI sign, not by price crossing the line.")
+
+atrMultInput   = input.float(1.0, "ATR Multiplier", minval = 0, step = 0.1, group = "Settings",
+     tooltip = "Number of ATRs between price and the trailing line — below the low in the bullish state, above the high in the bearish state. Larger values keep the line further from price without changing when it flips.")
+
+showMarkersInput = input.bool(true, "Flip Markers", group = "Style",
+     tooltip = "Marks each regime flip with a small dot at the freshly reset line — the bar where the CCI changed sign and the line jumped to the opposite side of price.")
+
+showFillInput    = input.bool(true, "Gradient Trail Fill", group = "Style",
+     tooltip = "Fills the span between price and the trailing line with a vertical gradient in the regime color — fully transparent at the line, strongest near price — visualizing the room left before the ratcheted exit level.")
+
+bullColorInput   = input.color(BULL_COLOR, "Bullish", inline = "state", group = "Style",
+     tooltip = "Color of the line, fill and markers while the CCI is at or above zero (line ratcheting upward below price).")
+
+bearColorInput   = input.color(BEAR_COLOR, "Bearish", inline = "state", group = "Style",
+     tooltip = "Color of the line, fill and markers while the CCI is below zero (line ratcheting downward above price).")
+
+lineWidthInput   = input.int(1, "Line Width", minval = 1, maxval = 5, group = "Style",
+     tooltip = "Width of the Trend Magic trailing line.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+// Momentum gate and volatility offset — the CCI sign picks the side of price, the ATR only sets the distance
+cciValue  = ta.cci(cciSourceInput, cciLengthInput)
+atrOffset = ta.atr(atrLengthInput) * atrMultInput
+
+var int   trendState = TREND_NONE
+var float trendLine  = na
+
+bool flipBullish = false
+bool flipBearish = false
+
+// The state machine starts once both the CCI and the ATR return usable values
+bool ready = not na(cciValue) and not na(atrOffset)
+
+if ready
+    if cciValue >= 0
+        // Bullish regime — the line rides low - ATR * multiplier and only ratchets upward.
+        // A sign flip resets it below price; within the state it never gives ground.
+        float candidate = low - atrOffset
+        trendLine   := trendState == TREND_UP ? math.max(trendLine, candidate) : candidate
+        flipBullish := trendState == TREND_DOWN
+        trendState  := TREND_UP
+    else
+        // Bearish regime — the line rides high + ATR * multiplier and only ratchets downward.
+        // A sign flip resets it above price; within the state it never gives ground.
+        float candidate = high + atrOffset
+        trendLine   := trendState == TREND_DOWN ? math.min(trendLine, candidate) : candidate
+        flipBearish := trendState == TREND_UP
+        trendState  := TREND_DOWN
+
+bool flipped = flipBullish or flipBearish
+
+// Price tests of the line in force — because the flip is CCI-gated, price can touch or pierce the
+// trailing level without changing the state, which is exactly the trailing-stop reference event
+bool bullTest = trendState == TREND_UP and nz(trendState[1], TREND_NONE) == TREND_UP and low <= trendLine and low[1] > trendLine[1]
+bool bearTest = trendState == TREND_DOWN and nz(trendState[1], TREND_NONE) == TREND_DOWN and high >= trendLine and high[1] < trendLine[1]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+color stateColor = trendState == TREND_UP ? bullColorInput : bearColorInput
+
+// Vertical gradient between the trailing line and price — fully transparent at the line, strongest near price
+color fillTopColor    = showFillInput ? (trendState == TREND_UP ? color.new(bullColorInput, FILL_PRICE_TRANSP) : color.new(bearColorInput, FILL_STOP_TRANSP)) : na
+color fillBottomColor = showFillInput ? (trendState == TREND_UP ? color.new(bullColorInput, FILL_STOP_TRANSP) : color.new(bearColorInput, FILL_PRICE_TRANSP)) : na
+
+magicPlotId = plot(trendLine, "Trend Magic", color = flipped ? na : stateColor, linewidth = lineWidthInput, style = plot.style_linebr)
+pricePlotId = plot(close, "Price Anchor", color = na, editable = false, display = display.none)
+
+fill(magicPlotId, pricePlotId, top_value = math.max(trendLine, close), bottom_value = math.min(trendLine, close), top_color = fillTopColor, bottom_color = fillBottomColor, title = "Trail Gradient Fill")
+
+plotshape(showMarkersInput and flipBullish ? trendLine : na, "Bullish Flip", shape.circle, location.absolute, color = bullColorInput, size = size.tiny)
+plotshape(showMarkersInput and flipBearish ? trendLine : na, "Bearish Flip", shape.circle, location.absolute, color = bearColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(flipBullish, "Bullish Flip", "Trend Magic flipped bullish on {{ticker}} ({{interval}}) — the CCI crossed up through zero and the line reset below price, ratcheting upward from here")
+alertcondition(flipBearish, "Bearish Flip", "Trend Magic flipped bearish on {{ticker}} ({{interval}}) — the CCI dropped below zero and the line reset above price, ratcheting downward from here")
+alertcondition(flipped, "Any Flip", "Trend Magic flipped on {{ticker}} ({{interval}}) — the CCI changed sign and the trailing line jumped to the opposite side of price")
+alertcondition(bullTest, "Bullish Line Test", "Trend Magic bullish line test on {{ticker}} ({{interval}}) — price touched the rising trailing line while the CCI held the bullish regime, the ratcheted exit reference for longs")
+alertcondition(bearTest, "Bearish Line Test", "Trend Magic bearish line test on {{ticker}} ({{interval}}) — price touched the falling trailing line while the CCI held the bearish regime, the ratcheted exit reference for shorts")
+
+//---------------------------------------------------------------------------------------------------------------------}

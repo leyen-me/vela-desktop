@@ -1,0 +1,393 @@
+// This work is licensed under Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Mitigation Blocks", "Mitigation Blocks", overlay = true, max_boxes_count = 300, max_lines_count = 300, max_labels_count = 300, max_bars_back = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+color GREEN = #089981
+color RED   = #f23645
+color GRAY  = #787b86
+color TEXT  = #d1d4dc
+
+int BULL = 1
+int BEAR = -1
+
+//block states
+int B_WAIT  = 0   //formed, waiting for the first return
+int B_TRADE = 1   //first return taken, trade open
+
+string SRC_RANGE = "Full range"
+string SRC_BODY  = "Body"
+
+string STOP_ZONE  = "Beyond the block"
+string STOP_SWING = "Beyond the failed swing"
+
+string GRP_DET   = "Detection"
+string GRP_TRADE = "Return Trade"
+string GRP_DISP  = "Display"
+string GRP_STYLE = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+swingLenInput = input.int(5, "Swing Length"
+  , minval  = 2
+  , maxval  = 50
+  , group   = GRP_DET
+  , tooltip = "Bars on each side a swing high or low must dominate. The sequence is read on these swings: a reference extreme, the opposite swing, a failed swing that does not reach the reference, then a close through the opposite swing.")
+
+dispInput = input.float(0.0, "Break Displacement (ATR)"
+  , minval  = 0
+  , step    = 0.25
+  , group   = GRP_DET
+  , tooltip = "Minimum body of the candle that breaks structure, as a multiple of ATR(14). 0 accepts any close through the swing; raise it to demand displacement on the break.")
+
+zoneInput = input.string(SRC_RANGE, "Block Boundaries"
+  , options = [SRC_RANGE, SRC_BODY]
+  , group   = GRP_DET
+  , tooltip = "Draw the block from the full range of its candles, or from their bodies only.")
+
+groupInput = input.int(3, "Max Candles In Block"
+  , minval  = 1
+  , maxval  = 5
+  , group   = GRP_DET
+  , tooltip = "The block is the last opposing candle before the failed swing, plus the consecutive opposing candles directly before it, up to this count.")
+
+maxAgeInput = input.int(120, "Max Bars To First Return"
+  , minval  = 5
+  , group   = GRP_DET
+  , tooltip = "A block not revisited within this many bars of its formation is retired.")
+
+showBreakerInput = input.bool(false, "Show Breaker Cases"
+  , group   = GRP_DET
+  , tooltip = "Mark the sequences whose final swing swept the reference extreme before the break. Those are breaker blocks, not mitigation blocks, and are drawn in gray for contrast only.")
+
+stopInput = input.string(STOP_ZONE, "Stop"
+  , options = [STOP_ZONE, STOP_SWING]
+  , group   = GRP_TRADE
+  , tooltip = "Invalidation for the return trade: beyond the far side of the block (tighter), or beyond the failed swing that created it (wider, survives deeper probes).")
+
+stopBufInput = input.float(0.1, "Stop Buffer (ATR)"
+  , minval  = 0
+  , step    = 0.05
+  , group   = GRP_TRADE)
+
+rrInput = input.float(2.0, "Target (R)"
+  , minval  = 0.5
+  , step    = 0.25
+  , group   = GRP_TRADE
+  , tooltip = "Target of the return trade as a multiple of its risk.")
+
+showTradeInput = input.bool(true, "Show Return Trade"
+  , group   = GRP_TRADE
+  , tooltip = "On the first return into the block, draw the entry at the block's near edge with its stop and target, and mark which one is reached. Later visits are ignored: first tests are the ones most frameworks weight.")
+
+showSeqInput = input.bool(true, "Show Sequence"
+  , group   = GRP_DISP
+  , tooltip = "Draw the reference extreme, the failed swing (LH or HL) and the structure break (MSS) that define each block.")
+
+maxBlocksInput = input.int(4, "Max Live Blocks Per Side"
+  , minval  = 1
+  , maxval  = 10
+  , group   = GRP_DISP)
+
+bullColorInput = input.color(GREEN, "Bullish", inline = "c", group = GRP_STYLE)
+bearColorInput = input.color(RED,   "Bearish", inline = "c", group = GRP_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Swings
+//---------------------------------------------------------------------------------------------------------------------{
+float atr = ta.atr(14)
+float ph  = ta.pivothigh(high, swingLenInput, swingLenInput)
+float pl  = ta.pivotlow(low, swingLenInput, swingLenInput)
+float hiN = ta.highest(high, swingLenInput)
+float loN = ta.lowest(low, swingLenInput)
+int   hiNOff = -ta.highestbars(high, swingLenInput)
+int   loNOff = -ta.lowestbars(low, swingLenInput)
+
+var float lastPh    = na
+var int   lastPhBar = na
+var float lastPl    = na
+var int   lastPlBar = na
+
+// bearish sequence: reference high, the low after it, the rally that follows (running high since the low)
+var float bRefHi   = na
+var int   bRefHiBar = na
+var float bLow     = na
+var int   bLowBar  = na
+var float bRunHi   = na
+var int   bRunHiBar = na
+var bool  bArmed   = false
+
+// bullish sequence: reference low, the high after it, the decline that follows (running low since the high)
+var float uRefLo   = na
+var int   uRefLoBar = na
+var float uHigh    = na
+var int   uHighBar = na
+var float uRunLo   = na
+var int   uRunLoBar = na
+var bool  uArmed   = false
+
+if not na(pl)
+    int plBar = bar_index - swingLenInput
+    // a new swing low arms the bearish read when a swing high precedes it
+    if not na(lastPh) and lastPhBar < plBar
+        bRefHi    := lastPh
+        bRefHiBar := lastPhBar
+        bLow      := pl
+        bLowBar   := plBar
+        bRunHi    := hiN
+        bRunHiBar := bar_index - hiNOff
+        bArmed    := true
+    lastPl    := pl
+    lastPlBar := plBar
+else if bArmed and high > bRunHi
+    bRunHi    := high
+    bRunHiBar := bar_index
+
+if not na(ph)
+    int phBar = bar_index - swingLenInput
+    if not na(lastPl) and lastPlBar < phBar
+        uRefLo    := lastPl
+        uRefLoBar := lastPlBar
+        uHigh     := ph
+        uHighBar  := phBar
+        uRunLo    := loN
+        uRunLoBar := bar_index - loNOff
+        uArmed    := true
+    lastPh    := ph
+    lastPhBar := phBar
+else if uArmed and low < uRunLo
+    uRunLo    := low
+    uRunLoBar := bar_index
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Formation
+//---------------------------------------------------------------------------------------------------------------------{
+// live blocks in parallel arrays
+var array<float> kTop   = array.new<float>()
+var array<float> kBot   = array.new<float>()
+var array<int>   kDir   = array.new<int>()
+var array<int>   kForm  = array.new<int>()
+var array<float> kSwing = array.new<float>()
+var array<int>   kState = array.new<int>()
+var array<float> kEntry = array.new<float>()
+var array<float> kStop  = array.new<float>()
+var array<float> kTgt   = array.new<float>()
+var array<box>   kBox   = array.new<box>()
+var array<box>   kTp    = array.new<box>()
+var array<box>   kSl    = array.new<box>()
+
+// @function    the block: the last opposing candle at or before the failed swing, plus consecutive opposing candles before it
+// @returns     [top, bottom, left bar], na when no opposing candle is found
+findBlock(int d, int swingOff, int floorOff) =>
+    float top  = na
+    float bot  = na
+    int   left = na
+    int   found = -1
+    int   lim = math.min(swingOff + 10, floorOff)
+    if swingOff <= lim
+        for i = swingOff to lim
+            bool opp = d == BEAR ? close[i] > open[i] : close[i] < open[i]
+            if opp
+                found := i
+                break
+    if found >= 0
+        int n = 0
+        int i = found
+        while i <= floorOff and n < groupInput
+            bool opp = d == BEAR ? close[i] > open[i] : close[i] < open[i]
+            if not opp
+                break
+            float hi = zoneInput == SRC_BODY ? math.max(open[i], close[i]) : high[i]
+            float lo = zoneInput == SRC_BODY ? math.min(open[i], close[i]) : low[i]
+            top  := na(top) ? hi : math.max(top, hi)
+            bot  := na(bot) ? lo : math.min(bot, lo)
+            left := bar_index - i
+            n += 1
+            i += 1
+    [top, bot, left]
+
+bool body0 = math.abs(close - open) >= dispInput * nz(atr)
+bool bearMb   = false
+bool bullMb   = false
+bool bearBrk  = false
+bool bullBrk  = false
+
+if bArmed and close < bLow and bar_index > bLowBar
+    bArmed := false
+    bool swept = bRunHi > bRefHi
+    if body0 and bRunHiBar < bar_index and bRunHiBar > bLowBar and bar_index - bLowBar < 400
+        if not swept
+            [zt, zb, zl] = findBlock(BEAR, bar_index - bRunHiBar, bar_index - bLowBar)
+            if not na(zt)
+                bearMb := true
+                kTop.push(zt)
+                kBot.push(zb)
+                kDir.push(BEAR)
+                kForm.push(bar_index)
+                kSwing.push(bRunHi)
+                kState.push(B_WAIT)
+                kEntry.push(na)
+                kStop.push(na)
+                kTgt.push(na)
+                kBox.push(box.new(zl, zt, bar_index, zb, border_color = color.new(bearColorInput, 30), bgcolor = color.new(bearColorInput, 78), text = "Bearish MB", text_size = size.tiny, text_color = TEXT, text_halign = text.align_left, text_valign = text.align_top))
+                kTp.push(box(na))
+                kSl.push(box(na))
+                if showSeqInput
+                    line.new(bRefHiBar, bRefHi, bRunHiBar, bRefHi, color = color.new(bearColorInput, 15), style = line.style_dotted)
+                    label.new(bRunHiBar, bRunHi, "LH", color = color(na), textcolor = bearColorInput, style = label.style_label_down, size = size.small, tooltip = "Failed swing: the rally stopped short of the reference high")
+                    line.new(bLowBar, bLow, bar_index, bLow, color = bearColorInput, style = line.style_dashed)
+                    label.new(int(math.round(0.5 * (bLowBar + bar_index))), bLow, "MSS", color = color(na), textcolor = bearColorInput, style = label.style_label_up, size = size.small)
+        else if showBreakerInput
+            bearBrk := true
+            label.new(bRunHiBar, bRunHi, "Sweep: breaker", color = color(na), textcolor = GRAY, style = label.style_label_down, size = size.tiny)
+
+if uArmed and close > uHigh and bar_index > uHighBar
+    uArmed := false
+    bool swept = uRunLo < uRefLo
+    if body0 and uRunLoBar < bar_index and uRunLoBar > uHighBar and bar_index - uHighBar < 400
+        if not swept
+            [zt, zb, zl] = findBlock(BULL, bar_index - uRunLoBar, bar_index - uHighBar)
+            if not na(zt)
+                bullMb := true
+                kTop.push(zt)
+                kBot.push(zb)
+                kDir.push(BULL)
+                kForm.push(bar_index)
+                kSwing.push(uRunLo)
+                kState.push(B_WAIT)
+                kEntry.push(na)
+                kStop.push(na)
+                kTgt.push(na)
+                kBox.push(box.new(zl, zt, bar_index, zb, border_color = color.new(bullColorInput, 30), bgcolor = color.new(bullColorInput, 78), text = "Bullish MB", text_size = size.tiny, text_color = TEXT, text_halign = text.align_left, text_valign = text.align_bottom))
+                kTp.push(box(na))
+                kSl.push(box(na))
+                if showSeqInput
+                    line.new(uRefLoBar, uRefLo, uRunLoBar, uRefLo, color = color.new(bullColorInput, 15), style = line.style_dotted)
+                    label.new(uRunLoBar, uRunLo, "HL", color = color(na), textcolor = bullColorInput, style = label.style_label_up, size = size.small, tooltip = "Failed swing: the decline stopped short of the reference low")
+                    line.new(uHighBar, uHigh, bar_index, uHigh, color = bullColorInput, style = line.style_dashed)
+                    label.new(int(math.round(0.5 * (uHighBar + bar_index))), uHigh, "MSS", color = color(na), textcolor = bullColorInput, style = label.style_label_down, size = size.small)
+        else if showBreakerInput
+            bullBrk := true
+            label.new(uRunLoBar, uRunLo, "Sweep: breaker", color = color(na), textcolor = GRAY, style = label.style_label_up, size = size.tiny)
+
+// keep at most the configured number of waiting blocks per side, oldest dropped first
+countSide(int d) =>
+    int n = 0
+    if kDir.size() > 0
+        for k = 0 to kDir.size() - 1
+            if kDir.get(k) == d and kState.get(k) == B_WAIT
+                n += 1
+    n
+
+removeBlock(int k, bool erase) =>
+    if erase
+        box.delete(kBox.get(k))
+    kTop.remove(k)
+    kBot.remove(k)
+    kDir.remove(k)
+    kForm.remove(k)
+    kSwing.remove(k)
+    kState.remove(k)
+    kEntry.remove(k)
+    kStop.remove(k)
+    kTgt.remove(k)
+    kBox.remove(k)
+    kTp.remove(k)
+    kSl.remove(k)
+
+for d in array.from(BULL, BEAR)
+    while countSide(d) > maxBlocksInput
+        int k = 0
+        while k < kDir.size()
+            if kDir.get(k) == d and kState.get(k) == B_WAIT
+                removeBlock(k, true)
+                break
+            k += 1
+
+//---------------------------------------------------------------------------------------------------------------------}
+// First return and trade
+//---------------------------------------------------------------------------------------------------------------------{
+bool bullRetest = false
+bool bearRetest = false
+bool tgtHit     = false
+bool stopHit    = false
+
+int m = kTop.size() - 1
+while m >= 0
+    int   d     = kDir.get(m)
+    float top   = kTop.get(m)
+    float bot   = kBot.get(m)
+    int   form  = kForm.get(m)
+    box   bx    = kBox.get(m)
+    if bar_index > form
+        if kState.get(m) == B_WAIT
+            bool touch = d == BEAR ? high >= bot : low <= top
+            if touch
+                float e    = d == BEAR ? math.max(bot, math.min(open, top)) : math.min(top, math.max(open, bot))
+                float stp  = stopInput == STOP_SWING ? (d == BEAR ? kSwing.get(m) + stopBufInput * atr : kSwing.get(m) - stopBufInput * atr) : (d == BEAR ? top + stopBufInput * atr : bot - stopBufInput * atr)
+                float risk = math.abs(stp - e)
+                float tgt  = d == BEAR ? e - rrInput * risk : e + rrInput * risk
+                kState.set(m, B_TRADE)
+                kEntry.set(m, e)
+                kStop.set(m, stp)
+                kTgt.set(m, tgt)
+                bx.set_right(bar_index)
+                if d == BULL
+                    bullRetest := true
+                else
+                    bearRetest := true
+                if showTradeInput
+                    kTp.set(m, box.new(bar_index, math.max(e, tgt), bar_index, math.min(e, tgt), border_color = color(na), bgcolor = color.new(GREEN, 85)))
+                    kSl.set(m, box.new(bar_index, math.max(e, stp), bar_index, math.min(e, stp), border_color = color(na), bgcolor = color.new(RED, 85)))
+                    label.new(bar_index, d == BULL ? low : high, "", color = d == BULL ? bullColorInput : bearColorInput, style = d == BULL ? label.style_triangleup : label.style_triangledown, size = size.small, tooltip = "First return into the mitigation block")
+                // a candle that touches and closes through the far side in one go has already been accepted beyond the block
+                bool sameBarStop = d == BEAR ? high >= stp : low <= stp
+                if sameBarStop
+                    stopHit := true
+                    if showTradeInput
+                        label.new(bar_index, stp, "Stop", color = color(na), textcolor = RED, style = label.style_label_left, size = size.small)
+                    removeBlock(m, false)
+            else if bar_index - form > maxAgeInput
+                // never revisited: retired without a trace
+                removeBlock(m, true)
+            else
+                bx.set_right(bar_index + 1)
+        else
+            float stp = kStop.get(m)
+            float tgt = kTgt.get(m)
+            bool sHit = d == BEAR ? high >= stp : low <= stp
+            bool tHit = d == BEAR ? low <= tgt : high >= tgt
+            if sHit or tHit
+                if showTradeInput
+                    box tp = kTp.get(m)
+                    box sl = kSl.get(m)
+                    tp.set_right(bar_index)
+                    sl.set_right(bar_index)
+                    label.new(bar_index, sHit ? stp : tgt, sHit ? "Stop" : "Target", color = color(na), textcolor = sHit ? RED : GREEN, style = label.style_label_left, size = size.small)
+                stopHit := stopHit or sHit
+                tgtHit  := tgtHit or (tHit and not sHit)
+                bx.set_right(bar_index)
+                removeBlock(m, false)
+            else if showTradeInput
+                box tp = kTp.get(m)
+                box sl = kSl.get(m)
+                tp.set_right(bar_index)
+                sl.set_right(bar_index)
+                bx.set_right(bar_index)
+    m -= 1
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(bullMb,     "Bullish Mitigation Block", "Bullish mitigation block formed on {{ticker}}: a higher low failed short of the prior low, then structure broke up")
+alertcondition(bearMb,     "Bearish Mitigation Block", "Bearish mitigation block formed on {{ticker}}: a lower high failed short of the prior high, then structure broke down")
+alertcondition(bullRetest, "Bullish Block Retest",     "Price returned to a bullish mitigation block on {{ticker}} for the first time")
+alertcondition(bearRetest, "Bearish Block Retest",     "Price returned to a bearish mitigation block on {{ticker}} for the first time")
+alertcondition(tgtHit,     "Return Trade Target",      "A mitigation block return trade reached its target on {{ticker}}")
+alertcondition(stopHit,    "Return Trade Stop",        "A mitigation block return trade was stopped on {{ticker}}")
+
+//---------------------------------------------------------------------------------------------------------------------}

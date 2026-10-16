@@ -1,0 +1,479 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("PRZ Execution"
+  , shorttitle       = "PRZ Execution"
+  , overlay          = true
+  , max_boxes_count  = 100
+  , max_lines_count  = 200
+  , max_labels_count = 300)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+int ST_IDLE    = 0
+int ST_ARMED   = 1
+int ST_TESTING = 2
+int ST_REACT   = 3
+int ST_RETEST  = 4
+
+string SRC_AUTO   = "Auto (harmonic completion window)"
+string SRC_MANUAL = "Manual levels"
+
+string ENTRY_TPB   = "Terminal bar rejection"
+string ENTRY_CLOSE = "Close back inside structure"
+string ENTRY_TOUCH = "First zone touch (limit at D)"
+
+string DIR_BULL = "Bullish (support)"
+string DIR_BEAR = "Bearish (resistance)"
+
+// maximum extension of the A-B swing that C may reach when validating the X-A-B-C sequence
+float C_MAX_AB_EXT = 1.13
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+string GRP_ZONE  = "Zone"
+string GRP_EXEC  = "Execution Rules"
+string GRP_STYLE = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+zoneSourceInput = input.string(SRC_AUTO, "Zone source", options = [SRC_AUTO, SRC_MANUAL], group = GRP_ZONE, tooltip = "Where the potential reversal zone comes from. 'Auto' projects a completion window beyond the most recent X-A-B-C swing sequence using the ratios below. 'Manual levels' uses the prices you enter, so a zone measured from any harmonic pattern can be managed here.")
+
+pivotLengthInput = input.int(8, "Swing pivot length", minval = 2, maxval = 50, group = GRP_ZONE, tooltip = "Auto mode only. Bars on each side required to confirm the swing highs/lows forming the X-A-B-C sequence. Larger values build zones from larger swings; pivots confirm with this many bars of lag.")
+
+ratioNearInput = input.float(0.786, "Completion ratio - near edge", minval = 0.1, maxval = 4, step = 0.01, group = GRP_ZONE, tooltip = "Auto mode only. XA-based ratio, projected from A, of the zone edge closest to price. 0.786-0.886 covers the classic retracement completion window; values above 1 project an extension window.")
+
+ratioFarInput = input.float(0.886, "Completion ratio - far edge", minval = 0.1, maxval = 4, step = 0.01, group = GRP_ZONE, tooltip = "Auto mode only. XA-based ratio of the zone edge furthest from price. Must differ from the near edge; the two ratios are sorted automatically.")
+
+ratioInvInput = input.float(1.0, "Invalidation ratio (limiting level)", minval = 0.2, maxval = 5, step = 0.01, group = GRP_ZONE, tooltip = "Auto mode only. XA-based ratio of the level whose decisive acceptance voids the pattern. 1.0 places it at X - the classic limiting level for retracement patterns; use a larger value for extension patterns. Always forced beyond the far edge.")
+
+manualDirectionInput = input.string(DIR_BULL, "Manual - direction", options = [DIR_BULL, DIR_BEAR], group = GRP_ZONE, tooltip = "Manual mode only. Bullish = the zone is expected support below price; bearish = expected resistance above price.")
+
+manualEdgeAInput = input.float(0.0, "Manual - zone edge A", minval = 0, group = GRP_ZONE, tooltip = "Manual mode only. One edge of the zone (order does not matter - edges are sorted by direction). Leave both edges at 0 to disable the manual zone.")
+
+manualEdgeBInput = input.float(0.0, "Manual - zone edge B", minval = 0, group = GRP_ZONE, tooltip = "Manual mode only. The other edge of the zone.")
+
+manualInvInput = input.float(0.0, "Manual - invalidation level (0 = auto)", minval = 0, group = GRP_ZONE, tooltip = "Manual mode only. Level whose decisive acceptance voids the setup. 0 places it one zone height beyond the far edge.")
+
+entryModeInput = input.string(ENTRY_TPB, "Entry confirmation", options = [ENTRY_TPB, ENTRY_CLOSE, ENTRY_TOUCH], group = GRP_EXEC, tooltip = "How the entry signal qualifies. 'Terminal bar rejection' waits for the bar testing the full zone plus a close back inside structure - evidence over price. 'Close back inside structure' signals on the first rejection close after any zone touch. 'First zone touch' mimics a resting limit order at D - best price, but it takes every zone.")
+
+atrLengthInput = input.int(14, "ATR length", minval = 1, group = GRP_EXEC, tooltip = "Average true range length used to judge terminal-bar size and as a floor for the reaction distance.")
+
+wideBarInput = input.float(1.5, "Wide bar threshold (x ATR)", minval = 0.5, step = 0.1, group = GRP_EXEC, tooltip = "A terminal bar whose range exceeds this many ATRs while closing beyond the zone is flagged as the classic warning bar.")
+
+reactionMultInput = input.float(2.0, "Reaction distance (x zone height)", minval = 0.25, step = 0.25, group = GRP_EXEC, tooltip = "Distance price must close away from the zone extreme (never less than one ATR) for the move to count as the initial reaction - the Type I candidate.")
+
+typeOneBarsInput = input.int(10, "Type I: bars clear of the zone", minval = 1, group = GRP_EXEC, tooltip = "After the initial reaction, this many consecutive bars without re-entering the zone confirm a Type I reversal - a prompt turn that holds.")
+
+retestTolInput = input.float(0.5, "Retest tolerance (x zone height)", minval = 0, step = 0.25, group = GRP_EXEC, tooltip = "How far beyond the original extreme a retest may travel before it is flagged as deep. Type II retests often probe deeper than the first test but should hold near the original extreme; the invalidation level always overrides.")
+
+invalidClosesInput = input.int(2, "Closes beyond limit to invalidate", minval = 1, maxval = 5, group = GRP_EXEC, tooltip = "Consecutive closes beyond the invalidation level required to void the pattern - decisive acceptance rather than a single wick through it.")
+
+timeoutBarsInput = input.int(100, "Episode timeout (bars)", minval = 10, group = GRP_EXEC, tooltip = "Bars after the first zone test before an unresolved episode expires, so stale zones are not monitored forever.")
+
+maxRiskInput = input.float(2.0, "Max acceptable stop distance (%)", minval = 0.05, step = 0.05, group = GRP_EXEC, tooltip = "Risk check shown in the table: distance from the near edge (entry reference) to the invalidation level as a percentage of price. A zone wider than this is graded 'too wide, pass' - skip it rather than widening the stop.")
+
+showSignalsInput      = input.bool(true, "Show execution labels", group = GRP_STYLE)
+showTableInput        = input.bool(true, "Show status table", group = GRP_STYLE)
+tablePositionInput    = input.string("Top right", "Table position", options = ["Top right", "Top left", "Bottom right", "Bottom left", "Middle right"], group = GRP_STYLE, tooltip = "Chart corner where the status table is drawn.")
+bullColorInput        = input.color(#089981, "Bullish", group = GRP_STYLE, inline = "colors1")
+bearColorInput        = input.color(#f23645, "Bearish", group = GRP_STYLE, inline = "colors1")
+neutralColorInput     = input.color(#ff9800, "Info", group = GRP_STYLE, inline = "colors1")
+invColorInput         = input.color(#787b86, "Invalidation", group = GRP_STYLE, inline = "colors2")
+zoneTransparencyInput = input.int(85, "Zone fill transparency", minval = 50, maxval = 99, group = GRP_STYLE, tooltip = "Transparency of the zone fill; the border uses a stronger shade of the same color.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// keep the pivot sequence alternating: replace the last pivot when a same-side, more extreme one prints
+addPivot(prices, pivotBars, highs, isHigh, price, barIdx) =>
+    n = array.size(prices)
+    if n == 0
+        array.push(prices, price)
+        array.push(pivotBars, barIdx)
+        array.push(highs, isHigh)
+    else
+        lastIsHigh = array.get(highs, n - 1)
+        lastPrice  = array.get(prices, n - 1)
+        if lastIsHigh == isHigh
+            if (isHigh and price >= lastPrice) or (not isHigh and price <= lastPrice)
+                array.set(prices, n - 1, price)
+                array.set(pivotBars, n - 1, barIdx)
+        else
+            array.push(prices, price)
+            array.push(pivotBars, barIdx)
+            array.push(highs, isHigh)
+    if array.size(prices) > 12
+        array.shift(prices)
+        array.shift(pivotBars)
+        array.shift(highs)
+
+// project the completion window and limiting level from the last confirmed X-A-B-C swing sequence
+candidateZone(prices, pivotBars, highs, rNear, rFar, rInv) =>
+    ok   = false
+    bull = false
+    float nearLvl = na
+    float farLvl  = na
+    float invLvl  = na
+    int   cBarIdx = na
+    n = array.size(prices)
+    if n >= 4
+        xP = array.get(prices, n - 4)
+        aP = array.get(prices, n - 3)
+        bP = array.get(prices, n - 2)
+        cP = array.get(prices, n - 1)
+        cIsHigh = array.get(highs, n - 1)
+        if cIsHigh and aP > xP and bP > xP and bP < aP and cP > bP and cP <= bP + C_MAX_AB_EXT * (aP - bP)
+            // bullish sequence: X low, A high, B low, C high - completion window projected below
+            bull    := true
+            nearLvl := aP - rNear * (aP - xP)
+            farLvl  := aP - rFar  * (aP - xP)
+            invLvl  := aP - rInv  * (aP - xP)
+            cBarIdx := array.get(pivotBars, n - 1)
+            ok      := true
+        else if not cIsHigh and aP < xP and bP < xP and bP > aP and cP < bP and cP >= bP - C_MAX_AB_EXT * (bP - aP)
+            // bearish sequence: X high, A low, B high, C low - completion window projected above
+            bull    := false
+            nearLvl := aP + rNear * (xP - aP)
+            farLvl  := aP + rFar  * (xP - aP)
+            invLvl  := aP + rInv  * (xP - aP)
+            cBarIdx := array.get(pivotBars, n - 1)
+            ok      := true
+    [ok, bull, nearLvl, farLvl, invLvl, cBarIdx]
+
+// grade the terminal price bar from its close location within the zone and its size
+gradeTerminalBar(pos, wide) =>
+    string txt = ""
+    if pos >= 1
+        txt := "Rejection - closed back inside structure"
+    else if pos >= 0.5
+        txt := "Constructive - rejection close within the zone"
+    else if pos >= 0
+        txt := "Weak - closed deep in the zone"
+    else
+        txt := wide ? "Wide close beyond the zone - classic warning" : "Closed beyond the zone - warning"
+    [txt, pos < 0, pos >= 0.5]
+
+// price formatting for the status table
+formatPrice(value) =>
+    na(value) ? "-" : str.tostring(value, format.mintick)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+var array<float> pivotPricesArray = array.new<float>()
+var array<int>   pivotBarsArray   = array.new<int>()
+var array<bool>  pivotHighsArray  = array.new<bool>()
+
+var int    state          = ST_IDLE
+var bool   zoneBull       = true
+var float  zoneNear       = na
+var float  zoneFar        = na
+var float  zoneInv        = na
+var int    zoneStartBar   = na
+var int    usedPatternBar = na
+var float  origExtreme    = na
+var float  retestExtreme  = na
+var int    testStartBar   = na
+var int    barsClear      = 0
+var int    invalidCount   = 0
+var bool   terminalSeen   = false
+var bool   entryDone      = false
+var bool   deepFlagged    = false
+var bool   manualCleared  = true
+var string terminalGrade  = "-"
+var string lastOutcome    = "-"
+
+var box  zoneBox     = na
+var line invalidLine = na
+var line extremeLine = na
+
+// per-bar event flags (drive the alerts)
+bool evtTestBegin    = false
+bool evtTerminalOk   = false
+bool evtTerminalWarn = false
+bool evtEntry        = false
+bool evtTypeOne      = false
+bool evtRetest       = false
+bool evtDeepRetest   = false
+bool evtTypeTwo      = false
+bool evtInvalid      = false
+int  resolveCode     = 0
+
+float atrValue       = nz(ta.atr(atrLengthInput), high - low)
+float pivotHighPrice = ta.pivothigh(pivotLengthInput, pivotLengthInput)
+float pivotLowPrice  = ta.pivotlow(pivotLengthInput, pivotLengthInput)
+
+bool confirmed = barstate.isconfirmed
+bool autoMode  = zoneSourceInput == SRC_AUTO
+
+// effective ratios: near < far < invalidation
+float ratioNearEff = math.min(ratioNearInput, ratioFarInput)
+float ratioFarEff  = math.max(math.max(ratioNearInput, ratioFarInput), ratioNearEff + 0.01)
+float ratioInvEff  = math.max(ratioInvInput, ratioFarEff + 0.02)
+
+// manual levels, sorted by direction
+bool  manualBull    = manualDirectionInput == DIR_BULL
+bool  manualSet     = manualEdgeAInput > 0 and manualEdgeBInput > 0 and manualEdgeAInput != manualEdgeBInput
+float manualNear    = manualSet ? (manualBull ? math.max(manualEdgeAInput, manualEdgeBInput) : math.min(manualEdgeAInput, manualEdgeBInput)) : na
+float manualFar     = manualSet ? (manualBull ? math.min(manualEdgeAInput, manualEdgeBInput) : math.max(manualEdgeAInput, manualEdgeBInput)) : na
+float manualHeight  = manualSet ? math.abs(manualNear - manualFar) : na
+float manualInvRaw  = manualInvInput > 0 ? manualInvInput : manualSet ? (manualBull ? manualFar - manualHeight : manualFar + manualHeight) : na
+float manualInvalid = manualSet ? (manualBull ? math.min(manualInvRaw, manualFar) : math.max(manualInvRaw, manualFar)) : na
+
+// pivot bookkeeping (approximate intrabar order when a bar confirms both a high and a low pivot)
+if confirmed
+    bool lowFirst = close <= open
+    if lowFirst and not na(pivotLowPrice)
+        addPivot(pivotPricesArray, pivotBarsArray, pivotHighsArray, false, pivotLowPrice, bar_index - pivotLengthInput)
+    if not na(pivotHighPrice)
+        addPivot(pivotPricesArray, pivotBarsArray, pivotHighsArray, true, pivotHighPrice, bar_index - pivotLengthInput)
+    if not lowFirst and not na(pivotLowPrice)
+        addPivot(pivotPricesArray, pivotBarsArray, pivotHighsArray, false, pivotLowPrice, bar_index - pivotLengthInput)
+
+// zone geometry for the current bar
+float dirSign    = zoneBull ? 1.0 : -1.0
+bool  zoneSet    = not na(zoneNear) and not na(zoneFar)
+float zoneTop    = zoneSet ? math.max(zoneNear, zoneFar) : na
+float zoneBottom = zoneSet ? math.min(zoneNear, zoneFar) : na
+float zoneHeight = zoneSet ? zoneTop - zoneBottom : na
+bool  touched    = zoneSet and state >= ST_ARMED and high >= zoneBottom and low <= zoneTop
+bool  fullTest   = zoneSet and state >= ST_ARMED and (zoneBull ? low <= zoneFar : high >= zoneFar)
+float testPrice  = zoneBull ? low : high
+float closePosition        = zoneSet and zoneHeight > 0 ? (close - zoneFar) * dirSign / zoneHeight : na
+bool  closeBeyondInvalid   = state >= ST_TESTING and not na(zoneInv) and (zoneInv - close) * dirSign > 0
+bool  closeInsideStructure = zoneSet and (close - zoneNear) * dirSign > 0
+bool  wideBar    = (high - low) >= wideBarInput * atrValue
+
+// manual zones re-arm only after price clears the zone by one zone height
+if confirmed and not autoMode and not manualCleared and manualSet
+    if (close - manualNear) * (manualBull ? 1.0 : -1.0) >= manualHeight
+        manualCleared := true
+
+// zone test begins: price arrives in the zone
+if confirmed and state == ST_ARMED and touched
+    state         := ST_TESTING
+    testStartBar  := bar_index
+    origExtreme   := testPrice
+    terminalSeen  := false
+    entryDone     := false
+    deepFlagged   := false
+    invalidCount  := 0
+    terminalGrade := "-"
+    evtTestBegin  := true
+    extremeLine   := line.new(bar_index, origExtreme, bar_index, origExtreme, color = neutralColorInput, style = line.style_dotted, width = 1)
+
+// track the developing test extreme (the working D point)
+if confirmed and state == ST_TESTING
+    origExtreme := zoneBull ? math.min(origExtreme, low) : math.max(origExtreme, high)
+
+// terminal price bar: first bar testing the full extent of the zone
+if confirmed and state >= ST_TESTING and not terminalSeen and fullTest
+    terminalSeen := true
+    [gradeText, gradeWarn, gradeOk] = gradeTerminalBar(closePosition, wideBar)
+    terminalGrade   := gradeText
+    evtTerminalWarn := gradeWarn
+    evtTerminalOk   := gradeOk
+    if showSignalsInput
+        label.new(bar_index, testPrice, "TPB", style = zoneBull ? label.style_label_up : label.style_label_down, color = #00000000, textcolor = gradeWarn ? (zoneBull ? bearColorInput : bullColorInput) : gradeOk ? (zoneBull ? bullColorInput : bearColorInput) : neutralColorInput, size = size.small, tooltip = "Terminal price bar - " + gradeText)
+
+// entry qualification during the test
+if confirmed and state == ST_TESTING and not entryDone
+    bool entryReady = entryModeInput == ENTRY_TOUCH or (entryModeInput == ENTRY_CLOSE and closeInsideStructure) or (entryModeInput == ENTRY_TPB and terminalSeen and closeInsideStructure)
+    if entryReady
+        entryDone := true
+        evtEntry  := true
+        if showSignalsInput
+            label.new(bar_index, testPrice, "Entry", style = zoneBull ? label.style_label_up : label.style_label_down, color = #00000000, textcolor = zoneBull ? bullColorInput : bearColorInput, size = size.small, tooltip = "Entry conditions met (" + entryModeInput + "); stop reference beyond the invalidation level")
+
+// initial reaction: price closes away from the extreme - Type I candidate
+if confirmed and state == ST_TESTING and closeInsideStructure and (close - origExtreme) * dirSign >= math.max(reactionMultInput * zoneHeight, atrValue)
+    state     := ST_REACT
+    barsClear := 0
+
+// after the reaction: either the move holds (Type I) or price returns for a retest (Type II assessment)
+if confirmed and state == ST_REACT
+    if touched
+        state         := ST_RETEST
+        retestExtreme := testPrice
+        evtRetest     := true
+    else
+        barsClear += 1
+        if barsClear >= typeOneBarsInput
+            resolveCode := 1
+
+// retest assessment: a Type II reversal holds at or near the original extreme before turning again
+if confirmed and state == ST_RETEST
+    retestExtreme := zoneBull ? math.min(retestExtreme, low) : math.max(retestExtreme, high)
+    if not deepFlagged and (origExtreme - retestExtreme) * dirSign > retestTolInput * zoneHeight
+        deepFlagged   := true
+        evtDeepRetest := true
+        if showSignalsInput
+            label.new(bar_index, testPrice, "Deep retest", style = zoneBull ? label.style_label_up : label.style_label_down, color = #00000000, textcolor = neutralColorInput, size = size.small, tooltip = "Retest travelled beyond tolerance past the original extreme - demand more reaction evidence")
+    if closeInsideStructure
+        resolveCode := 2
+
+// invalidation and timeout apply to every active phase
+if confirmed and state >= ST_TESTING
+    invalidCount := closeBeyondInvalid ? invalidCount + 1 : 0
+    if invalidCount >= invalidClosesInput
+        resolveCode := 3
+    else if resolveCode == 0 and bar_index - testStartBar >= timeoutBarsInput
+        resolveCode := 4
+
+// episode resolution
+if confirmed and resolveCode > 0
+    evtTypeOne := resolveCode == 1
+    evtTypeTwo := resolveCode == 2
+    evtInvalid := resolveCode == 3
+    lastOutcome := resolveCode == 1 ? "Type I reversal" : resolveCode == 2 ? (deepFlagged ? "Type II reversal (deep retest)" : "Type II reversal") : resolveCode == 3 ? "Invalidated" : "Expired"
+    if showSignalsInput
+        if resolveCode == 1
+            label.new(bar_index, testPrice, "Type I", style = zoneBull ? label.style_label_up : label.style_label_down, color = #00000000, textcolor = zoneBull ? bullColorInput : bearColorInput, size = size.small, tooltip = "Type I reversal - prompt turn held clear of the zone; manage from the initial extreme")
+        if resolveCode == 2
+            label.new(bar_index, testPrice, "Type II", style = zoneBull ? label.style_label_up : label.style_label_down, color = #00000000, textcolor = zoneBull ? bullColorInput : bearColorInput, size = size.small, tooltip = "Type II reversal - retest held near the original extreme and rejected; re-entry point")
+        if resolveCode == 3
+            label.new(bar_index, zoneInv, "PRZ violated", style = label.style_label_left, color = #00000000, textcolor = zoneBull ? bearColorInput : bullColorInput, size = size.small, tooltip = "Decisive acceptance beyond the limiting level - pattern void. A violated zone is information about trend strength; watch for continuation through the zone")
+        if resolveCode == 4
+            label.new(bar_index, close, "Expired", style = label.style_label_left, color = #00000000, textcolor = invColorInput, size = size.tiny, tooltip = "Episode timed out without resolution")
+    if not na(zoneBox)
+        box.set_right(zoneBox, bar_index)
+    if not na(invalidLine)
+        line.set_x2(invalidLine, bar_index)
+    if not na(extremeLine)
+        line.set_x2(extremeLine, bar_index)
+    if autoMode
+        usedPatternBar := zoneStartBar
+    else
+        manualCleared := false
+    state         := ST_IDLE
+    zoneNear      := na
+    zoneFar       := na
+    zoneInv       := na
+    zoneStartBar  := na
+    testStartBar  := na
+    origExtreme   := na
+    retestExtreme := na
+    zoneBox       := na
+    invalidLine   := na
+    extremeLine   := na
+
+// arming: define the zone before arrival (auto pattern projection or manual levels)
+if confirmed and (state == ST_IDLE or state == ST_ARMED)
+    bool  candidateOk   = false
+    bool  candidateBull = true
+    float candidateNear = na
+    float candidateFar  = na
+    float candidateInv  = na
+    int   candidateBar  = na
+    if autoMode
+        [pOk, pBull, pNear, pFar, pInv, pBarIdx] = candidateZone(pivotPricesArray, pivotBarsArray, pivotHighsArray, ratioNearEff, ratioFarEff, ratioInvEff)
+        float pDir = pBull ? 1.0 : -1.0
+        if pOk and (na(usedPatternBar) or pBarIdx != usedPatternBar) and (close - pInv) * pDir > 0
+            candidateOk   := true
+            candidateBull := pBull
+            candidateNear := pNear
+            candidateFar  := pFar
+            candidateInv  := pInv
+            candidateBar  := pBarIdx
+    else
+        if manualSet and manualCleared and (close - manualNear) * (manualBull ? 1.0 : -1.0) > 0
+            candidateOk   := true
+            candidateBull := manualBull
+            candidateNear := manualNear
+            candidateFar  := manualFar
+            candidateInv  := manualInvalid
+            candidateBar  := state == ST_ARMED ? zoneStartBar : bar_index
+    if candidateOk
+        bool changedZone = state == ST_IDLE or candidateBull != zoneBull or candidateNear != zoneNear or candidateFar != zoneFar or candidateInv != zoneInv or candidateBar != zoneStartBar
+        if changedZone
+            zoneBull     := candidateBull
+            zoneNear     := candidateNear
+            zoneFar      := candidateFar
+            zoneInv      := candidateInv
+            zoneStartBar := candidateBar
+            if not na(zoneBox)
+                box.delete(zoneBox)
+            if not na(invalidLine)
+                line.delete(invalidLine)
+            color zoneColor = zoneBull ? bullColorInput : bearColorInput
+            zoneBox     := box.new(zoneStartBar, math.max(zoneNear, zoneFar), bar_index, math.min(zoneNear, zoneFar), border_color = color.new(zoneColor, 60), border_width = 1, border_style = line.style_dashed, bgcolor = color.new(zoneColor, zoneTransparencyInput))
+            invalidLine := line.new(zoneStartBar, zoneInv, bar_index, zoneInv, color = invColorInput, style = line.style_dashed, width = 1)
+            state       := ST_ARMED
+    else if state == ST_ARMED
+        if not na(zoneBox)
+            box.delete(zoneBox)
+        if not na(invalidLine)
+            line.delete(invalidLine)
+        zoneBox      := na
+        invalidLine  := na
+        zoneNear     := na
+        zoneFar      := na
+        zoneInv      := na
+        zoneStartBar := na
+        state        := ST_IDLE
+        if not autoMode
+            manualCleared := false
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+// extend the active zone, invalidation level and original-extreme reference to the current bar
+if state >= ST_ARMED and not na(zoneBox)
+    box.set_right(zoneBox, bar_index)
+if state >= ST_ARMED and not na(invalidLine)
+    line.set_x2(invalidLine, bar_index)
+if state >= ST_TESTING and not na(extremeLine)
+    line.set_xy1(extremeLine, testStartBar, origExtreme)
+    line.set_xy2(extremeLine, bar_index, origExtreme)
+
+string tablePosition = tablePositionInput == "Top right" ? position.top_right : tablePositionInput == "Top left" ? position.top_left : tablePositionInput == "Bottom right" ? position.bottom_right : tablePositionInput == "Bottom left" ? position.bottom_left : position.middle_right
+
+var table statusTable = na
+if showTableInput and barstate.islast
+    if na(statusTable)
+        statusTable := table.new(tablePosition, 2, 8, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+    string stateText = state == ST_IDLE ? (autoMode ? "Idle - no armed zone" : manualSet ? "Idle - waiting to arm" : "Idle - set manual levels") : state == ST_ARMED ? "Armed - awaiting test" : state == ST_TESTING ? "Testing - price in zone" : state == ST_REACT ? "Reaction - Type I watch" : "Retest - Type II watch"
+    float riskPct    = state >= ST_ARMED ? math.abs(zoneNear - zoneInv) / close * 100 : na
+    string riskText  = na(riskPct) ? "-" : str.tostring(riskPct, "#.##") + "% - " + (riskPct <= maxRiskInput ? "acceptable" : "too wide, pass")
+    string zoneText  = state >= ST_ARMED ? formatPrice(zoneNear) + " / " + formatPrice(zoneFar) : "-"
+    string dirText   = state >= ST_ARMED ? (zoneBull ? "Bullish (support)" : "Bearish (resistance)") : "-"
+    color keyColor   = DASH_HEADER
+    color riskColor  = na(riskPct) ? DASH_TEXT : riskPct <= maxRiskInput ? bullColorInput : bearColorInput
+    table.cell(statusTable, 0, 0, "PRZ execution", text_color = DASH_TEXT, text_size = size.small)
+    table.cell(statusTable, 1, 0, autoMode ? "Auto zone" : "Manual zone", text_color = keyColor, text_size = size.small)
+    table.cell(statusTable, 0, 1, "State", text_color = keyColor, text_size = size.small)
+    table.cell(statusTable, 1, 1, stateText, text_color = DASH_TEXT, text_size = size.small)
+    table.cell(statusTable, 0, 2, "Direction", text_color = keyColor, text_size = size.small)
+    table.cell(statusTable, 1, 2, dirText, text_color = state >= ST_ARMED ? (zoneBull ? bullColorInput : bearColorInput) : DASH_TEXT, text_size = size.small)
+    table.cell(statusTable, 0, 3, "Zone (near / far)", text_color = keyColor, text_size = size.small)
+    table.cell(statusTable, 1, 3, zoneText, text_color = DASH_TEXT, text_size = size.small)
+    table.cell(statusTable, 0, 4, "Invalidation", text_color = keyColor, text_size = size.small)
+    table.cell(statusTable, 1, 4, state >= ST_ARMED ? formatPrice(zoneInv) : "-", text_color = DASH_TEXT, text_size = size.small)
+    table.cell(statusTable, 0, 5, "Terminal bar", text_color = keyColor, text_size = size.small)
+    table.cell(statusTable, 1, 5, terminalGrade, text_color = DASH_TEXT, text_size = size.small)
+    table.cell(statusTable, 0, 6, "Stop distance", text_color = keyColor, text_size = size.small)
+    table.cell(statusTable, 1, 6, riskText, text_color = riskColor, text_size = size.small)
+    table.cell(statusTable, 0, 7, "Last outcome", text_color = keyColor, text_size = size.small)
+    table.cell(statusTable, 1, 7, lastOutcome, text_color = DASH_TEXT, text_size = size.small)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(evtTestBegin,    "PRZ test begun",              "Price has entered the potential reversal zone - watch the terminal price bar")
+alertcondition(evtTerminalOk,   "Terminal bar - constructive", "Terminal price bar tested the full zone and closed back toward structure - constructive rejection")
+alertcondition(evtTerminalWarn, "Terminal bar - warning",      "Terminal price bar closed beyond the zone - completion is being accepted, caution")
+alertcondition(evtEntry,        "PRZ entry confirmed",         "Entry conditions met at the potential reversal zone")
+alertcondition(evtTypeOne,      "Type I reversal confirmed",   "Prompt reversal held clear of the zone - Type I; manage from the initial extreme")
+alertcondition(evtRetest,       "PRZ retest under way",        "Price has returned to the zone after the initial reaction - Type II assessment")
+alertcondition(evtDeepRetest,   "Deep retest",                 "Retest travelled beyond tolerance past the original extreme - demand more reaction evidence")
+alertcondition(evtTypeTwo,      "Type II reversal confirmed",  "Retest held near the original extreme and rejected - Type II reversal; re-entry point")
+alertcondition(evtInvalid,      "PRZ invalidated",             "Decisive acceptance beyond the limiting level - pattern void; possible continuation through the zone")
+
+//---------------------------------------------------------------------------------------------------------------------}

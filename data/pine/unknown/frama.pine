@@ -1,0 +1,196 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("FRAMA", shorttitle = "FRAMA", overlay = true)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+EXP_COEFFICIENT = 4.6         // published coefficient of the dimension-to-alpha exponential map
+ALPHA_MIN       = 0.01        // published lower clamp of the smoothing factor
+ALPHA_MAX       = 1.0         // published upper clamp of the smoothing factor
+LOG_2           = math.log(2) // box-counting base of the fractal dimension estimate
+
+TREND_UP   =  1
+TREND_FLAT =  0
+TREND_DOWN = -1
+
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+FLAT_COLOR    = #787b86
+NEUTRAL_COLOR = #787b86
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+FILL_PRICE_TRANSP = 70  // gradient transparency at the price end of the fill
+FILL_LINE_TRANSP  = 100 // gradient transparency at the FRAMA end of the fill
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+srcInput           = input.source(hl2, "Source", group = "Settings",
+     tooltip = "Price series the adaptive average smooths. Ehlers' published FRAMA filters the bar midpoint hl2 = (high + low) / 2. The fractal dimension itself is always measured from highs and lows, whatever the source.")
+
+lengthInput        = input.int(16, "Window Length", minval = 4, step = 2, group = "Settings",
+     tooltip = "Even lookback window N, split into two equal halves for the box-counting dimension estimate — Ehlers' published default is 16. Odd values are rounded down to the nearest even window. Longer windows steady the estimate but are slower to notice that a regime has changed.")
+
+flatThresholdInput = input.float(0.05, "Flat Threshold", minval = 0, step = 0.01, group = "Trend Regime",
+     tooltip = "One-bar change of FRAMA, as a fraction of ATR, below which the line is read as flat (congestion). Beyond it, the slope marks a directional phase. Raise the threshold to demand steeper trends; lower it for more sensitive regime shifts.")
+
+atrLengthInput     = input.int(14, "ATR Normalization Length", minval = 1, group = "Trend Regime",
+     tooltip = "ATR window used to normalize FRAMA's one-bar slope, so the flat threshold behaves consistently across symbols and timeframes.")
+
+showDashboardInput     = input.bool(true, "Show Dashboard", group = "Dashboard",
+     tooltip = "Displays a compact panel with the current regime read, the estimated fractal dimension (1 = line-like trend, 2 = space-filling noise), the effective smoothing factor, and its EMA-equivalent length.")
+
+dashboardLocationInput = input.string("Top Right", "Location", options = ["Top Right", "Bottom Right", "Bottom Left", "Top Left"], group = "Dashboard",
+     tooltip = "Chart corner the dashboard is anchored to.")
+
+dashboardSizeInput     = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = "Dashboard",
+     tooltip = "Text size of the dashboard.")
+
+trendColorInput    = input.bool(true, "Trend Regime Coloring", group = "Style",
+     tooltip = "Colors FRAMA by its regime read — bullish while sloping up beyond the flat threshold, bearish while sloping down, flat color inside congestion. Disable to draw the line in the neutral color.")
+
+gradientInput      = input.bool(true, "Adaptive Gradient", group = "Style",
+     tooltip = "Blends the trend color toward the flat color as the fractal dimension rises toward 2 (noisy, space-filling price) and saturates it as the dimension falls toward 1 (clean, line-like trend), so the line pales in congestion and glows as it accelerates.")
+
+bullColorInput     = input.color(BULL_COLOR, "Bullish", inline = "state", group = "Style",
+     tooltip = "Bullish color, used while FRAMA slopes upward and for bullish crossings/fill.")
+
+bearColorInput     = input.color(BEAR_COLOR, "Bearish", inline = "state", group = "Style",
+     tooltip = "Bearish color, used while FRAMA slopes downward and for bearish crossings/fill.")
+
+flatColorInput     = input.color(FLAT_COLOR, "Flat", inline = "state", group = "Style",
+     tooltip = "Color used while FRAMA is flat, and as the faded end of the adaptive gradient.")
+
+neutralColorInput  = input.color(NEUTRAL_COLOR, "Neutral", group = "Style",
+     tooltip = "Line color used when trend regime coloring is disabled.")
+
+lineWidthInput     = input.int(2, "Line Width", minval = 1, maxval = 5, group = "Style",
+     tooltip = "Width of the FRAMA line.")
+
+showFillInput      = input.bool(true, "Price / FRAMA Gradient Fill", group = "Style",
+     tooltip = "Fills the area between the source and FRAMA with a vertical gradient — bullish while price holds above the average, bearish while below — fading to fully transparent at the line. Makes the dynamic support/resistance read visible: price rides one side of the line in trends and oscillates across a flat line in congestion.")
+
+showCrossesInput   = input.bool(false, "Price Crossing Markers", group = "Style",
+     tooltip = "Displays small triangle markers when the source crosses over or under FRAMA. Off by default to keep the chart clean — the crossing alerts work regardless.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+// na-proof source — the recursive filter must never ingest na
+float src = nz(srcInput, close)
+
+// Even window enforcement — the box-counting estimate needs two equal halves of N/2 bars
+int halfLength   = math.max(2, lengthInput / 2)
+int windowLength = 2 * halfLength
+
+// Normalized ranges — each half's highest high minus lowest low over N/2, the full window's range over N
+halfHigh = ta.highest(high, halfLength)
+halfLow  = ta.lowest(low, halfLength)
+fullHigh = ta.highest(high, windowLength)
+fullLow  = ta.lowest(low, windowLength)
+
+float n1 = (halfHigh - halfLow) / halfLength
+float n2 = (halfHigh[halfLength] - halfLow[halfLength]) / halfLength
+float n3 = (fullHigh - fullLow) / windowLength
+
+// Fractal dimension — D = (log(N1 + N2) - log(N3)) / log(2), held at its prior value when a range degenerates to zero
+bool windowReady = not na(n1) and not na(n2) and not na(n3)
+
+var float fractalDim = 1.0
+if windowReady and n1 > 0 and n2 > 0 and n3 > 0
+    fractalDim := (math.log(n1 + n2) - math.log(n3)) / LOG_2
+
+// Smoothing factor — alpha = exp(-4.6 x (D - 1)), clamped to the published 0.01 - 1 range
+float effectiveAlpha = math.min(math.max(math.exp(-EXP_COEFFICIENT * (fractalDim - 1)), ALPHA_MIN), ALPHA_MAX)
+
+// FRAMA recursion — alpha x price + (1 - alpha) x prior FRAMA, seeded with the source until the window fills
+var float frama = na
+frama := not windowReady or na(frama[1]) ? src : effectiveAlpha * src + (1 - effectiveAlpha) * frama[1]
+
+// Trend regime — ATR-normalized one-bar slope measured against the flat threshold
+atrValue        = ta.atr(atrLengthInput)
+framaSlope      = frama - nz(frama[1], frama)
+normalizedSlope = na(atrValue) or atrValue == 0 ? 0.0 : framaSlope / atrValue
+trendState      = normalizedSlope > flatThresholdInput ? TREND_UP : normalizedSlope < -flatThresholdInput ? TREND_DOWN : TREND_FLAT
+
+// Events — price crossings and regime transitions
+crossUp   = ta.crossover(src, frama)
+crossDown = ta.crossunder(src, frama)
+
+prevState    = nz(trendState[1], TREND_FLAT)
+bullishPhase = trendState == TREND_UP   and prevState != TREND_UP
+bearishPhase = trendState == TREND_DOWN and prevState != TREND_DOWN
+flatPhase    = trendState == TREND_FLAT and prevState != TREND_FLAT
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+// Adaptivity read for the gradient — 1 when the dimension says clean trend, 0 when it says noise
+adaptivity = math.max(math.min(2 - fractalDim, 1), 0)
+
+framaColor = switch
+    not trendColorInput      => neutralColorInput
+    trendState == TREND_UP   => gradientInput ? color.from_gradient(adaptivity, 0, 1, flatColorInput, bullColorInput) : bullColorInput
+    trendState == TREND_DOWN => gradientInput ? color.from_gradient(adaptivity, 0, 1, flatColorInput, bearColorInput) : bearColorInput
+    => flatColorInput
+
+priceAbove      = src > frama
+fillTopColor    = showFillInput ? (priceAbove ? color.new(bullColorInput, FILL_PRICE_TRANSP) : color.new(bearColorInput, FILL_LINE_TRANSP)) : na
+fillBottomColor = showFillInput ? (priceAbove ? color.new(bullColorInput, FILL_LINE_TRANSP) : color.new(bearColorInput, FILL_PRICE_TRANSP)) : na
+
+srcPlotId   = plot(src, "Source", color = na, editable = false, display = display.none)
+framaPlotId = plot(frama, "FRAMA", color = framaColor, linewidth = lineWidthInput)
+
+fill(srcPlotId, framaPlotId, top_value = math.max(src, frama), bottom_value = math.min(src, frama), top_color = fillTopColor, bottom_color = fillBottomColor, title = "Price / FRAMA Gradient Fill")
+
+plotshape(showCrossesInput and crossUp, "Bullish Price Cross", shape.triangleup, location.belowbar, color = bullColorInput, size = size.tiny)
+plotshape(showCrossesInput and crossDown, "Bearish Price Cross", shape.triangledown, location.abovebar, color = bearColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+dashboardLocation = switch dashboardLocationInput
+    "Top Right"    => position.top_right
+    "Bottom Right" => position.bottom_right
+    "Bottom Left"  => position.bottom_left
+    => position.top_left
+
+dashboardTextSize = switch dashboardSizeInput
+    "Tiny"  => size.tiny
+    "Small" => size.small
+    => size.normal
+
+var table dashboardTable = table.new(dashboardLocation, 2, 4, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+if barstate.islast and showDashboardInput
+    regimeText  = trendState == TREND_UP ? "Trending Up" : trendState == TREND_DOWN ? "Trending Down" : "Ranging"
+    regimeColor = trendState == TREND_UP ? bullColorInput : trendState == TREND_DOWN ? bearColorInput : flatColorInput
+
+    // EMA-equivalent length implied by the current smoothing factor — how slow the line acts right now
+    effectiveLength = 2 / effectiveAlpha - 1
+
+    table.cell(dashboardTable, 0, 0, "Regime",      text_color = DASH_HEADER, text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 0, regimeText,    text_color = regimeColor,    text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 1, "Fractal Dim", text_color = DASH_HEADER, text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 1, str.tostring(fractalDim, "#.##"),      text_color = DASH_TEXT,   text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 2, "Eff. Alpha",  text_color = DASH_HEADER, text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 2, str.tostring(effectiveAlpha, "#.###"), text_color = DASH_TEXT,   text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 3, "Eff. Length", text_color = DASH_HEADER, text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 3, str.tostring(effectiveLength, "#.#"),  text_color = DASH_TEXT,   text_size = dashboardTextSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(crossUp, "Bullish Price Cross", "Price crossed above FRAMA on {{ticker}} ({{interval}})")
+alertcondition(crossDown, "Bearish Price Cross", "Price crossed below FRAMA on {{ticker}} ({{interval}})")
+alertcondition(bullishPhase, "Bullish Trend Phase", "FRAMA slope turned decisively upward on {{ticker}} ({{interval}}) — bullish directional phase")
+alertcondition(bearishPhase, "Bearish Trend Phase", "FRAMA slope turned decisively downward on {{ticker}} ({{interval}}) — bearish directional phase")
+alertcondition(flatPhase, "Flat Regime", "FRAMA flattened on {{ticker}} ({{interval}}) — congestion regime")
+
+//---------------------------------------------------------------------------------------------------------------------}

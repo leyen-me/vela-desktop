@@ -1,0 +1,425 @@
+// This work is licensed under Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Momentum Thrust", "Momentum Thrust", overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR = #089981
+BEAR_COLOR = #f23645
+LATE_COLOR = #ff9800 // the one accent - thrusts that arrive late in an extended move
+BASE_COLOR = #5b9cf6 // quiet base the thrust erupts from
+GREY_COLOR = #787b86
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+BASE_GROUP     = "Quiet Base"
+IGNITION_GROUP = "Ignition"
+LOCATION_GROUP = "Location"
+TRADE_GROUP    = "Follow-Through"
+STYLE_GROUP    = "Style"
+DASH_GROUP     = "Dashboard"
+
+SIDE_BOTH = "Both"
+SIDE_BULL = "Bullish Only"
+SIDE_BEAR = "Bearish Only"
+
+STOP_IGNITION = "Ignition Extreme"
+STOP_BASE     = "Opposite Side of Base"
+
+STATUS_NONE   = 0
+STATUS_ACTIVE = 1
+STATUS_EXITED = 2
+STATUS_FAILED = 3
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+baseLenInput = input.int(10, "Base Length", minval = 3, maxval = 100, group = BASE_GROUP
+  , tooltip = "Bars immediately before the ignition that must form the quiet base. A thrust is defined against the calm that precedes it, so the scan only fires out of a tight, low-activity stretch.")
+
+baseWidthInput = input.float(4.0, "Maximum Base Width (ATR)", minval = 0.5, step = 0.25, group = BASE_GROUP
+  , tooltip = "Highest high minus lowest low of the base, in multiples of the reference ATR. Lower values demand tighter bases; raise it on symbols that rarely go quiet.")
+
+baseActivityInput = input.float(0.9, "Maximum Base Activity", minval = 0.1, maxval = 2, step = 0.05, group = BASE_GROUP
+  , tooltip = "Average true range across the base as a fraction of the reference ATR. Below 1 means the bars in the base were narrower than normal: the narrow-range stretch thrusts erupt from.")
+
+refLenInput = input.int(50, "Reference ATR Length", minval = 5, group = BASE_GROUP
+  , tooltip = "Slow average true range that defines a normal bar for this symbol. Base width, base activity, thrust size and range expansion are all measured in these units, read at the last bar of the base.")
+
+sideInput = input.string(SIDE_BOTH, "Direction", options = [SIDE_BOTH, SIDE_BULL, SIDE_BEAR], group = IGNITION_GROUP
+  , tooltip = "Scan for upside thrusts, downside thrusts or both.")
+
+ignitionBarsInput = input.int(3, "Ignition Window (bars)", minval = 1, maxval = 5, group = IGNITION_GROUP
+  , tooltip = "A thrust can take one bar or a short burst of consecutive bars. Every bar in the window must close in the thrust direction, and the shortest window that qualifies is the one reported.")
+
+thrustSizeInput = input.float(2.0, "Minimum Thrust (ATR)", minval = 0.5, step = 0.25, group = IGNITION_GROUP
+  , tooltip = "Net close-to-close travel across the ignition window, in reference ATRs. The outsized part of the definition: the burst must cover several normal bars of ground at once.")
+
+rangeExpansionInput = input.float(1.5, "Range Expansion (ATR)", minval = 0.5, step = 0.1, group = IGNITION_GROUP
+  , tooltip = "The widest bar of the ignition window must span at least this many reference ATRs: range expansion against the quiet base.")
+
+closeLocationInput = input.float(75, "Close Location (%)", minval = 50, maxval = 100, step = 5, group = IGNITION_GROUP
+  , tooltip = "The final ignition bar must close in the top part of its range for an upside thrust (bottom part for a downside one). 75 keeps the close in the outer quarter, the conviction close of a burst.")
+
+useVolumeInput = input.bool(true, "Volume Expansion", inline = "volume", group = IGNITION_GROUP
+  , tooltip = "Require the heaviest bar of the ignition window to trade a multiple of the average volume measured at the end of the base. Skipped automatically on symbols without volume data.")
+
+volumeMultInput = input.float(1.5, "", minval = 1, step = 0.1, inline = "volume", group = IGNITION_GROUP)
+
+volumeLenInput = input.int(20, "Volume Average Length", minval = 2, group = IGNITION_GROUP
+  , tooltip = "Length of the volume average the ignition is compared with.")
+
+useRsiInput = input.bool(true, "RSI Swing Through Midline", group = IGNITION_GROUP
+  , tooltip = "Oscillator side of the signature: RSI must start the ignition at or below the neutral ceiling and finish it at or beyond the thrust zone, a near-vertical swing through the midline rather than a drift. Mirrored for downside thrusts.")
+
+rsiLenInput = input.int(14, "RSI Length", minval = 2, group = IGNITION_GROUP
+  , tooltip = "Length of the RSI used for the midline swing test.")
+
+rsiStartInput = input.float(60, "Start At or Below", minval = 40, maxval = 70, step = 1, inline = "rsi", group = IGNITION_GROUP
+  , tooltip = "RSI at the last bar of the base must sit at or below this level for an upside thrust (at or above 100 minus it for a downside one).")
+
+rsiZoneInput = input.float(65, "Finish At or Above", minval = 50, maxval = 95, step = 1, inline = "rsi", group = IGNITION_GROUP
+  , tooltip = "RSI on the final ignition bar must reach this level for an upside thrust (100 minus it for a downside one).")
+
+contextLenInput = input.int(60, "Trend Context (bars)", minval = 10, maxval = 500, group = LOCATION_GROUP
+  , tooltip = "Window, ending at the base, over which the move already travelled in the thrust direction is measured. Position does most of the work in separating an initiation thrust from an exhaustion spike.")
+
+lateRunInput = input.float(8, "Late Thrust Run (ATR)", minval = 1, step = 0.5, group = LOCATION_GROUP
+  , tooltip = "When price had already travelled this many reference ATRs in the thrust direction across the context window (from the window's opposite extreme to the far side of the base), the base sits late in an extended move and the same burst reads as a possible climax. Those thrusts are tagged Late in the accent color.")
+
+tradeLateInput = input.bool(false, "Track Late Thrusts", group = LOCATION_GROUP
+  , tooltip = "Also open the follow-through plan on Late thrusts. Off by default: thrust systems usually gate entries by trend position, and a late burst is a caution flag rather than a go-with signal.")
+
+holdBarsInput = input.int(5, "Holding Clock (bars)", minval = 1, maxval = 50, group = TRADE_GROUP
+  , tooltip = "Bars the thrust is given to deliver before the plan exits at the close. Momentum bursts are brief by definition: the burst style enters on the ignition and exits into strength within a few bars, typically three to five on daily charts.")
+
+stopModeInput = input.string(STOP_IGNITION, "Invalidation", options = [STOP_IGNITION, STOP_BASE], group = TRADE_GROUP
+  , tooltip = "Level whose close-through ends the plan as a failed thrust. Ignition Extreme uses the low of the ignition bars (high for downside thrusts): giving back the whole burst argues it was exhaustive. Opposite Side of Base is wider and tolerates a deeper test.")
+
+showBaseInput = input.bool(true, "Base Boxes", group = STYLE_GROUP
+  , tooltip = "Shade the quiet base each thrust erupted from.")
+
+showPlanInput = input.bool(true, "Follow-Through Plan", group = STYLE_GROUP
+  , tooltip = "Draw the entry and invalidation levels while the holding clock runs, then the realized span from entry to exit.")
+
+showLabelsInput = input.bool(true, "Labels", group = STYLE_GROUP
+  , tooltip = "Tag each thrust and each plan outcome. Hover a thrust tag for its measured signature.")
+
+labelSizeInput = input.string("Small", "Label Size", options = ["Tiny", "Small", "Normal"], group = STYLE_GROUP)
+
+bullColorInput = input.color(BULL_COLOR, "Upside", inline = "colors", group = STYLE_GROUP)
+bearColorInput = input.color(BEAR_COLOR, "Downside", inline = "colors", group = STYLE_GROUP)
+lateColorInput = input.color(LATE_COLOR, "Late", inline = "colors", group = STYLE_GROUP)
+baseColorInput = input.color(BASE_COLOR, "Base", inline = "colors", group = STYLE_GROUP)
+
+showDashInput = input.bool(true, "Show Dashboard", group = DASH_GROUP
+  , tooltip = "Panel with the latest thrust's measured signature and the state of its follow-through plan.")
+
+dashPosInput = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], inline = "dash", group = DASH_GROUP)
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], inline = "dash", group = DASH_GROUP)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types & Functions
+//---------------------------------------------------------------------------------------------------------------------{
+//Follow-through plan opened by a thrust
+type Plan
+    int   dir        = 0
+    int   status     = 0
+    int   entryBar   = 0
+    float entry      = na
+    float stop       = na
+    float origin     = na
+    float best       = na
+    float deepest    = 0.
+    int   exitBar    = 0
+    float exitPrice  = na
+    line  entryLine  = na
+    line  stopLine   = na
+
+getSize(string s) =>
+    switch s
+        "Tiny"  => size.tiny
+        "Small" => size.small
+        => size.normal
+
+getPosition(string p) =>
+    switch p
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        => position.bottom_left
+
+//Percent change from a to b, signed in the plan's direction
+signedPct(float a, float b, int dir) =>
+    a == 0 or na(a) or na(b) ? na : dir * (b - a) / a * 100
+
+fmtPct(float x) =>
+    na(x) ? "-" : (x >= 0 ? "+" : "") + str.tostring(x, "#.##") + "%"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Measurements
+//---------------------------------------------------------------------------------------------------------------------{
+labelSize = getSize(labelSizeInput)
+
+refAtr     = ta.atr(refLenInput)
+trueRange  = ta.tr(true)
+baseHighS  = ta.highest(high, baseLenInput)
+baseLowS   = ta.lowest(low, baseLenInput)
+baseActS   = ta.sma(trueRange, baseLenInput)
+ctxLowS    = ta.lowest(low, contextLenInput)
+ctxHighS   = ta.highest(high, contextLenInput)
+rsiValue   = ta.rsi(close, rsiLenInput)
+volumeAvg  = ta.sma(volume, volumeLenInput)
+
+//Consecutive closes in each direction, ending on this bar
+upRun   = ta.barssince(not (close > close[1]))
+downRun = ta.barssince(not (close < close[1]))
+
+barSpan     = high - low
+closeLocUp  = barSpan > 0 ? (close - low) / barSpan * 100 : 50.
+closeLocDn  = barSpan > 0 ? (high - close) / barSpan * 100 : 50.
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Thrust Detection
+//---------------------------------------------------------------------------------------------------------------------{
+var Plan plan = Plan.new()
+
+bool  bullThrust   = false
+bool  bearThrust   = false
+bool  thrustLate   = false
+int   thrustBars   = 0
+float thrustAtr    = na
+float thrustRange  = na
+float thrustVolume = na
+float thrustRsi0   = na
+float baseTop      = na
+float baseBottom   = na
+float baseWidth    = na
+float priorRun     = na
+float ignitionLow  = na
+float ignitionHigh = na
+
+bool scanUp   = sideInput != SIDE_BEAR
+bool scanDown = sideInput != SIDE_BULL
+var int lastThrustBar = na
+
+//One thrust per burst: an open plan, or a late tag still inside its holding clock, pauses the scan
+bool canScan  = barstate.isconfirmed and plan.status != STATUS_ACTIVE and bar_index > refLenInput + baseLenInput + ignitionBarsInput
+  and (na(lastThrustBar) or bar_index - lastThrustBar > holdBarsInput)
+
+if canScan
+    for k = 1 to ignitionBarsInput
+        float a  = refAtr[k]
+        float hi = baseHighS[k]
+        float lo = baseLowS[k]
+        if na(a) or a <= 0 or na(hi) or na(lo)
+            continue
+        bool quiet = hi - lo <= baseWidthInput * a and baseActS[k] <= baseActivityInput * a
+        if not quiet
+            continue
+        float move = close - close[k]
+        float widest = 0.
+        float heaviest = 0.
+        float ignLo    = low
+        float ignHi    = high
+        for j = 0 to k - 1
+            widest   := math.max(widest, trueRange[j])
+            heaviest := math.max(heaviest, nz(volume[j]))
+            ignLo    := math.min(ignLo, low[j])
+            ignHi    := math.max(ignHi, high[j])
+        float avgVol = volumeAvg[k]
+        bool  volOk  = not useVolumeInput or na(avgVol) or avgVol <= 0 or heaviest >= volumeMultInput * avgVol
+        bool  sizeOk = math.abs(move) >= thrustSizeInput * a and widest >= rangeExpansionInput * a
+        float r0     = rsiValue[k]
+        float runUp   = (hi - ctxLowS[k]) / a
+        float runDown = (ctxHighS[k] - lo) / a
+
+        bool upOk = scanUp and move > 0 and sizeOk and volOk and upRun >= k and close > hi and closeLocUp >= closeLocationInput
+          and (not useRsiInput or (r0 <= rsiStartInput and rsiValue >= rsiZoneInput))
+        bool dnOk = scanDown and move < 0 and sizeOk and volOk and downRun >= k and close < lo and closeLocDn >= closeLocationInput
+          and (not useRsiInput or (r0 >= 100 - rsiStartInput and rsiValue <= 100 - rsiZoneInput))
+
+        if upOk or dnOk
+            bullThrust   := upOk
+            bearThrust   := dnOk
+            thrustBars   := k
+            thrustAtr    := math.abs(move) / a
+            thrustRange  := widest / a
+            thrustVolume := na(avgVol) or avgVol <= 0 ? na : heaviest / avgVol
+            thrustRsi0   := r0
+            baseTop      := hi
+            baseBottom   := lo
+            baseWidth    := (hi - lo) / a
+            priorRun     := upOk ? runUp : runDown
+            thrustLate   := not na(priorRun) and priorRun >= lateRunInput
+            ignitionLow  := ignLo
+            ignitionHigh := ignHi
+            break
+
+anyThrust = bullThrust or bearThrust
+
+if anyThrust
+    lastThrustBar := bar_index
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Follow-Through Plan
+//---------------------------------------------------------------------------------------------------------------------{
+bool planExit   = false
+bool planFailed = false
+
+//Manage the open plan first: invalidation on a close through the stop, otherwise the clock exit
+if plan.status == STATUS_ACTIVE and bar_index > plan.entryBar and barstate.isconfirmed
+    int   d     = plan.dir
+    float edge  = d == 1 ? high : low
+    plan.best  := d == 1 ? math.max(plan.best, edge) : math.min(plan.best, edge)
+    float leg   = math.abs(plan.best - plan.origin)
+    float pause = d == 1 ? plan.best - low : high - plan.best
+    if leg > 0
+        plan.deepest := math.max(plan.deepest, pause / leg)
+    color c = d == 1 ? bullColorInput : bearColorInput
+    if not na(plan.entryLine)
+        line.set_x2(plan.entryLine, bar_index)
+        line.set_x2(plan.stopLine, bar_index)
+    if d * (close - plan.stop) < 0
+        planFailed     := true
+        plan.status    := STATUS_FAILED
+        plan.exitBar   := bar_index
+        plan.exitPrice := close
+    else if bar_index - plan.entryBar >= holdBarsInput
+        planExit       := true
+        plan.status    := STATUS_EXITED
+        plan.exitBar   := bar_index
+        plan.exitPrice := close
+    if planFailed or planExit
+        float result = signedPct(plan.entry, plan.exitPrice, d)
+        color rc     = result >= 0 ? c : GREY_COLOR
+        if showPlanInput
+            box.new(plan.entryBar, math.max(plan.entry, plan.exitPrice), bar_index, math.min(plan.entry, plan.exitPrice)
+              , border_color = color.new(rc, 70), bgcolor = color.new(rc, 85))
+        if showLabelsInput
+            string tip = (planFailed ? "Failed thrust: close through the invalidation level" : "Holding clock complete: exit at the close")
+              + "\nEntry " + str.tostring(plan.entry, format.mintick) + " / exit " + str.tostring(plan.exitPrice, format.mintick)
+              + "\nResult " + fmtPct(result) + " over " + str.tostring(bar_index - plan.entryBar) + " bars"
+              + "\nDeepest pause: " + str.tostring(plan.deepest * 100, "#") + "% of the thrust leg"
+            //Tagged under the realized span (over it for downside plans), clear of the bars that follow the exit
+            label.new(bar_index, d == 1 ? math.min(plan.entry, plan.exitPrice) : math.max(plan.entry, plan.exitPrice), (planFailed ? "Failed " : "Exit ") + fmtPct(result)
+              , style     = d == 1 ? label.style_label_up : label.style_label_down
+              , color     = color.new(planFailed ? GREY_COLOR : c, 80)
+              , textcolor = planFailed ? GREY_COLOR : c
+              , size      = labelSize
+              , tooltip   = tip)
+
+//A new thrust: base box, tag, and the plan when the location allows it
+if anyThrust
+    int   d       = bullThrust ? 1 : -1
+    color sideCol = d == 1 ? bullColorInput : bearColorInput
+    color tagCol  = thrustLate ? lateColorInput : sideCol
+    int   baseEnd = bar_index - thrustBars
+    if showBaseInput
+        box.new(baseEnd - baseLenInput + 1, baseTop, baseEnd, baseBottom
+          , border_color = color.new(baseColorInput, 50), bgcolor = color.new(baseColorInput, 85))
+    if showLabelsInput
+        string tip = (thrustLate ? "Late thrust: an extended move behind the base, possible climax rather than initiation"
+              : "Initiation thrust out of a quiet base")
+          + "\nPrior run: " + str.tostring(priorRun, "#.#") + " ATR over " + str.tostring(contextLenInput) + " bars"
+          + "\nThrust: " + str.tostring(thrustAtr, "#.##") + " ATR in " + str.tostring(thrustBars) + (thrustBars == 1 ? " bar" : " bars")
+          + "\nWidest bar: " + str.tostring(thrustRange, "#.##") + " ATR"
+          + "\nClose location: " + str.tostring(d == 1 ? closeLocUp : closeLocDn, "#") + "% toward the extreme"
+          + (na(thrustVolume) ? "" : "\nVolume: " + str.tostring(thrustVolume, "#.##") + "x average")
+          + "\nRSI: " + str.tostring(thrustRsi0, "#") + " to " + str.tostring(rsiValue, "#")
+          + "\nBase: " + str.tostring(baseLenInput) + " bars, " + str.tostring(baseWidth, "#.##") + " ATR wide"
+        label.new(bar_index, d == 1 ? low : high, thrustLate ? "Late Thrust" : "Thrust"
+          , style     = d == 1 ? label.style_label_up : label.style_label_down
+          , color     = tagCol
+          , textcolor = color.white
+          , size      = labelSize
+          , tooltip   = tip)
+    if not thrustLate or tradeLateInput
+        plan.dir       := d
+        plan.status    := STATUS_ACTIVE
+        plan.entryBar  := bar_index
+        plan.entry     := close
+        plan.origin    := close[thrustBars]
+        plan.best      := d == 1 ? high : low
+        plan.deepest   := 0.
+        plan.stop      := stopModeInput == STOP_BASE ? (d == 1 ? baseBottom : baseTop) : (d == 1 ? ignitionLow : ignitionHigh)
+        plan.exitPrice := na
+        if showPlanInput
+            plan.entryLine := line.new(bar_index, close, bar_index, close, color = sideCol, width = 2)
+            plan.stopLine  := line.new(bar_index, plan.stop, bar_index, plan.stop, color = color.new(GREY_COLOR, 20), style = line.style_dashed)
+        else
+            plan.entryLine := line(na)
+            plan.stopLine  := line(na)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var int   lastDir     = 0
+var bool  lastLate    = false
+var int   lastBars    = 0
+var float lastSize    = na
+var float lastRange   = na
+var float lastVolume  = na
+var float lastRsiFrom = na
+var float lastRsiTo   = na
+var int   lastBar     = na
+
+if anyThrust
+    lastDir     := bullThrust ? 1 : -1
+    lastLate    := thrustLate
+    lastBars    := thrustBars
+    lastSize    := thrustAtr
+    lastRange   := thrustRange
+    lastVolume  := thrustVolume
+    lastRsiFrom := thrustRsi0
+    lastRsiTo   := rsiValue
+    lastBar     := bar_index
+
+var table dash = na
+
+if barstate.islast and showDashInput
+    if na(dash)
+        dash := table.new(getPosition(dashPosInput), 2, 6, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+    ts = getSize(dashSizeInput)
+    color dirCol = lastLate ? lateColorInput : lastDir == 1 ? bullColorInput : lastDir == -1 ? bearColorInput : DASH_TEXT
+    string thrustText = lastDir == 0 ? "None yet" : (lastDir == 1 ? "Up" : "Down") + (lastLate ? " late" : "") + ", " + str.tostring(bar_index - lastBar) + " bars"
+    string sizeText = na(lastSize) ? "-" : str.tostring(lastSize, "#.#") + " ATR, " + str.tostring(lastBars) + (lastBars == 1 ? " bar" : " bars")
+    string rangeText = na(lastRange) ? "-" : str.tostring(lastRange, "#.#") + " ATR"
+    string volText = na(lastVolume) ? "n/a" : str.tostring(lastVolume, "#.#") + "x avg"
+    string rsiText = na(lastRsiFrom) ? "-" : str.tostring(lastRsiFrom, "#") + " to " + str.tostring(lastRsiTo, "#")
+    string statusText = switch plan.status
+        STATUS_ACTIVE => "Clock " + str.tostring(bar_index - plan.entryBar) + "/" + str.tostring(holdBarsInput) + " " + fmtPct(signedPct(plan.entry, close, plan.dir))
+        STATUS_EXITED => "Exit " + fmtPct(signedPct(plan.entry, plan.exitPrice, plan.dir))
+        STATUS_FAILED => "Failed " + fmtPct(signedPct(plan.entry, plan.exitPrice, plan.dir))
+        => lastLate ? "Caution" : "Scanning"
+    color statusCol = plan.status == STATUS_FAILED or plan.status == STATUS_NONE ? DASH_TEXT : (plan.dir == 1 ? bullColorInput : bearColorInput)
+
+    table.cell(dash, 0, 0, "Last Thrust", text_color = DASH_HEADER, text_size = ts, text_halign = text.align_left)
+    table.cell(dash, 1, 0, thrustText, text_color = dirCol, text_size = ts, text_halign = text.align_right)
+    table.cell(dash, 0, 1, "Size", text_color = DASH_HEADER, text_size = ts, text_halign = text.align_left)
+    table.cell(dash, 1, 1, sizeText, text_color = DASH_TEXT, text_size = ts, text_halign = text.align_right)
+    table.cell(dash, 0, 2, "Widest Bar", text_color = DASH_HEADER, text_size = ts, text_halign = text.align_left)
+    table.cell(dash, 1, 2, rangeText, text_color = DASH_TEXT, text_size = ts, text_halign = text.align_right)
+    table.cell(dash, 0, 3, "Volume", text_color = DASH_HEADER, text_size = ts, text_halign = text.align_left)
+    table.cell(dash, 1, 3, volText, text_color = DASH_TEXT, text_size = ts, text_halign = text.align_right)
+    table.cell(dash, 0, 4, "RSI Swing", text_color = DASH_HEADER, text_size = ts, text_halign = text.align_left)
+    table.cell(dash, 1, 4, rsiText, text_color = DASH_TEXT, text_size = ts, text_halign = text.align_right)
+    table.cell(dash, 0, 5, "Plan", text_color = DASH_HEADER, text_size = ts, text_halign = text.align_left)
+    table.cell(dash, 1, 5, statusText, text_color = statusCol, text_size = ts, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(bullThrust and not thrustLate, "Upside Thrust", "Momentum Thrust: upside thrust out of a quiet base on {{ticker}} ({{interval}})")
+alertcondition(bearThrust and not thrustLate, "Downside Thrust", "Momentum Thrust: downside thrust out of a quiet base on {{ticker}} ({{interval}})")
+alertcondition(anyThrust and thrustLate, "Late Thrust", "Momentum Thrust: late thrust in an extended move on {{ticker}}, possible climax ({{interval}})")
+alertcondition(planFailed, "Failed Follow-Through", "Momentum Thrust: the thrust gave back its burst and closed through the invalidation level on {{ticker}} ({{interval}})")
+alertcondition(planExit, "Holding Clock Exit", "Momentum Thrust: holding clock complete, plan exits at the close on {{ticker}} ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

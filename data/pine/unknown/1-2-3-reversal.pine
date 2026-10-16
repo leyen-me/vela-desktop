@@ -1,0 +1,339 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("1-2-3 Reversal", shorttitle = "1-2-3 Reversal", overlay = true, max_lines_count = 500, max_labels_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+NEUTRAL_COLOR = #787b86
+HIDDEN_COLOR  = #00000000
+
+DETECTION_GROUP = 'Pattern Detection'
+STYLE_GROUP     = 'Style'
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+swingLengthInput = input.int(5, 'Swing Length', minval = 1, group = DETECTION_GROUP, tooltip = 'Number of bars to the left and right a high or low must dominate to count as a confirmed swing point - the objective pivot rule that defines points 1, 2 and 3. Set 2 for a Williams fractal style rule, larger values for slower structures with fewer candidates.')
+
+triggerRuleInput = input.string('Close', 'Point 2 Break Rule', options = ['Close', 'Wick'], group = DETECTION_GROUP, tooltip = 'How the break of point 2 completes the pattern. Close requires a bar close beyond the trigger level, filtering false breakouts of it; Wick treats any trade beyond the level as the trigger. Invalidation always uses a fresh extreme beyond point 1.')
+
+bullColorInput = input.color(BULL_COLOR, 'Bullish', inline = 'colors', group = STYLE_GROUP, tooltip = 'Color of bullish 1-2-3 drawings - a decline reversing up.')
+
+bearColorInput = input.color(BEAR_COLOR, 'Bearish', inline = 'colors', group = STYLE_GROUP, tooltip = 'Color of bearish 1-2-3 drawings - an advance reversing down.')
+
+invalidColorInput = input.color(NEUTRAL_COLOR, 'Invalidated', group = STYLE_GROUP, tooltip = 'Color applied to formed setups whose point 1 broke before the trigger fired.')
+
+showPointsInput = input.bool(true, 'Point Labels & Legs', group = STYLE_GROUP, tooltip = 'Number the three pattern points on the chart and connect them with the 1-2 and 2-3 legs.')
+
+showLevelsInput = input.bool(true, 'Trigger & Invalidation Levels', group = STYLE_GROUP, tooltip = 'Extend the point 2 trigger level (dashed) and the point 1 invalidation level (dotted) to the right while a setup is live. The trigger level turns solid once broken.')
+
+showP3StopInput = input.bool(false, 'Point 3 Stop Level', group = STYLE_GROUP, tooltip = 'Also extend a level from point 3 - the tighter stop placement, risking less per trade than point 1 but hit by ordinary noise more often.')
+
+showEventsInput = input.bool(true, 'Event Labels', group = STYLE_GROUP, tooltip = 'Tag the bar that breaks point 2 (Trigger) and the bar where a formed setup breaks point 1 (Invalidated).')
+
+keepFailedInput = input.bool(true, 'Keep Invalidated Setups', group = STYLE_GROUP, tooltip = 'Keep invalidated setups on the chart in the invalidated color instead of removing them. Only fully formed candidates - all three points printed - are kept as a record.')
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types
+//---------------------------------------------------------------------------------------------------------------------{
+// Counter-trend candidate lifecycle: stage 1 = point 1 confirmed (trend extreme), stage 2 = point 2
+// confirmed (pivot ending the first counter-trend swing), stage 3 = point 3 confirmed short of point 1
+// (armed candidate, awaiting the break of point 2)
+type Setup
+    bool  isBull
+    int   stage = 1
+    float p1
+    int   p1Bar
+    float p2
+    int   p2Bar
+    float p3
+    int   p3Bar
+    label p1Lb
+    label p2Lb
+    label p3Lb
+    line  leg12
+    line  leg23
+    line  trigLn
+    line  invLn
+    line  p3Ln
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Variables
+//---------------------------------------------------------------------------------------------------------------------{
+var int   trendDir      = 0
+var float trendExtreme  = na
+var float lastSwingHigh = na
+var float lastSwingLow  = na
+var Setup liveSetup     = na
+
+pivotHigh = ta.pivothigh(swingLengthInput, swingLengthInput)
+pivotLow  = ta.pivotlow(swingLengthInput, swingLengthInput)
+swingBar  = bar_index - swingLengthInput
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions & Methods
+//---------------------------------------------------------------------------------------------------------------------{
+// Remove every drawing owned by a setup (partial candidates and hidden invalidations)
+method erase(Setup this) =>
+    if not na(this.p1Lb)
+        label.delete(this.p1Lb)
+    if not na(this.p2Lb)
+        label.delete(this.p2Lb)
+    if not na(this.p3Lb)
+        label.delete(this.p3Lb)
+    if not na(this.leg12)
+        line.delete(this.leg12)
+    if not na(this.leg23)
+        line.delete(this.leg23)
+    if not na(this.trigLn)
+        line.delete(this.trigLn)
+    if not na(this.invLn)
+        line.delete(this.invLn)
+    if not na(this.p3Ln)
+        line.delete(this.p3Ln)
+
+// Drop everything built on top of point 1 - used when a pullback takes point 1 out and the count restarts
+method clearFromPoint2(Setup this) =>
+    if not na(this.p2Lb)
+        label.delete(this.p2Lb)
+        this.p2Lb := na
+    if not na(this.p3Lb)
+        label.delete(this.p3Lb)
+        this.p3Lb := na
+    if not na(this.leg12)
+        line.delete(this.leg12)
+        this.leg12 := na
+    if not na(this.leg23)
+        line.delete(this.leg23)
+        this.leg23 := na
+    if not na(this.trigLn)
+        line.delete(this.trigLn)
+        this.trigLn := na
+    if not na(this.invLn)
+        line.delete(this.invLn)
+        this.invLn := na
+    if not na(this.p3Ln)
+        line.delete(this.p3Ln)
+        this.p3Ln := na
+    this.p2    := na
+    this.p2Bar := na
+    this.p3    := na
+    this.p3Bar := na
+
+// Stop the level rays at the current bar once the setup resolves
+method freezeLevels(Setup this) =>
+    if not na(this.trigLn)
+        line.set_extend(this.trigLn, extend.none)
+        line.set_xy2(this.trigLn, bar_index, this.p2)
+    if not na(this.invLn)
+        line.set_extend(this.invLn, extend.none)
+        line.set_xy2(this.invLn, bar_index, this.p1)
+    if not na(this.p3Ln)
+        line.set_extend(this.p3Ln, extend.none)
+        line.set_xy2(this.p3Ln, bar_index, this.p3)
+
+// Recolor a formed setup and freeze its levels - the dead candidate stays on the chart as a record
+method fade(Setup this, color faded) =>
+    if not na(this.p1Lb)
+        label.set_textcolor(this.p1Lb, faded)
+    if not na(this.p2Lb)
+        label.set_textcolor(this.p2Lb, faded)
+    if not na(this.p3Lb)
+        label.set_textcolor(this.p3Lb, faded)
+    if not na(this.leg12)
+        line.set_color(this.leg12, faded)
+    if not na(this.leg23)
+        line.set_color(this.leg23, faded)
+    if not na(this.trigLn)
+        line.set_color(this.trigLn, faded)
+    if not na(this.invLn)
+        line.set_color(this.invLn, faded)
+    if not na(this.p3Ln)
+        line.set_color(this.p3Ln, color.new(faded, 50))
+    this.freezeLevels()
+
+// Place or move point 1 - the extreme of the trend being tested, the full invalidation level
+method setPoint1(Setup this, int x, float y) =>
+    this.p1    := y
+    this.p1Bar := x
+    if showPointsInput
+        color col = this.isBull ? bullColorInput : bearColorInput
+        if na(this.p1Lb)
+            this.p1Lb := label.new(x, y, '1', style = this.isBull ? label.style_label_up : label.style_label_down, color = HIDDEN_COLOR, textcolor = col, size = size.small, tooltip = 'Point 1 - trend extreme, the full invalidation level')
+        else
+            label.set_xy(this.p1Lb, x, y)
+
+// Place or move point 2 - the pivot ending the first counter-trend swing, the trigger level
+method setPoint2(Setup this, int x, float y) =>
+    this.p2    := y
+    this.p2Bar := x
+    color col = this.isBull ? bullColorInput : bearColorInput
+    if showPointsInput
+        if na(this.p2Lb)
+            this.p2Lb := label.new(x, y, '2', style = this.isBull ? label.style_label_down : label.style_label_up, color = HIDDEN_COLOR, textcolor = col, size = size.small, tooltip = 'Point 2 - end of the first counter-trend swing, the trigger level')
+        else
+            label.set_xy(this.p2Lb, x, y)
+        if na(this.leg12)
+            this.leg12 := line.new(this.p1Bar, this.p1, x, y, color = col)
+        else
+            line.set_xy2(this.leg12, x, y)
+    if showLevelsInput
+        if na(this.trigLn)
+            this.trigLn := line.new(x, y, x + 1, y, color = col, style = line.style_dashed, extend = extend.right)
+        else
+            line.set_xy1(this.trigLn, x, y)
+            line.set_xy2(this.trigLn, x + 1, y)
+        if na(this.invLn)
+            this.invLn := line.new(this.p1Bar, this.p1, this.p1Bar + 1, this.p1, color = col, style = line.style_dotted, extend = extend.right)
+
+// Place or move point 3 - the pullback extreme that held short of point 1
+method setPoint3(Setup this, int x, float y) =>
+    this.p3    := y
+    this.p3Bar := x
+    color col = this.isBull ? bullColorInput : bearColorInput
+    if showPointsInput
+        if na(this.p3Lb)
+            this.p3Lb := label.new(x, y, '3', style = this.isBull ? label.style_label_up : label.style_label_down, color = HIDDEN_COLOR, textcolor = col, size = size.small, tooltip = 'Point 3 - pullback extreme that held short of point 1')
+        else
+            label.set_xy(this.p3Lb, x, y)
+        if na(this.leg23)
+            this.leg23 := line.new(this.p2Bar, this.p2, x, y, color = col)
+        else
+            line.set_xy2(this.leg23, x, y)
+    if showP3StopInput
+        if na(this.p3Ln)
+            this.p3Ln := line.new(x, y, x + 1, y, color = color.new(col, 50), style = line.style_dotted, extend = extend.right)
+        else
+            line.set_xy1(this.p3Ln, x, y)
+            line.set_xy2(this.p3Ln, x + 1, y)
+
+// Small transparent event tag, body placed on the side of the level clear of price
+eventMark(int x, float y, string txt, color col, bool below) =>
+    if showEventsInput
+        label.new(x, y, txt, style = below ? label.style_label_up : label.style_label_down, color = HIDDEN_COLOR, textcolor = col, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Setup Tracking
+//---------------------------------------------------------------------------------------------------------------------{
+// One counter-trend candidate is tracked at a time: bullish setups only after a decline, bearish only
+// after an advance. Completion - the break of point 2 - is the first structural break against the
+// prevailing trend, so it flips the tracked trend and the hunt resumes in the opposite direction.
+bullFormedAlert      = false
+bearFormedAlert      = false
+bullTriggerAlert     = false
+bearTriggerAlert     = false
+bullInvalidatedAlert = false
+bearInvalidatedAlert = false
+
+if barstate.isconfirmed
+    // Running extreme of the prevailing trend - the developing point 1 before a pivot confirms it
+    if trendDir == 1
+        trendExtreme := math.max(nz(trendExtreme, high), high)
+    else if trendDir == -1
+        trendExtreme := math.min(nz(trendExtreme, low), low)
+
+    // Bootstrap: the pattern only means something after a trend worth reversing, so establish one first
+    if trendDir == 0
+        if not na(pivotHigh)
+            lastSwingHigh := pivotHigh
+        if not na(pivotLow)
+            lastSwingLow := pivotLow
+        if not na(lastSwingHigh) and close > lastSwingHigh
+            trendDir     := 1
+            trendExtreme := high
+        else if not na(lastSwingLow) and close < lastSwingLow
+            trendDir     := -1
+            trendExtreme := low
+
+    int setupDir = -trendDir
+    if setupDir != 0
+        float extremePivot = setupDir == 1 ? pivotLow : pivotHigh
+        float counterPivot = setupDir == 1 ? pivotHigh : pivotLow
+        color setupColor   = setupDir == 1 ? bullColorInput : bearColorInput
+
+        // ----- pivot events -----
+        if not na(extremePivot)
+            // a confirmed pivot can extend the tracked extreme (swings printed just before the trend flip)
+            trendExtreme := setupDir == 1 ? math.min(trendExtreme, extremePivot) : math.max(trendExtreme, extremePivot)
+            bool isTrendExtreme = setupDir * (trendExtreme - extremePivot) >= 0
+            if na(liveSetup)
+                if isTrendExtreme
+                    liveSetup := Setup.new(isBull = setupDir == 1)
+                    liveSetup.setPoint1(swingBar, extremePivot)
+            else if liveSetup.stage == 1
+                if isTrendExtreme
+                    liveSetup.setPoint1(swingBar, extremePivot)
+            else if liveSetup.stage == 2
+                if setupDir * (extremePivot - liveSetup.p1) > 0
+                    // pullback bottomed short of point 1: candidate armed
+                    liveSetup.setPoint3(swingBar, extremePivot)
+                    liveSetup.stage := 3
+                    if setupDir == 1
+                        bullFormedAlert := true
+                    else
+                        bearFormedAlert := true
+                else
+                    // pullback reached point 1: void, the count restarts at the new extreme
+                    liveSetup.clearFromPoint2()
+                    liveSetup.stage := 1
+                    liveSetup.setPoint1(swingBar, extremePivot)
+            else if liveSetup.stage == 3 and setupDir * (extremePivot - liveSetup.p1) > 0 and setupDir * (liveSetup.p3 - extremePivot) > 0
+                // the pullback deepened but still held: point 3 follows its true bottom
+                liveSetup.setPoint3(swingBar, extremePivot)
+        if not na(counterPivot) and not na(liveSetup)
+            if liveSetup.stage == 1
+                if swingBar > liveSetup.p1Bar
+                    liveSetup.setPoint2(swingBar, counterPivot)
+                    liveSetup.stage := 2
+            else if liveSetup.stage == 2 and setupDir * (counterPivot - liveSetup.p2) > 0
+                // the first counter-trend swing extended before any pullback pivot printed
+                liveSetup.setPoint2(swingBar, counterPivot)
+
+        // ----- price events -----
+        if not na(liveSetup) and liveSetup.stage >= 2
+            float breachExtreme = setupDir == 1 ? low : high
+            float breakSource   = triggerRuleInput == 'Close' ? close : setupDir == 1 ? high : low
+            if setupDir * (liveSetup.p1 - breachExtreme) > 0
+                // fresh extreme beyond point 1: the candidate is dead, wait for a new point 1
+                if liveSetup.stage == 3
+                    eventMark(bar_index, liveSetup.p1, 'Invalidated', invalidColorInput, setupDir == -1)
+                    if keepFailedInput
+                        liveSetup.fade(invalidColorInput)
+                    else
+                        liveSetup.erase()
+                    if setupDir == 1
+                        bullInvalidatedAlert := true
+                    else
+                        bearInvalidatedAlert := true
+                else
+                    liveSetup.erase()
+                liveSetup := na
+            else if liveSetup.stage == 3 and setupDir * (breakSource - liveSetup.p2) > 0
+                // break of point 2: the pattern completes and the prevailing trend flips
+                if not na(liveSetup.trigLn)
+                    line.set_style(liveSetup.trigLn, line.style_solid)
+                liveSetup.freezeLevels()
+                eventMark(bar_index, liveSetup.p2, 'Trigger', setupColor, setupDir == 1)
+                if setupDir == 1
+                    bullTriggerAlert := true
+                else
+                    bearTriggerAlert := true
+                liveSetup    := na
+                trendDir     := setupDir
+                trendExtreme := setupDir == 1 ? high : low
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(bullFormedAlert, 'Bullish Setup Formed', 'Bullish 1-2-3 setup formed - point 3 held above point 1, awaiting a break of the point 2 trigger')
+alertcondition(bearFormedAlert, 'Bearish Setup Formed', 'Bearish 1-2-3 setup formed - point 3 held below point 1, awaiting a break of the point 2 trigger')
+alertcondition(bullTriggerAlert, 'Bullish Reversal Triggered', 'Bullish 1-2-3 completed - point 2 broken, first higher high after the first higher low')
+alertcondition(bearTriggerAlert, 'Bearish Reversal Triggered', 'Bearish 1-2-3 completed - point 2 broken, first lower low after the first lower high')
+alertcondition(bullInvalidatedAlert, 'Bullish Setup Invalidated', 'Bullish 1-2-3 invalidated - point 1 broke before the trigger, the higher low is gone')
+alertcondition(bearInvalidatedAlert, 'Bearish Setup Invalidated', 'Bearish 1-2-3 invalidated - point 1 broke before the trigger, the lower high is gone')
+
+//---------------------------------------------------------------------------------------------------------------------}

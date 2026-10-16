@@ -1,0 +1,532 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Re-accumulation"
+  , shorttitle       = "Re-accumulation"
+  , overlay          = true
+  , format           = format.price
+  , max_boxes_count  = 250
+  , max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+//Tracker stages: no candidate, stall high found and awaiting the first reaction low, active range, breakout under test
+int STAGE_IDLE      = 0
+int STAGE_AWAIT_LOW = 1
+int STAGE_RANGE     = 2
+int STAGE_BREAKOUT  = 3
+
+//Storage cap for the per-reaction volume series feeding the contraction read
+int MAX_DOWN_VOLUMES = 2000
+
+color BULL_COLOR    = #089981
+color BEAR_COLOR    = #f23645
+color NEUTRAL_COLOR = #787b86 // the developing range - structure until it resolves
+color TRANSP_COLOR  = #00000000
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+int MARKER_TRANSP   = 30
+
+string GROUP_TREND = "Uptrend Context"
+string GROUP_RANGE = "Range Detection"
+string GROUP_EVID  = "Absorption Evidence"
+string GROUP_DASH  = "Dashboard"
+string GROUP_STYLE = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+trendLookbackInput = input.int(50, "Uptrend Lookback (Bars)"
+  , minval  = 10
+  , group   = GROUP_TREND
+  , tooltip = "Bars used to qualify the prior advance. The first reaction high must be the highest high of this window, with price up by at least the minimum advance across it - without a prior uptrend there is nothing to re-accumulate, and a range after a decline is candidate accumulation instead.")
+
+trendMultInput = input.float(2.0, "Minimum Advance (xATR)"
+  , minval  = 0.25
+  , step    = 0.25
+  , group   = GROUP_TREND
+  , tooltip = "Net advance into the range start, in ATR multiples measured over the uptrend lookback, required before a pause qualifies as candidate re-accumulation. Raise it to demand a stronger markup leg into the range.")
+
+atrLengthInput = input.int(14, "ATR Length"
+  , minval  = 1
+  , group   = GROUP_TREND
+  , tooltip = "Average True Range length used to normalize the prior advance.")
+
+pivotLengthInput = input.int(5, "Swing Length"
+  , minval  = 2
+  , group   = GROUP_RANGE
+  , tooltip = "Swing strength of the pivots that mark the first reaction high and low - the range boundaries. A pivot must be the extreme of this many bars on each side, so boundaries confirm this many bars after they print.")
+
+minRangeBarsInput = input.int(15, "Minimum Range Duration (Bars)"
+  , minval  = 5
+  , group   = GROUP_RANGE
+  , tooltip = "Bars the pause must last, counted from the first reaction high, before it is treated as a trading range. Resolutions before that are discarded as simple pullbacks rather than ranges.")
+
+springBarsInput = input.int(5, "Spring Recovery Window (Bars)"
+  , minval  = 1
+  , group   = GROUP_RANGE
+  , tooltip = "Maximum bars price may close below range support and still snap back as a spring. Holding below support any longer is a decisive loss - it argues the range was distribution after all and invalidates the re-accumulation hypothesis.")
+
+confirmBarsInput = input.int(3, "Breakout Hold (Bars)"
+  , minval  = 1
+  , group   = GROUP_RANGE
+  , tooltip = "Consecutive closes above the range high required for the breakout to count as held. The diagnosis is treated as confirmed only when price breaks and holds above the range with expanding participation.")
+
+volLengthInput = input.int(20, "Volume Average Length"
+  , minval  = 1
+  , group   = GROUP_RANGE
+  , tooltip = "Simple moving average length of volume used as the participation baseline for the breakout volume-expansion check.")
+
+breakoutVolMultInput = input.float(1.5, "Breakout Volume Multiple"
+  , minval  = 0.5
+  , step    = 0.1
+  , group   = GROUP_RANGE
+  , tooltip = "Expanding participation requirement: at least one bar of the breakout leg must trade this multiple of the pre-breakout average volume before the breakout confirms re-accumulation. On symbols without volume data the check is skipped.")
+
+supportZoneInput = input.float(25, "Support Zone (% of Range Height)"
+  , minval  = 5
+  , maxval  = 50
+  , step    = 5
+  , group   = GROUP_EVID
+  , tooltip = "Depth of the support zone above the range low, as a share of the range height. Dips into this zone that recover quickly count as absorption evidence - stronger hands buying the dips faster than weaker hands sell the rallies.")
+
+dipRecoveryBarsInput = input.int(5, "Dip Recovery Window (Bars)"
+  , minval  = 1
+  , group   = GROUP_EVID
+  , tooltip = "Maximum bars a dip may linger inside the support zone and still count as a quickly recovered dip.")
+
+showDashboardInput = input.bool(true, "Show Dashboard"
+  , group   = GROUP_DASH
+  , tooltip = "Shows the evidence dashboard - the diagnostic checklist of absorption behavior traders weigh for or against the label before the range resolves.")
+
+dashboardPositionInput = input.string("Top Right", "Position"
+  , options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"]
+  , group   = GROUP_DASH
+  , tooltip = "Chart corner the dashboard is anchored to.")
+
+dashboardSizeInput = input.string("Small", "Size"
+  , options = ["Tiny", "Small", "Normal"]
+  , group   = GROUP_DASH
+  , tooltip = "Dashboard text size.")
+
+showBoxInput = input.bool(true, "Show Range Box"
+  , group   = GROUP_STYLE
+  , tooltip = "Draws the trading range between the first reaction high and low. Dashed while the hypothesis is live, solid once the range resolves.")
+
+showHigherLowsInput = input.bool(true, "Higher-Low Markers"
+  , group   = GROUP_STYLE
+  , tooltip = "Marks higher lows forming inside the range - demand appearing at progressively higher levels.")
+
+showEventLabelsInput = input.bool(true, "Event Labels"
+  , group   = GROUP_STYLE
+  , tooltip = "Labels springs, the confirmed resolution and the loss of support on the chart.")
+
+fillTransparencyInput = input.int(90, "Range Fill Transparency"
+  , minval  = 50
+  , maxval  = 100
+  , group   = GROUP_STYLE)
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "colors", group = GROUP_STYLE)
+
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "colors", group = GROUP_STYLE)
+
+neutralColorInput = input.color(NEUTRAL_COLOR, "Developing", inline = "colors", group = GROUP_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+//Compares average down-move volume between the first and second half of the range - shrinking volume
+//on reactions is the absorption signature the re-accumulation label leans on
+getDownVolumeTrend(volumesArray) =>
+    int elementCount = array.size(volumesArray)
+    bool isValid = elementCount >= 4
+    bool isContracting = false
+    if isValid
+        int halfCount = math.floor(elementCount / 2)
+        float firstSum  = 0.0
+        float secondSum = 0.0
+        for i = 0 to elementCount - 1
+            if i < halfCount
+                firstSum += array.get(volumesArray, i)
+            else
+                secondSum += array.get(volumesArray, i)
+        isContracting := secondSum / (elementCount - halfCount) < firstSum / halfCount
+    [isValid, isContracting]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Uptrend Context & Swings
+//---------------------------------------------------------------------------------------------------------------------{
+
+float atrValue       = ta.atr(atrLengthInput)
+float volumeSma      = ta.sma(nz(volume), volLengthInput)
+float highestHigh    = ta.highest(high, trendLookbackInput)
+float pivotHighPrice = ta.pivothigh(high, pivotLengthInput, pivotLengthInput)
+float pivotLowPrice  = ta.pivotlow(low, pivotLengthInput, pivotLengthInput)
+
+//Trend qualification evaluated at the pivot bar: the stall high must be the lookback-window high and
+//price must have advanced by the minimum ATR-normalized amount into it - the context requirement
+float highAtPivot       = high[pivotLengthInput]
+float highestAtPivot    = highestHigh[pivotLengthInput]
+float atrAtPivot        = atrValue[pivotLengthInput]
+float priorCloseAtPivot = close[pivotLengthInput + trendLookbackInput]
+
+float gainAtPivot = not na(priorCloseAtPivot) and not na(atrAtPivot) and atrAtPivot > 0 ? (highAtPivot - priorCloseAtPivot) / atrAtPivot : na
+bool  uptrendOk   = not na(pivotHighPrice) and not na(gainAtPivot) and gainAtPivot >= trendMultInput and not na(highestAtPivot) and highAtPivot >= highestAtPivot
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Range State Machine
+//---------------------------------------------------------------------------------------------------------------------{
+
+var int   stage       = STAGE_IDLE
+var float rangeTop    = na
+var float rangeBottom = na
+var int   topBar      = na
+var int   bottomBar   = na
+var bool  established = false
+var box   rangeBox    = na
+
+//Absorption evidence, reset when a new range forms and kept after resolution for the dashboard
+var int   higherLowCount  = 0
+var int   dipCount        = 0
+var int   springCount     = 0
+var float lastInternalLow = na
+var float closePosSum     = 0.0
+var int   rangeBarCount   = 0
+var float upVolumeSum     = 0.0
+var int   upVolumeCount   = 0
+var float downVolumeSum   = 0.0
+var int   downVolumeCount = 0
+var array<float> downVolumeArray = array.new_float()
+
+//Support penetration, support-zone dip and breakout trackers
+var int   belowSupportBar   = na
+var float penetrationLow    = na
+var int   penetrationLowBar = na
+var int   dipStartBar       = na
+var int   lastSpringBar     = na
+var int   breakoutBar       = na
+var int   holdCount         = 0
+var float maxBreakoutVol    = na
+var float preBreakoutSma    = na
+
+var string rangeStatus = "None"
+
+//Per-bar event flags for labels and alerts
+bool rangeDetectedEvent = false
+bool supportTestEvent   = false
+bool springEvent        = false
+bool breakoutEvent      = false
+bool confirmedEvent     = false
+bool invalidatedEvent   = false
+bool doReset  = false
+bool doCancel = false
+
+//A confirmed stall high inside an established uptrend opens a candidate: the first reaction high
+if stage == STAGE_IDLE and uptrendOk
+    stage    := STAGE_AWAIT_LOW
+    rangeTop := pivotHighPrice
+    topBar   := bar_index - pivotLengthInput
+
+//Waiting for the first reaction low that completes the range boundaries. A newer, higher stall high
+//supersedes the candidate - the trend simply continued before pausing
+if stage == STAGE_AWAIT_LOW
+    if not na(pivotHighPrice) and pivotHighPrice >= rangeTop
+        rangeTop := pivotHighPrice
+        topBar   := bar_index - pivotLengthInput
+    if not na(pivotLowPrice) and bar_index - pivotLengthInput > topBar and pivotLowPrice < rangeTop
+        stage           := STAGE_RANGE
+        rangeBottom     := pivotLowPrice
+        bottomBar       := bar_index - pivotLengthInput
+        lastInternalLow := pivotLowPrice
+        established     := false
+        higherLowCount  := 0
+        dipCount        := 0
+        springCount     := 0
+        closePosSum     := 0.0
+        rangeBarCount   := 0
+        upVolumeSum     := 0.0
+        upVolumeCount   := 0
+        downVolumeSum   := 0.0
+        downVolumeCount := 0
+        array.clear(downVolumeArray)
+        belowSupportBar   := na
+        penetrationLow    := na
+        penetrationLowBar := na
+        dipStartBar       := na
+        lastSpringBar     := na
+        breakoutBar       := na
+        holdCount         := 0
+        maxBreakoutVol    := na
+        preBreakoutSma    := na
+        rangeStatus       := "Forming"
+        //Backfill the tallies from the reaction low bar so the evidence covers the whole range
+        float newRangeHeight = rangeTop - rangeBottom
+        for i = 0 to pivotLengthInput - 1
+            int offset = pivotLengthInput - i
+            float barClose  = close[offset]
+            float prevClose = close[offset + 1]
+            float barVolume = nz(volume[offset])
+            rangeBarCount += 1
+            closePosSum   += math.min(math.max((barClose - rangeBottom) / newRangeHeight, 0.0), 1.0)
+            if not na(prevClose)
+                if barClose > prevClose
+                    upVolumeSum   += barVolume
+                    upVolumeCount += 1
+                else if barClose < prevClose
+                    downVolumeSum   += barVolume
+                    downVolumeCount += 1
+                    if array.size(downVolumeArray) >= MAX_DOWN_VOLUMES
+                        array.shift(downVolumeArray)
+                    array.push(downVolumeArray, barVolume)
+
+//Active range: tally the evidence, watch the edges, and resolve on a held breakout or a decisive
+//loss of support - until then the bearish alternative remains live
+if stage == STAGE_RANGE
+    float rangeHeight = rangeTop - rangeBottom
+    rangeBarCount += 1
+    closePosSum   += math.min(math.max((close - rangeBottom) / rangeHeight, 0.0), 1.0)
+    if close > close[1]
+        upVolumeSum   += nz(volume)
+        upVolumeCount += 1
+    else if close < close[1]
+        downVolumeSum   += nz(volume)
+        downVolumeCount += 1
+        if array.size(downVolumeArray) >= MAX_DOWN_VOLUMES
+            array.shift(downVolumeArray)
+        array.push(downVolumeArray, nz(volume))
+
+    //The pause has lasted long enough to count as a trading range - the hypothesis goes live
+    if not established and bar_index - topBar >= minRangeBarsInput
+        established        := true
+        rangeDetectedEvent := true
+        rangeStatus        := "Developing"
+        if showBoxInput
+            rangeBox := box.new(topBar, rangeTop, bar_index, rangeBottom, border_color = neutralColorInput, border_width = 1, border_style = line.style_dashed, bgcolor = color.new(neutralColorInput, fillTransparencyInput))
+
+    if established and not na(rangeBox)
+        box.set_right(rangeBox, bar_index)
+
+    if established
+        //Higher lows forming inside the range - demand stepping up
+        if not na(pivotLowPrice) and bar_index - pivotLengthInput > bottomBar
+            if pivotLowPrice > rangeBottom and pivotLowPrice > lastInternalLow
+                higherLowCount += 1
+                if showHigherLowsInput
+                    label.new(bar_index - pivotLengthInput, pivotLowPrice, "", style = label.style_circle, color = color.new(bullColorInput, MARKER_TRANSP), size = size.tiny, tooltip = "Higher low inside the range - demand appearing at a progressively higher level")
+            lastInternalLow := pivotLowPrice
+
+        //Dips into the support zone that recover quickly - absorption at the lower edge
+        float supportZoneTop = rangeBottom + rangeHeight * supportZoneInput / 100
+        if na(dipStartBar) and low <= supportZoneTop and close >= rangeBottom
+            dipStartBar      := bar_index
+            supportTestEvent := true
+        if not na(dipStartBar) and close > supportZoneTop
+            if bar_index - dipStartBar <= dipRecoveryBarsInput
+                dipCount += 1
+            dipStartBar := na
+
+    //Spring versus decisive loss: a brief break below support that snaps back supports the label;
+    //holding below support argues the range was distribution after all
+    if na(belowSupportBar)
+        if close < rangeBottom
+            belowSupportBar   := bar_index
+            penetrationLow    := low
+            penetrationLowBar := bar_index
+        else if established and low < rangeBottom and (na(lastSpringBar) or bar_index - lastSpringBar > springBarsInput)
+            springCount   += 1
+            springEvent   := true
+            lastSpringBar := bar_index
+            if showEventLabelsInput
+                label.new(bar_index, low, "Spring", style = label.style_label_up, color = TRANSP_COLOR, textcolor = bullColorInput, size = size.small, tooltip = "Spring: the poke below range support (" + str.tostring(rangeBottom, format.mintick) + ") failed and snapped back within the bar - supporting evidence for re-accumulation")
+    else
+        if low < penetrationLow
+            penetrationLow    := low
+            penetrationLowBar := bar_index
+        if close >= rangeBottom
+            if established and bar_index - belowSupportBar <= springBarsInput
+                springCount   += 1
+                springEvent   := true
+                lastSpringBar := bar_index
+                if showEventLabelsInput
+                    label.new(penetrationLowBar, penetrationLow, "Spring", style = label.style_label_up, color = TRANSP_COLOR, textcolor = bullColorInput, size = size.small, tooltip = "Spring: the break below range support (" + str.tostring(rangeBottom, format.mintick) + ") failed and snapped back within " + str.tostring(bar_index - belowSupportBar) + " bar(s) - supporting evidence for re-accumulation")
+            belowSupportBar   := na
+            penetrationLow    := na
+            penetrationLowBar := na
+        else if bar_index - belowSupportBar >= springBarsInput
+            if established
+                invalidatedEvent := true
+                rangeStatus      := "Invalidated"
+                if not na(rangeBox)
+                    box.delete(rangeBox)
+                    rangeBox := box.new(topBar, rangeTop, bar_index, rangeBottom, border_color = bearColorInput, border_width = 1, border_style = line.style_solid, bgcolor = color.new(bearColorInput, fillTransparencyInput))
+                if showEventLabelsInput
+                    label.new(bar_index, high, "Support lost", style = label.style_label_down, color = TRANSP_COLOR, textcolor = bearColorInput, size = size.small, tooltip = "Decisive loss of range support (" + str.tostring(rangeBottom, format.mintick) + ") - price held below it beyond the spring window, arguing the range was distribution after all")
+                doReset := true
+            else
+                doCancel := true
+
+    //Breakout above the range - the diagnosis is only confirmed once it holds with expanding participation
+    if close > rangeTop and not doReset and not doCancel
+        if established
+            stage          := STAGE_BREAKOUT
+            breakoutBar    := bar_index
+            preBreakoutSma := volumeSma[1]
+            rangeStatus    := "Breakout"
+            breakoutEvent  := true
+        else
+            doCancel := true
+
+//Breakout under test: confirm once the close has held above the range for the required bars and some
+//bar of the leg expanded participation; fall back inside and the range read simply resumes
+if stage == STAGE_BREAKOUT
+    if not na(rangeBox)
+        box.set_right(rangeBox, bar_index)
+    if close > rangeTop
+        if bar_index == breakoutBar
+            holdCount      := 1
+            maxBreakoutVol := nz(volume)
+        else
+            holdCount      += 1
+            maxBreakoutVol := math.max(maxBreakoutVol, nz(volume))
+        bool volumeExpanded = na(preBreakoutSma) or preBreakoutSma <= 0 or maxBreakoutVol >= breakoutVolMultInput * preBreakoutSma
+        if holdCount >= confirmBarsInput and volumeExpanded
+            confirmedEvent := true
+            rangeStatus    := "Confirmed"
+            if not na(rangeBox)
+                box.delete(rangeBox)
+                rangeBox := box.new(topBar, rangeTop, bar_index, rangeBottom, border_color = bullColorInput, border_width = 1, border_style = line.style_solid, bgcolor = color.new(bullColorInput, fillTransparencyInput))
+            if showEventLabelsInput
+                label.new(bar_index, low, "Re-accumulation", style = label.style_label_up, color = TRANSP_COLOR, textcolor = bullColorInput, size = size.small, tooltip = "Re-accumulation confirmed: the breakout held " + str.tostring(holdCount) + " close(s) above the range high (" + str.tostring(rangeTop, format.mintick) + ") with expanding participation - trend resumption")
+            doReset := true
+    else
+        stage          := STAGE_RANGE
+        rangeStatus    := "Developing"
+        breakoutBar    := na
+        holdCount      := 0
+        maxBreakoutVol := na
+        preBreakoutSma := na
+        if close < rangeBottom
+            belowSupportBar   := bar_index
+            penetrationLow    := low
+            penetrationLowBar := bar_index
+
+//Apply the resolution or the quiet discard of a pause that never became a range
+if doCancel
+    rangeStatus := "None"
+if doCancel or doReset
+    stage             := STAGE_IDLE
+    rangeTop          := na
+    rangeBottom       := na
+    topBar            := na
+    bottomBar         := na
+    established       := false
+    rangeBox          := na
+    lastInternalLow   := na
+    belowSupportBar   := na
+    penetrationLow    := na
+    penetrationLowBar := na
+    dipStartBar       := na
+    lastSpringBar     := na
+    breakoutBar       := na
+    holdCount         := 0
+    maxBreakoutVol    := na
+    preBreakoutSma    := na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+
+string tablePosition = switch dashboardPositionInput
+    "Top Right"    => position.top_right
+    "Top Left"     => position.top_left
+    "Bottom Right" => position.bottom_right
+    => position.bottom_left
+
+string tableTextSize = switch dashboardSizeInput
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    => size.small
+
+if showDashboardInput and barstate.islast
+    var table dashboardTable = table.new(tablePosition, 2, 10, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+    //Diagnostic metrics: volume on rallies versus reactions, the down-move volume trend, and where
+    //within the range closes concentrate - the evidence weighed before resolution
+    bool  hasRange          = rangeBarCount > 0
+    bool  hasVolumeData     = upVolumeCount + downVolumeCount > 0 and upVolumeSum + downVolumeSum > 0
+    float rallyAvgVolume    = upVolumeCount > 0 ? upVolumeSum / upVolumeCount : na
+    float reactionAvgVolume = downVolumeCount > 0 ? downVolumeSum / downVolumeCount : na
+    float volumeRatio       = hasVolumeData and not na(rallyAvgVolume) and not na(reactionAvgVolume) and reactionAvgVolume > 0 ? rallyAvgVolume / reactionAvgVolume : na
+    float avgClosePosition  = hasRange ? closePosSum / rangeBarCount : na
+    [downTrendValid, downTrendContracting] = getDownVolumeTrend(downVolumeArray)
+
+    int evidenceTotal = hasVolumeData ? 6 : 4
+    int evidenceScore = 0
+    evidenceScore += higherLowCount > 0 ? 1 : 0
+    evidenceScore += dipCount > 0 ? 1 : 0
+    evidenceScore += springCount > 0 ? 1 : 0
+    evidenceScore += not na(avgClosePosition) and avgClosePosition > 0.5 ? 1 : 0
+    if hasVolumeData
+        evidenceScore += not na(volumeRatio) and volumeRatio > 1 ? 1 : 0
+        evidenceScore += downTrendValid and downTrendContracting ? 1 : 0
+
+    color dimColor    = DASH_HEADER
+    color statusColor = rangeStatus == "Confirmed" ? bullColorInput : rangeStatus == "Invalidated" ? bearColorInput : rangeStatus == "None" ? DASH_HEADER : neutralColorInput
+
+    string durationText = hasRange ? str.tostring(rangeBarCount) + " bars" : "-"
+    string ratioText    = not na(volumeRatio) ? str.tostring(volumeRatio, "#.##") + "x" : "-"
+    color  ratioColor   = na(volumeRatio) ? dimColor : volumeRatio > 1 ? bullColorInput : bearColorInput
+    string downVolText  = hasVolumeData and downTrendValid ? (downTrendContracting ? "Contracting" : "Expanding") : "-"
+    color  downVolColor = hasVolumeData and downTrendValid ? (downTrendContracting ? bullColorInput : bearColorInput) : dimColor
+    string closePosText = not na(avgClosePosition) ? str.tostring(math.round(avgClosePosition * 100)) + "%" : "-"
+    color  closePosColor = na(avgClosePosition) ? dimColor : avgClosePosition > 0.5 ? bullColorInput : bearColorInput
+    string evidenceText = hasRange ? str.tostring(evidenceScore) + "/" + str.tostring(evidenceTotal) : "-"
+    color  evidenceColor = hasRange ? color.from_gradient(evidenceScore, 0, evidenceTotal, bearColorInput, bullColorInput) : dimColor
+
+    table.cell(dashboardTable, 0, 0, "Re-accumulation", text_color = DASH_TEXT, text_size = tableTextSize, text_halign = text.align_center)
+    table.merge_cells(dashboardTable, 0, 0, 1, 0)
+    table.cell(dashboardTable, 0, 1, "Status", text_color = dimColor, text_size = tableTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 1, rangeStatus, text_color = statusColor, text_size = tableTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 2, "Duration", text_color = dimColor, text_size = tableTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 2, durationText, text_color = DASH_TEXT, text_size = tableTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 3, "Higher lows", text_color = dimColor, text_size = tableTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 3, hasRange ? str.tostring(higherLowCount) : "-", text_color = higherLowCount > 0 ? bullColorInput : dimColor, text_size = tableTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 4, "Dips recovered", text_color = dimColor, text_size = tableTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 4, hasRange ? str.tostring(dipCount) : "-", text_color = dipCount > 0 ? bullColorInput : dimColor, text_size = tableTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 5, "Springs", text_color = dimColor, text_size = tableTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 5, hasRange ? str.tostring(springCount) : "-", text_color = springCount > 0 ? bullColorInput : dimColor, text_size = tableTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 6, "Rally/reaction vol", text_color = dimColor, text_size = tableTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 6, ratioText, text_color = ratioColor, text_size = tableTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 7, "Down-move volume", text_color = dimColor, text_size = tableTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 7, downVolText, text_color = downVolColor, text_size = tableTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 8, "Close position", text_color = dimColor, text_size = tableTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 8, closePosText, text_color = closePosColor, text_size = tableTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 9, "Evidence", text_color = dimColor, text_size = tableTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 9, evidenceText, text_color = evidenceColor, text_size = tableTextSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(rangeDetectedEvent, "Re-accumulation Range Detected", "Trading range established inside an uptrend on {{ticker}} ({{interval}}) - candidate re-accumulation; watch absorption behavior at the range edges while the bearish alternative stays live")
+
+alertcondition(supportTestEvent, "Support Zone Test", "Price dipped into the support zone of a candidate re-accumulation range on {{ticker}} ({{interval}}) - a quick recovery adds absorption evidence; a decisive loss of the range low argues distribution")
+
+alertcondition(springEvent, "Spring Detected", "Spring on {{ticker}} ({{interval}}) - the break below range support failed and snapped back, supporting evidence that the range is re-accumulation")
+
+alertcondition(breakoutEvent, "Breakout Above Range", "Close above the range high on {{ticker}} ({{interval}}) - the re-accumulation diagnosis confirms only if the breakout holds with expanding participation")
+
+alertcondition(confirmedEvent, "Re-accumulation Confirmed", "Re-accumulation confirmed on {{ticker}} ({{interval}}) - the breakout held above the range with expanding participation and the uptrend has resumed")
+
+alertcondition(invalidatedEvent, "Range Invalidated", "Decisive loss of range support on {{ticker}} ({{interval}}) - the re-accumulation hypothesis is invalidated; the range read is distribution after all")
+
+//---------------------------------------------------------------------------------------------------------------------}

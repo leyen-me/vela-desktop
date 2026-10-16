@@ -1,0 +1,296 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Implied Volatility", shorttitle = "Implied Volatility", overlay = false, format = format.price, precision = 2, dynamic_requests = true)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+UNKNOWN_REGIME = -1
+LOW_REGIME     = 0
+NEUTRAL_REGIME = 1
+HIGH_REGIME    = 2
+
+LOW_IV_COLOR  = #089981 // bottom of the rank scale - premium cheap versus its own history
+MID_IV_COLOR  = #ff9800 // middle of the rank scale - the one accent
+HIGH_IV_COLOR = #f23645 // top of the rank scale - premium rich versus its own history
+NEUTRAL_COLOR = #787b86
+RANGE_COLOR   = color.new(#787b86, 40)
+RV_COLOR      = #787b86
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+FILL_VALUE_TRANSP = 50  // gradient transparency at the IV value
+FILL_ZERO_TRANSP  = 100 // gradient transparency at the zero line
+BAND_EDGE_TRANSP  = 80  // regime band transparency at the 52-week extremity
+BAND_INNER_TRANSP = 100 // regime band transparency at the rank threshold level
+
+ANNUAL_TRADING_DAYS = 252
+CALENDAR_DAYS       = 365.0
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+sourceModeInput     = input.string("Auto", "IV Source", options = ["Auto", "Manual"], group = "Data",
+     tooltip = "Auto detects a published implied volatility index for the chart symbol - VIX for the S&P 500, VXN for the Nasdaq 100, RVX for the Russell 2000, VXD for the Dow, GVZ for gold, OVX for crude oil, EVZ for EUR/USD, BVIV/EVIV for Bitcoin/Ether - and falls back to the Auto Fallback index when none exists. Manual reads the symbol below instead.")
+
+manualSymbolInput   = input.symbol("CBOE:VIX", "Manual IV Symbol", group = "Data",
+     tooltip = "Implied volatility series used when the source mode is Manual. Any published IV index works - the VIX family, GVZ, OVX, a bond or crypto volatility index - or a per-symbol IV series if your data plan provides one.")
+
+fallbackSymbolInput = input.symbol("CBOE:VIX", "Auto Fallback Index", group = "Data",
+     tooltip = "Proxy used in Auto mode when the chart symbol has no dedicated IV index. IV is extracted from option prices, so markets without options substitute a related market's implied volatility - such as an equity index's - as the risk-regime read. The dashboard flags when this proxy is in use.")
+
+timeframeInput      = input.timeframe("D", "IV Timeframe", group = "Data",
+     tooltip = "Timeframe the IV series is sampled from and the rank/percentile window is counted in. The classic convention uses daily sessions - 252 of them is 52 weeks - so the default is D regardless of the chart timeframe. Leave empty to use the chart timeframe instead.")
+
+lookbackInput       = input.int(252, "Lookback (Sessions)", minval = 20, maxval = 1260, group = "Rank & Percentile",
+     tooltip = "Window for IV Rank and IV Percentile, in bars of the IV timeframe. 252 daily sessions is the classic 52-week convention. Both readings stay empty until a full window of history exists.")
+
+rankHighInput       = input.float(50.0, "Rank High ≥", minval = 0, maxval = 100, inline = "rank", group = "Rank & Percentile",
+     tooltip = "IV Rank at or above this marks the high-IV regime - premium rich versus the past year. A common heuristic treats rank above 50 as elevated, but a single extreme spike inflates the range and compresses every later rank reading, so cross-check the percentile before concluding premium is genuinely rich.")
+
+rankLowInput        = input.float(20.0, "Low ≤", minval = 0, maxval = 100, inline = "rank", group = "Rank & Percentile",
+     tooltip = "IV Rank at or below this marks the low-IV regime - premium cheap versus the past year's range.")
+
+pctHighInput        = input.float(80.0, "Percentile High ≥", minval = 0, maxval = 100, inline = "pct", group = "Rank & Percentile",
+     tooltip = "IV Percentile at or above this is treated as high: IV was lower on at least this share of lookback sessions. Percentile is more robust to a single outlier spike than rank - quoting both avoids being fooled by either.")
+
+pctLowInput         = input.float(20.0, "Low ≤", minval = 0, maxval = 100, inline = "pct", group = "Rank & Percentile",
+     tooltip = "IV Percentile at or below this is treated as low: IV was higher on most lookback sessions.")
+
+rvLengthInput       = input.int(21, "Realized Volatility Length", minval = 2, maxval = 252, group = "Realized Volatility",
+     tooltip = "Sessions in the close-to-close realized volatility window of the chart symbol, annualized to the same percent scale as IV. 21 trading days matches the 30-calendar-day horizon of standard IV quotes, making the IV minus RV spread a direct volatility risk premium read.")
+
+moveDaysInput       = input.int(30, "Expected Move Horizon (Days)", minval = 1, maxval = 365, group = "Expected Move",
+     tooltip = "Calendar-day horizon of the one-standard-deviation expected move shown in the dashboard: price × IV × sqrt(days / 365), the common approximation of the range the options market is pricing - the direct input to stop distance and position size.")
+
+showDashboardInput  = input.bool(true, "Show Dashboard", group = "Dashboard",
+     tooltip = "Displays a pane dashboard summarizing the IV source, current IV, IV Rank, IV Percentile, regime, 52-week range, realized volatility, volatility risk premium, and the expected move.")
+
+dashPositionInput   = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = "Dashboard",
+     tooltip = "Position of the dashboard on the pane.")
+
+dashSizeInput       = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = "Dashboard",
+     tooltip = "Text size of the dashboard.")
+
+lowIvColorInput     = input.color(LOW_IV_COLOR, "Low IV", inline = "gradient", group = "Style",
+     tooltip = "Color of the IV line and gradient at the bottom of the rank scale - volatility cheap versus its own history.")
+
+midIvColorInput     = input.color(MID_IV_COLOR, "Mid", inline = "gradient", group = "Style",
+     tooltip = "Color of the IV line and gradient at the middle of the rank scale.")
+
+highIvColorInput    = input.color(HIGH_IV_COLOR, "High IV", inline = "gradient", group = "Style",
+     tooltip = "Color of the IV line and gradient at the top of the rank scale - volatility rich versus its own history.")
+
+showRangeInput      = input.bool(true, "Show 52W Range & Regime Bands", group = "Style",
+     tooltip = "Displays the 52-week IV high and low with the rank threshold levels between them, shading the high-IV and low-IV regime bands so the current print's position inside its one-year range is visible at a glance.")
+
+rangeColorInput     = input.color(RANGE_COLOR, "Range Lines", group = "Style",
+     tooltip = "Color of the 52-week IV high and low lines.")
+
+showRvInput         = input.bool(true, "Show Realized Volatility", group = "Style",
+     tooltip = "Plots the chart symbol's realized volatility next to IV so the volatility risk premium - the gap between the movement being priced and the movement actually delivered - is visible at a glance.")
+
+rvColorInput        = input.color(RV_COLOR, "Realized Volatility", group = "Style",
+     tooltip = "Color of the realized volatility line.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+getPosition(positionText) =>
+    switch positionText
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        => position.bottom_left
+
+getTextSize(sizeText) =>
+    switch sizeText
+        "Tiny"  => size.tiny
+        "Small" => size.small
+        => size.normal
+
+formatValue(value, formatString) =>
+    na(value) ? "—" : str.tostring(value, formatString)
+
+// Maps the chart symbol to its published implied volatility index, "" when none exists
+resolveAutoSymbol() =>
+    string mapped = switch syminfo.root
+        "SPX"       => "CBOE:VIX"
+        "SPY"       => "CBOE:VIX"
+        "ES"        => "CBOE:VIX"
+        "US500"     => "CBOE:VIX"
+        "SPX500"    => "CBOE:VIX"
+        "SPX500USD" => "CBOE:VIX"
+        "NDX"       => "CBOE:VXN"
+        "QQQ"       => "CBOE:VXN"
+        "NQ"        => "CBOE:VXN"
+        "US100"     => "CBOE:VXN"
+        "NAS100"    => "CBOE:VXN"
+        "NAS100USD" => "CBOE:VXN"
+        "USTEC"     => "CBOE:VXN"
+        "RUT"       => "CBOE:RVX"
+        "IWM"       => "CBOE:RVX"
+        "RTY"       => "CBOE:RVX"
+        "US2000"    => "CBOE:RVX"
+        "DJI"       => "CBOE:VXD"
+        "DIA"       => "CBOE:VXD"
+        "YM"        => "CBOE:VXD"
+        "US30"      => "CBOE:VXD"
+        "GC"        => "CBOE:GVZ"
+        "GLD"       => "CBOE:GVZ"
+        "GOLD"      => "CBOE:GVZ"
+        "XAUUSD"    => "CBOE:GVZ"
+        "CL"        => "CBOE:OVX"
+        "USO"       => "CBOE:OVX"
+        "USOIL"     => "CBOE:OVX"
+        "UKOIL"     => "CBOE:OVX"
+        "WTICOUSD"  => "CBOE:OVX"
+        "EURUSD"    => "CBOE:EVZ"
+        "6E"        => "CBOE:EVZ"
+        "FXE"       => "CBOE:EVZ"
+        => ""
+    if mapped == ""
+        string base = na(syminfo.basecurrency) ? "" : syminfo.basecurrency
+        mapped := base == "BTC" or base == "XBT" ? "VOLMEX:BVIV" : base == "ETH" ? "VOLMEX:EVIV" : base == "XAU" ? "CBOE:GVZ" : ""
+    mapped
+
+// Evaluated inside request.security() on the IV symbol, so every ta.* call runs on every bar of that context.
+// IV Rank = 100 × (IV - IV_low) / (IV_high - IV_low); IV Percentile = 100 × n_below / n_total
+ivMetrics(lookback) =>
+    float iv = close
+    float hi = ta.highest(close, lookback)
+    float lo = ta.lowest(close, lookback)
+    float rank = not na(iv) and not na(hi) and not na(lo) and hi > lo ? 100 * (iv - lo) / (hi - lo) : na
+    int below = 0
+    int total = 0
+    for sessionOffset = 1 to lookback
+        float pastIv = close[sessionOffset]
+        if not na(pastIv) and not na(iv)
+            total += 1
+            if pastIv < iv
+                below += 1
+    float percentile = total == lookback ? 100.0 * below / total : na
+    [iv, hi, lo, rank, percentile]
+
+// Evaluated inside request.security() on the chart symbol, so the ta.* call runs on every bar of that context.
+// Close-to-close realized volatility, annualized to the same percent scale as IV
+realizedVolCalc(length) =>
+    float logReturn = math.log(close / close[1])
+    ta.stdev(logReturn, length) * math.sqrt(ANNUAL_TRADING_DAYS) * 100
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+string autoSymbol = resolveAutoSymbol()
+bool   usingProxy = sourceModeInput == "Auto" and autoSymbol == ""
+string ivSymbol   = sourceModeInput == "Manual" ? manualSymbolInput : usingProxy ? fallbackSymbolInput : autoSymbol
+
+[ivValue, ivHigh52, ivLow52, ivRank, ivPercentile] = request.security(ivSymbol, timeframeInput, ivMetrics(lookbackInput), ignore_invalid_symbol = true)
+
+realizedVol = request.security(syminfo.tickerid, timeframeInput, realizedVolCalc(rvLengthInput))
+
+// Rank thresholds mapped into IV space - the levels where IV Rank equals the high and low thresholds
+rankHighLevel = ivLow52 + rankHighInput / 100 * (ivHigh52 - ivLow52)
+rankLowLevel  = ivLow52 + rankLowInput  / 100 * (ivHigh52 - ivLow52)
+
+// Regime classification from IV Rank - rich / neutral / cheap versus the market's own one-year history
+regime = na(ivRank) ? UNKNOWN_REGIME : ivRank >= rankHighInput ? HIGH_REGIME : ivRank <= rankLowInput ? LOW_REGIME : NEUTRAL_REGIME
+
+previousRegime = nz(regime[1], UNKNOWN_REGIME)
+regimeChange   = regime != UNKNOWN_REGIME and previousRegime != UNKNOWN_REGIME and regime != previousRegime
+
+// Volatility risk premium - the spread between priced movement and delivered movement
+volRiskPremium = ivValue - realizedVol
+
+// One-standard-deviation expected move over the horizon: price × IV × sqrt(days / 365)
+expectedMovePct = ivValue * math.sqrt(moveDaysInput / CALENDAR_DAYS)
+expectedMoveAbs = close * expectedMovePct / 100
+
+// Threshold crossings
+rankCrossHigh  = ta.crossover(ivRank, rankHighInput)
+rankCrossLow   = ta.crossunder(ivRank, rankLowInput)
+pctCrossHigh   = ta.crossover(ivPercentile, pctHighInput)
+pctCrossLow    = ta.crossunder(ivPercentile, pctLowInput)
+ivCrossAboveRv = ta.crossover(ivValue, realizedVol)
+ivCrossBelowRv = ta.crossunder(ivValue, realizedVol)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+// Value-based coloring across the full rank scale
+color ivColor = na(ivRank) ? lowIvColorInput : ivRank <= 50 ? color.from_gradient(ivRank, 0, 50, lowIvColorInput, midIvColorInput) : color.from_gradient(ivRank, 50, 100, midIvColorInput, highIvColorInput)
+
+ivPlotId   = plot(ivValue, "Implied Volatility", color = ivColor, linewidth = 2)
+zeroPlotId = plot(0, "Zero Line", color = color.new(NEUTRAL_COLOR, 70), linewidth = 1)
+
+fill(ivPlotId, zeroPlotId, top_value = ivValue, bottom_value = 0, top_color = color.new(ivColor, FILL_VALUE_TRANSP), bottom_color = color.new(ivColor, FILL_ZERO_TRANSP), title = "IV Gradient Fill")
+
+high52PlotId    = plot(showRangeInput ? ivHigh52 : na, "52W IV High", color = rangeColorInput, linewidth = 1)
+low52PlotId     = plot(showRangeInput ? ivLow52 : na, "52W IV Low", color = rangeColorInput, linewidth = 1)
+highLevelPlotId = plot(showRangeInput ? rankHighLevel : na, "High IV Threshold", color = color.new(highIvColorInput, 60), linewidth = 1)
+lowLevelPlotId  = plot(showRangeInput ? rankLowLevel : na, "Low IV Threshold", color = color.new(lowIvColorInput, 60), linewidth = 1)
+
+fill(high52PlotId, highLevelPlotId, top_value = ivHigh52, bottom_value = rankHighLevel, top_color = color.new(highIvColorInput, BAND_EDGE_TRANSP), bottom_color = color.new(highIvColorInput, BAND_INNER_TRANSP), title = "High IV Regime Band")
+fill(lowLevelPlotId, low52PlotId, top_value = rankLowLevel, bottom_value = ivLow52, top_color = color.new(lowIvColorInput, BAND_INNER_TRANSP), bottom_color = color.new(lowIvColorInput, BAND_EDGE_TRANSP), title = "Low IV Regime Band")
+
+plot(showRvInput ? realizedVol : na, "Realized Volatility", color = rvColorInput, linewidth = 1)
+
+plot(ivRank, "IV Rank", color = ivColor, display = display.data_window, editable = false)
+plot(ivPercentile, "IV Percentile", color = NEUTRAL_COLOR, display = display.data_window, editable = false)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dashboard = showDashboardInput ? table.new(getPosition(dashPositionInput), 2, 9, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1) : na
+
+if showDashboardInput and barstate.islast
+    textSize   = getTextSize(dashSizeInput)
+    labelColor = DASH_HEADER
+    valueColor = DASH_TEXT
+
+    sourceText = ivSymbol + (usingProxy ? " (proxy)" : "") + (na(ivValue) ? " (no data)" : "")
+    regimeText = regime == HIGH_REGIME ? "High (Rich)" : regime == LOW_REGIME ? "Low (Cheap)" : regime == NEUTRAL_REGIME ? "Neutral" : "—"
+    rangeText  = formatValue(ivLow52, "#.##") + " – " + formatValue(ivHigh52, "#.##")
+    pctText    = na(ivPercentile) ? "—" : str.tostring(ivPercentile, "#.#") + "%"
+    vrpText    = na(volRiskPremium) ? "—" : (volRiskPremium >= 0 ? "+" : "") + str.tostring(volRiskPremium, "#.##")
+    moveText   = na(expectedMoveAbs) ? "—" : "±" + str.tostring(expectedMoveAbs, format.mintick) + " (" + formatValue(expectedMovePct, "#.##") + "%)"
+
+    regimeColor = regime == HIGH_REGIME ? highIvColorInput : regime == LOW_REGIME ? lowIvColorInput : regime == NEUTRAL_REGIME ? midIvColorInput : valueColor
+    pctColor    = na(ivPercentile) ? valueColor : ivPercentile >= pctHighInput ? highIvColorInput : ivPercentile <= pctLowInput ? lowIvColorInput : valueColor
+    vrpColor    = na(volRiskPremium) ? valueColor : volRiskPremium < 0 ? highIvColorInput : lowIvColorInput
+
+    table.cell(dashboard, 0, 0, "IV Source", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboard, 1, 0, sourceText, text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboard, 0, 1, "Implied Volatility", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboard, 1, 1, formatValue(ivValue, "#.##"), text_color = ivColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboard, 0, 2, "IV Rank (" + str.tostring(lookbackInput) + ")", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboard, 1, 2, formatValue(ivRank, "#.#"), text_color = ivColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboard, 0, 3, "IV Percentile (" + str.tostring(lookbackInput) + ")", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboard, 1, 3, pctText, text_color = pctColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboard, 0, 4, "Regime", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboard, 1, 4, regimeText, text_color = regimeColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboard, 0, 5, "52W Range", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboard, 1, 5, rangeText, text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboard, 0, 6, "Realized Vol (" + str.tostring(rvLengthInput) + ")", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboard, 1, 6, formatValue(realizedVol, "#.##"), text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboard, 0, 7, "IV − RV Premium", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboard, 1, 7, vrpText, text_color = vrpColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboard, 0, 8, "1σ Move (" + str.tostring(moveDaysInput) + "d)", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboard, 1, 8, moveText, text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(rankCrossHigh, "IV Rank Above High Threshold", "IV Rank crossed above its high threshold - implied volatility rich versus its one-year range; options expensive, wider expected movement ({{interval}})")
+alertcondition(rankCrossLow, "IV Rank Below Low Threshold", "IV Rank crossed below its low threshold - implied volatility cheap versus its one-year range; options inexpensive, compressed expectations ({{interval}})")
+alertcondition(pctCrossHigh, "IV Percentile Above High Threshold", "IV Percentile crossed above its high threshold - IV was lower on most sessions of the lookback ({{interval}})")
+alertcondition(pctCrossLow, "IV Percentile Below Low Threshold", "IV Percentile crossed below its low threshold - IV was higher on most sessions of the lookback ({{interval}})")
+alertcondition(regimeChange, "IV Regime Change", "Implied volatility regime changed - reassess stop distance, position size, and premium richness ({{interval}})")
+alertcondition(ivCrossAboveRv, "IV Premium Over Realized", "Implied volatility crossed above realized volatility - the market is paying a premium over delivered movement ({{interval}})")
+alertcondition(ivCrossBelowRv, "IV Discount To Realized", "Implied volatility crossed below realized volatility - options are pricing less movement than the market has delivered ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

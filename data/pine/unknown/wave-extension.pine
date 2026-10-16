@@ -1,0 +1,474 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Wave Extension", shorttitle = "Wave Extension", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 100)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+NEUTRAL_COLOR = #ff9800 // projections and the extended-fifth watch - the one accent of the script
+SUBWAVE_COLOR = #787b86 // sub-wave labels are structure - grey
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+FIFTH_PROJ_RATIO = 0.618 // wave 5 projection: 0.618 of the distance from the start of wave 1 to the end of wave 3
+MIN_SUB_PIVOTS   = 4     // interior sub-pivots required for a five-wave internal subdivision (5 legs = 4 interior turns)
+MAX_SWINGS       = 60
+MAX_SUB_SWINGS   = 400
+
+TOP_RIGHT_OPTION    = "Top Right"
+TOP_LEFT_OPTION     = "Top Left"
+BOTTOM_RIGHT_OPTION = "Bottom Right"
+BOTTOM_LEFT_OPTION  = "Bottom Left"
+
+GRP_SWING = "Swing Detection"
+GRP_EXT   = "Extension Detection"
+GRP_TOOLS = "Projections & Guidelines"
+GRP_DASH  = "Dashboard"
+GRP_STYLE = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Inputs
+//---------------------------------------------------------------------------------------------------------------------{
+swingLengthInput = input.int(10, "Swing Length", minval = 2, group = GRP_SWING, tooltip = "Bars on each side required to confirm a swing high/low. These swings define the five waves of the candidate impulse, so this sets the wave degree the extension is read at.")
+subLengthInput   = input.int(4, "Sub-wave Length", minval = 1, group = GRP_SWING, tooltip = "Pivot length of the finer zigzag used to inspect the extended wave's internal subdivision. Keep it well below Swing Length (values at or above it are clamped to Swing Length - 1).")
+
+extRatioInput      = input.float(1.618, "Extension Ratio", minval = 1.05, maxval = 5, step = 0.01, group = GRP_EXT, tooltip = "A motive wave (1, 3 or 5) is labeled extended when its price length reaches at least this multiple of the next largest motive wave. 1.618 is the classic reference; the label is ultimately about disproportion, not a fixed cutoff, so lower it to flag milder elongation.")
+requireSubdivInput = input.bool(true, "Require Internal Five-Wave Subdivision", group = GRP_EXT, tooltip = "Only label an extension when the candidate wave subdivides into at least five internal legs (four interior sub-wave pivots), the exaggerated internal subdivision that defines an extension. When it fails, the structure is still counted as an impulse without extension.")
+eqTolInput         = input.float(10, "Waves 1-3 Equality Tolerance (%)", minval = 1, maxval = 50, step = 0.5, group = GRP_EXT, tooltip = "When waves 1 and 3 of a developing impulse differ in length by less than this percentage, neither has extended - since most impulses contain one extension, an extended fifth becomes the live scenario and is flagged.")
+
+showProjInput     = input.bool(true, "Wave 5 Targets While Wave 3 Extends", group = GRP_TOOLS, tooltip = "Once wave 3 is identified as extending (at the wave 4 pivot), project wave 5 at equality with wave 1 and at 0.618 of the distance from the start of wave 1 to the end of wave 3, rather than expecting another oversized leg.")
+showWatchInput    = input.bool(true, "Extended Fifth Watch", group = GRP_TOOLS, tooltip = "Flag the wave 4 pivot when waves 1 and 3 are near equal in length - odds then favor an extended fifth, arguing against fading strength on the first sign of hesitation.")
+showZoneInput     = input.bool(true, "Post-Extension Retracement Zone", group = GRP_TOOLS, tooltip = "After a fifth-wave extension completes, shade the price territory of the extension's second sub-wave: the subsequent correction is commonly sharp and returns roughly to this area.")
+showSubwavesInput = input.bool(true, "Extended Wave Sub-Structure", group = GRP_TOOLS, tooltip = "Trace the extended wave's internal sub-waves with a dotted path, labeling i-iv when a clean five is found. This is the subdivision that makes extensions easy to miscount as extra waves of the higher degree.")
+
+showDashInput     = input.bool(true, "Extension Statistics", group = GRP_DASH, tooltip = "Dashboard counting detected impulses by extended wave. Third-wave extensions tend to dominate in stock indices while fifth-wave extensions appear more often in commodities; a large share of impulses with no extension suggests re-examining whether the structures are really impulses.")
+dashLocationInput = input.string(TOP_RIGHT_OPTION, "Location", options = [TOP_RIGHT_OPTION, TOP_LEFT_OPTION, BOTTOM_RIGHT_OPTION, BOTTOM_LEFT_OPTION], group = GRP_DASH, tooltip = "Dashboard location on the chart.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish Impulse", group = GRP_STYLE)
+bearColorInput = input.color(BEAR_COLOR, "Bearish Impulse", group = GRP_STYLE)
+projColorInput = input.color(NEUTRAL_COLOR, "Projections & Watch", group = GRP_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Pivot State
+//---------------------------------------------------------------------------------------------------------------------{
+var swingPricesArray = array.new<float>()
+var swingBarsArray   = array.new<int>()
+var swingDirsArray   = array.new<int>()
+
+var subPricesArray = array.new<float>()
+var subBarsArray   = array.new<int>()
+var subDirsArray   = array.new<int>()
+
+var projLinesArray  = array.new<line>()
+var projLabelsArray = array.new<label>()
+
+var int lastImpulseEndBar = -1
+var int lastProjStartBar  = -1
+var int lastWatchStartBar = -1
+
+var int extWave1Count    = 0
+var int extWave3Count    = 0
+var int extWave5Count    = 0
+var int noExtensionCount = 0
+
+var float zoneTopPrice    = na
+var float zoneBottomPrice = na
+var bool  zoneIsBull      = false
+var bool  zoneArmed       = false
+var box   zoneBox         = na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+f_swingPrice(idx) =>
+    array.get(swingPricesArray, idx)
+
+f_swingBar(idx) =>
+    array.get(swingBarsArray, idx)
+
+f_swingDir(idx) =>
+    array.get(swingDirsArray, idx)
+
+f_swingLabelStyle(idx) =>
+    array.get(swingDirsArray, idx) == 1 ? label.style_label_down : label.style_label_up
+
+// Appends (or extends) a primary swing pivot, enforcing high/low alternation.
+// Returns [appended, changed]: appended locks the previous pivot in place, changed covers replacements too.
+f_addSwingPivot(dir, price, barIdx) =>
+    appended = false
+    changed  = false
+    swingCount = array.size(swingDirsArray)
+    if swingCount == 0
+        array.push(swingPricesArray, price)
+        array.push(swingBarsArray, barIdx)
+        array.push(swingDirsArray, dir)
+        appended := true
+        changed  := true
+    else
+        lastDir = array.get(swingDirsArray, swingCount - 1)
+        if lastDir == dir
+            lastPrice = array.get(swingPricesArray, swingCount - 1)
+            if (dir == 1 and price >= lastPrice) or (dir == -1 and price <= lastPrice)
+                array.set(swingPricesArray, swingCount - 1, price)
+                array.set(swingBarsArray, swingCount - 1, barIdx)
+                changed := true
+        else
+            array.push(swingPricesArray, price)
+            array.push(swingBarsArray, barIdx)
+            array.push(swingDirsArray, dir)
+            appended := true
+            changed  := true
+    [appended, changed]
+
+// Same alternation logic for the finer sub-wave zigzag. Returns true when the stored pivots changed.
+f_addSubPivot(dir, price, barIdx) =>
+    changed = false
+    subCount = array.size(subDirsArray)
+    if subCount == 0
+        array.push(subPricesArray, price)
+        array.push(subBarsArray, barIdx)
+        array.push(subDirsArray, dir)
+        changed := true
+    else
+        lastDir = array.get(subDirsArray, subCount - 1)
+        if lastDir == dir
+            lastPrice = array.get(subPricesArray, subCount - 1)
+            if (dir == 1 and price >= lastPrice) or (dir == -1 and price <= lastPrice)
+                array.set(subPricesArray, subCount - 1, price)
+                array.set(subBarsArray, subCount - 1, barIdx)
+                changed := true
+        else
+            array.push(subPricesArray, price)
+            array.push(subBarsArray, barIdx)
+            array.push(subDirsArray, dir)
+            changed := true
+    changed
+
+// Validates a five-wave impulse spanning swing pivots s..s+5 under the hard rules, and measures its motive waves.
+// Returns [ok, isBull, extRaw, ratio, len1, len3, len5] where extRaw is the largest motive wave (1, 3 or 5)
+// and ratio is its length relative to the next largest motive wave.
+f_checkImpulse(s) =>
+    p0 = f_swingPrice(s)
+    p1 = f_swingPrice(s + 1)
+    p2 = f_swingPrice(s + 2)
+    p3 = f_swingPrice(s + 3)
+    p4 = f_swingPrice(s + 4)
+    p5 = f_swingPrice(s + 5)
+    isBull = f_swingDir(s) == -1
+    len1 = math.abs(p1 - p0)
+    len3 = math.abs(p3 - p2)
+    len5 = math.abs(p5 - p4)
+    // Wave 2 holds above the start of wave 1, wave 4 stays out of wave 1 territory, every motive wave advances.
+    bullOk = p1 > p0 and p2 < p1 and p2 > p0 and p3 > math.max(p1, p2) and p4 < p3 and p4 > p1 and p5 > math.max(p3, p4)
+    bearOk = p1 < p0 and p2 > p1 and p2 < p0 and p3 < math.min(p1, p2) and p4 > p3 and p4 < p1 and p5 < math.min(p3, p4)
+    structureOk = isBull ? bullOk : bearOk
+    // Hard rule filter: wave 3 can never be the shortest motive wave - the count is invalid regardless of looks.
+    ruleThreeOk = not (len3 < len1 and len3 < len5)
+    ok = structureOk and ruleThreeOk
+    maxLen = math.max(len1, math.max(len3, len5))
+    minLen = math.min(len1, math.min(len3, len5))
+    midLen = len1 + len3 + len5 - maxLen - minLen
+    ratio  = midLen > 0 ? maxLen / midLen : -1.0
+    extRaw = maxLen == len1 ? 1 : maxLen == len3 ? 3 : 5
+    [ok, isBull, extRaw, ratio, len1, len3, len5]
+
+// Validates the first four waves of a developing impulse spanning swing pivots s..s+4 (newest pivot = wave 4).
+// Returns [ok, isBull, len1, len3, move03].
+f_checkFourWaves(s) =>
+    p0 = f_swingPrice(s)
+    p1 = f_swingPrice(s + 1)
+    p2 = f_swingPrice(s + 2)
+    p3 = f_swingPrice(s + 3)
+    p4 = f_swingPrice(s + 4)
+    isBull = f_swingDir(s) == -1
+    len1   = math.abs(p1 - p0)
+    len3   = math.abs(p3 - p2)
+    move03 = math.abs(p3 - p0)
+    bullOk = p1 > p0 and p2 < p1 and p2 > p0 and p3 > math.max(p1, p2) and p4 < p3 and p4 > p1
+    bearOk = p1 < p0 and p2 > p1 and p2 < p0 and p3 < math.min(p1, p2) and p4 > p3 and p4 < p1
+    ok = isBull ? bullOk : bearOk
+    [ok, isBull, len1, len3, move03]
+
+// Collects the sub-wave pivots lying strictly inside the bar span of one wave.
+// Returns [prices, bars, dirs] of the interior sub-pivots, in chronological order.
+f_subPivotsBetween(startBar, endBar) =>
+    interiorPrices = array.new<float>()
+    interiorBars   = array.new<int>()
+    interiorDirs   = array.new<int>()
+    storedSubCount = array.size(subDirsArray)
+    if storedSubCount > 0
+        for subIdx = 0 to storedSubCount - 1
+            pivotBar = array.get(subBarsArray, subIdx)
+            if pivotBar > startBar and pivotBar < endBar
+                array.push(interiorPrices, array.get(subPricesArray, subIdx))
+                array.push(interiorBars, pivotBar)
+                array.push(interiorDirs, array.get(subDirsArray, subIdx))
+    [interiorPrices, interiorBars, interiorDirs]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic - zigzag construction
+//---------------------------------------------------------------------------------------------------------------------{
+subLength = math.min(subLengthInput, math.max(1, swingLengthInput - 1))
+
+swingHigh = ta.pivothigh(high, swingLengthInput, swingLengthInput)
+swingLow  = ta.pivotlow(low, swingLengthInput, swingLengthInput)
+subHigh   = ta.pivothigh(high, subLength, subLength)
+subLow    = ta.pivotlow(low, subLength, subLength)
+
+swingPivotBar = bar_index - swingLengthInput
+subPivotBar   = bar_index - subLength
+
+newSwingAppended = false
+swingChanged     = false
+if not na(swingHigh) and not na(swingLow)
+    // Outside bar produced both pivots: order them to preserve alternation with the previous pivot.
+    swingCountNow = array.size(swingDirsArray)
+    lastSwingDir  = swingCountNow > 0 ? array.get(swingDirsArray, swingCountNow - 1) : 0
+    if lastSwingDir == 1
+        [appendedLowFirst, changedLowFirst] = f_addSwingPivot(-1, swingLow, swingPivotBar)
+        [appendedHighNext, changedHighNext] = f_addSwingPivot(1, swingHigh, swingPivotBar)
+        newSwingAppended := appendedLowFirst or appendedHighNext
+        swingChanged     := changedLowFirst or changedHighNext
+    else
+        [appendedHighFirst, changedHighFirst] = f_addSwingPivot(1, swingHigh, swingPivotBar)
+        [appendedLowNext, changedLowNext]     = f_addSwingPivot(-1, swingLow, swingPivotBar)
+        newSwingAppended := appendedHighFirst or appendedLowNext
+        swingChanged     := changedHighFirst or changedLowNext
+else if not na(swingHigh)
+    [appendedHighOnly, changedHighOnly] = f_addSwingPivot(1, swingHigh, swingPivotBar)
+    newSwingAppended := appendedHighOnly
+    swingChanged     := changedHighOnly
+else if not na(swingLow)
+    [appendedLowOnly, changedLowOnly] = f_addSwingPivot(-1, swingLow, swingPivotBar)
+    newSwingAppended := appendedLowOnly
+    swingChanged     := changedLowOnly
+
+subDirty = false
+if not na(subHigh) and not na(subLow)
+    subCountNow = array.size(subDirsArray)
+    lastSubDir  = subCountNow > 0 ? array.get(subDirsArray, subCountNow - 1) : 0
+    if lastSubDir == 1
+        subDirty := f_addSubPivot(-1, subLow, subPivotBar) or subDirty
+        subDirty := f_addSubPivot(1, subHigh, subPivotBar) or subDirty
+    else
+        subDirty := f_addSubPivot(1, subHigh, subPivotBar) or subDirty
+        subDirty := f_addSubPivot(-1, subLow, subPivotBar) or subDirty
+else if not na(subHigh)
+    subDirty := f_addSubPivot(1, subHigh, subPivotBar)
+else if not na(subLow)
+    subDirty := f_addSubPivot(-1, subLow, subPivotBar)
+
+if subDirty
+    while array.size(subDirsArray) > MAX_SUB_SWINGS
+        array.shift(subPricesArray)
+        array.shift(subBarsArray)
+        array.shift(subDirsArray)
+
+// Alert flags (recomputed every bar)
+extUpAlert        = false
+extDownAlert      = false
+thirdExtUpAlert   = false
+thirdExtDownAlert = false
+fifthWatchUpAlert   = false
+fifthWatchDownAlert = false
+zoneHitUpAlert   = false
+zoneHitDownAlert = false
+
+swingCount = array.size(swingDirsArray)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic - completed impulse & extension labeling
+//---------------------------------------------------------------------------------------------------------------------{
+// A five-wave sequence is read once the swing AFTER its final pivot is confirmed, locking wave 5 in place:
+// confirmed detections never repaint.
+if newSwingAppended and swingCount >= 7
+    endIdx   = swingCount - 2
+    startIdx = endIdx - 5
+    if f_swingBar(startIdx) > lastImpulseEndBar
+        [impulseOk, impulseBull, extRawWave, extRatio, len1, len3, len5] = f_checkImpulse(startIdx)
+        if impulseOk
+            extWave = extRatio >= extRatioInput ? extRawWave : 0
+            interiorPrices = array.new<float>()
+            interiorBars   = array.new<int>()
+            interiorDirs   = array.new<int>()
+            if extWave > 0
+                // Identify step 2: the extended wave should subdivide into a clear five of its own.
+                [foundPrices, foundBars, foundDirs] = f_subPivotsBetween(f_swingBar(startIdx + extWave - 1), f_swingBar(startIdx + extWave))
+                interiorPrices := foundPrices
+                interiorBars   := foundBars
+                interiorDirs   := foundDirs
+                if requireSubdivInput and array.size(interiorDirs) < MIN_SUB_PIVOTS
+                    extWave := 0
+            // A newer structure is confirmed: any earlier retracement zone is no longer the live guideline.
+            zoneArmed := false
+            lastImpulseEndBar := f_swingBar(endIdx)
+            if extWave == 1
+                extWave1Count += 1
+            else if extWave == 3
+                extWave3Count += 1
+            else if extWave == 5
+                extWave5Count += 1
+            else
+                noExtensionCount += 1
+            if extWave > 0
+                impulseColor = impulseBull ? bullColorInput : bearColorInput
+                subCount     = array.size(interiorDirs)
+                // Wave path - the extended wave is drawn heavier.
+                for leg = 0 to 4
+                    line.new(f_swingBar(startIdx + leg), f_swingPrice(startIdx + leg), f_swingBar(startIdx + leg + 1), f_swingPrice(startIdx + leg + 1), color = impulseColor, width = leg == extWave - 1 ? 2 : 1)
+                // Wave labels 1..5 with measurements on the extended wave.
+                bars1 = f_swingBar(startIdx + 1) - f_swingBar(startIdx)
+                bars3 = f_swingBar(startIdx + 3) - f_swingBar(startIdx + 2)
+                bars5 = f_swingBar(startIdx + 5) - f_swingBar(startIdx + 4)
+                extTip = "Extended wave " + str.tostring(extWave) + ": " + str.tostring(extRatio, "#.##") + "x the next largest motive wave" + "\nWave 1: " + str.tostring(len1, format.mintick) + " over " + str.tostring(bars1) + " bars" + "\nWave 3: " + str.tostring(len3, format.mintick) + " over " + str.tostring(bars3) + " bars" + "\nWave 5: " + str.tostring(len5, format.mintick) + " over " + str.tostring(bars5) + " bars" + "\nInterior sub-pivots: " + str.tostring(subCount) + "\nGuideline of equality: the two non-extended waves tend toward equality in price and time."
+                for pt = 1 to 5
+                    ptIdx = startIdx + pt
+                    isExtEnd = pt == extWave
+                    label.new(f_swingBar(ptIdx), f_swingPrice(ptIdx), str.tostring(pt), style = f_swingLabelStyle(ptIdx), color = isExtEnd ? color.new(impulseColor, 10) : #00000000, textcolor = isExtEnd ? chart.bg_color : impulseColor, size = size.small, tooltip = isExtEnd ? extTip : "Wave " + str.tostring(pt) + " of a confirmed five-wave impulse.")
+                // Internal five-wave subdivision of the extended wave.
+                if showSubwavesInput and subCount > 0
+                    extStartIdx  = startIdx + extWave - 1
+                    prevSubBar   = f_swingBar(extStartIdx)
+                    prevSubPrice = f_swingPrice(extStartIdx)
+                    for pathIdx = 0 to subCount - 1
+                        line.new(prevSubBar, prevSubPrice, array.get(interiorBars, pathIdx), array.get(interiorPrices, pathIdx), color = color.new(impulseColor, 40), style = line.style_dotted)
+                        prevSubBar   := array.get(interiorBars, pathIdx)
+                        prevSubPrice := array.get(interiorPrices, pathIdx)
+                    line.new(prevSubBar, prevSubPrice, f_swingBar(extStartIdx + 1), f_swingPrice(extStartIdx + 1), color = color.new(impulseColor, 40), style = line.style_dotted)
+                    if subCount == MIN_SUB_PIVOTS
+                        for subLabelIdx = 0 to subCount - 1
+                            subLabelText = subLabelIdx == 0 ? "i" : subLabelIdx == 1 ? "ii" : subLabelIdx == 2 ? "iii" : "iv"
+                            label.new(array.get(interiorBars, subLabelIdx), array.get(interiorPrices, subLabelIdx), subLabelText, style = array.get(interiorDirs, subLabelIdx) == 1 ? label.style_label_down : label.style_label_up, color = #00000000, textcolor = SUBWAVE_COLOR, size = size.tiny, tooltip = "Sub-wave " + subLabelText + " of the extended wave: the extension subdivides into a clear five of its own, which is why it is easily miscounted as waves of the higher degree.")
+                // Frost & Prechter guideline: after a fifth-wave extension the correction is sharp and returns
+                // roughly to the price territory of the extension's second sub-wave.
+                if extWave == 5
+                    firstSubIdx = -1
+                    if subCount > 0
+                        for scanIdx = 0 to subCount - 1
+                            if firstSubIdx == -1 and array.get(interiorDirs, scanIdx) == (impulseBull ? 1 : -1)
+                                firstSubIdx := scanIdx
+                    if firstSubIdx >= 0 and firstSubIdx + 1 < subCount
+                        subOnePrice = array.get(interiorPrices, firstSubIdx)
+                        subTwoPrice = array.get(interiorPrices, firstSubIdx + 1)
+                        zoneTop    = impulseBull ? subOnePrice : subTwoPrice
+                        zoneBottom = impulseBull ? subTwoPrice : subOnePrice
+                        if zoneTop > zoneBottom
+                            zoneTopPrice    := zoneTop
+                            zoneBottomPrice := zoneBottom
+                            zoneIsBull      := impulseBull
+                            zoneArmed       := true
+                            zoneBox         := na
+                            if showZoneInput
+                                zoneColor = impulseBull ? bearColorInput : bullColorInput
+                                zoneBox := box.new(f_swingBar(endIdx), zoneTop, bar_index, zoneBottom, border_color = color.new(zoneColor, 60), border_style = line.style_dashed, border_width = 1, bgcolor = color.new(zoneColor, 85), text = "wave ii of the extension", text_size = size.tiny, text_color = color.new(zoneColor, 30), text_halign = text.align_right, text_valign = text.align_center)
+                extUpAlert   := impulseBull
+                extDownAlert := not impulseBull
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic - developing impulse readings at the wave 4 pivot
+//---------------------------------------------------------------------------------------------------------------------{
+if swingChanged
+    // In-progress readings follow the live swing structure: rebuild them whenever a pivot forms or extends.
+    if array.size(projLinesArray) > 0
+        for lineIdx = 0 to array.size(projLinesArray) - 1
+            line.delete(array.get(projLinesArray, lineIdx))
+        array.clear(projLinesArray)
+    if array.size(projLabelsArray) > 0
+        for labelIdx = 0 to array.size(projLabelsArray) - 1
+            label.delete(array.get(projLabelsArray, labelIdx))
+        array.clear(projLabelsArray)
+    if swingCount >= 5
+        fourStartIdx = swingCount - 5
+        if f_swingBar(fourStartIdx) > lastImpulseEndBar
+            [fourOk, fourBull, fourLen1, fourLen3, fourMove03] = f_checkFourWaves(fourStartIdx)
+            if fourOk
+                pivotFourPrice = f_swingPrice(swingCount - 1)
+                pivotFourBar   = f_swingBar(swingCount - 1)
+                fourStartBar   = f_swingBar(fourStartIdx)
+                dirSign        = fourBull ? 1.0 : -1.0
+                // Wave 3 already disproportionate: trust the equality-based wave 5 projections.
+                if fourLen1 > 0 and fourLen3 >= extRatioInput * fourLen1
+                    eqTarget  = pivotFourPrice + dirSign * fourLen1
+                    fibTarget = pivotFourPrice + dirSign * FIFTH_PROJ_RATIO * fourMove03
+                    if showProjInput
+                        array.push(projLinesArray, line.new(pivotFourBar, eqTarget, pivotFourBar + 1, eqTarget, extend = extend.right, color = projColorInput, style = line.style_dotted))
+                        array.push(projLinesArray, line.new(pivotFourBar, fibTarget, pivotFourBar + 1, fibTarget, extend = extend.right, color = projColorInput, style = line.style_dotted))
+                        array.push(projLabelsArray, label.new(pivotFourBar, eqTarget, "5 = 1", style = label.style_label_left, color = #00000000, textcolor = projColorInput, size = size.tiny, tooltip = "Wave 5 projection at equality with wave 1: when wave 3 extends, the two non-extended waves tend toward equality, so wave 5 is projected at the length of wave 1 from the wave 4 pivot."))
+                        array.push(projLabelsArray, label.new(pivotFourBar, fibTarget, "5 = 0.618 (0-3)", style = label.style_label_left, color = #00000000, textcolor = projColorInput, size = size.tiny, tooltip = "Wave 5 projection at 0.618 of the distance from the start of wave 1 to the end of wave 3, measured from the wave 4 pivot."))
+                    if fourStartBar != lastProjStartBar
+                        thirdExtUpAlert   := fourBull
+                        thirdExtDownAlert := not fourBull
+                        lastProjStartBar  := fourStartBar
+                // Waves 1 and 3 near equal: neither extended, so treat an extended fifth as the live scenario.
+                if math.abs(fourLen1 - fourLen3) <= eqTolInput * 0.01 * math.max(fourLen1, fourLen3)
+                    if showWatchInput
+                        array.push(projLabelsArray, label.new(pivotFourBar, pivotFourPrice, "extended 5th watch", style = fourBull ? label.style_label_up : label.style_label_down, color = #00000000, textcolor = projColorInput, size = size.tiny, tooltip = "Waves 1 and 3 are near equal in length (within " + str.tostring(eqTolInput, "#.#") + "%). Neither extended, and most impulses contain exactly one extension, so the odds favor an extended fifth - be slow to call a top or bottom on the first sign of hesitation."))
+                    if fourStartBar != lastWatchStartBar
+                        fifthWatchUpAlert   := fourBull
+                        fifthWatchDownAlert := not fourBull
+                        lastWatchStartBar   := fourStartBar
+
+// Cap stored swings once processing is done for the bar.
+if swingChanged
+    while array.size(swingDirsArray) > MAX_SWINGS
+        array.shift(swingPricesArray)
+        array.shift(swingBarsArray)
+        array.shift(swingDirsArray)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic - post-extension retracement zone tracking
+//---------------------------------------------------------------------------------------------------------------------{
+if zoneArmed
+    if not na(zoneBox)
+        box.set_right(zoneBox, bar_index)
+    zoneTouched = zoneIsBull ? low <= zoneTopPrice : high >= zoneBottomPrice
+    if zoneTouched
+        zoneArmed        := false
+        zoneHitUpAlert   := zoneIsBull
+        zoneHitDownAlert := not zoneIsBull
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+dashLocation = switch dashLocationInput
+    TOP_RIGHT_OPTION    => position.top_right
+    TOP_LEFT_OPTION     => position.top_left
+    BOTTOM_RIGHT_OPTION => position.bottom_right
+    => position.bottom_left
+
+var table dashTable = table.new(dashLocation, 3, 5, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+if showDashInput and barstate.islast
+    totalImpulses = extWave1Count + extWave3Count + extWave5Count + noExtensionCount
+    table.cell(dashTable, 0, 0, "Extension", text_color = DASH_HEADER, text_size = size.small, text_halign = text.align_left, tooltip = "Detected five-wave impulses grouped by which wave extended. Stock indices lean toward third-wave extensions, commodities toward fifth-wave ones. Most textbook impulses contain one extension - if None dominates, re-examine whether these structures are really impulses.")
+    table.cell(dashTable, 1, 0, "Count", text_color = DASH_HEADER, text_size = size.small, text_halign = text.align_right)
+    table.cell(dashTable, 2, 0, "Share", text_color = DASH_HEADER, text_size = size.small, text_halign = text.align_right)
+    rowTitles = array.from("Wave 1", "Wave 3", "Wave 5", "None")
+    rowCounts = array.from(extWave1Count, extWave3Count, extWave5Count, noExtensionCount)
+    for rowIdx = 0 to 3
+        rowCount  = array.get(rowCounts, rowIdx)
+        shareText = totalImpulses > 0 ? str.tostring(100.0 * rowCount / totalImpulses, "#.#") + "%" : "-"
+        table.cell(dashTable, 0, rowIdx + 1, array.get(rowTitles, rowIdx), text_color = DASH_HEADER, text_size = size.small, text_halign = text.align_left)
+        table.cell(dashTable, 1, rowIdx + 1, str.tostring(rowCount), text_color = DASH_TEXT, text_size = size.small, text_halign = text.align_right)
+        table.cell(dashTable, 2, rowIdx + 1, shareText, text_color = DASH_TEXT, text_size = size.small, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(extUpAlert, "Bullish Wave Extension Confirmed", "Bullish five-wave impulse with an extended wave confirmed on {{ticker}} {{interval}}")
+alertcondition(extDownAlert, "Bearish Wave Extension Confirmed", "Bearish five-wave impulse with an extended wave confirmed on {{ticker}} {{interval}}")
+alertcondition(thirdExtUpAlert, "Extended Third Underway (Up)", "Wave 3 of a developing bullish impulse is extending on {{ticker}} {{interval}} - wave 5 projected at equality with wave 1 and 0.618 of waves 0-3")
+alertcondition(thirdExtDownAlert, "Extended Third Underway (Down)", "Wave 3 of a developing bearish impulse is extending on {{ticker}} {{interval}} - wave 5 projected at equality with wave 1 and 0.618 of waves 0-3")
+alertcondition(fifthWatchUpAlert, "Extended Fifth Watch (Up)", "Waves 1 and 3 are near equal in a developing bullish impulse on {{ticker}} {{interval}} - an extended fifth is the live scenario")
+alertcondition(fifthWatchDownAlert, "Extended Fifth Watch (Down)", "Waves 1 and 3 are near equal in a developing bearish impulse on {{ticker}} {{interval}} - an extended fifth is the live scenario")
+alertcondition(zoneHitUpAlert, "Retracement Zone Reached (After Bullish Extended 5th)", "Correction returned to the second sub-wave territory of the bullish fifth-wave extension on {{ticker}} {{interval}}")
+alertcondition(zoneHitDownAlert, "Retracement Zone Reached (After Bearish Extended 5th)", "Correction returned to the second sub-wave territory of the bearish fifth-wave extension on {{ticker}} {{interval}}")
+
+//---------------------------------------------------------------------------------------------------------------------}

@@ -1,0 +1,328 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Line Break"
+  , shorttitle      = "Line Break"
+  , overlay         = false
+  , format          = format.price
+  , max_boxes_count = 500
+  , max_lines_count = 100)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+//Default palette
+color BULL_COLOR    = #089981
+color BEAR_COLOR    = #f23645
+color NEUTRAL_COLOR = #5b9cf6
+
+//Maximum number of lines kept in memory (well above the largest displayable window)
+int MAX_STORED_LINES = 250
+
+//Body transparency of the synthetic chart lines
+int CONTINUATION_TRANSP = 70
+int TURNAROUND_TRANSP   = 30
+
+string GROUP_SETTINGS  = "Settings"
+string GROUP_DISPLAY   = "Display"
+string GROUP_DASHBOARD = "Dashboard"
+string GROUP_STYLE     = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+breakCountInput = input.int(3, "Line Break Count"
+  , minval  = 1
+  , maxval  = 10
+  , group   = GROUP_SETTINGS
+  , tooltip = "Number of prior lines whose extreme the close must break for a reversal (turnaround) line to print. 3 is the classic three-line break (3LB); 2 reverses more easily and higher counts give slower charts. Continuation lines only require a close beyond the last line's extreme.")
+
+tfInput = input.timeframe("", "Close Timeframe"
+  , group   = GROUP_SETTINGS
+  , tooltip = "Timeframe of the closing prices the lines are built from. Use a timeframe equal to or above the chart's; lower selections fall back to the chart timeframe. Higher timeframe closes are only processed once their bar is confirmed, so historical lines do not repaint.")
+
+extendedRunInput = input.int(8, "Extended Run Length"
+  , minval  = 2
+  , maxval  = 50
+  , group   = GROUP_SETTINGS
+  , tooltip = "Number of consecutive same-color lines treated as an extended run. The 'Extended Run' alert fires when the current run reaches this length - practitioners grow cautious after long unbroken sequences, treating late continuation lines as increasingly fragile.")
+
+showChartInput = input.bool(true, "Line Break Chart"
+  , group   = GROUP_DISPLAY
+  , tooltip = "Draw the synthetic line break chart to the right of the last bar, with equal-width lines exactly as a standalone line break chart would print them. Turnaround lines are drawn with a more opaque body.")
+
+chartLinesInput = input.int(30, "Chart Lines"
+  , minval  = 5
+  , maxval  = 100
+  , inline  = "chart"
+  , group   = GROUP_DISPLAY
+  , tooltip = "Maximum number of recent lines shown on the synthetic chart.")
+
+chartWidthInput = input.int(2, "Width"
+  , minval  = 1
+  , maxval  = 4
+  , inline  = "chart"
+  , group   = GROUP_DISPLAY
+  , tooltip = "Horizontal width of each synthetic chart line, in bars.")
+
+showHistoryInput = input.bool(true, "Historical Lines"
+  , group   = GROUP_DISPLAY
+  , tooltip = "Shade the active line's body across chart time. Each step marks the bar whose close printed a new line; long flat segments show closes drifting inside the prior line's range, where nothing is drawn.")
+
+showMarkersInput = input.bool(true, "Turnaround Markers"
+  , group   = GROUP_DISPLAY
+  , tooltip = "Mark the closes that printed turnaround lines - the chart's principal signal - with a small circle at the line's closing price.")
+
+showLevelsInput = input.bool(true, "Trigger Levels On Price Chart"
+  , group   = GROUP_DISPLAY
+  , tooltip = "Plot the continuation trigger (the last line's extreme) and the reversal trigger (the opposite extreme of the prior lines) on the price chart, so breakout levels can be cross-checked against standard candles before acting.")
+
+barColorInput = input.bool(false, "Color Price Chart Candles"
+  , group   = GROUP_DISPLAY
+  , tooltip = "Color the price chart candles with the current line direction, turning the standard chart into a close-confirmed trend filter.")
+
+showDashInput = input.bool(true, "Show Dashboard"
+  , group   = GROUP_DASHBOARD
+  , tooltip = "Display a summary of the current line break state: source timeframe, line direction, run length, total lines, and the continuation/reversal trigger prices.")
+
+dashLocInput = input.string("Top Right", "Location"
+  , options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"]
+  , inline  = "dash"
+  , group   = GROUP_DASHBOARD
+  , tooltip = "Position of the dashboard on the chart.")
+
+dashSizeInput = input.string("Small", "Size"
+  , options = ["Tiny", "Small", "Normal"]
+  , inline  = "dash"
+  , group   = GROUP_DASHBOARD
+  , tooltip = "Text size of the dashboard.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish Lines", group = GROUP_STYLE)
+
+bearColorInput = input.color(BEAR_COLOR, "Bearish Lines", group = GROUP_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+//Highest line top and lowest line bottom over the most recent `count` stored lines
+lineExtremes(array<float> opens, array<float> closes, int count) =>
+    int sizeNow = array.size(closes)
+    int span    = math.min(count, sizeNow)
+    float highestTop   = na
+    float lowestBottom = na
+    if span > 0
+        for i = sizeNow - span to sizeNow - 1
+            float iTop    = math.max(array.get(opens, i), array.get(closes, i))
+            float iBottom = math.min(array.get(opens, i), array.get(closes, i))
+            highestTop   := na(highestTop)   ? iTop    : math.max(highestTop,   iTop)
+            lowestBottom := na(lowestBottom) ? iBottom : math.min(lowestBottom, iBottom)
+    [highestTop, lowestBottom]
+
+//Maps the dashboard location input to a table position
+getTablePosition(string positionName) =>
+    switch positionName
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        "Bottom Left"  => position.bottom_left
+        => position.top_right
+
+//Maps the dashboard size input to a text size
+getTextSize(string sizeName) =>
+    switch sizeName
+        "Tiny"   => size.tiny
+        "Normal" => size.normal
+        => size.small
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Line Construction
+//---------------------------------------------------------------------------------------------------------------------{
+
+var array<float> lineOpenArray  = array.new_float()
+var array<float> lineCloseArray = array.new_float()
+var array<bool>  lineTurnArray  = array.new_bool()
+
+var float baseClose  = na
+var int   totalLines = 0
+var int   runLength  = 0
+
+//Closes feeding the chart: chart closes by default, confirmed higher timeframe closes when one is selected
+bool  useHtf      = tfInput != "" and timeframe.in_seconds(tfInput) > timeframe.in_seconds()
+float htfClose    = request.security(syminfo.tickerid, tfInput, close[1], lookahead = barmerge.lookahead_on)
+bool  processNow  = useHtf ? timeframe.change(tfInput) : true
+float sourceClose = useHtf ? htfClose : close
+
+bool newLine       = false
+bool newTurnaround = false
+int  newDirection  = 0
+
+if processNow and not na(sourceClose)
+    float srcClose = sourceClose
+    if array.size(lineCloseArray) == 0
+        //Bootstrap: the first close is the base, the first line prints once a close differs from it
+        if na(baseClose)
+            baseClose := srcClose
+        else if srcClose != baseClose
+            newLine      := true
+            newDirection := srcClose > baseClose ? 1 : -1
+            array.push(lineOpenArray, baseClose)
+            array.push(lineCloseArray, srcClose)
+            array.push(lineTurnArray, false)
+    else
+        int   sizeBefore = array.size(lineCloseArray)
+        float prevOpen   = array.get(lineOpenArray,  sizeBefore - 1)
+        float prevClose  = array.get(lineCloseArray, sizeBefore - 1)
+        bool  prevUp     = prevClose > prevOpen
+        float prevTop    = math.max(prevOpen, prevClose)
+        float prevBottom = math.min(prevOpen, prevClose)
+        //Reversal filter: the extreme of the previous `breakCountInput` lines
+        [breakHigh, breakLow] = lineExtremes(lineOpenArray, lineCloseArray, breakCountInput)
+        float newOpen = na
+        if prevUp and srcClose > prevTop
+            //Continuation up: close above the prior line's high, drawn from that high
+            newOpen      := prevTop
+            newDirection := 1
+        else if not prevUp and srcClose < prevBottom
+            //Continuation down: close below the prior line's low, drawn from that low
+            newOpen      := prevBottom
+            newDirection := -1
+        else if prevUp and srcClose < breakLow
+            //Bearish turnaround: close below the lowest point of the prior lines, drawn from the last line's base
+            newOpen       := prevOpen
+            newDirection  := -1
+            newTurnaround := true
+        else if not prevUp and srcClose > breakHigh
+            //Bullish turnaround: close above the highest point of the prior lines, drawn from the last line's base
+            newOpen       := prevOpen
+            newDirection  := 1
+            newTurnaround := true
+        if not na(newOpen)
+            newLine := true
+            array.push(lineOpenArray, newOpen)
+            array.push(lineCloseArray, srcClose)
+            array.push(lineTurnArray, newTurnaround)
+    if newLine
+        totalLines += 1
+        runLength  := newTurnaround ? 1 : runLength + 1
+        if array.size(lineCloseArray) > MAX_STORED_LINES
+            array.shift(lineOpenArray)
+            array.shift(lineCloseArray)
+            array.shift(lineTurnArray)
+
+//State of the latest line
+int   storedLines   = array.size(lineCloseArray)
+float lastOpen      = storedLines > 0 ? array.get(lineOpenArray,  storedLines - 1) : na
+float lastClose     = storedLines > 0 ? array.get(lineCloseArray, storedLines - 1) : na
+int   lineDirection = storedLines > 0 ? (lastClose > lastOpen ? 1 : -1) : 0
+float lineTop       = storedLines > 0 ? math.max(lastOpen, lastClose) : na
+float lineBottom    = storedLines > 0 ? math.min(lastOpen, lastClose) : na
+float lineMid       = math.avg(lineTop, lineBottom)
+
+//Prices a close must break to print the next line
+[windowTop, windowBottom] = lineExtremes(lineOpenArray, lineCloseArray, breakCountInput)
+float continuationLevel = lineDirection == 1 ? lineTop : lineDirection == -1 ? lineBottom : na
+float reversalLevel     = lineDirection == 1 ? windowBottom : lineDirection == -1 ? windowTop : na
+
+color directionColor    = lineDirection == -1 ? bearColorInput : bullColorInput
+color continuationColor = lineDirection == -1 ? bearColorInput : bullColorInput
+color reversalColor     = lineDirection == -1 ? bullColorInput : bearColorInput
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Historical Lines
+//---------------------------------------------------------------------------------------------------------------------{
+
+color historyLineColor = showHistoryInput ? directionColor : color.new(directionColor, 100)
+color edgeFillColor    = showHistoryInput ? color.new(directionColor, 65)  : na
+color centerFillColor  = showHistoryInput ? color.new(directionColor, 100) : na
+
+topPlotId    = plot(lineTop,    "Line Top",    historyLineColor, 1, plot.style_stepline)
+midPlotId    = plot(lineMid,    "Line Mid",    color.new(chart.fg_color, 100), editable = false, display = display.none)
+bottomPlotId = plot(lineBottom, "Line Bottom", historyLineColor, 1, plot.style_stepline)
+
+fill(topPlotId, midPlotId,    lineTop, lineMid,    edgeFillColor,   centerFillColor, title = "Upper Body Gradient")
+fill(midPlotId, bottomPlotId, lineMid, lineBottom, centerFillColor, edgeFillColor,   title = "Lower Body Gradient")
+
+float bullTurnMarker = showMarkersInput and newTurnaround and newDirection == 1  ? lastClose : na
+float bearTurnMarker = showMarkersInput and newTurnaround and newDirection == -1 ? lastClose : na
+
+plotshape(bullTurnMarker, "Bullish Turnaround", shape.circle, location.absolute, bullColorInput, size = size.tiny)
+plotshape(bearTurnMarker, "Bearish Turnaround", shape.circle, location.absolute, bearColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Price Chart Overlays
+//---------------------------------------------------------------------------------------------------------------------{
+
+plot(showLevelsInput ? continuationLevel : na, "Continuation Trigger", continuationColor, 1, plot.style_steplinebr, force_overlay = true)
+plot(showLevelsInput ? reversalLevel     : na, "Reversal Trigger",     reversalColor,     1, plot.style_steplinebr, force_overlay = true)
+
+barcolor(barColorInput and lineDirection != 0 ? directionColor : na, title = "Line Direction")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Line Break Chart
+//---------------------------------------------------------------------------------------------------------------------{
+
+var array<box> chartBoxArray = array.new_box()
+var line separatorLine = na
+
+if barstate.islast
+    while array.size(chartBoxArray) > 0
+        box.delete(array.pop(chartBoxArray))
+    line.delete(separatorLine)
+    separatorLine := na
+    if showChartInput and storedLines > 0
+        separatorLine := line.new(bar_index + 2, lineTop, bar_index + 2, lineBottom, xloc.bar_index, extend.both, color.new(chart.fg_color, 70), line.style_dotted, 1)
+        int drawCount = math.min(chartLinesInput, storedLines)
+        int leftEdge  = bar_index + 3
+        for i = 0 to drawCount - 1
+            int   lineIndex = storedLines - drawCount + i
+            float boxOpen   = array.get(lineOpenArray,  lineIndex)
+            float boxClose  = array.get(lineCloseArray, lineIndex)
+            bool  boxTurn   = array.get(lineTurnArray,  lineIndex)
+            color boxColor  = boxClose > boxOpen ? bullColorInput : bearColorInput
+            int   boxLeft   = leftEdge + i * chartWidthInput
+            box lineBox = box.new(boxLeft, math.max(boxOpen, boxClose), boxLeft + chartWidthInput, math.min(boxOpen, boxClose), border_color = boxColor, border_width = 1, xloc = xloc.bar_index, bgcolor = color.new(boxColor, boxTurn ? TURNAROUND_TRANSP : CONTINUATION_TRANSP))
+            array.push(chartBoxArray, lineBox)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+
+var table dashTable = na
+string dashTextSize = getTextSize(dashSizeInput)
+
+if showDashInput and barstate.islast
+    if na(dashTable)
+        dashTable := table.new(getTablePosition(dashLocInput), 2, 7, bgcolor = color.new(chart.bg_color, 30), frame_color = color.new(chart.fg_color, 85), frame_width = 1)
+        table.merge_cells(dashTable, 0, 0, 1, 0)
+    color  labelColor = color.new(chart.fg_color, 30)
+    string dirText    = lineDirection == 1 ? "▲ Up" : lineDirection == -1 ? "▼ Down" : "-"
+    color  dirColor   = lineDirection == 0 ? chart.fg_color : directionColor
+    table.cell(dashTable, 0, 0, str.tostring(breakCountInput) + "-Line Break", text_color = chart.fg_color, text_size = dashTextSize, bgcolor = color.new(NEUTRAL_COLOR, 80))
+    table.cell(dashTable, 0, 1, "Closes", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 1, useHtf ? tfInput : timeframe.period, text_color = chart.fg_color, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 2, "Direction", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 2, dirText, text_color = dirColor, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 3, "Run", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 3, str.tostring(runLength), text_color = chart.fg_color, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 4, "Lines", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 4, str.tostring(totalLines), text_color = chart.fg_color, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 5, "Continuation", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 5, storedLines > 0 ? str.tostring(continuationLevel, format.mintick) : "-", text_color = continuationColor, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 6, "Reversal", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 6, storedLines > 0 ? str.tostring(reversalLevel, format.mintick) : "-", text_color = reversalColor, text_size = dashTextSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(newLine and newDirection == 1,  "New Up Line",   "Line break: new up line printed - close above the prior line's high.")
+alertcondition(newLine and newDirection == -1, "New Down Line", "Line break: new down line printed - close below the prior line's low.")
+alertcondition(newTurnaround and newDirection == 1,  "Bullish Turnaround Line", "Line break: bullish turnaround line printed - close broke above the highest point of the prior lines.")
+alertcondition(newTurnaround and newDirection == -1, "Bearish Turnaround Line", "Line break: bearish turnaround line printed - close broke below the lowest point of the prior lines.")
+alertcondition(newLine and runLength == extendedRunInput, "Extended Run", "Line break: the current run reached the extended run length.")
+
+//---------------------------------------------------------------------------------------------------------------------}

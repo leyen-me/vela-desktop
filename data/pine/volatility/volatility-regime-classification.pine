@@ -1,0 +1,356 @@
+// This work is licensed under Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Volatility Regime Classification", "Volatility Regime Classification", overlay = false, format = format.price, precision = 2, max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+LOW_COLOR    = #089981 // compressed volatility
+NORMAL_COLOR = #787b86
+HIGH_COLOR   = #ff9800 // the one accent: elevated volatility
+CRISIS_COLOR = #f23645
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+MEASURE_ATR = "ATR %"
+MEASURE_RV  = "Realized Volatility"
+MEASURE_BBW = "Bollinger BandWidth"
+
+MEASURE_GROUP = "Volatility Measure"
+FIT_GROUP     = "Data-Drawn Boundaries"
+STATE_GROUP   = "State Stability"
+STYLE_GROUP   = "Style"
+DASH_GROUP    = "Dashboard"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+measureInput = input.string(MEASURE_ATR, "Measure", options = [MEASURE_ATR, MEASURE_RV, MEASURE_BBW], group = MEASURE_GROUP
+  , tooltip = "Volatility series that is classified. ATR % is the average true range as a percent of price, gaps included. Realized Volatility is the standard deviation of log returns, annualized. Bollinger BandWidth is the 2-deviation band width as a percent of its basis. All three are scale-free, so boundaries learned over years of history stay comparable.")
+
+lengthInput = input.int(14, "Length", minval = 2, group = MEASURE_GROUP
+  , tooltip = "Lookback of the volatility measure.")
+
+periodsInput = input.int(252, "Periods per Year", minval = 1, group = MEASURE_GROUP
+  , tooltip = "Annualization factor for Realized Volatility only: 252 for daily bars on exchange calendars, 365 for 24/7 markets.")
+
+trainInput = input.int(500, "Training Window", minval = 50, maxval = 2000, group = FIT_GROUP
+  , tooltip = "Bars of volatility history the boundaries are learned from. The classifier runs a one-dimensional k-means on the log of the measure over this rolling window, so the states are drawn by the data of this symbol and timeframe rather than by fixed thresholds. Only past bars enter the fit.")
+
+minTrainInput = input.int(150, "Minimum History", minval = 20, group = FIT_GROUP
+  , tooltip = "Bars of history required before the first fit. The window grows until it reaches the training length.")
+
+crisisInput = input.bool(true, "Crisis Tier", inline = "crisis", group = FIT_GROUP
+  , tooltip = "Fit four clusters instead of three and keep a Crisis state above High. When the window holds a genuine stress episode, the top cluster sits at least this multiple above the Normal center and the High/Crisis boundary is drawn by the data; when it does not, the top cluster folds into High and Crisis starts at this multiple of the Normal center, so a never-seen shock can still be named on its first bars.")
+
+crisisMultInput = input.float(2, "", minval = 1.1, step = 0.1, inline = "crisis", group = FIT_GROUP)
+
+refitInput = input.int(5, "Refit Every (bars)", minval = 1, maxval = 50, group = FIT_GROUP
+  , tooltip = "Cadence of the k-means refinement as the window rolls. Each refit starts from the previous centers and runs the passes below; volatility clusters drift slowly, so refitting every few bars keeps them converged at a fraction of the cost.")
+
+itersInput = input.int(5, "Passes per Refit", minval = 1, maxval = 30, group = FIT_GROUP
+  , tooltip = "Lloyd iterations per refit. The first fit, seeded at evenly spaced quantiles, runs three times as many.")
+
+hystInput = input.float(0.15, "Hysteresis", minval = 0, maxval = 0.45, step = 0.05, group = STATE_GROUP
+  , tooltip = "Buffer around each boundary as a fraction of the log distance between the two neighbouring cluster centers. The reading must clear the boundary by this margin to move up a state, or fall below it by the same margin to move down.")
+
+confirmInput = input.int(2, "Confirmation Bars", minval = 1, maxval = 20, group = STATE_GROUP
+  , tooltip = "Consecutive closed bars a new state must hold before it is committed: a minimum dwell that stops borderline readings from flipping between adjacent states.")
+
+showBoundsInput = input.bool(true, "Boundaries", group = STYLE_GROUP
+  , tooltip = "Plot the learned boundaries between adjacent states.")
+
+showBgInput = input.bool(true, "State Background", group = STYLE_GROUP
+  , tooltip = "Tint the pane while the Low, High or Crisis state is in force.")
+
+showSwitchInput = input.bool(true, "State Change Labels", group = STYLE_GROUP)
+
+lowColorInput    = input.color(LOW_COLOR, "Low", inline = "colors", group = STYLE_GROUP)
+normalColorInput = input.color(NORMAL_COLOR, "Normal", inline = "colors", group = STYLE_GROUP)
+highColorInput   = input.color(HIGH_COLOR, "High", inline = "colors", group = STYLE_GROUP)
+crisisColorInput = input.color(CRISIS_COLOR, "Crisis", inline = "colors", group = STYLE_GROUP)
+
+showDashInput = input.bool(true, "Show Dashboard", group = DASH_GROUP
+  , tooltip = "Readout over the classified history: the state's boundaries in the measure's units, share of time spent in it, the empirical probability that a bar in the state is followed by another bar in it (the persistence the classification relies on), the average completed run, and an inverse-volatility size scale relative to the Normal state.")
+
+dashDetailInput = input.string("Current State", "Detail", options = ["Current State", "All States"], group = DASH_GROUP
+  , tooltip = "Current State keeps a compact panel for the state in force; All States tabulates every state side by side.")
+dashPosInput  = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], inline = "dash", group = DASH_GROUP)
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], inline = "dash", group = DASH_GROUP)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+getSize(string s) =>
+    switch s
+        "Tiny"  => size.tiny
+        "Small" => size.small
+        => size.normal
+
+getPosition(string p) =>
+    switch p
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        => position.bottom_left
+
+stateName(int s) =>
+    switch s
+        0 => "Low"
+        1 => "Normal"
+        2 => "High"
+        => "Crisis"
+
+stateColor(int s) =>
+    switch s
+        0 => lowColorInput
+        1 => normalColorInput
+        2 => highColorInput
+        => crisisColorInput
+
+fmtVol(float v) =>
+    na(v) ? "-" : str.tostring(v, v >= 10 ? "#.#" : "#.##") + "%"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Volatility Measure
+//---------------------------------------------------------------------------------------------------------------------{
+atrPct  = 100 * ta.atr(lengthInput) / close
+logRet  = close > 0 and close[1] > 0 ? math.log(close / close[1]) : na
+rvPct   = 100 * ta.stdev(logRet, lengthInput) * math.sqrt(periodsInput)
+basis   = ta.sma(close, lengthInput)
+priceSd = ta.stdev(close, lengthInput)
+bbwPct  = basis > 0 ? 100 * 4 * priceSd / basis : na
+
+measure = switch measureInput
+    MEASURE_ATR => atrPct
+    MEASURE_RV  => rvPct
+    => bbwPct
+
+logVol = measure > 0 ? math.log(measure) : na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Rolling One-Dimensional K-Means
+//---------------------------------------------------------------------------------------------------------------------{
+var array<float> window  = array.new<float>()
+var array<float> centers = array.new<float>()
+int k = crisisInput ? 4 : 3
+
+if barstate.isconfirmed and not na(logVol)
+    array.push(window, logVol)
+    if array.size(window) > trainInput
+        array.shift(window)
+
+int n = array.size(window)
+
+var int lastFit = na
+
+if barstate.isconfirmed and n >= minTrainInput and (na(lastFit) or bar_index - lastFit >= refitInput or array.size(centers) != k)
+    //Seed once at evenly spaced quantiles, then refine from the previous centers as the window rolls
+    int passes = itersInput
+    if array.size(centers) != k
+        array.clear(centers)
+        for i = 0 to k - 1
+            array.push(centers, array.percentile_linear_interpolation(window, 100 * (i + 0.5) / k))
+        passes := 3 * itersInput
+    lastFit := bar_index
+    for it = 1 to passes
+        array<float> sums   = array.new<float>(k, 0.)
+        array<int>   counts = array.new<int>(k, 0)
+        for i = 0 to n - 1
+            float v    = array.get(window, i)
+            int   best = 0
+            for j = 1 to k - 1
+                if v > (array.get(centers, j - 1) + array.get(centers, j)) / 2
+                    best := j
+            array.set(sums, best, array.get(sums, best) + v)
+            array.set(counts, best, array.get(counts, best) + 1)
+        for j = 0 to k - 1
+            if array.get(counts, j) > 0
+                array.set(centers, j, array.get(sums, j) / array.get(counts, j))
+        array.sort(centers)
+
+//Boundaries between adjacent states, in log units, at the midpoints of neighbouring cluster centers
+float b0 = na
+float b1 = na
+float b2 = na
+float g0 = na
+float g1 = na
+float g2 = na
+bool  crisisLive = false
+
+if array.size(centers) == k and n >= minTrainInput
+    b0 := (array.get(centers, 0) + array.get(centers, 1)) / 2
+    g0 := array.get(centers, 1) - array.get(centers, 0)
+    if k == 3
+        b1 := (array.get(centers, 1) + array.get(centers, 2)) / 2
+        g1 := array.get(centers, 2) - array.get(centers, 1)
+    else
+        crisisLive := array.get(centers, 3) - array.get(centers, 1) >= math.log(crisisMultInput)
+        b1 := (array.get(centers, 1) + array.get(centers, 2)) / 2
+        g1 := array.get(centers, 2) - array.get(centers, 1)
+        //Data-drawn crisis boundary when a distinct stress cluster exists, otherwise the multiple of the Normal center
+        b2 := crisisLive ? (array.get(centers, 2) + array.get(centers, 3)) / 2 : math.max(array.get(centers, 1) + math.log(crisisMultInput), b1 + g1)
+        g2 := crisisLive ? array.get(centers, 3) - array.get(centers, 2) : b2 - b1
+
+//---------------------------------------------------------------------------------------------------------------------}
+// State Machine
+//---------------------------------------------------------------------------------------------------------------------{
+var int   state     = na
+var int   pending   = na
+var int   pendCount = 0
+var int   runStart  = na
+var int   prevState = na
+var int   lastRun   = 0
+
+var array<int>   occupancy = array.new<int>(4, 0)
+var array<int>   stays     = array.new<int>(4, 0)
+var array<int>   exits     = array.new<int>(4, 0)
+var array<int>   runSum    = array.new<int>(4, 0)
+var array<int>   runCount  = array.new<int>(4, 0)
+
+bool changed = false
+
+if barstate.isconfirmed and not na(b0) and not na(logVol)
+    //Raw state: boundaries cleared by the reading
+    int raw = logVol > b0 ? 1 : 0
+    if raw == 1 and logVol > b1
+        raw := 2
+    if raw == 2 and not na(b2) and logVol > b2
+        raw := 3
+
+    if na(state)
+        state    := raw
+        runStart := bar_index
+    else
+        //Hysteresis: each boundary must be cleared by its buffer
+        int cand = raw
+        while cand > state
+            float bnd = cand == 1 ? b0 : cand == 2 ? b1 : b2
+            float gap = cand == 1 ? g0 : cand == 2 ? g1 : g2
+            if logVol > bnd + hystInput * gap
+                break
+            cand -= 1
+        while cand < state
+            float bnd = cand == 0 ? b0 : cand == 1 ? b1 : b2
+            float gap = cand == 0 ? g0 : cand == 1 ? g1 : g2
+            if logVol < bnd - hystInput * gap
+                break
+            cand += 1
+
+        //Persistence: the candidate must hold for the confirmation run
+        if cand == state
+            pending   := na
+            pendCount := 0
+        else
+            if cand == pending
+                pendCount += 1
+            else
+                pending   := cand
+                pendCount := 1
+            if pendCount >= confirmInput
+                array.set(runSum, state, array.get(runSum, state) + bar_index - runStart)
+                array.set(runCount, state, array.get(runCount, state) + 1)
+                lastRun   := bar_index - runStart
+                prevState := state
+                state     := cand
+                runStart  := bar_index
+                pending   := na
+                pendCount := 0
+                changed   := true
+
+    //Persistence statistics over the classified history: occupancy and bar-to-bar stay/exit counts
+    array.set(occupancy, state, array.get(occupancy, state) + 1)
+    if not na(state[1])
+        int prior = state[1]
+        if prior == state
+            array.set(stays, prior, array.get(stays, prior) + 1)
+        else
+            array.set(exits, prior, array.get(exits, prior) + 1)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visuals
+//---------------------------------------------------------------------------------------------------------------------{
+color sc = na(state) ? normalColorInput : stateColor(state)
+
+plot(measure, "Volatility", sc, 2)
+plot(showBoundsInput and not na(b0) ? math.exp(b0) : na, "Low / Normal Boundary", color.new(lowColorInput, 30), 1, plot.style_stepline)
+plot(showBoundsInput and not na(b1) ? math.exp(b1) : na, "Normal / High Boundary", color.new(highColorInput, 30), 1, plot.style_stepline)
+plot(showBoundsInput and not na(b2) ? math.exp(b2) : na, "High / Crisis Boundary", color.new(crisisColorInput, 30), 1, plot.style_stepline)
+
+bgcolor(showBgInput and not na(state) and state != 1 ? color.new(sc, 91) : na, title = "State Background")
+
+if showSwitchInput and changed
+    label.new(bar_index, measure, stateName(state)
+      , style     = label.style_label_down
+      , color     = sc
+      , textcolor = color.white
+      , size      = size.tiny
+      , tooltip   = stateName(prevState) + " to " + stateName(state) + " after " + str.tostring(lastRun) + " bars in " + stateName(prevState) + "\nReading: " + fmtVol(measure) + " (" + measureInput + ")")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dash = na
+
+//Range, time share, stay probability, average run and size scale of one state
+stateRange(int st) =>
+    float lo = st == 0 ? na : math.exp(st == 1 ? b0 : st == 2 ? b1 : b2)
+    float hi = st == 0 ? math.exp(b0) : st == 1 ? math.exp(b1) : st == 2 and k == 4 ? math.exp(b2) : na
+    na(lo) ? "< " + fmtVol(hi) : na(hi) ? "> " + fmtVol(lo) : fmtVol(lo) + " to " + fmtVol(hi)
+
+stateStats(int st) =>
+    int   total  = array.sum(occupancy)
+    int   stay   = array.get(stays, st)
+    int   exit   = array.get(exits, st)
+    int   runs   = array.get(runCount, st)
+    float share  = total > 0 ? 100.0 * array.get(occupancy, st) / total : na
+    float pStay  = stay + exit > 0 ? 100.0 * stay / (stay + exit) : na
+    float avgRun = runs > 0 ? array.get(runSum, st) / runs : na
+    float center = st == 3 and not crisisLive ? math.exp(b2) : math.exp(array.get(centers, st))
+    float scale  = center > 0 ? math.exp(array.get(centers, 1)) / center : na
+    [share, pStay, avgRun, scale]
+
+fmtPctNum(float x) =>
+    na(x) ? "-" : str.tostring(x, x >= 99.95 ? "#" : "#.#") + "%"
+
+if barstate.islast and showDashInput and not na(state) and array.size(centers) == k
+    ts = getSize(dashSizeInput)
+    if dashDetailInput == "Current State"
+        if na(dash)
+            dash := table.new(getPosition(dashPosInput), 2, 6, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+        [share, pStay, avgRun, scale] = stateStats(state)
+        array<string> names  = array.from("State", "Range", "Time in State", "Stay Probability", "Average Run", "Size vs Normal")
+        array<string> values = array.from(stateName(state) + ", " + str.tostring(bar_index - runStart) + " bars", stateRange(state), fmtPctNum(share), fmtPctNum(pStay), na(avgRun) ? "-" : str.tostring(avgRun, "#") + " bars", na(scale) ? "-" : str.tostring(scale, "#.##") + "x")
+        for r = 0 to 5
+            table.cell(dash, 0, r, array.get(names, r), text_color = DASH_HEADER, text_size = ts, text_halign = text.align_left)
+            table.cell(dash, 1, r, array.get(values, r), text_color = r == 0 ? stateColor(state) : DASH_TEXT, text_size = ts, text_halign = text.align_right)
+    else
+        if na(dash)
+            dash := table.new(getPosition(dashPosInput), 6, 5, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+        array<string> heads = array.from("State", "Range", "Time", "Stay", "Avg Run", "Size")
+        for c = 0 to 5
+            table.cell(dash, c, 0, array.get(heads, c), text_color = DASH_HEADER, text_size = ts, text_halign = c == 0 ? text.align_left : text.align_right)
+        for st = 0 to k - 1
+            [share, pStay, avgRun, scale] = stateStats(st)
+            table.cell(dash, 0, st + 1, (st == state ? "> " : "") + stateName(st), text_color = stateColor(st), text_size = ts, text_halign = text.align_left)
+            table.cell(dash, 1, st + 1, stateRange(st), text_color = DASH_TEXT, text_size = ts, text_halign = text.align_right)
+            table.cell(dash, 2, st + 1, fmtPctNum(share), text_color = DASH_TEXT, text_size = ts, text_halign = text.align_right)
+            table.cell(dash, 3, st + 1, fmtPctNum(pStay), text_color = DASH_TEXT, text_size = ts, text_halign = text.align_right)
+            table.cell(dash, 4, st + 1, na(avgRun) ? "-" : str.tostring(avgRun, "#") + " bars", text_color = DASH_TEXT, text_size = ts, text_halign = text.align_right)
+            table.cell(dash, 5, st + 1, na(scale) ? "-" : str.tostring(scale, "#.##") + "x", text_color = DASH_TEXT, text_size = ts, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(changed and state == 0, "Low State", "Volatility Regime Classification: {{ticker}} entered the Low volatility state ({{interval}})")
+alertcondition(changed and state == 1, "Normal State", "Volatility Regime Classification: {{ticker}} returned to the Normal volatility state ({{interval}})")
+alertcondition(changed and state == 2, "High State", "Volatility Regime Classification: {{ticker}} entered the High volatility state ({{interval}})")
+alertcondition(changed and state == 3, "Crisis State", "Volatility Regime Classification: {{ticker}} entered the Crisis volatility state ({{interval}})")
+alertcondition(changed, "Any State Change", "Volatility Regime Classification: volatility state change on {{ticker}} ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

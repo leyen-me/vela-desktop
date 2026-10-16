@@ -1,0 +1,240 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/ MPL-2.0
+//@version=6
+indicator("AMD POC Trade Setup", shorttitle="AMD POC Trade", overlay=true, max_boxes_count=500, max_lines_count=500, max_polylines_count=100)
+
+// --- Constants ---
+string TIMEZONE = "America/New_York"
+
+// --- Inputs ---
+accLen = input.int(40, "Accumulation Length (Bars)", minval=5, group="AMD Logic", tooltip="Number of chart bars used to identify the tight accumulation range.")
+accWidth = input.float(0.1, "Accumulation Range Max %", minval=0.1, step=0.1, group="AMD Logic", tooltip="Maximum percentage height allowed for an accumulation range before timeframe normalization.")
+normalizeAccWidth = input.bool(true, "Normalize Range Threshold", group="AMD Logic", tooltip="Adjusts the percentage threshold using the square-root relationship between the chart timeframe and the reference timeframe.")
+referenceTf = input.timeframe("1", "Normalization Reference Timeframe", group="AMD Logic", tooltip="The timeframe where the Accumulation Range Max % input is applied directly. One minute is the default reference.")
+chartSeconds = nz(timeframe.in_seconds(), 60)
+referenceSeconds = nz(timeframe.in_seconds(referenceTf), 60)
+timeframeScale = math.sqrt(chartSeconds / referenceSeconds)
+effectiveAccWidth = normalizeAccWidth ? accWidth * timeframeScale : accWidth
+manLook = input.int(20, "Max Search Window", minval=1, group="AMD Logic", tooltip="Maximum number of bars after accumulation for a manipulation and POC break.")
+minPocBreakAtr = input.float(0.15, "Minimum POC Break (ATR)", minval=0.0, step=0.05, group="POC Break Confirmation", tooltip="Requires the close to move this many ATRs beyond the POC before a setup can trigger.")
+minBreakBodyAtr = input.float(0.20, "Minimum Break Candle Body (ATR)", minval=0.0, step=0.05, group="POC Break Confirmation", tooltip="Requires the POC break candle body to be at least this many ATRs.")
+breakCloseStrength = input.float(0.65, "Break Candle Close Strength", minval=0.5, maxval=1.0, step=0.05, group="POC Break Confirmation", tooltip="Requires bearish breaks to close near the low and bullish breaks to close near the high.")
+
+profileRows = input.int(24, "Volume Profile Rows", minval=5, maxval=50, group="Accumulation Volume Profile", tooltip="Number of price rows used to build the accumulation-only volume profile.")
+profileWidth = input.int(18, "Maximum Profile Width", minval=3, maxval=50, group="Accumulation Volume Profile", tooltip="Maximum horizontal width of the volume profile in bars.")
+showProfile = input.bool(true, "Show Accumulation Volume Profile", group="Accumulation Volume Profile", tooltip="Plot the volume profile when manipulation begins.")
+
+useSydney = input.bool(false, "Sydney Session (17:00-02:00 EST)", group="Sessions")
+useTokyo = input.bool(false, "Tokyo Session (19:00-04:00 EST)", group="Sessions")
+useLondon = input.bool(false, "London Session (03:00-12:00 EST)", group="Sessions")
+useNY = input.bool(true, "New York Session (08:00-17:00 EST)", group="Sessions")
+showSess = input.bool(true, "Highlight Active Session Time", group="Sessions")
+
+accColor = input.color(color.new(color.gray, 80), "Accumulation", group="Style")
+manColor = input.color(color.new(#f23645, 75), "Manipulation Bearish", group="Style")
+manColorB = input.color(color.new(#089981, 75), "Manipulation Bullish", group="Style")
+profileColor = input.color(color.new(#5b9cf6, 35), "Volume Profile", group="Style")
+pocColor = input.color(#f23645, "Point of Control", group="Style")
+tpColor = input.color(color.new(#089981, 75), "Take Profit", group="Style")
+slColor = input.color(color.new(#f23645, 75), "Stop Loss", group="Style")
+labelOffset = input.float(1.0, "Label Offset (ATR Multiplier)", minval=0.0, group="Style", tooltip="Distance between the AMD label and the signal candle, measured in ATRs.")
+
+// --- Session Logic ---
+inSession(sess) =>
+    not na(time(timeframe.period, sess, TIMEZONE))
+
+isInAnySession = (useSydney and inSession("1700-0200")) or
+     (useTokyo and inSession("1900-0400")) or
+     (useLondon and inSession("0300-1200")) or
+     (useNY and inSession("0800-1700"))
+
+bgcolor(showSess and isInAnySession ? color.new(color.blue, 96) : na)
+
+// --- State ---
+var float accHigh = na
+var float accLow = na
+var int accStartBar = na
+var int accEndBar = na
+var bool manipulationHigh = false
+var bool manipulationLow = false
+var float manipulationExtremum = na
+
+var bool profileReady = false
+var float profilePoc = na
+var array<float> profileVolumes = array.new_float(0)
+var line pocLine = na
+
+var box tpBox = na
+var box slBox = na
+var float entryLevel = na
+var float tpLevel = na
+var float slLevel = na
+var bool isTradeActive = false
+var bool isBullishTrade = false
+
+// --- Accumulation Detection ---
+highs = ta.highest(high, accLen)
+lows = ta.lowest(low, accLen)
+rangePct = lows != 0.0 ? (highs - lows) / lows * 100.0 : na
+isAccumulating = rangePct <= effectiveAccWidth and isInAnySession
+
+if isAccumulating and not isTradeActive
+    accHigh := highs
+    accLow := lows
+    accStartBar := bar_index - accLen + 1
+    accEndBar := bar_index
+    manipulationHigh := false
+    manipulationLow := false
+    manipulationExtremum := na
+    profileReady := false
+    profilePoc := na
+
+// --- ATR and Trade Lifecycle ---
+atr = ta.atr(14)
+
+if isTradeActive
+    if not na(tpBox)
+        tpBox.set_right(bar_index)
+    if not na(slBox)
+        slBox.set_right(bar_index)
+    if not na(pocLine)
+        pocLine.set_x2(bar_index)
+
+    if isBullishTrade
+        if low <= slLevel or high >= tpLevel
+            isTradeActive := false
+    else
+        if high >= slLevel or low <= tpLevel
+            isTradeActive := false
+
+// --- Accumulation Volume Profile Snapshot ---
+// The profile is built only from the bars contained in the stored accumulation range.
+if not isAccumulating and not na(accHigh) and not na(accLow) and bar_index <= accEndBar + manLook and isInAnySession
+    bool startsBearishManipulation = not manipulationHigh and not manipulationLow and high > accHigh
+    bool startsBullishManipulation = not manipulationHigh and not manipulationLow and low < accLow
+
+    if startsBearishManipulation
+        manipulationHigh := true
+        manipulationExtremum := high
+
+    else if startsBullishManipulation
+        manipulationLow := true
+        manipulationExtremum := low
+
+    if (startsBearishManipulation or startsBullishManipulation) and not profileReady
+        array.clear(profileVolumes)
+        float profileStep = (accHigh - accLow) / profileRows
+        float maxProfileVolume = 0.0
+        int accumulationBars = math.max(1, accEndBar - accStartBar + 1)
+
+        if profileStep > 0.0
+            for row = 0 to profileRows - 1
+                float rowLow = accLow + profileStep * row
+                float rowHigh = rowLow + profileStep
+                float rowVolume = 0.0
+
+                for offset = 1 to accumulationBars
+                    float barLow = low[offset]
+                    float barHigh = high[offset]
+                    float barRange = barHigh - barLow
+                    float overlap = math.max(0.0, math.min(rowHigh, barHigh) - math.max(rowLow, barLow))
+                    float volumeShare = barRange > 0.0 ? volume[offset] * overlap / barRange : 0.0
+                    rowVolume += nz(volumeShare)
+
+                array.push(profileVolumes, rowVolume)
+                maxProfileVolume := math.max(maxProfileVolume, rowVolume)
+
+            int pocRow = 0
+            float pocVolume = array.get(profileVolumes, 0)
+            for row = 1 to profileRows - 1
+                float rowVolume = array.get(profileVolumes, row)
+                if rowVolume > pocVolume
+                    pocVolume := rowVolume
+                    pocRow := row
+
+            profilePoc := accLow + profileStep * (pocRow + 0.5)
+            profileReady := true
+
+            // Keep each setup's POC line for historical reference.
+            pocLine := line.new(accStartBar, profilePoc, bar_index, profilePoc, xloc=xloc.bar_index, extend=extend.none, color=pocColor, width=2)
+
+            // Draw the accumulation range first so the profile remains visible inside it.
+            box.new(accStartBar, accHigh, accEndBar, accLow, bgcolor=accColor, border_color=na)
+
+            if showProfile and maxProfileVolume > 0.0
+                int profileRight = accEndBar
+                array<chart.point> profilePoints = array.new<chart.point>(0)
+                array.push(profilePoints, chart.point.from_index(profileRight, accLow))
+
+                for row = 0 to profileRows - 1
+                    float rowVolume = array.get(profileVolumes, row)
+                    int rowWidth = math.max(1, int(math.round(profileWidth * rowVolume / maxProfileVolume)))
+                    int profileLeft = math.max(accStartBar, profileRight - rowWidth + 1)
+                    float rowBottom = accLow + profileStep * row
+                    float rowTop = rowBottom + profileStep
+                    array.push(profilePoints, chart.point.from_index(profileLeft, rowBottom))
+                    array.push(profilePoints, chart.point.from_index(profileLeft, rowTop))
+
+                array.push(profilePoints, chart.point.from_index(profileRight, accHigh))
+                polyline.new(profilePoints, curved=false, closed=true, xloc=xloc.bar_index, line_color=profileColor, fill_color=profileColor, line_width=1, force_overlay=true)
+
+    // Keep the manipulation range updated until the POC break occurs.
+    if manipulationHigh
+        manipulationExtremum := math.max(manipulationExtremum, high)
+    if manipulationLow
+        manipulationExtremum := math.min(manipulationExtremum, low)
+
+    // Require displacement beyond the POC, a meaningful candle body, and a close near the candle extreme.
+    breakBody = math.abs(close - open)
+    breakRange = high - low
+    bearCloseStrengthValue = breakRange > 0.0 ? (high - close) / breakRange : 0.0
+    bullCloseStrengthValue = breakRange > 0.0 ? (close - low) / breakRange : 0.0
+
+    // A bearish AMD setup requires a high sweep followed by a strong close below the accumulation POC.
+    bearPocBreak = manipulationHigh and profileReady and
+         close < profilePoc - atr * minPocBreakAtr and
+         close < open and
+         breakBody >= atr * minBreakBodyAtr and
+         bearCloseStrengthValue >= breakCloseStrength
+    if bearPocBreak and not isTradeActive
+        box.new(accEndBar, manipulationExtremum, bar_index, accHigh, bgcolor=manColor, border_color=na)
+
+        entryLevel := profilePoc
+        slLevel := accHigh
+        tpLevel := accLow
+        isTradeActive := true
+        isBullishTrade := false
+        tpBox := box.new(bar_index, math.max(entryLevel, tpLevel), bar_index, math.min(entryLevel, tpLevel), bgcolor=tpColor, border_color=na)
+        slBox := box.new(bar_index, math.max(entryLevel, slLevel), bar_index, math.min(entryLevel, slLevel), bgcolor=slColor, border_color=na)
+        if not na(pocLine)
+            pocLine.set_x2(bar_index)
+
+        alert("Bearish AMD TP/SL Trade Setup", alert.freq_once_per_bar)
+        accHigh := na
+        accLow := na
+        profileReady := false
+        manipulationHigh := false
+
+    // A bullish AMD setup requires a low sweep followed by a strong close above the accumulation POC.
+    bullPocBreak = manipulationLow and profileReady and
+         close > profilePoc + atr * minPocBreakAtr and
+         close > open and
+         breakBody >= atr * minBreakBodyAtr and
+         bullCloseStrengthValue >= breakCloseStrength
+    if bullPocBreak and not isTradeActive
+        box.new(accEndBar, accLow, bar_index, manipulationExtremum, bgcolor=manColorB, border_color=na)
+
+        entryLevel := profilePoc
+        slLevel := accLow
+        tpLevel := accHigh
+        isTradeActive := true
+        isBullishTrade := true
+        tpBox := box.new(bar_index, math.max(entryLevel, tpLevel), bar_index, math.min(entryLevel, tpLevel), bgcolor=tpColor, border_color=na)
+        slBox := box.new(bar_index, math.max(entryLevel, slLevel), bar_index, math.min(entryLevel, slLevel), bgcolor=slColor, border_color=na)
+        if not na(pocLine)
+            pocLine.set_x2(bar_index)
+
+        alert("Bullish AMD TP/SL Trade Setup", alert.freq_once_per_bar)
+        accHigh := na
+        accLow := na
+        profileReady := false
+        manipulationLow := false

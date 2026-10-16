@@ -1,0 +1,318 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Single Prints", shorttitle = "Single Prints", overlay = true, format = format.price, max_boxes_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR     = #089981
+BEAR_COLOR     = #f23645
+REPAIRED_COLOR = #787b86
+NEUTRAL_COLOR  = #5b9cf6
+
+BORDER_TRANSPARENCY       = 40
+GHOST_FILL_TRANSPARENCY   = 92
+GHOST_BORDER_TRANSPARENCY = 70
+ROW_EPSILON               = 1e-6
+
+PROFILE_GROUP = "Profile"
+SINGLES_GROUP = "Single Prints"
+STYLE_GROUP   = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+anchorInput = input.timeframe("D", "Profile Anchor", group = PROFILE_GROUP,
+     tooltip = "Span each TPO profile covers. Every anchor period builds its own time-price distribution; the default keeps one profile per session, the classic frame for reading single prints.")
+
+periodInput = input.timeframe("30", "TPO Period", group = PROFILE_GROUP,
+     tooltip = "Duration of one TPO time bracket. A price level traded during exactly one bracket is a single print; 30 minutes is the traditional setting. Must not be lower than the chart timeframe.")
+
+rowModeInput = input.string("Auto", "Row Sizing", options = ["Auto", "Ticks"], group = PROFILE_GROUP,
+     tooltip = "Auto derives the row height from the profile range and the row count below. Ticks uses a fixed height per row instead, keeping rows identical across sessions.")
+
+autoRowsInput = input.int(40, "Auto Row Count", minval = 10, maxval = 200, group = PROFILE_GROUP,
+     tooltip = "Approximate number of price rows spanning the profile range when Row Sizing is Auto.")
+
+ticksInput = input.int(10, "Ticks Per Row", minval = 1, group = PROFILE_GROUP,
+     tooltip = "Height of one price row in ticks when Row Sizing is Ticks.")
+
+minRowsInput = input.int(1, "Minimum Height (Rows)", minval = 1, group = SINGLES_GROUP,
+     tooltip = "Discard single-print ranges spanning fewer rows than this. Raise it to keep only the widest thin zones left by the fastest one-directional moves.")
+
+showDevelopingInput = input.bool(true, "Developing Single Prints", group = SINGLES_GROUP,
+     tooltip = "Highlight single prints as they appear inside the live session, drawn with dashed borders. Fresh mid-session singles mark initiative range extension, but they stay provisional — a later bracket can still trade through them before the session completes.")
+
+keepRepairedInput = input.bool(true, "Keep Repaired Zones", group = SINGLES_GROUP,
+     tooltip = "Keep fully repaired zones on the chart as muted ghosts instead of removing them. Once price has auctioned through the whole range the level is retired and loses most of its significance.")
+
+maxZonesInput = input.int(50, "Maximum Zones", minval = 5, maxval = 250, group = SINGLES_GROUP,
+     tooltip = "Number of completed single-print zones kept on the chart, counting both active and repaired ones. Older zones are removed first.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "direction", group = STYLE_GROUP,
+     tooltip = "Color of single prints left by a rising bracket, watched as potential support when price rotates back down to them.")
+
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "direction", group = STYLE_GROUP,
+     tooltip = "Color of single prints left by a falling bracket, watched as potential resistance when price rotates back up into them.")
+
+repairedColorInput = input.color(REPAIRED_COLOR, "Repaired", group = STYLE_GROUP,
+     tooltip = "Color of fully repaired (retired) zones when they are kept on the chart.")
+
+fillTransparencyInput = input.int(80, "Fill Transparency", minval = 0, maxval = 100, group = STYLE_GROUP,
+     tooltip = "Transparency of the zone fills; zone borders are drawn more opaque than the fill.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Height of one profile row, quantized to the symbol tick so row edges sit on tradable prices
+rowHeightOf(array<float> highArray, array<float> lowArray) =>
+    float rowHeight = na
+    if array.size(highArray) > 0
+        if rowModeInput == "Ticks"
+            rowHeight := ticksInput * syminfo.mintick
+        else
+            float span = array.max(highArray) - array.min(lowArray)
+            rowHeight := math.max(syminfo.mintick, math.round(span / autoRowsInput / syminfo.mintick) * syminfo.mintick)
+    rowHeight
+
+// Sweeps the bracket ranges for stretches of rows holding exactly one TPO and merges them into single-print ranges.
+// Runs touching the profile extremes are excluded — by convention those are buying/selling tails, not single prints.
+singleRuns(array<float> highArray, array<float> lowArray, array<float> openArray, array<float> closeArray, float rowHeight) =>
+    topArray    = array.new<float>()
+    bottomArray = array.new<float>()
+    bullArray   = array.new<bool>()
+    ownerArray  = array.new<int>()
+    int periods = array.size(highArray)
+    if periods >= 2 and not na(rowHeight) and rowHeight > 0
+        float base = array.min(lowArray)
+        // each bracket prints the half-open row interval [startRow, endRow)
+        startArray = array.new<int>()
+        endArray   = array.new<int>()
+        for periodIndex = 0 to periods - 1
+            int startRow = int(math.floor((array.get(lowArray, periodIndex) - base) / rowHeight + ROW_EPSILON))
+            int endRow   = int(math.floor((array.get(highArray, periodIndex) - base) / rowHeight + ROW_EPSILON)) + 1
+            array.push(startArray, startRow)
+            array.push(endArray, endRow)
+        sortedStarts = array.copy(startArray)
+        sortedEnds   = array.copy(endArray)
+        array.sort(sortedStarts, order.ascending)
+        array.sort(sortedEnds, order.ascending)
+        int lowestRow  = array.get(sortedStarts, 0)
+        int highestRow = array.get(sortedEnds, periods - 1)
+        // walk the row boundaries in order, tracking how many brackets cover each stretch of rows
+        int startPointer = 0
+        int endPointer   = 0
+        int coverage     = 0
+        int runStartRow  = na
+        while endPointer < periods
+            int nextRow = startPointer < periods ? math.min(array.get(sortedStarts, startPointer), array.get(sortedEnds, endPointer)) : array.get(sortedEnds, endPointer)
+            int previousCoverage = coverage
+            while startPointer < periods and array.get(sortedStarts, startPointer) == nextRow
+                coverage     += 1
+                startPointer += 1
+            while endPointer < periods and array.get(sortedEnds, endPointer) == nextRow
+                coverage   -= 1
+                endPointer += 1
+            if previousCoverage == 1 and coverage != 1 and not na(runStartRow)
+                // a stretch printed by exactly one bracket just ended at nextRow
+                bool midProfile = runStartRow > lowestRow and nextRow < highestRow
+                if midProfile and nextRow - runStartRow >= minRowsInput
+                    int middleRow  = int(math.floor((runStartRow + nextRow - 1) / 2.0))
+                    int ownerIndex = -1
+                    for periodIndex = 0 to periods - 1
+                        if array.get(startArray, periodIndex) <= middleRow and middleRow < array.get(endArray, periodIndex)
+                            ownerIndex := periodIndex
+                            break
+                    if ownerIndex >= 0
+                        array.push(topArray, base + nextRow * rowHeight)
+                        array.push(bottomArray, base + runStartRow * rowHeight)
+                        array.push(bullArray, array.get(closeArray, ownerIndex) >= array.get(openArray, ownerIndex))
+                        array.push(ownerArray, ownerIndex)
+                runStartRow := na
+            if previousCoverage != 1 and coverage == 1
+                runStartRow := nextRow
+    [topArray, bottomArray, bullArray, ownerArray]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// TPO Data Collection
+//---------------------------------------------------------------------------------------------------------------------{
+if timeframe.in_seconds(timeframe.period) > timeframe.in_seconds(periodInput)
+    runtime.error("The TPO period must be greater than or equal to the chart timeframe — lower the chart timeframe or raise the TPO period.")
+if timeframe.in_seconds(periodInput) >= timeframe.in_seconds(anchorInput)
+    runtime.error("The profile anchor must be greater than the TPO period — raise the anchor or lower the TPO period.")
+
+var array<float> periodHighArray  = array.new<float>()
+var array<float> periodLowArray   = array.new<float>()
+var array<float> periodOpenArray  = array.new<float>()
+var array<float> periodCloseArray = array.new<float>()
+var array<int>   periodStartArray = array.new<int>()
+
+var array<box>   zoneBoxArray        = array.new<box>()
+var array<float> zoneTopArray        = array.new<float>()
+var array<float> zoneBottomArray     = array.new<float>()
+var array<float> zoneOrigTopArray    = array.new<float>()
+var array<float> zoneOrigBottomArray = array.new<float>()
+var array<bool>  zoneActiveArray     = array.new<bool>()
+var array<bool>  zoneTouchedArray    = array.new<bool>()
+
+var array<box>   developingBoxArray  = array.new<box>()
+var array<float> previousTopArray    = array.new<float>()
+var array<float> previousBottomArray = array.new<float>()
+
+bool anchorChange = timeframe.change(anchorInput) or barstate.isfirst
+bool periodChange = timeframe.change(periodInput)
+
+// A completed session freezes its profile — its surviving mid-profile singles become standing zones, extended right until repaired
+if anchorChange
+    if array.size(periodHighArray) > 0
+        float finalRowHeight = rowHeightOf(periodHighArray, periodLowArray)
+        [finalTops, finalBottoms, finalBulls, finalOwners] = singleRuns(periodHighArray, periodLowArray, periodOpenArray, periodCloseArray, finalRowHeight)
+        int finalCount = array.size(finalTops)
+        if finalCount > 0
+            for runIndex = 0 to finalCount - 1
+                float zoneTop    = array.get(finalTops, runIndex)
+                float zoneBottom = array.get(finalBottoms, runIndex)
+                color zoneColor  = array.get(finalBulls, runIndex) ? bullColorInput : bearColorInput
+                int   zoneLeft   = array.get(periodStartArray, array.get(finalOwners, runIndex))
+                box zoneBox = box.new(zoneLeft, zoneTop, bar_index - 1, zoneBottom, border_color = color.new(zoneColor, BORDER_TRANSPARENCY), bgcolor = color.new(zoneColor, fillTransparencyInput), extend = extend.right)
+                array.push(zoneBoxArray, zoneBox)
+                array.push(zoneTopArray, zoneTop)
+                array.push(zoneBottomArray, zoneBottom)
+                array.push(zoneOrigTopArray, zoneTop)
+                array.push(zoneOrigBottomArray, zoneBottom)
+                array.push(zoneActiveArray, true)
+                array.push(zoneTouchedArray, false)
+        while array.size(zoneBoxArray) > maxZonesInput
+            box.delete(array.shift(zoneBoxArray))
+            array.shift(zoneTopArray)
+            array.shift(zoneBottomArray)
+            array.shift(zoneOrigTopArray)
+            array.shift(zoneOrigBottomArray)
+            array.shift(zoneActiveArray)
+            array.shift(zoneTouchedArray)
+    array.clear(periodHighArray)
+    array.clear(periodLowArray)
+    array.clear(periodOpenArray)
+    array.clear(periodCloseArray)
+    array.clear(periodStartArray)
+    previousTopArray    := array.new<float>()
+    previousBottomArray := array.new<float>()
+
+// A new bracket opens on every TPO period and on the session's first bar; the running bracket absorbs each bar's range
+if array.size(periodHighArray) == 0 or periodChange
+    array.push(periodHighArray, high)
+    array.push(periodLowArray, low)
+    array.push(periodOpenArray, open)
+    array.push(periodCloseArray, close)
+    array.push(periodStartArray, bar_index)
+else
+    int lastIndex = array.size(periodHighArray) - 1
+    array.set(periodHighArray, lastIndex, math.max(array.get(periodHighArray, lastIndex), high))
+    array.set(periodLowArray, lastIndex, math.min(array.get(periodLowArray, lastIndex), low))
+    array.set(periodCloseArray, lastIndex, close)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Zone Monitoring
+//---------------------------------------------------------------------------------------------------------------------{
+// When price rotates back, the traded stretch of a zone is repaired and the box shrinks to the unfinished remainder;
+// a zone fully auctioned through is retired, while a probe that closes back outside leaves the imbalance defended
+float previousClose = nz(close[1], close)
+bool retestEvent    = false
+bool defendedEvent  = false
+bool repairedEvent  = false
+int zoneCount = array.size(zoneBoxArray)
+if zoneCount > 0
+    for zoneIndex = 0 to zoneCount - 1
+        if array.get(zoneActiveArray, zoneIndex)
+            float entryTop    = array.get(zoneTopArray, zoneIndex)
+            float entryBottom = array.get(zoneBottomArray, zoneIndex)
+            if high >= entryBottom and low <= entryTop
+                if not array.get(zoneTouchedArray, zoneIndex)
+                    array.set(zoneTouchedArray, zoneIndex, true)
+                    retestEvent := true
+                float zoneTop    = entryTop
+                float zoneBottom = entryBottom
+                if low <= entryBottom and high >= entryTop
+                    zoneBottom := zoneTop
+                else if low <= entryBottom
+                    zoneBottom := math.min(high, entryTop)
+                else if high >= entryTop
+                    zoneTop := math.max(low, entryBottom)
+                else if entryTop - high >= low - entryBottom
+                    zoneBottom := high
+                else
+                    zoneTop := low
+                box zoneBox = array.get(zoneBoxArray, zoneIndex)
+                if zoneTop - zoneBottom < syminfo.mintick
+                    array.set(zoneActiveArray, zoneIndex, false)
+                    repairedEvent := true
+                    if keepRepairedInput
+                        box.set_extend(zoneBox, extend.none)
+                        box.set_right(zoneBox, bar_index)
+                        box.set_top(zoneBox, array.get(zoneOrigTopArray, zoneIndex))
+                        box.set_bottom(zoneBox, array.get(zoneOrigBottomArray, zoneIndex))
+                        box.set_bgcolor(zoneBox, color.new(repairedColorInput, GHOST_FILL_TRANSPARENCY))
+                        box.set_border_color(zoneBox, color.new(repairedColorInput, GHOST_BORDER_TRANSPARENCY))
+                    else
+                        box.delete(zoneBox)
+                else
+                    array.set(zoneTopArray, zoneIndex, zoneTop)
+                    array.set(zoneBottomArray, zoneIndex, zoneBottom)
+                    box.set_top(zoneBox, zoneTop)
+                    box.set_bottom(zoneBox, zoneBottom)
+                    if previousClose >= entryTop and close > entryTop
+                        defendedEvent := true
+                    else if previousClose <= entryBottom and close < entryBottom
+                        defendedEvent := true
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Developing Single Prints
+//---------------------------------------------------------------------------------------------------------------------{
+// The live session is rescanned on every bar — fresh mid-profile singles argue against fading the move while they last,
+// and a later bracket rotating back through them repairs them before the session ever completes
+float liveRowHeight = rowHeightOf(periodHighArray, periodLowArray)
+[liveTops, liveBottoms, liveBulls, liveOwners] = singleRuns(periodHighArray, periodLowArray, periodOpenArray, periodCloseArray, liveRowHeight)
+bool newSinglesEvent = false
+int liveCount = array.size(liveTops)
+if liveCount > 0
+    for runIndex = 0 to liveCount - 1
+        float middle = (array.get(liveTops, runIndex) + array.get(liveBottoms, runIndex)) / 2
+        bool seenBefore = false
+        int previousCount = array.size(previousTopArray)
+        if previousCount > 0
+            for previousIndex = 0 to previousCount - 1
+                if middle <= array.get(previousTopArray, previousIndex) and middle >= array.get(previousBottomArray, previousIndex)
+                    seenBefore := true
+                    break
+        if not seenBefore
+            newSinglesEvent := true
+previousTopArray    := liveTops
+previousBottomArray := liveBottoms
+
+if array.size(developingBoxArray) > 0
+    for eachBox in developingBoxArray
+        box.delete(eachBox)
+    array.clear(developingBoxArray)
+if showDevelopingInput and barstate.islast and liveCount > 0
+    for runIndex = 0 to liveCount - 1
+        color runColor = array.get(liveBulls, runIndex) ? bullColorInput : bearColorInput
+        int   runLeft  = array.get(periodStartArray, array.get(liveOwners, runIndex))
+        array.push(developingBoxArray, box.new(runLeft, array.get(liveTops, runIndex), bar_index, array.get(liveBottoms, runIndex), border_color = color.new(runColor, BORDER_TRANSPARENCY), border_style = line.style_dashed, bgcolor = color.new(runColor, fillTransparencyInput)))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+int activeZoneCount = 0
+if zoneCount > 0
+    for zoneIndex = 0 to zoneCount - 1
+        if array.get(zoneActiveArray, zoneIndex)
+            activeZoneCount += 1
+plot(activeZoneCount, "Active Single-Print Zones", color = NEUTRAL_COLOR, display = display.data_window, precision = 0)
+
+alertcondition(newSinglesEvent, "New Single Prints", "New single prints on {{ticker}} ({{interval}}) — fresh mid-profile singles mark initiative range extension in the developing session")
+alertcondition(retestEvent, "Single Prints First Retest", "{{ticker}} ({{interval}}) is retesting a single-print zone for the first time — watch whether the thin range repairs or gets rejected")
+alertcondition(defendedEvent, "Single Prints Defended", "{{ticker}} ({{interval}}) probed a single-print zone and closed back outside it — the original imbalance is still being defended")
+alertcondition(repairedEvent, "Single Prints Repaired", "A single-print zone on {{ticker}} ({{interval}}) has been fully auctioned through and is now retired")
+
+//---------------------------------------------------------------------------------------------------------------------}

@@ -1,0 +1,298 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Ensemble Voting of Signals", shorttitle = "Ensemble Voting of Signals", overlay = false, format = format.price, precision = 1)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+ENSEMBLE_GROUP = 'Ensemble Vote'
+TREND_GROUP    = 'Trend Components'
+MOMENTUM_GROUP = 'Momentum Components'
+CHANNEL_GROUP  = 'Channel & Volatility Components'
+VOLUME_GROUP   = 'Volume Components'
+DASH_GROUP     = 'Dashboard'
+STYLE_GROUP    = 'Style'
+
+NEUTRAL_COLOR = #787b86 // neutral rating, midline, inactive voters
+ZONE_TRANSP   = 93      // soft shading of the Buy / Sell rating bands
+DASH_BG       = #161616
+DASH_FRAME    = #2E2E2E
+DASH_HEADER   = #808080
+DASH_TEXT     = #DBDBDB
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+signalThresholdInput = input.int(20, 'Signal Threshold', minval = 0, maxval = 100, group = ENSEMBLE_GROUP, tooltip = 'Net weighted consensus (0-100 scale) the score must exceed before the panel rates the market a Buy or a Sell. Higher values demand broader agreement and produce fewer, more conservative ratings.')
+strongThresholdInput = input.int(60, 'Strong Threshold', minval = 0, maxval = 100, group = ENSEMBLE_GROUP, tooltip = 'Consensus level marking the supermajority Strong Buy and Strong Sell bands. Values below the Signal Threshold are treated as equal to it.')
+smoothingInput       = input.int(3, 'Consensus Smoothing', minval = 1, maxval = 50, group = ENSEMBLE_GROUP, tooltip = 'EMA length applied to the raw vote tally so the rating does not flicker at band edges. Set to 1 to read the raw, unsmoothed tally.')
+neutralZoneInput     = input.float(5, 'Oscillator Neutral Zone', minval = 0, maxval = 25, step = 0.5, group = ENSEMBLE_GROUP, tooltip = 'Half-width of the neutral zone around the 50 midline of the bounded components (RSI, Stochastic, Bollinger %B, Donchian, MFI). Readings inside the zone cast a neutral vote instead of forcing a direction.')
+
+maCrossEnableInput = input.bool(true, 'EMA Cross', inline = 'maCross', group = TREND_GROUP, tooltip = 'Include the EMA Cross voter in the panel.')
+maCrossWeightInput = input.float(1, '', minval = 0, maxval = 10, step = 0.5, inline = 'maCross', group = TREND_GROUP, tooltip = 'Trend vote from the relative position of a fast and a slow EMA: bullish while the fast EMA holds above the slow EMA. The number sets the component weight in the tally.')
+maCrossFastInput   = input.int(20, 'Fast/Slow Length', minval = 1, inline = 'maCrossLen', group = TREND_GROUP, tooltip = 'Fast EMA length of the EMA Cross component.')
+maCrossSlowInput   = input.int(50, '', minval = 1, inline = 'maCrossLen', group = TREND_GROUP, tooltip = 'Fast and slow EMA lengths used by the EMA Cross component.')
+priceMaEnableInput = input.bool(true, 'Price vs SMA', inline = 'priceMa', group = TREND_GROUP, tooltip = 'Include the Price vs SMA voter in the panel.')
+priceMaWeightInput = input.float(1, '', minval = 0, maxval = 10, step = 0.5, inline = 'priceMa', group = TREND_GROUP, tooltip = 'Trend vote from the closing price relative to a simple moving average: bullish while price holds above it. The number sets the component weight in the tally.')
+priceMaLengthInput = input.int(200, 'SMA Length', minval = 1, group = TREND_GROUP, tooltip = 'Length of the simple moving average used by the Price vs SMA component. The default of 200 reads the long-term trend.')
+
+rsiEnableInput   = input.bool(true, 'RSI', inline = 'rsi', group = MOMENTUM_GROUP, tooltip = 'Include the RSI voter in the panel.')
+rsiWeightInput   = input.float(1, '', minval = 0, maxval = 10, step = 0.5, inline = 'rsi', group = MOMENTUM_GROUP, tooltip = 'Momentum vote from RSI relative to its 50 midline, with the neutral zone applied. The number sets the component weight in the tally.')
+rsiLengthInput   = input.int(14, 'RSI Length', minval = 1, group = MOMENTUM_GROUP, tooltip = 'RSI lookback length.')
+macdEnableInput  = input.bool(true, 'MACD', inline = 'macd', group = MOMENTUM_GROUP, tooltip = 'Include the MACD voter in the panel.')
+macdWeightInput  = input.float(1, '', minval = 0, maxval = 10, step = 0.5, inline = 'macd', group = MOMENTUM_GROUP, tooltip = 'Momentum vote from the MACD line relative to its signal line: bullish while the MACD line holds above the signal line. The number sets the component weight in the tally.')
+macdFastInput    = input.int(12, 'Fast/Slow/Signal', minval = 1, inline = 'macdLen', group = MOMENTUM_GROUP, tooltip = 'Fast EMA length of the MACD line.')
+macdSlowInput    = input.int(26, '', minval = 1, inline = 'macdLen', group = MOMENTUM_GROUP, tooltip = 'Slow EMA length of the MACD line.')
+macdSignalInput  = input.int(9, '', minval = 1, inline = 'macdLen', group = MOMENTUM_GROUP, tooltip = 'Fast, slow and signal EMA lengths of the MACD component.')
+stochEnableInput = input.bool(true, 'Stochastic %K', inline = 'stoch', group = MOMENTUM_GROUP, tooltip = 'Include the Stochastic voter in the panel.')
+stochWeightInput = input.float(1, '', minval = 0, maxval = 10, step = 0.5, inline = 'stoch', group = MOMENTUM_GROUP, tooltip = 'Momentum vote from the smoothed Stochastic %K relative to its 50 midline, with the neutral zone applied. The number sets the component weight in the tally.')
+stochLengthInput = input.int(14, '%K Length/Smoothing', minval = 1, inline = 'stochLen', group = MOMENTUM_GROUP, tooltip = '%K lookback length of the Stochastic component.')
+stochSmoothInput = input.int(3, '', minval = 1, inline = 'stochLen', group = MOMENTUM_GROUP, tooltip = '%K lookback and smoothing lengths of the Stochastic component.')
+
+bbEnableInput       = input.bool(true, 'Bollinger %B', inline = 'bb', group = CHANNEL_GROUP, tooltip = 'Include the Bollinger %B voter in the panel.')
+bbWeightInput       = input.float(1, '', minval = 0, maxval = 10, step = 0.5, inline = 'bb', group = CHANNEL_GROUP, tooltip = 'Volatility-channel vote from %B, the position of price inside the Bollinger Bands: bullish in the upper half of the bands, with the neutral zone applied around the middle. The number sets the component weight in the tally.')
+bbLengthInput       = input.int(20, 'Length/Multiplier', minval = 1, inline = 'bbLen', group = CHANNEL_GROUP, tooltip = 'Basis SMA length of the Bollinger Bands.')
+bbMultInput         = input.float(2, '', minval = 0.1, step = 0.1, inline = 'bbLen', group = CHANNEL_GROUP, tooltip = 'Basis length and standard deviation multiplier of the Bollinger Bands.')
+donchianEnableInput = input.bool(true, 'Donchian Position', inline = 'don', group = CHANNEL_GROUP, tooltip = 'Include the Donchian Position voter in the panel.')
+donchianWeightInput = input.float(1, '', minval = 0, maxval = 10, step = 0.5, inline = 'don', group = CHANNEL_GROUP, tooltip = 'Channel vote from the position of price inside the Donchian channel: bullish in the upper half of the range, with the neutral zone applied around the middle. The number sets the component weight in the tally.')
+donchianLengthInput = input.int(20, 'Channel Length', minval = 1, group = CHANNEL_GROUP, tooltip = 'Donchian channel lookback length.')
+
+obvEnableInput = input.bool(true, 'OBV Trend', inline = 'obv', group = VOLUME_GROUP, tooltip = 'Include the OBV Trend voter in the panel.')
+obvWeightInput = input.float(1, '', minval = 0, maxval = 10, step = 0.5, inline = 'obv', group = VOLUME_GROUP, tooltip = 'Volume vote from On Balance Volume relative to its EMA: bullish while OBV holds above its average, signalling accumulation. The number sets the component weight in the tally.')
+obvLengthInput = input.int(20, 'OBV EMA Length', minval = 1, group = VOLUME_GROUP, tooltip = 'EMA length applied to OBV to define its trend.')
+mfiEnableInput = input.bool(true, 'MFI', inline = 'mfi', group = VOLUME_GROUP, tooltip = 'Include the MFI voter in the panel.')
+mfiWeightInput = input.float(1, '', minval = 0, maxval = 10, step = 0.5, inline = 'mfi', group = VOLUME_GROUP, tooltip = 'Volume vote from the Money Flow Index relative to its 50 midline, with the neutral zone applied. The number sets the component weight in the tally.')
+mfiLengthInput = input.int(14, 'MFI Length', minval = 1, group = VOLUME_GROUP, tooltip = 'MFI lookback length.')
+
+showDashboardInput     = input.bool(true, 'Show Dashboard', group = DASH_GROUP, tooltip = 'Display the component dashboard listing each voter, its family, its current vote and weight, together with the vote counts, consensus score, agreement and rating.')
+dashboardLocationInput = input.string('Top Right', 'Location', options = ['Top Right', 'Top Left', 'Bottom Right', 'Bottom Left', 'Middle Right'], group = DASH_GROUP, tooltip = 'Position of the dashboard on the pane.')
+dashboardSizeInput     = input.string('Small', 'Size', options = ['Tiny', 'Small', 'Normal'], group = DASH_GROUP, tooltip = 'Text size of the dashboard.')
+
+bullColorInput     = input.color(#089981, 'Bullish', inline = 'colors', group = STYLE_GROUP, tooltip = 'Color of bullish consensus elements.')
+bearColorInput     = input.color(#f23645, 'Bearish', inline = 'colors', group = STYLE_GROUP, tooltip = 'Colors of bullish and bearish consensus elements.')
+gradientFillInput  = input.bool(true, 'Gradient Fill', group = STYLE_GROUP, tooltip = 'Fill the area between the zero line and the consensus score with a directional gradient.')
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Directional vote from the relative position of two series: +1 bullish, -1 bearish, 0 neutral
+directionVote(float a, float b) =>
+    na(a) or na(b) ? 0 : a > b ? 1 : a < b ? -1 : 0
+
+// Directional vote from a 0-100 bounded oscillator with a neutral zone around the 50 midline
+midlineVote(float value, float buffer) =>
+    na(value) ? 0 : value > 50 + buffer ? 1 : value < 50 - buffer ? -1 : 0
+
+// Rating band from the consensus score: 2 strong buy, 1 buy, 0 neutral, -1 sell, -2 strong sell
+getBand(float value, float signalLevel, float strongBandLevel) =>
+    value > strongBandLevel ? 2 : value > signalLevel ? 1 : value < -strongBandLevel ? -2 : value < -signalLevel ? -1 : 0
+
+getRatingText(int bandValue) =>
+    bandValue == 2 ? 'Strong Buy' : bandValue == 1 ? 'Buy' : bandValue == -1 ? 'Sell' : bandValue == -2 ? 'Strong Sell' : 'Neutral'
+
+getRatingColor(int bandValue) =>
+    bandValue > 0 ? bullColorInput : bandValue < 0 ? bearColorInput : NEUTRAL_COLOR
+
+getLocation(string pos) =>
+    switch pos
+        'Top Right'    => position.top_right
+        'Top Left'     => position.top_left
+        'Bottom Right' => position.bottom_right
+        'Bottom Left'  => position.bottom_left
+        => position.middle_right
+
+getSize(string sizeOption) =>
+    sizeOption == 'Tiny' ? size.tiny : sizeOption == 'Small' ? size.small : size.normal
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Ensemble Components
+//---------------------------------------------------------------------------------------------------------------------{
+// Every component is computed on every bar - toggles only remove a voter from the tally
+
+// Trend
+fastEma  = ta.ema(close, maCrossFastInput)
+slowEma  = ta.ema(close, maCrossSlowInput)
+trendSma = ta.sma(close, priceMaLengthInput)
+
+// Momentum
+rsiValue       = ta.rsi(close, rsiLengthInput)
+macdLine       = ta.ema(close, macdFastInput) - ta.ema(close, macdSlowInput)
+macdSignalLine = ta.ema(macdLine, macdSignalInput)
+stochValue     = ta.sma(ta.stoch(close, high, low, stochLengthInput), stochSmoothInput)
+
+// Channel & volatility - price position inside each channel, scaled to 0-100
+bbBasis  = ta.sma(close, bbLengthInput)
+bbDev    = ta.stdev(close, bbLengthInput) * bbMultInput
+bbWidth  = 2 * bbDev
+percentB = na(bbBasis) or na(bbWidth) ? float(na) : bbWidth > 0 ? 100 * (close - (bbBasis - bbDev)) / bbWidth : 50
+
+donchianHigh  = ta.highest(high, donchianLengthInput)
+donchianLow   = ta.lowest(low, donchianLengthInput)
+donchianWidth = donchianHigh - donchianLow
+donchianPct   = na(donchianWidth) ? float(na) : donchianWidth > 0 ? 100 * (close - donchianLow) / donchianWidth : 50
+
+// Volume
+obvValue = ta.obv
+obvEma   = ta.ema(ta.obv, obvLengthInput)
+mfiValue = ta.mfi(hlc3, mfiLengthInput)
+
+// Votes
+maCrossVote  = directionVote(fastEma, slowEma)
+priceMaVote  = directionVote(close, trendSma)
+rsiVote      = midlineVote(rsiValue, neutralZoneInput)
+macdVote     = directionVote(macdLine, macdSignalLine)
+stochVote    = midlineVote(stochValue, neutralZoneInput)
+bbVote       = midlineVote(percentB, neutralZoneInput)
+donchianVote = midlineVote(donchianPct, neutralZoneInput)
+obvVote      = directionVote(obvValue, obvEma)
+mfiVote      = midlineVote(mfiValue, neutralZoneInput)
+
+// A component only joins the tally once its calculation has enough history
+maCrossValid  = not na(fastEma) and not na(slowEma)
+priceMaValid  = not na(trendSma)
+rsiValid      = not na(rsiValue)
+macdValid     = not na(macdSignalLine)
+stochValid    = not na(stochValue)
+bbValid       = not na(percentB)
+donchianValid = not na(donchianPct)
+obvValid      = not na(obvValue) and not na(obvEma)
+mfiValid      = not na(mfiValue)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Vote Aggregation
+//---------------------------------------------------------------------------------------------------------------------{
+votesArray   = array.from(maCrossVote, priceMaVote, rsiVote, macdVote, stochVote, bbVote, donchianVote, obvVote, mfiVote)
+weightsArray = array.from(maCrossWeightInput, priceMaWeightInput, rsiWeightInput, macdWeightInput, stochWeightInput, bbWeightInput, donchianWeightInput, obvWeightInput, mfiWeightInput)
+enabledArray = array.from(maCrossEnableInput, priceMaEnableInput, rsiEnableInput, macdEnableInput, stochEnableInput, bbEnableInput, donchianEnableInput, obvEnableInput, mfiEnableInput)
+validArray   = array.from(maCrossValid, priceMaValid, rsiValid, macdValid, stochValid, bbValid, donchianValid, obvValid, mfiValid)
+
+float bullWeight   = 0.
+float bearWeight   = 0.
+float activeWeight = 0.
+int   bullVotes    = 0
+int   bearVotes    = 0
+int   neutralVotes = 0
+
+if array.size(votesArray) > 0
+    for i = 0 to array.size(votesArray) - 1
+        if array.get(enabledArray, i) and array.get(validArray, i)
+            componentWeight = array.get(weightsArray, i)
+            componentVote   = array.get(votesArray, i)
+            activeWeight += componentWeight
+            if componentVote > 0
+                bullWeight += componentWeight
+                bullVotes  += 1
+            else if componentVote < 0
+                bearWeight += componentWeight
+                bearVotes  += 1
+            else
+                neutralVotes += 1
+
+// Net weighted consensus scaled to -100..+100, smoothed, then thresholded into rating bands
+rawScore  = activeWeight > 0 ? 100 * (bullWeight - bearWeight) / activeWeight : 0.
+consensus = ta.ema(rawScore, smoothingInput)
+
+// Share of active weight sitting on the dominant side of the panel
+agreement = activeWeight > 0 ? 100 * math.max(bullWeight, bearWeight) / activeWeight : 0.
+
+strongLevel = math.max(strongThresholdInput, signalThresholdInput)
+band        = getBand(consensus, signalThresholdInput, strongLevel)
+bandChanged = band != nz(band[1], band)
+
+scoreColor = consensus > 0 ? bullColorInput : consensus < 0 ? bearColorInput : NEUTRAL_COLOR
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Plots
+//---------------------------------------------------------------------------------------------------------------------{
+hline(strongLevel, 'Strong Buy Level', color = color.new(bullColorInput, 50), linestyle = hline.style_dashed)
+hline(signalThresholdInput, 'Buy Level', color = color.new(bullColorInput, 65), linestyle = hline.style_dashed)
+hline(0, 'Midline', color = NEUTRAL_COLOR, linestyle = hline.style_dotted)
+hline(-signalThresholdInput, 'Sell Level', color = color.new(bearColorInput, 65), linestyle = hline.style_dashed)
+hline(-strongLevel, 'Strong Sell Level', color = color.new(bearColorInput, 50), linestyle = hline.style_dashed)
+
+consensusPlotId = plot(consensus, 'Consensus Score', color = scoreColor, linewidth = 1)
+zeroPlotId      = plot(0, 'Zero Anchor', color = na, editable = false, display = display.none)
+
+fillTopColor    = gradientFillInput ? (consensus > 0 ? color.new(bullColorInput, 50) : color.new(bearColorInput, 100)) : na
+fillBottomColor = gradientFillInput ? (consensus > 0 ? color.new(bullColorInput, 100) : color.new(bearColorInput, 50)) : na
+fill(consensusPlotId, zeroPlotId, top_value = math.max(consensus, 0), bottom_value = math.min(consensus, 0), top_color = fillTopColor, bottom_color = fillBottomColor)
+
+plot(rawScore, 'Raw Vote Tally', color = NEUTRAL_COLOR, editable = false, display = display.data_window)
+plot(agreement, 'Agreement %', color = NEUTRAL_COLOR, editable = false, display = display.data_window)
+plot(band, 'Rating Band', color = NEUTRAL_COLOR, editable = false, display = display.data_window)
+
+// Soft rating-band shading anchored on hidden plots - the Buy and Sell bands, deepening into the Strong bands
+buyLevelId     = plot(signalThresholdInput, 'Buy Zone Anchor', color = na, editable = false, display = display.none)
+strongBuyId    = plot(strongLevel, 'Strong Buy Zone Anchor', color = na, editable = false, display = display.none)
+sellLevelId    = plot(-signalThresholdInput, 'Sell Zone Anchor', color = na, editable = false, display = display.none)
+strongSellId   = plot(-strongLevel, 'Strong Sell Zone Anchor', color = na, editable = false, display = display.none)
+topAnchorId    = plot(100, 'Top Anchor', color = na, editable = false, display = display.none)
+bottomAnchorId = plot(-100, 'Bottom Anchor', color = na, editable = false, display = display.none)
+
+fill(buyLevelId, topAnchorId, color.new(bullColorInput, ZONE_TRANSP), title = 'Buy Zone')
+fill(strongBuyId, topAnchorId, color.new(bullColorInput, ZONE_TRANSP), title = 'Strong Buy Zone')
+fill(sellLevelId, bottomAnchorId, color.new(bearColorInput, ZONE_TRANSP), title = 'Sell Zone')
+fill(strongSellId, bottomAnchorId, color.new(bearColorInput, ZONE_TRANSP), title = 'Strong Sell Zone')
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var string[] componentNamesArray    = array.from('EMA Cross', 'Price vs SMA', 'RSI', 'MACD', 'Stochastic %K', 'Bollinger %B', 'Donchian', 'OBV Trend', 'MFI')
+var string[] componentFamiliesArray = array.from('Trend', 'Trend', 'Momentum', 'Momentum', 'Momentum', 'Volatility', 'Channel', 'Volume', 'Volume')
+
+var table dashboardTable = table.new(getLocation(dashboardLocationInput), 4, 14, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+if showDashboardInput and barstate.islast
+    textColor = DASH_TEXT
+    dimColor  = DASH_HEADER
+    textSize  = getSize(dashboardSizeInput)
+    summaryBg = DASH_BG
+
+    table.cell(dashboardTable, 0, 0, 'Component', text_color = dimColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 0, 'Family', text_color = dimColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 2, 0, 'Vote', text_color = dimColor, text_size = textSize)
+    table.cell(dashboardTable, 3, 0, 'Weight', text_color = dimColor, text_size = textSize)
+
+    int rowIndex = 1
+    if array.size(componentNamesArray) > 0
+        for i = 0 to array.size(componentNamesArray) - 1
+            if array.get(enabledArray, i)
+                isValid   = array.get(validArray, i)
+                voteValue = array.get(votesArray, i)
+                voteText  = not isValid ? 'n/a' : voteValue > 0 ? '▲' : voteValue < 0 ? '▼' : '—'
+                voteColor = not isValid ? dimColor : voteValue > 0 ? bullColorInput : voteValue < 0 ? bearColorInput : dimColor
+                table.cell(dashboardTable, 0, rowIndex, array.get(componentNamesArray, i), text_color = textColor, text_size = textSize, text_halign = text.align_left)
+                table.cell(dashboardTable, 1, rowIndex, array.get(componentFamiliesArray, i), text_color = dimColor, text_size = textSize, text_halign = text.align_left)
+                table.cell(dashboardTable, 2, rowIndex, voteText, text_color = voteColor, text_size = textSize)
+                table.cell(dashboardTable, 3, rowIndex, str.tostring(array.get(weightsArray, i), '#.##'), text_color = textColor, text_size = textSize)
+                rowIndex += 1
+
+    table.cell(dashboardTable, 0, rowIndex, 'Votes', text_color = dimColor, text_size = textSize, text_halign = text.align_left, bgcolor = summaryBg)
+    table.cell(dashboardTable, 1, rowIndex, '▲ ' + str.tostring(bullVotes), text_color = bullColorInput, text_size = textSize, bgcolor = summaryBg)
+    table.cell(dashboardTable, 2, rowIndex, '▼ ' + str.tostring(bearVotes), text_color = bearColorInput, text_size = textSize, bgcolor = summaryBg)
+    table.cell(dashboardTable, 3, rowIndex, '— ' + str.tostring(neutralVotes), text_color = dimColor, text_size = textSize, bgcolor = summaryBg)
+
+    table.cell(dashboardTable, 0, rowIndex + 1, 'Consensus', text_color = dimColor, text_size = textSize, text_halign = text.align_left, bgcolor = summaryBg)
+    table.cell(dashboardTable, 1, rowIndex + 1, (consensus > 0 ? '+' : '') + str.tostring(consensus, '#.#'), text_color = scoreColor, text_size = textSize, bgcolor = summaryBg)
+    table.cell(dashboardTable, 2, rowIndex + 1, 'Agree', text_color = dimColor, text_size = textSize, bgcolor = summaryBg)
+    table.cell(dashboardTable, 3, rowIndex + 1, str.tostring(agreement, '#') + '%', text_color = textColor, text_size = textSize, bgcolor = summaryBg)
+
+    ratingColor = getRatingColor(band)
+    table.cell(dashboardTable, 0, rowIndex + 2, 'Rating', text_color = dimColor, text_size = textSize, text_halign = text.align_left, bgcolor = summaryBg)
+    table.cell(dashboardTable, 1, rowIndex + 2, getRatingText(band), text_color = ratingColor, text_size = textSize, bgcolor = color.new(ratingColor, 85))
+    table.cell(dashboardTable, 2, rowIndex + 2, '', text_size = textSize, bgcolor = DASH_BG)
+    table.cell(dashboardTable, 3, rowIndex + 2, '', text_size = textSize, bgcolor = DASH_BG)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(bandChanged and band == 2, 'Strong Buy Consensus', 'Ensemble Voting of Signals: consensus entered the Strong Buy band ({{ticker}}, {{interval}})')
+alertcondition(bandChanged and band == 1, 'Buy Consensus', 'Ensemble Voting of Signals: consensus entered the Buy band ({{ticker}}, {{interval}})')
+alertcondition(bandChanged and band == 0, 'Neutral Consensus', 'Ensemble Voting of Signals: consensus returned to the Neutral band ({{ticker}}, {{interval}})')
+alertcondition(bandChanged and band == -1, 'Sell Consensus', 'Ensemble Voting of Signals: consensus entered the Sell band ({{ticker}}, {{interval}})')
+alertcondition(bandChanged and band == -2, 'Strong Sell Consensus', 'Ensemble Voting of Signals: consensus entered the Strong Sell band ({{ticker}}, {{interval}})')
+alertcondition(bandChanged, 'Rating Change', 'Ensemble Voting of Signals: consensus rating changed bands ({{ticker}}, {{interval}})')
+
+//---------------------------------------------------------------------------------------------------------------------}

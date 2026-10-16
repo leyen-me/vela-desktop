@@ -1,0 +1,335 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("January Effect", shorttitle = "January Effect", overlay = true, format = format.percent, precision = 2, max_labels_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+color BULL_COLOR    = #089981
+color BEAR_COLOR    = #f23645
+color NEUTRAL_COLOR = #787b86
+color LABEL_BG      = #00000000
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+int BG_TRANSP     = 88
+
+string CALC_GROUP  = "Calculation"
+string STYLE_GROUP = "Style"
+
+string TARGET_REST = "Rest of year (Feb-Dec)"
+string TARGET_FULL = "Full year (Jan-Dec)"
+
+string POS_TOP_RIGHT    = "Top Right"
+string POS_TOP_LEFT     = "Top Left"
+string POS_BOTTOM_RIGHT = "Bottom Right"
+string POS_BOTTOM_LEFT  = "Bottom Left"
+
+string SIZE_TINY   = "Tiny"
+string SIZE_SMALL  = "Small"
+string SIZE_NORMAL = "Normal"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+useRelativeInput = input.bool(false, "Measure Relative To Benchmark", inline = "bench", group = CALC_GROUP, tooltip = "Study the chart symbol divided by a benchmark instead of raw price. The January effect was documented mainly in small caps relative to large caps, so the classic test runs on the size spread - e.g. a small-cap index chart against a large-cap benchmark - rather than on an index outright.")
+
+benchmarkInput = input.symbol("SP:SPX", "", inline = "bench", group = CALC_GROUP, tooltip = "Benchmark symbol used when the relative mode is on.")
+
+barometerTargetInput = input.string(TARGET_REST, "Barometer Target", options = [TARGET_REST, TARGET_FULL], group = CALC_GROUP, tooltip = "Window the January barometer call is graded against. 'Rest of year' compares January's direction with the February-December return, the reading with actual predictive content. 'Full year' is the popular almanac phrasing, but it contains January itself, which flatters the hit rate.")
+
+sampleYearsInput = input.int(0, "Sample Window (Years)", minval = 0, maxval = 200, group = CALC_GROUP, tooltip = "0 samples every completed year on the chart. A positive value keeps only the most recent N years - the January effect is the textbook case of an anomaly fading after publication, so judging it on recent data is the honest test.")
+
+highlightJanInput = input.bool(true, "Highlight January", group = STYLE_GROUP, tooltip = "Shades the January window. The tint follows the January-to-date direction of the studied series: bullish above the December close, bearish below, neutral while no December reference exists yet.")
+
+showJanLabelsInput = input.bool(true, "January Return Labels", group = STYLE_GROUP, tooltip = "Prints each completed January's return above its final bar. The label tooltip carries the year's barometer call and, once the year completes, whether that call hit or missed.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "dir", group = STYLE_GROUP)
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "dir", group = STYLE_GROUP)
+
+showTableInput     = input.bool(true, "Dashboard", inline = "tbl", group = STYLE_GROUP, tooltip = "Dashboard summarizing January against the other months, the barometer hit rate against the always-up baseline, and the current year's status.")
+tablePositionInput = input.string(POS_TOP_RIGHT, "", options = [POS_TOP_RIGHT, POS_TOP_LEFT, POS_BOTTOM_RIGHT, POS_BOTTOM_LEFT], inline = "tbl", group = STYLE_GROUP)
+tableSizeInput     = input.string(SIZE_SMALL, "Dashboard Size", options = [SIZE_TINY, SIZE_SMALL, SIZE_NORMAL], group = STYLE_GROUP)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Table position constant from the style option
+getTablePosition(string positionName) =>
+    switch positionName
+        POS_TOP_LEFT     => position.top_left
+        POS_BOTTOM_RIGHT => position.bottom_right
+        POS_BOTTOM_LEFT  => position.bottom_left
+        => position.top_right
+
+// Text size constant from the style option
+getTextSize(string sizeName) =>
+    switch sizeName
+        SIZE_TINY   => size.tiny
+        SIZE_NORMAL => size.normal
+        => size.small
+
+// Signed percent text from a fractional return
+formatPercent(float value) =>
+    na(value) ? "n/a" : (value >= 0 ? "+" : "") + str.tostring(value * 100, "#.##") + "%"
+
+// Signed percentage-point text from a fractional difference
+formatPoints(float value) =>
+    na(value) ? "n/a" : (value >= 0 ? "+" : "") + str.tostring(value * 100, "#.##") + " pp"
+
+// Bull/bear color from the sign of a value, foreground when unavailable
+signColor(float value) =>
+    na(value) ? DASH_TEXT : value >= 0 ? bullColorInput : bearColorInput
+
+// Ticker part of an EXCHANGE:SYMBOL string
+tickerOnly(string symbolText) =>
+    array<string> partsArray = str.split(symbolText, ":")
+    int partsCount = array.size(partsArray)
+    partsCount > 0 ? array.get(partsArray, partsCount - 1) : symbolText
+
+// Count, positive count, return sum and earliest year of the records inside the sample window
+sampleStats(array<int> yearArray, array<float> returnArray, int minYear) =>
+    int   sampleCount   = 0
+    int   positiveCount = 0
+    float returnSum     = 0.0
+    int   earliestYear  = na
+    int   recordCount   = array.size(returnArray)
+    if recordCount > 0
+        for i = 0 to recordCount - 1
+            int recordYear = array.get(yearArray, i)
+            if recordYear >= minYear
+                float recordReturn = array.get(returnArray, i)
+                sampleCount   += 1
+                positiveCount += recordReturn > 0 ? 1 : 0
+                returnSum     += recordReturn
+                earliestYear  := na(earliestYear) ? recordYear : math.min(earliestYear, recordYear)
+    [sampleCount, positiveCount, returnSum, earliestYear]
+
+// Barometer pairs inside the sample window: pair count, hits, and up target windows
+barometerStats(array<int> yearArray, array<float> janArray, array<float> targetArray, int minYear) =>
+    int pairCount   = 0
+    int hitCount    = 0
+    int upCount     = 0
+    int recordCount = array.size(yearArray)
+    if recordCount > 0
+        for i = 0 to recordCount - 1
+            if array.get(yearArray, i) >= minYear
+                float janReturn    = array.get(janArray, i)
+                float targetReturn = array.get(targetArray, i)
+                pairCount += 1
+                hitCount  += (janReturn > 0) == (targetReturn > 0) ? 1 : 0
+                upCount   += targetReturn > 0 ? 1 : 0
+    [pairCount, hitCount, upCount]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Monthly Accounting
+//---------------------------------------------------------------------------------------------------------------------{
+
+// January needs intra-year bars: quarterly and yearly charts cannot isolate the month
+bool tfOk = timeframe.in_seconds(timeframe.period) <= timeframe.in_seconds("1M")
+
+// Optional benchmark for the relative (size-spread) reading
+float benchClose = request.security(benchmarkInput, timeframe.period, close)
+
+// Studied series: raw price, or price over benchmark when the relative mode is on
+float studySrc = useRelativeInput ? (not na(benchClose) and benchClose > 0 ? close / benchClose : na) : close
+
+// Month boundaries from bar open times
+bool isNewMonth    = tfOk and nz(month[1], month) != month
+bool janStartEvent = isNewMonth and month == 1
+
+// Close at the end of the month before the current one - the base for month returns - and which month it belongs to
+var float monthRefClose = na
+var int   monthRefMonth = na
+var int   monthRefYear  = na
+
+// Last completed January: its return, year, and closing value of the studied series
+var float lastJanReturn = na
+var int   lastJanYear   = na
+var float lastJanClose  = na
+
+// Completed month records, with their years so the sample window can filter them
+var array<int>   janYearArray     = array.new<int>()
+var array<float> janReturnArray   = array.new<float>()
+var array<int>   otherYearArray   = array.new<int>()
+var array<float> otherReturnArray = array.new<float>()
+
+// Completed January / target-window pairs grading the barometer
+var array<int>   pairYearArray   = array.new<int>()
+var array<float> pairJanArray    = array.new<float>()
+var array<float> pairTargetArray = array.new<float>()
+
+// Per-bar events feeding labels and alerts
+bool  janClosedEvent   = false
+bool  pairClosedEvent  = false
+bool  pairHitLatest    = false
+float pairTargetLatest = na
+
+if isNewMonth
+    int   finishedMonth = month[1]
+    int   finishedYear  = year[1]
+    float finishedClose = studySrc[1]
+
+    // A month return is only valid against the close of the immediately preceding calendar month
+    bool refAdjacent = not na(monthRefMonth) and (finishedMonth == 1 ? monthRefMonth == 12 and monthRefYear == finishedYear - 1 : monthRefMonth == finishedMonth - 1 and monthRefYear == finishedYear)
+    float monthReturn = refAdjacent and not na(monthRefClose) and monthRefClose > 0 and not na(finishedClose) ? finishedClose / monthRefClose - 1 : na
+
+    if not na(monthReturn)
+        if finishedMonth == 1
+            array.push(janYearArray, finishedYear)
+            array.push(janReturnArray, monthReturn)
+            lastJanReturn  := monthReturn
+            lastJanYear    := finishedYear
+            lastJanClose   := finishedClose
+            janClosedEvent := true
+        else
+            array.push(otherYearArray, finishedYear)
+            array.push(otherReturnArray, monthReturn)
+
+        // December closed: grade that year's barometer call against its target window
+        if finishedMonth == 12 and not na(lastJanYear) and lastJanYear == finishedYear and not na(lastJanClose) and lastJanClose > 0
+            float restReturn   = finishedClose / lastJanClose - 1
+            float fullReturn   = (1 + lastJanReturn) * (1 + restReturn) - 1
+            float targetReturn = barometerTargetInput == TARGET_FULL ? fullReturn : restReturn
+            array.push(pairYearArray, finishedYear)
+            array.push(pairJanArray, lastJanReturn)
+            array.push(pairTargetArray, targetReturn)
+            pairClosedEvent  := true
+            pairHitLatest    := (lastJanReturn > 0) == (targetReturn > 0)
+            pairTargetLatest := targetReturn
+
+    monthRefClose := finishedClose
+    monthRefMonth := finishedMonth
+    monthRefYear  := finishedYear
+
+// January-to-date return of the studied series, measured from the December close
+bool  inJanuary          = tfOk and month == 1
+bool  refIsPrevDecember  = not na(monthRefMonth) and monthRefMonth == 12 and monthRefYear == year - 1
+float janToDate          = inJanuary and refIsPrevDecember and not na(monthRefClose) and monthRefClose > 0 and not na(studySrc) ? studySrc / monthRefClose - 1 : na
+
+// Running rest-of-year return once the current year's January has completed
+float sinceJanClose = not inJanuary and not na(lastJanYear) and lastJanYear == year and not na(lastJanClose) and lastJanClose > 0 and not na(studySrc) ? studySrc / lastJanClose - 1 : na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+
+// January window shading, tinted by the January-to-date direction
+color janBgColor = highlightJanInput and inJanuary ? color.new(na(janToDate) ? NEUTRAL_COLOR : janToDate >= 0 ? bullColorInput : bearColorInput, BG_TRANSP) : na
+bgcolor(janBgColor, title = "January Highlight")
+
+// January label whose tooltip receives the barometer outcome when the year completes
+var label  lastJanLabelId = na
+var string lastJanTooltip = ""
+
+if showJanLabelsInput and janClosedEvent
+    bool   janUp      = lastJanReturn > 0
+    string callText   = janUp ? "up" : "down"
+    string targetText = barometerTargetInput == TARGET_FULL ? "the full year" : "the rest of the year"
+    lastJanTooltip := "January " + str.tostring(lastJanYear) + ": " + formatPercent(lastJanReturn) + "\nBarometer call: " + callText + " for " + targetText
+    lastJanLabelId := label.new(bar_index - 1, high[1], "Jan " + formatPercent(lastJanReturn), style = label.style_label_down, color = LABEL_BG, textcolor = janUp ? bullColorInput : bearColorInput, size = size.small, tooltip = lastJanTooltip)
+
+if pairClosedEvent and not na(lastJanLabelId)
+    label.set_tooltip(lastJanLabelId, lastJanTooltip + "\nOutcome: " + (pairHitLatest ? "hit" : "miss") + " (" + formatPercent(pairTargetLatest) + ")")
+
+// Dashboard: January vs the other months, barometer grading, and the current year's status
+var table dashTable = table.new(getTablePosition(tablePositionInput), 2, 13, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+string tableTextSize = getTextSize(tableSizeInput)
+
+if barstate.islast
+    if not tfOk
+        table.cell(dashTable, 0, 0, "January effect needs a monthly or lower timeframe - quarterly and yearly bars cannot isolate January", text_color = BEAR_COLOR, text_size = tableTextSize)
+    else if showTableInput
+        int minSampleYear = sampleYearsInput > 0 ? year - sampleYearsInput : 0
+
+        [janCount, janPositive, janSum, janEarliest]       = sampleStats(janYearArray, janReturnArray, minSampleYear)
+        [otherCount, otherPositive, otherSum, otherEarliest] = sampleStats(otherYearArray, otherReturnArray, minSampleYear)
+        [pairCount, hitCount, upCount]                     = barometerStats(pairYearArray, pairJanArray, pairTargetArray, minSampleYear)
+
+        float janAvg       = janCount > 0 ? janSum / janCount : na
+        float otherAvg     = otherCount > 0 ? otherSum / otherCount : na
+        float janPremium   = not na(janAvg) and not na(otherAvg) ? janAvg - otherAvg : na
+        float janPosRate   = janCount > 0 ? 100.0 * janPositive / janCount : na
+        float otherPosRate = otherCount > 0 ? 100.0 * otherPositive / otherCount : na
+        float hitRate      = pairCount > 0 ? 100.0 * hitCount / pairCount : na
+        float baseRate     = pairCount > 0 ? 100.0 * upCount / pairCount : na
+        float baroEdge     = pairCount > 0 ? (hitCount - upCount) / (1.0 * pairCount) : na
+
+        string basisText    = useRelativeInput ? syminfo.ticker + " / " + tickerOnly(benchmarkInput) : syminfo.ticker
+        string windowText   = barometerTargetInput == TARGET_FULL ? "Jan-Dec" : "Feb-Dec"
+        string janCountText = str.tostring(janCount) + (na(janEarliest) ? "" : " (since " + str.tostring(janEarliest) + ")")
+        string janAvgText   = na(janAvg) ? "n/a" : formatPercent(janAvg) + " (" + str.tostring(janPosRate, "#.#") + "% up)"
+        string otherAvgText = na(otherAvg) ? "n/a" : formatPercent(otherAvg) + " (" + str.tostring(otherPosRate, "#.#") + "% up)"
+        string hitText      = pairCount > 0 ? str.tostring(hitRate, "#.#") + "% (" + str.tostring(hitCount) + "/" + str.tostring(pairCount) + ")" : "n/a"
+        string baseText     = pairCount > 0 ? str.tostring(baseRate, "#.#") + "% (" + str.tostring(upCount) + "/" + str.tostring(pairCount) + ")" : "n/a"
+
+        // Current year status
+        float  curJanValue = na
+        string curJanText  = "no January data"
+        if inJanuary
+            curJanText  := na(janToDate) ? "in progress (no December reference)" : formatPercent(janToDate) + " in progress"
+            curJanValue := janToDate
+        else if not na(lastJanYear) and lastJanYear == year
+            curJanText  := formatPercent(lastJanReturn) + " final"
+            curJanValue := lastJanReturn
+
+        bool   callKnown = not inJanuary and not na(lastJanYear) and lastJanYear == year
+        string callText  = inJanuary ? "Pending (January open)" : callKnown ? (lastJanReturn > 0 ? "Up (" : "Down (") + windowText + ")" : "n/a"
+        color  callColor = callKnown ? (lastJanReturn > 0 ? bullColorInput : bearColorInput) : DASH_TEXT
+
+        // Section: January effect
+        table.cell(dashTable, 0, 0, "January effect", text_color = DASH_TEXT, text_size = tableTextSize, text_halign = text.align_left, tooltip = "Studied series: " + basisText + (useRelativeInput ? " (benchmark " + benchmarkInput + ")" : "") + ". Completed months only - the running month is excluded until it closes. Daily charts give the cleanest month boundaries.")
+        table.cell(dashTable, 1, 0, basisText, text_color = DASH_TEXT, text_size = tableTextSize, text_halign = text.align_right)
+        table.cell(dashTable, 0, 1, "Completed Januaries", text_color = DASH_HEADER, text_size = tableTextSize, text_halign = text.align_left, tooltip = "Completed Januaries inside the sample window.")
+        table.cell(dashTable, 1, 1, janCountText, text_color = DASH_TEXT, text_size = tableTextSize, text_halign = text.align_right)
+        table.cell(dashTable, 0, 2, "January avg", text_color = DASH_HEADER, text_size = tableTextSize, text_halign = text.align_left, tooltip = "Average completed January return of the studied series, with the share of Januaries that closed higher.")
+        table.cell(dashTable, 1, 2, janAvgText, text_color = signColor(janAvg), text_size = tableTextSize, text_halign = text.align_right)
+        table.cell(dashTable, 0, 3, "Other months avg", text_color = DASH_HEADER, text_size = tableTextSize, text_halign = text.align_left, tooltip = "Average completed non-January month" + (na(otherEarliest) ? "" : " since " + str.tostring(otherEarliest)) + ", the comparison the January effect is judged against.")
+        table.cell(dashTable, 1, 3, otherAvgText, text_color = signColor(otherAvg), text_size = tableTextSize, text_halign = text.align_right)
+        table.cell(dashTable, 0, 4, "January premium", text_color = DASH_HEADER, text_size = tableTextSize, text_halign = text.align_left, tooltip = "Average January return minus the average other-month return, in percentage points - the January effect itself.")
+        table.cell(dashTable, 1, 4, formatPoints(janPremium), text_color = signColor(janPremium), text_size = tableTextSize, text_halign = text.align_right)
+
+        // Section: January barometer
+        table.cell(dashTable, 0, 5, "January barometer", text_color = DASH_TEXT, text_size = tableTextSize, text_halign = text.align_left, tooltip = "As goes January, so goes the target window: a positive January calls an up window, a negative January a down one.")
+        table.cell(dashTable, 1, 5, windowText, text_color = DASH_TEXT, text_size = tableTextSize, text_halign = text.align_right)
+        table.cell(dashTable, 0, 6, "Hit rate", text_color = DASH_HEADER, text_size = tableTextSize, text_halign = text.align_left, tooltip = "Share of sampled years where January's direction matched the target window's direction.")
+        table.cell(dashTable, 1, 6, hitText, text_color = DASH_TEXT, text_size = tableTextSize, text_halign = text.align_right)
+        table.cell(dashTable, 0, 7, "Always-up baseline", text_color = DASH_HEADER, text_size = tableTextSize, text_halign = text.align_left, tooltip = "Hit rate of always calling an up window. Years simply tend to be positive, so the barometer only adds value above this line.")
+        table.cell(dashTable, 1, 7, baseText, text_color = DASH_TEXT, text_size = tableTextSize, text_halign = text.align_right)
+        table.cell(dashTable, 0, 8, "Edge vs baseline", text_color = DASH_HEADER, text_size = tableTextSize, text_halign = text.align_left, tooltip = "Barometer hit rate minus the always-up baseline, in percentage points.")
+        table.cell(dashTable, 1, 8, formatPoints(baroEdge), text_color = signColor(baroEdge), text_size = tableTextSize, text_halign = text.align_right)
+
+        // Section: current year
+        table.cell(dashTable, 0, 9, "This year", text_color = DASH_TEXT, text_size = tableTextSize, text_halign = text.align_left)
+        table.cell(dashTable, 1, 9, str.tostring(year), text_color = DASH_TEXT, text_size = tableTextSize, text_halign = text.align_right)
+        table.cell(dashTable, 0, 10, "January", text_color = DASH_HEADER, text_size = tableTextSize, text_halign = text.align_left, tooltip = "This year's January return of the studied series - running while January is open, final once it closes.")
+        table.cell(dashTable, 1, 10, curJanText, text_color = signColor(curJanValue), text_size = tableTextSize, text_halign = text.align_right)
+        table.cell(dashTable, 0, 11, "Barometer call", text_color = DASH_HEADER, text_size = tableTextSize, text_halign = text.align_left, tooltip = "Direction January calls for the target window. Treat it as weak context - its record barely beats always calling an up year.")
+        table.cell(dashTable, 1, 11, callText, text_color = callColor, text_size = tableTextSize, text_halign = text.align_right)
+        table.cell(dashTable, 0, 12, "Since January close", text_color = DASH_HEADER, text_size = tableTextSize, text_halign = text.align_left, tooltip = "Running return of the studied series since this year's January close - the rest-of-year window the barometer speaks to.")
+        table.cell(dashTable, 1, 12, formatPercent(sinceJanClose), text_color = signColor(sinceJanClose), text_size = tableTextSize, text_halign = text.align_right)
+
+// Data window readouts
+plot(inJanuary ? janToDate * 100 : na, "January To Date %", NEUTRAL_COLOR, display = display.data_window)
+plot(lastJanReturn * 100, "Last Completed January %", NEUTRAL_COLOR, display = display.data_window)
+plot(sinceJanClose * 100, "Since January Close %", NEUTRAL_COLOR, display = display.data_window)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(janStartEvent, "January Started", "January effect: {{ticker}} entered January - the seasonal window the January effect is measured on is open")
+alertcondition(janClosedEvent and lastJanReturn > 0, "January Closed Higher", "January effect: {{ticker}} closed January higher - the January barometer call for the target window is up")
+alertcondition(janClosedEvent and lastJanReturn <= 0, "January Closed Lower", "January effect: {{ticker}} closed January lower - the January barometer call for the target window is down")
+alertcondition(pairClosedEvent and pairHitLatest, "Barometer Call Hit", "January effect: the year completed on {{ticker}} and the January barometer call matched the target window's direction")
+alertcondition(pairClosedEvent and not pairHitLatest, "Barometer Call Missed", "January effect: the year completed on {{ticker}} and the January barometer call missed the target window's direction")
+
+//---------------------------------------------------------------------------------------------------------------------}

@@ -1,0 +1,229 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Elastic Volume-weighted MA", shorttitle = "Elastic Volume-weighted MA", overlay = true)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+CUMULATIVE_BUDGET = "Cumulative Volume (Lookback)"
+FLOAT_BUDGET      = "Shares Outstanding (Float)"
+
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+NEUTRAL_COLOR = #787b86
+SLOW_COLOR    = #ff9800               // the one accent - the slow line of the optional crossover pair
+EMA_REF_COLOR = #787b86               // comparison line is structure - grey
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+FILL_PRICE_TRANSP = 70  // gradient transparency at the price end of the fill
+FILL_LINE_TRANSP  = 100 // gradient transparency at the eVWMA end of the fill
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+srcInput              = input.source(close, "Source", group = "Settings",
+     tooltip = "Price series the recursion blends in. Fries computed the average on the close, but any source works — each bar's value enters the line in proportion to the volume that traded on it.")
+
+budgetModeInput       = input.string(CUMULATIVE_BUDGET, "Volume Budget (N)", options = [CUMULATIVE_BUDGET, FLOAT_BUDGET], group = "Settings",
+     tooltip = "How the volume budget N — the recursion's denominator and the single input that decides whether the line reads fast or slow — is derived. Cumulative Volume sums volume over the lookback (optionally scaled by the multiplier), the common convention on markets without float data. Shares Outstanding uses the symbol's float (or total shares where no float figure exists) as Fries proposed, making the line a cost-basis approximation of the average price the current shareholder base paid; on symbols without share data it falls back to the cumulative budget automatically.")
+
+budgetLookbackInput   = input.int(20, "Budget Lookback", minval = 1, group = "Settings",
+     tooltip = "Number of bars whose volume is summed to form the cumulative budget. The budget plays the role a period plays in ordinary averages: larger budgets produce a smoother, slower line, smaller ones a faster line that a single heavy bar can relocate almost entirely.")
+
+budgetMultiplierInput = input.float(1, "Budget Multiplier", minval = 0.1, step = 0.5, group = "Settings",
+     tooltip = "Scales the summed volume, per the convention of substituting a multiple of recent cumulative volume where no float exists. Values above 1 slow the line without touching the lookback. Ignored in Shares Outstanding mode.")
+
+pairInput             = input.bool(false, "Second eVWMA", group = "Crossover Pair",
+     tooltip = "Adds a second, slower eVWMA to form a crossover pair running on the same volume clock — crossings that thin-trade drift is far less able to trigger, filtering breakout attempts that lack participation. Crossings between the two lines are covered by the pair alerts.")
+
+pairMultipleInput     = input.float(4, "Second Budget Multiple", minval = 1, step = 0.5, group = "Crossover Pair",
+     tooltip = "The slow line's budget as a multiple of the main budget. Larger multiples produce a smoother, slower second line — 4 turns the default 20-bar budget into an 80-bar-equivalent one, echoing classic fast/slow pairings such as 50/200.")
+
+showEmaInput          = input.bool(false, "Comparison EMA", group = "Comparison",
+     tooltip = "Overlays a conventional EMA of similar speed. The two track closely while volume is steady and separate sharply after volume shocks — the eVWMA's signature — because only the eVWMA lets a heavy bar consume a large share of its budget while quiet bars barely move it.")
+
+emaLengthInput        = input.int(39, "EMA Length", minval = 1, group = "Comparison",
+     tooltip = "Length of the comparison EMA. An N-bar cumulative budget updates at an average rate of about 1/N per bar, the speed of a (2N - 1)-bar EMA — 39 for the default 20-bar budget.")
+
+stretchThresholdInput = input.float(10, "Stretch Threshold %", minval = 0, step = 0.5, group = "Cost-Basis Stretch",
+     tooltip = "Distance of price from the eVWMA, in percent, beyond which the stretch alerts fire and the dashboard highlights the reading. With a float-scale budget the line approximates the shareholder base's cost basis, so a large stretch reads as holders sitting on large open profits (or losses) — a condition worth knowing, though not a timing signal by itself. Typical distances vary by symbol and timeframe, so tune the threshold to the market.")
+
+showDashboardInput     = input.bool(true, "Show Dashboard", group = "Dashboard",
+     tooltip = "Displays a compact panel with the active volume budget, the share of the line the latest bar rewrote (its volume as a fraction of the budget), the slope read, and price's position and percentage stretch against the line.")
+
+dashboardLocationInput = input.string("Top Right", "Location", options = ["Top Right", "Bottom Right", "Bottom Left", "Top Left"], group = "Dashboard",
+     tooltip = "Chart corner the dashboard is anchored to.")
+
+dashboardSizeInput     = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = "Dashboard",
+     tooltip = "Text size of the dashboard.")
+
+trendColorInput   = input.bool(true, "Slope Trend Coloring", group = "Style",
+     tooltip = "Colors the eVWMA by its slope — bullish while the line rises, bearish while it falls, neutral on bars that leave it exactly unchanged (zero volume). Only volume-backed moves relocate the line quickly, so its slope is a participation-weighted trend read; disable to draw the line in the neutral color.")
+
+bullColorInput    = input.color(BULL_COLOR, "Bullish", inline = "direction", group = "Style",
+     tooltip = "Bullish color, used while the eVWMA slopes upward and for bullish crossings/fill.")
+
+bearColorInput    = input.color(BEAR_COLOR, "Bearish", inline = "direction", group = "Style",
+     tooltip = "Bearish color, used while the eVWMA slopes downward and for bearish crossings/fill.")
+
+neutralColorInput = input.color(NEUTRAL_COLOR, "Neutral", group = "Style",
+     tooltip = "Line color used when slope trend coloring is disabled, or when a zero-volume bar leaves the line unchanged.")
+
+slowColorInput    = input.color(SLOW_COLOR, "Second eVWMA", inline = "reference", group = "Style",
+     tooltip = "Color of the second, slower eVWMA of the crossover pair.")
+
+emaColorInput     = input.color(EMA_REF_COLOR, "EMA", inline = "reference", group = "Style",
+     tooltip = "Color of the comparison EMA line.")
+
+lineWidthInput    = input.int(2, "Line Width", minval = 1, maxval = 5, group = "Style",
+     tooltip = "Width of the eVWMA lines.")
+
+showFillInput     = input.bool(true, "Price / eVWMA Gradient Fill", group = "Style",
+     tooltip = "Fills the area between the source and the eVWMA with a vertical gradient — bullish while price holds above the line, bearish while below — fading to fully transparent at the eVWMA. Price's side of a volume-aware baseline is the standard bias read.")
+
+showMarkersInput  = input.bool(false, "Price Crossing Markers", group = "Style",
+     tooltip = "Displays small triangle markers when the source crosses over or under the eVWMA. Off by default to keep the chart clean — the crossing alerts work regardless.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Fries' elastic volume-weighted moving average (Technical Analysis of Stocks & Commodities, 2001) — an EMA whose
+// smoothing constant is the bar's share of the volume budget N:
+//     eVWMA = (previous * (N - V) + V * price) / N
+// V is clamped to N so a single giant bar can at most relocate the whole line to price, and a zero-volume bar
+// multiplies the prior value by N/N and adds nothing — the line is exactly unchanged
+elasticVwma(float src, float budget) =>
+    var float value = na
+    float tradedVolume = na(budget) or budget <= 0 ? float(na) : math.min(nz(volume), budget)
+    if not na(src) and not na(tradedVolume)
+        value := na(value) ? src : (value * (budget - tradedVolume) + tradedVolume * src) / budget
+    value
+
+// Compact display of share/contract counts for the dashboard
+formatBudget(float value) =>
+    float absValue = math.abs(value)
+    switch
+        absValue >= 1e12 => str.tostring(value / 1e12, "#.##") + "T"
+        absValue >= 1e9  => str.tostring(value / 1e9, "#.##") + "B"
+        absValue >= 1e6  => str.tostring(value / 1e6, "#.##") + "M"
+        absValue >= 1e3  => str.tostring(value / 1e3, "#.##") + "K"
+        => str.tostring(value, "#.##")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+// Volume budget N — recent cumulative volume (optionally scaled), or the symbol's share count per Fries'
+// original proposal, falling back to the cumulative budget where no share data exists
+sumVolume        = math.sum(nz(volume), budgetLookbackInput)
+cumulativeBudget = sumVolume * budgetMultiplierInput
+sharesFloat      = na(syminfo.shares_outstanding_float) ? syminfo.shares_outstanding_total : syminfo.shares_outstanding_float
+floatActive      = budgetModeInput == FLOAT_BUDGET and not na(sharesFloat)
+budget           = floatActive ? sharesFloat : cumulativeBudget
+
+// Both eVWMAs run on every bar so their recursive histories stay consistent even while hidden
+evwmaValue = elasticVwma(srcInput, budget)
+slowValue  = elasticVwma(srcInput, budget * pairMultipleInput)
+
+// Conventional average of similar speed — tracks the eVWMA while volume is steady, separates after volume shocks
+emaValue = ta.ema(srcInput, emaLengthInput)
+
+// Share of the budget the latest bar consumed — the fraction of the line that bar rewrote (its effective alpha)
+barWeightPct = na(budget) or budget <= 0 ? float(na) : math.min(nz(volume), budget) / budget * 100
+
+// Cost-basis stretch — price's distance from the line, in percent
+stretchPct = na(evwmaValue) or evwmaValue == 0 ? float(na) : (srcInput - evwmaValue) / evwmaValue * 100
+
+// Slope of the eVWMA — the participation-weighted trend read; exactly zero on zero-volume bars
+slope = evwmaValue - nz(evwmaValue[1], evwmaValue)
+
+// Price crossings, slope reversals, pair crossings, and stretch threshold events
+crossUp       = ta.crossover(srcInput, evwmaValue)
+crossDown     = ta.crossunder(srcInput, evwmaValue)
+slopeTurnUp   = slope > 0 and nz(slope[1]) <= 0
+slopeTurnDown = slope < 0 and nz(slope[1]) >= 0
+pairCrossUp   = ta.crossover(evwmaValue, slowValue)
+pairCrossDown = ta.crossunder(evwmaValue, slowValue)
+stretchAbove  = ta.crossover(stretchPct, stretchThresholdInput)
+stretchBelow  = ta.crossunder(stretchPct, -stretchThresholdInput)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+evwmaColor = trendColorInput ? (slope > 0 ? bullColorInput : slope < 0 ? bearColorInput : neutralColorInput) : neutralColorInput
+
+priceAbove      = srcInput > evwmaValue
+fillTopColor    = showFillInput ? (priceAbove ? color.new(bullColorInput, FILL_PRICE_TRANSP) : color.new(bearColorInput, FILL_LINE_TRANSP)) : na
+fillBottomColor = showFillInput ? (priceAbove ? color.new(bullColorInput, FILL_LINE_TRANSP) : color.new(bearColorInput, FILL_PRICE_TRANSP)) : na
+
+srcPlotId   = plot(srcInput, "Source", color = na, editable = false, display = display.none)
+evwmaPlotId = plot(evwmaValue, "eVWMA", color = evwmaColor, linewidth = lineWidthInput)
+
+plot(pairInput ? slowValue : na, "Second eVWMA", color = slowColorInput, linewidth = lineWidthInput)
+plot(showEmaInput ? emaValue : na, "Comparison EMA", color = emaColorInput)
+
+fill(srcPlotId, evwmaPlotId, top_value = math.max(srcInput, evwmaValue), bottom_value = math.min(srcInput, evwmaValue), top_color = fillTopColor, bottom_color = fillBottomColor, title = "Price / eVWMA Gradient Fill")
+
+plotshape(showMarkersInput and crossUp, "Bullish Price Cross", shape.triangleup, location.belowbar, color = bullColorInput, size = size.tiny)
+plotshape(showMarkersInput and crossDown, "Bearish Price Cross", shape.triangledown, location.abovebar, color = bearColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+dashboardLocation = switch dashboardLocationInput
+    "Top Right"    => position.top_right
+    "Bottom Right" => position.bottom_right
+    "Bottom Left"  => position.bottom_left
+    => position.top_left
+
+dashboardTextSize = switch dashboardSizeInput
+    "Tiny"  => size.tiny
+    "Small" => size.small
+    => size.normal
+
+var table dashboardTable = table.new(dashboardLocation, 2, 5, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+if barstate.islast and showDashboardInput
+    // Active budget and the latest bar's weight — how much of the line this bar rewrote
+    budgetText = na(budget) or budget <= 0 ? "—" : (floatActive ? "Shares " : "Σ Vol ") + formatBudget(budget)
+    weightText = na(barWeightPct) ? "—" : str.tostring(barWeightPct, "#.##") + "%"
+
+    slopeNow   = nz(slope)
+    slopeText  = slopeNow > 0 ? "Rising" : slopeNow < 0 ? "Falling" : "Flat"
+    slopeColor = slopeNow > 0 ? bullColorInput : slopeNow < 0 ? bearColorInput : neutralColorInput
+
+    aboveNow  = not na(evwmaValue) and srcInput > evwmaValue
+    biasText  = na(evwmaValue) ? "—" : aboveNow ? "Above eVWMA" : "Below eVWMA"
+    biasColor = na(evwmaValue) ? neutralColorInput : aboveNow ? bullColorInput : bearColorInput
+
+    stretchText  = na(stretchPct) ? "—" : (stretchPct >= 0 ? "+" : "") + str.tostring(stretchPct, "#.##") + "%"
+    stretchColor = na(stretchPct) ? DASH_TEXT : stretchPct > stretchThresholdInput ? bullColorInput : stretchPct < -stretchThresholdInput ? bearColorInput : DASH_TEXT
+
+    table.cell(dashboardTable, 0, 0, "Budget (N)", text_color = DASH_HEADER,  text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 0, budgetText,   text_color = DASH_TEXT,    text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 1, "Bar Weight", text_color = DASH_HEADER,  text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 1, weightText,   text_color = DASH_TEXT,    text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 2, "Slope",      text_color = DASH_HEADER,  text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 2, slopeText,    text_color = slopeColor,   text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 3, "Price",      text_color = DASH_HEADER,  text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 3, biasText,     text_color = biasColor,    text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 4, "Stretch",    text_color = DASH_HEADER,  text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 4, stretchText,  text_color = stretchColor, text_size = dashboardTextSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(crossUp, "Bullish Price Cross", "Price crossed above the eVWMA on {{ticker}} ({{interval}})")
+alertcondition(crossDown, "Bearish Price Cross", "Price crossed below the eVWMA on {{ticker}} ({{interval}})")
+alertcondition(slopeTurnUp, "eVWMA Slope Up", "eVWMA slope turned upward on {{ticker}} ({{interval}})")
+alertcondition(slopeTurnDown, "eVWMA Slope Down", "eVWMA slope turned downward on {{ticker}} ({{interval}})")
+alertcondition(pairInput and pairCrossUp, "Pair Bullish Cross", "Fast eVWMA crossed above the slow eVWMA on {{ticker}} ({{interval}})")
+alertcondition(pairInput and pairCrossDown, "Pair Bearish Cross", "Fast eVWMA crossed below the slow eVWMA on {{ticker}} ({{interval}})")
+alertcondition(stretchAbove, "Stretch Above Threshold", "Price stretched beyond the threshold above the eVWMA on {{ticker}} ({{interval}}) — holders sitting on large open profits")
+alertcondition(stretchBelow, "Stretch Below Threshold", "Price stretched beyond the threshold below the eVWMA on {{ticker}} ({{interval}}) — holders sitting on large open losses")
+
+//---------------------------------------------------------------------------------------------------------------------}

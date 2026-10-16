@@ -1,0 +1,274 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Bitcoin Expectile Model", "Bitcoin Expectile Model", overlay = true)
+//---------------------------------------------------------------------------------------------------------------------}
+// Throw errors
+//---------------------------------------------------------------------------------------------------------------------{
+if timeframe.in_seconds(timeframe.period) < 86400
+    runtime.error('Only the daily timeframe or higher are available for this model')
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+// Line style enums
+enum line_style
+    solid  = '⎯⎯⎯'
+    dotted = '····'
+    dashed = '----'
+
+// Dates
+startDate = input.time(timestamp("16 Jul 2010 00:00"), 'Start Date',
+  tooltip = 'Time at which the model starts being evaluated, ignoring any prices before the set date')
+
+genesisCorrect = input.bool(false, 'Correct for genesis block', tooltip = 'Offset X axis by the missing bars between genesis block and chart starting time')
+
+// Expectiles
+enableA = input.bool(true, '', inline = 'A', group = 'Expectiles')
+enableB = input.bool(true, '', inline = 'B', group = 'Expectiles')
+enableC = input.bool(true, '', inline = 'C', group = 'Expectiles')
+enableD = input.bool(true, '', inline = 'D', group = 'Expectiles')
+enableE = input.bool(true, '', inline = 'E', group = 'Expectiles')
+enableF = input.bool(true, '', inline = 'F', group = 'Expectiles')
+enableG = input.bool(true, '', inline = 'G', group = 'Expectiles')
+
+expectileA = input.float(99.99, '', minval = 0, maxval = 100, inline = 'A', group = 'Expectiles') / 100
+expectileB = input.float(99   , '', minval = 0, maxval = 100, inline = 'B', group = 'Expectiles') / 100
+expectileC = input.float(90   , '', minval = 0, maxval = 100, inline = 'C', group = 'Expectiles') / 100
+expectileD = input.float(50   , '', minval = 0, maxval = 100, inline = 'D', group = 'Expectiles') / 100
+expectileE = input.float(10   , '', minval = 0, maxval = 100, inline = 'E', group = 'Expectiles') / 100
+expectileF = input.float(1    , '', minval = 0, maxval = 100, inline = 'F', group = 'Expectiles') / 100
+expectileG = input.float(0.001, '', minval = 0, maxval = 100, inline = 'G', group = 'Expectiles') / 100
+
+eAColor = input.color(#f23645, '', inline = 'A', group = 'Expectiles')
+eBColor = input.color(#ff5d00, '', inline = 'B', group = 'Expectiles') 
+eCColor = input.color(#2962ff, '', inline = 'C', group = 'Expectiles') 
+eDColor = input.color(#ffeb3b, '', inline = 'D', group = 'Expectiles')
+eEColor = input.color(#089981, '', inline = 'E', group = 'Expectiles') 
+eFColor = input.color(#9c27b0, '', inline = 'F', group = 'Expectiles')
+eGColor = input.color(#311b92, '', inline = 'G', group = 'Expectiles')
+
+fitZones = input.bool(true, 'Fit Zones', inline = 'fit_zones', group = 'Expectiles')
+
+fitZonesTransp = input.int(80, 'Opacity %', 
+  minval = 0, 
+  maxval = 100, 
+  inline = 'fit_zones',
+  group = 'Expectiles')
+
+// Forecast
+extDate = input.time(timestamp("01 Jan 2047 00:00"), 'Forecast End', group = 'Forecast')
+
+lineStyle = input.enum(line_style.solid, 'Forecast Line Style',
+  group = 'Forecast')
+
+extZones = input.bool(true, 'Forecast Zones', inline = 'fcast_zones', group = 'Forecast')
+
+extZonesTransp = input.int(80, 'Opacity %', 
+  minval = 0,
+  maxval = 100,
+  inline = 'fcast_zones',
+  group = 'Forecast')
+
+// Misc
+iters = input.int(20, 'Iterations Number', group = 'Model Fit')
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types
+//---------------------------------------------------------------------------------------------------------------------{
+type ols
+    array<float> fit
+    array<float> beta
+    array<float> residuals
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Solve first degree OLS problem
+ols_solve(x, y, w) =>
+    Sxx = 0.0
+    Sx  = 0.0
+    S1  = 0.0
+    Sxy = 0.0
+    Sy  = 0.0
+
+    for i = 0 to x.size()-1
+        xi = x.get(i)
+        yi = y.get(i)
+        wi = w.get(i)
+
+        Sxx += wi * xi * xi
+        Sx  += wi * xi
+        S1  += wi
+        Sxy += wi * xi * yi
+        Sy  += wi * yi
+
+    det = Sxx * S1 - Sx * Sx
+    slope = (S1 * Sxy - Sx * Sy) / det
+    intercept = (Sxx * Sy - Sx * Sxy) / det
+
+    array.from(slope, intercept)
+
+// OLS object generator
+get_ols(x, y, w) =>
+    fit = array.new<float>(0)
+    residuals = array.new<float>(0)
+
+    beta = ols_solve(x, y, w)
+
+    for [idx, element] in x
+        point = beta.get(0) * element + beta.get(1)
+        fit.push(point)
+        residuals.push(y.get(idx) - point)
+
+    ols.new(fit, beta, residuals)
+
+// Function performing iterative least squares
+get_expectile(x, y, tau_param, iters_param) =>
+    ols olsObject = na
+    n = x.size()
+    
+    // Initialize weights as uniform vector
+    weights = array.new<float>(n, 1.0)
+
+    // Start iterative least squares
+    for i = 0 to iters_param - 1
+        olsObject := get_ols(x, y, weights) 
+
+        // Update weights
+        for idx = 0 to n - 1
+            if olsObject.residuals.get(idx) >= 0
+                weights.set(idx, tau_param)
+            else
+                weights.set(idx, 1.0 - tau_param)
+    
+    // Final ols object
+    olsObject
+
+// Helper to make fills in between polylines
+polyline_fill_helper(charts_points_a, charts_points_b, fill_color) =>
+    batchSize = 4999
+    N = charts_points_a.size()
+
+    // Construct and display batches
+    for i = 0 to N-1 by batchSize
+        // Get copies
+        aCopy = charts_points_a.copy()
+        bCopy = charts_points_b.copy()
+
+        // Get batches
+        aSlice = aCopy.slice(i, math.min(i + batchSize + 1, N))
+        bSlice = bCopy.slice(i, math.min(i + batchSize + 1, N))
+        bSlice.reverse()
+
+        // Merge batches
+        concat = array.concat(aSlice, bSlice)
+
+        // Display fill
+        polyline.new(concat, xloc = xloc.bar_time, fill_color = fill_color, line_color = color(na))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Display model
+//---------------------------------------------------------------------------------------------------------------------{
+var startTime = time
+genesisBlock = timestamp(2009, 1, 3)
+
+var tauValues = array.new<float>(0)
+var polylineColor = array.new<color>(0)
+
+var t = array.new_int(0)
+var x = array.new_float(0)
+var y = array.new_float(0)
+
+// Populate values
+if barstate.isfirst
+    if enableA
+        tauValues.push(expectileA), polylineColor.push(eAColor)
+    if enableB
+        tauValues.push(expectileB), polylineColor.push(eBColor)
+    if enableC
+        tauValues.push(expectileC), polylineColor.push(eCColor)
+    if enableD
+        tauValues.push(expectileD), polylineColor.push(eDColor)
+    if enableE
+        tauValues.push(expectileE), polylineColor.push(eEColor)
+    if enableF
+        tauValues.push(expectileF), polylineColor.push(eFColor)
+    if enableG
+        tauValues.push(expectileG), polylineColor.push(eGColor)
+
+// Get offset
+tfToMs = timeframe.in_seconds(timeframe.period) * 1000
+offset = math.floor((startTime - genesisBlock) / tfToMs)
+
+n = bar_index + 1 + (genesisCorrect ? offset : 0)
+dt = ta.change(time)
+
+// Populate data
+if time >= startDate
+    t.push(time)
+    x.push(math.log(n))
+    y.push(math.log(close))
+
+// Delete previous polylines
+for element in polyline.all
+    element.delete()
+
+// Compute and display model
+if barstate.islast
+    array<chart.point> prevPoints = na
+    array<chart.point> prevExtrapolated = na
+    
+    // Loop over tau
+    for [idxTau, tau] in tauValues
+        points = array.new<chart.point>(0)
+        extrapolated = array.new<chart.point>(0)
+
+        // Get model coefficients given tau
+        getOls = get_expectile(x, y, tau, iters)
+        coeffs = getOls.beta
+    
+        for [idx, element] in x
+            value = element * coeffs.get(0) + coeffs.get(1)
+
+            points.push(chart.point.from_time(t.get(idx), math.exp(value)))
+
+        // Display fit
+        polyline.new(points, xloc = xloc.bar_time, line_color = polylineColor.get(idxTau))
+
+        // Fit Zones
+        if fitZones and not na(prevPoints)
+            prevColor = polylineColor.get(idxTau-1)
+            polyline_fill_helper(points, prevPoints, color.new(prevColor, fitZonesTransp))
+
+        prevPoints := points
+
+        // Extrapolation
+        iter = (extDate - time) / dt
+
+        for i = 0 to iter
+            nextX = math.log(n+i)
+            value = nextX * coeffs.get(0) + coeffs.get(1)
+            
+            extrapolated.push(chart.point.from_time(time + dt * i, math.exp(value)))      
+
+        // Display forecast
+        forecastStyle = switch lineStyle
+            line_style.solid  => line.style_solid
+            line_style.dashed => line.style_dashed
+            line_style.dotted => line.style_dotted
+
+        polyline.new(extrapolated, 
+          xloc = xloc.bar_time, 
+          line_color = polylineColor.get(idxTau),
+          line_style = forecastStyle)
+
+        // Forecast zones
+        if extZones and not na(prevExtrapolated)
+            prevColor = polylineColor.get(idxTau-1)
+            polyline_fill_helper(extrapolated, prevExtrapolated, color.new(prevColor, extZonesTransp))
+
+        prevExtrapolated := extrapolated
+
+//---------------------------------------------------------------------------------------------------------------------}

@@ -1,0 +1,495 @@
+// This work is licensed under Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Complex H&S", shorttitle = "Complex H&S", overlay = true, max_lines_count = 500, max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+color BULL_COLOR    = #089981
+color BEAR_COLOR    = #f23645
+color NEUTRAL_COLOR = #787b86
+color HIDDEN_COLOR  = #00000000
+
+int MAX_SWINGS    = 60
+int MAX_SHOULDERS = 3
+
+string DETECT_GROUP = 'Pattern Detection'
+string TREND_GROUP  = 'Prior Trend'
+string DONE_GROUP   = 'Neckline Break'
+string STYLE_GROUP  = 'Style'
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+swingLengthInput = input.int(5, 'Swing Length', minval = 2, maxval = 50, group = DETECT_GROUP, tooltip = 'Bars to the left and right a high or low must dominate to count as a confirmed swing. Shoulders, heads and neckline troughs are read from these swings, so the latest right shoulder is recognized this many bars after it prints.')
+
+headExcessInput = input.float(15.0, 'Head Prominence (%)', minval = 1, maxval = 90, step = 1, group = DETECT_GROUP, tooltip = 'How far the head must stand above every shoulder, as a percentage of the head-to-neckline height. Below this the peaks are nearly level and the structure reads as a triple top or a range instead.')
+
+minShoulderInput = input.float(30.0, 'Minimum Shoulder Height (%)', minval = 5, maxval = 95, step = 5, group = DETECT_GROUP, tooltip = 'Smallest shoulder height above the neckline, as a percentage of the head height above it, so minor wiggles near the neckline do not count as shoulders.')
+
+doubleHeadInput = input.float(10.0, 'Double Head Tolerance (%)', minval = 0, maxval = 50, step = 1, group = DETECT_GROUP, tooltip = 'Two adjacent peaks within this percentage of the head height of each other, both clearly above every shoulder, form a double head. Set to 0 to disable double heads.')
+
+tiltInput = input.float(50.0, 'Neckline Tilt Limit (%)', minval = 0, maxval = 200, step = 5, group = DETECT_GROUP, tooltip = 'Largest drift of the neckline across the pattern, as a percentage of the head height. With many swings the neckline may be gently sloped; a steep one describes a different structure.')
+
+maxSpanInput = input.int(250, 'Maximum Pattern Length (bars)', minval = 20, maxval = 1000, group = DETECT_GROUP, tooltip = 'Most bars from the first left shoulder to the last right shoulder.')
+
+symmetryInput = input.bool(false, 'Require Shoulder Symmetry', group = DETECT_GROUP, tooltip = 'Only accept patterns with as many right shoulders as left shoulders. Symmetry is a noted tendency in classical charting, not a rule, so it is off by default and always reported in the tooltip.')
+
+atrLengthInput = input.int(14, 'ATR Length', minval = 1, maxval = 200, group = DETECT_GROUP, tooltip = 'Average True Range length scaling the neckline tolerance, the prior trend and the break buffer.')
+
+trendFilterInput = input.bool(true, 'Require Prior Trend', group = TREND_GROUP, tooltip = 'Only accept tops that an advance ran into, and inverse patterns that a decline ran into: the window before the first shoulder must reach well beyond the neckline on the far side.')
+trendLengthInput = input.int(60, 'Prior Trend Window (bars)', minval = 5, maxval = 500, group = TREND_GROUP, tooltip = 'Bars before the first left shoulder inspected for the prior trend.')
+trendSizeInput   = input.float(2.0, 'Minimum Prior Move (ATR)', minval = 0, maxval = 50, step = 0.5, group = TREND_GROUP, tooltip = 'The prior trend must start at least this many ATRs beyond the neckline.')
+
+breakBufferInput = input.float(0.0, 'Decisive Break Buffer (ATR)', minval = 0, maxval = 3, step = 0.05, group = DONE_GROUP, tooltip = 'Extra ATR multiple the close must clear beyond the neckline for the break to complete the pattern.')
+
+windowInput = input.int(80, 'Completion Window (bars)', minval = 5, maxval = 500, group = DONE_GROUP, tooltip = 'Bars after the last right shoulder within which the neckline break must arrive. Before the break the pattern is a scenario, not a signal.')
+
+reclaimInput = input.int(2, 'Closes Back for Failure', minval = 1, maxval = 10, group = DONE_GROUP, tooltip = 'Consecutive closes back across the broken neckline that mark the break as failed, the standard trap. A close beyond the nearest right shoulder fails the pattern at once.')
+
+showTargetInput = input.bool(true, 'Measured Target', group = DONE_GROUP, tooltip = 'Project the head-to-neckline height from the break via the measure rule. A planning reference, not a promise.')
+
+watchInput = input.int(80, 'Post-Break Watch (bars)', minval = 5, maxval = 500, group = DONE_GROUP, tooltip = 'Bars the target and stop are tracked after the break.')
+
+bullColorInput    = input.color(BULL_COLOR, 'Inverse (Bullish)', inline = 'colors', group = STYLE_GROUP)
+bearColorInput    = input.color(BEAR_COLOR, 'Top (Bearish)', inline = 'colors', group = STYLE_GROUP)
+neutralColorInput = input.color(NEUTRAL_COLOR, 'Unconfirmed', inline = 'colors', group = STYLE_GROUP, tooltip = 'Color of patterns awaiting the neckline break, and of stops and failures.')
+
+showEventsInput = input.bool(true, 'Event Labels', group = STYLE_GROUP, tooltip = 'Mark retests, targets, stops and failures after the break.')
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types
+//---------------------------------------------------------------------------------------------------------------------{
+
+// dir = -1 top, 1 inverse. state 0 = awaiting the break, 1 = completed
+type Pattern
+    int   dir
+    int   firstIdx
+    int   lastIdx
+    int   headIdx
+    int   head2Idx
+    int   leftCount
+    int   rightCount
+    int   x1
+    float y1
+    float slope
+    float height
+    int   headBar
+    float headPrice
+    int   lastShoulderBar
+    float lastShoulderPrice
+    string infoText
+    int   state    = 0
+    int   breakBar = 0
+    float target
+    float stop
+    bool  retested = false
+    int   reclaims = 0
+    array<line>  legs
+    array<label> marks
+    line  neckLn
+    line  targetLn
+    label targetLb
+    line  stopLn
+    label stopLb
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Variables
+//---------------------------------------------------------------------------------------------------------------------{
+
+var array<float> zzPriceArray = array.new<float>()
+var array<int>   zzBarArray   = array.new<int>()
+var array<int>   zzDirArray   = array.new<int>()
+
+var array<float> highArray   = array.new<float>()
+var array<float> lowArray    = array.new<float>()
+var array<float> cumVolArray = array.new<float>()
+
+var Pattern topForming     = na
+var Pattern inverseForming = na
+var Pattern topActive      = na
+var Pattern inverseActive  = na
+
+float atrValue  = ta.atr(atrLengthInput)
+float pivotHigh = ta.pivothigh(high, swingLengthInput, swingLengthInput)
+float pivotLow  = ta.pivotlow(low, swingLengthInput, swingLengthInput)
+
+var float cumVol = 0.0
+cumVol += nz(volume)
+array.push(highArray, high)
+array.push(lowArray, low)
+array.push(cumVolArray, cumVol)
+
+var bool volumeSeen = false
+if nz(volume) > 0
+    volumeSeen := true
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions & Methods
+//---------------------------------------------------------------------------------------------------------------------{
+
+method neckAt(Pattern this, int x) =>
+    this.y1 + this.slope * (x - this.x1)
+
+method patternColor(Pattern this) =>
+    this.dir == 1 ? bullColorInput : bearColorInput
+
+method erase(Pattern this) =>
+    if not na(this.legs)
+        for ln in this.legs
+            line.delete(ln)
+    if not na(this.marks)
+        for lb in this.marks
+            label.delete(lb)
+    line.delete(this.neckLn)
+
+method recolor(Pattern this, color col) =>
+    if not na(this.legs)
+        for ln in this.legs
+            line.set_color(ln, col)
+    if not na(this.marks)
+        for lb in this.marks
+            label.set_textcolor(lb, col)
+    line.set_color(this.neckLn, col)
+
+eventMark(int x, float y, string txt, color col, bool below, string tip) =>
+    if showEventsInput
+        label.new(x, y, txt, style = below ? label.style_label_up : label.style_label_down, color = HIDDEN_COLOR, textcolor = col, size = size.small, tooltip = tip)
+
+// Average volume of the leg that ends at swing index k (from the previous swing)
+legVolume(int k) =>
+    float result = na
+    if k >= 1
+        int fromBar = array.get(zzBarArray, k - 1)
+        int toBar   = array.get(zzBarArray, k)
+        result := toBar > fromBar ? (array.get(cumVolArray, toBar) - array.get(cumVolArray, fromBar)) / (toBar - fromBar) : na
+    result
+
+// Maintain the alternating swing sequence; a same-side swing that extends the last one replaces it
+pushSwing(float price, int swingBar, int swingDir) =>
+    bool changed = false
+    int  n       = array.size(zzPriceArray)
+    if n > 0 and array.get(zzDirArray, n - 1) == swingDir
+        if (swingDir == 1 and price >= array.get(zzPriceArray, n - 1)) or (swingDir == -1 and price <= array.get(zzPriceArray, n - 1))
+            array.set(zzPriceArray, n - 1, price)
+            array.set(zzBarArray, n - 1, swingBar)
+            changed := true
+    else
+        array.push(zzPriceArray, price)
+        array.push(zzBarArray, swingBar)
+        array.push(zzDirArray, swingDir)
+        if array.size(zzPriceArray) > MAX_SWINGS
+            array.shift(zzPriceArray)
+            array.shift(zzBarArray)
+            array.shift(zzDirArray)
+        changed := true
+    changed
+
+// Validate one configuration: shoulders and head(s) between swing indices first..last (both peaks, for a top),
+// returning the neckline anchor and slope when it qualifies
+evaluate(int dir, int iFirst, int iLast, int headIdx, int head2Idx) =>
+    int   e      = -dir
+    bool  ok     = true
+    // With a double head, the more extreme of the two sets the height
+    int   topIdx = na(head2Idx) ? headIdx : (e * (array.get(zzPriceArray, head2Idx) - array.get(zzPriceArray, headIdx)) > 0 ? head2Idx : headIdx)
+    float headP  = array.get(zzPriceArray, topIdx)
+    // Neckline through the most extreme trough on each side of the head(s)
+    int   leftTrough  = na
+    int   rightTrough = na
+    int   leftEnd     = math.min(headIdx, na(head2Idx) ? headIdx : head2Idx)
+    int   rightStart  = math.max(headIdx, na(head2Idx) ? headIdx : head2Idx)
+    for k = iFirst + 1 to leftEnd - 1 by 2
+        if na(leftTrough) or e * (array.get(zzPriceArray, k) - array.get(zzPriceArray, leftTrough)) < 0
+            leftTrough := k
+    for k = rightStart + 1 to iLast - 1 by 2
+        if na(rightTrough) or e * (array.get(zzPriceArray, k) - array.get(zzPriceArray, rightTrough)) < 0
+            rightTrough := k
+    int   x1    = na
+    float y1    = na
+    float slope = na
+    float height = na
+    if na(leftTrough) or na(rightTrough)
+        ok := false
+    else
+        x1     := array.get(zzBarArray, leftTrough)
+        y1     := array.get(zzPriceArray, leftTrough)
+        slope  := (array.get(zzPriceArray, rightTrough) - y1) / (array.get(zzBarArray, rightTrough) - x1)
+        height := e * (headP - (y1 + slope * (array.get(zzBarArray, topIdx) - x1)))
+        ok     := height > 0 and math.abs(slope * (array.get(zzBarArray, iLast) - array.get(zzBarArray, iFirst))) <= tiltInput / 100 * height
+        // Two heads must be nearly level with each other
+        if ok and not na(head2Idx)
+            ok := math.abs(array.get(zzPriceArray, head2Idx) - array.get(zzPriceArray, headIdx)) <= doubleHeadInput / 100 * height
+    if ok
+        float tol = 0.25 * atrValue
+        for k = iFirst to iLast
+            int   b    = array.get(zzBarArray, k)
+            float p    = array.get(zzPriceArray, k)
+            float neck = y1 + slope * (b - x1)
+            if array.get(zzDirArray, k) == e
+                // Peaks: shoulders clearly below the head(s) and well above the neckline, heads on top
+                if k == headIdx or k == head2Idx
+                    if e * (p - neck) <= 0
+                        ok := false
+                else
+                    float h = e * (p - neck)
+                    float lowerHead = na(head2Idx) ? headP : (e == 1 ? math.min(array.get(zzPriceArray, headIdx), array.get(zzPriceArray, head2Idx)) : math.max(array.get(zzPriceArray, headIdx), array.get(zzPriceArray, head2Idx)))
+                    if h < minShoulderInput / 100 * height or e * (lowerHead - p) < headExcessInput / 100 * height
+                        ok := false
+            else
+                // Troughs may not pierce the neckline
+                if e * (p - neck) < -tol
+                    ok := false
+    [ok, x1, y1, slope, height]
+
+// Search the swings ending at the newest peak (trough for an inverse) for the largest complex head and shoulders:
+// several shoulders on a side or a double head, around one dominant head
+tryDetect(int dir) =>
+    Pattern result = na
+    int e = -dir
+    int n = array.size(zzPriceArray)
+    if n >= 7 and array.get(zzDirArray, n - 1) == e and atrValue > 0
+        int iLast     = n - 1
+        int bestTotal = 0
+        int bFirst   = na
+        int bHead    = na
+        int bHead2   = na
+        int bLeft    = 0
+        int bRight   = 0
+        int   bX1    = na
+        float bY1    = na
+        float bSlope = na
+        float bHeight = na
+        // Candidate heads, walking back over peaks: each must top every later peak of the pattern
+        float laterMax = na
+        for h = iLast - 2 to 2 by 2
+            float hp = array.get(zzPriceArray, h)
+            if na(laterMax) or e * (hp - laterMax) > 0
+                int rightCount = int((iLast - h) / 2)
+                if rightCount <= MAX_SHOULDERS
+                    // Optional double head: the adjacent earlier peak, checked for levelness against the pattern height
+                    int head2 = na
+                    if doubleHeadInput > 0 and h - 2 >= 0
+                        head2 := h - 2
+                    int variants = na(head2) ? 0 : 1
+                    for variant = 0 to variants
+                        int h2      = variant == 1 ? head2 : na
+                        int leftTop = variant == 1 ? head2 : h
+                        for leftCount = 1 to MAX_SHOULDERS
+                            int iFirst = leftTop - 2 * leftCount
+                            if iFirst >= 0 and array.get(zzBarArray, iLast) - array.get(zzBarArray, iFirst) <= maxSpanInput
+                                bool complexOk = leftCount >= 2 or rightCount >= 2 or not na(h2)
+                                bool symOk     = not symmetryInput or leftCount == rightCount
+                                int  total     = leftCount + rightCount + (na(h2) ? 0 : 1)
+                                if complexOk and symOk and total > bestTotal
+                                    [ok, x1, y1, slope, height] = evaluate(dir, iFirst, iLast, h, h2)
+                                    // Prior trend into the first shoulder from beyond the neckline
+                                    if ok and trendFilterInput
+                                        int   fb     = array.get(zzBarArray, iFirst)
+                                        float origin = e == 1 ? array.get(lowArray, fb) : array.get(highArray, fb)
+                                        if fb - trendLengthInput >= 0
+                                            for b = fb - trendLengthInput to fb
+                                                origin := e == 1 ? math.min(origin, array.get(lowArray, b)) : math.max(origin, array.get(highArray, b))
+                                            ok := e * ((y1 + slope * (fb - x1)) - origin) >= trendSizeInput * atrValue
+                                        else
+                                            ok := false
+                                    if ok
+                                        bestTotal := total
+                                        bFirst    := iFirst
+                                        bHead     := h
+                                        bHead2    := h2
+                                        bLeft     := leftCount
+                                        bRight    := rightCount
+                                        bX1       := x1
+                                        bY1       := y1
+                                        bSlope    := slope
+                                        bHeight   := height
+            laterMax := na(laterMax) ? hp : (e == 1 ? math.max(laterMax, hp) : math.min(laterMax, hp))
+
+        if bestTotal > 0
+            Pattern active = dir == 1 ? inverseActive : topActive
+            int     headBar = array.get(zzBarArray, bHead)
+            if na(active) or active.headBar != headBar
+                // Volume signature: heaviest into the left shoulders, lighter into the head, lighter still on the right
+                float vLeft  = 0.0
+                float vRight = 0.0
+                int leftTopIdx = na(bHead2) ? bHead : bHead2
+                for k = bFirst to leftTopIdx - 2 by 2
+                    vLeft += nz(legVolume(k))
+                for k = bHead + 2 to iLast by 2
+                    vRight += nz(legVolume(k))
+                vLeft  := vLeft / bLeft
+                vRight := vRight / bRight
+                float vHead = nz(legVolume(leftTopIdx))
+                string volText = volumeSeen and vLeft > 0 ? 'Volume into the head ' + str.tostring(vHead / vLeft, '#.##') + 'x and into the right shoulders ' + str.tostring(vRight / vLeft, '#.##') + 'x the left shoulders' + (vHead < vLeft and vRight < vHead ? ' (classical fade)' : '') : 'Volume signature: n/a'
+                string shape = str.tostring(bLeft) + ' left shoulder' + (bLeft > 1 ? 's' : '') + ', ' + (na(bHead2) ? 'one head' : 'double head') + ', ' + str.tostring(bRight) + ' right shoulder' + (bRight > 1 ? 's' : '')
+
+                float headPrice = na(bHead2) ? array.get(zzPriceArray, bHead) : (e == 1 ? math.max(array.get(zzPriceArray, bHead), array.get(zzPriceArray, bHead2)) : math.min(array.get(zzPriceArray, bHead), array.get(zzPriceArray, bHead2)))
+                result := Pattern.new(dir = dir, firstIdx = bFirst, lastIdx = iLast, headIdx = bHead, head2Idx = bHead2, leftCount = bLeft, rightCount = bRight, x1 = bX1, y1 = bY1, slope = bSlope, height = bHeight, headBar = headBar, headPrice = headPrice, lastShoulderBar = array.get(zzBarArray, iLast), lastShoulderPrice = array.get(zzPriceArray, iLast), infoText = shape + '\n' + volText)
+                result.legs  := array.new<line>()
+                result.marks := array.new<label>()
+                color col   = neutralColorInput
+                bool  isTop = dir == -1
+                for k = bFirst to iLast
+                    if k < iLast
+                        result.legs.push(line.new(array.get(zzBarArray, k), array.get(zzPriceArray, k), array.get(zzBarArray, k + 1), array.get(zzPriceArray, k + 1), color = col, width = 2))
+                    if array.get(zzDirArray, k) == e
+                        string tag = k == bHead or k == bHead2 ? 'H' : k < bHead ? 'LS' : 'RS'
+                        result.marks.push(label.new(array.get(zzBarArray, k), array.get(zzPriceArray, k), tag, style = isTop ? label.style_label_down : label.style_label_up, color = HIDDEN_COLOR, textcolor = col, size = size.small, tooltip = shape))
+                result.neckLn := line.new(bX1, bY1, bar_index, bY1 + bSlope * (bar_index - bX1), color = col, style = line.style_dashed, width = 2)
+    result
+
+// Advance a pattern awaiting its break: 0 = waiting, 1 = completed, 2 = invalidated or expired
+trackForming(Pattern p) =>
+    int   evt  = 0
+    int   e    = -p.dir
+    float neck = p.neckAt(bar_index)
+    line.set_xy2(p.neckLn, bar_index, neck)
+    bool headTaken = e == 1 ? high > p.headPrice : low < p.headPrice
+    bool broke     = e == 1 ? close < neck - breakBufferInput * atrValue : close > neck + breakBufferInput * atrValue
+    if headTaken or bar_index - p.lastShoulderBar > windowInput
+        p.erase()
+        evt := 2
+    else if broke
+        color col = p.patternColor()
+        p.state    := 1
+        p.breakBar := bar_index
+        p.target   := neck - e * p.height
+        p.stop     := p.lastShoulderPrice
+        p.recolor(col)
+        line.set_style(p.neckLn, line.style_solid)
+        string name = p.dir == -1 ? 'Complex H&S' : 'Complex Inverse H&S'
+        string tip  = name + ' completed: close through the neckline at ' + str.tostring(neck, format.mintick) + '\n' + p.infoText
+        // The pattern name sits on the far side of the neckline under the head, empty space until the break
+        label.new(p.headBar, p.neckAt(p.headBar), name, style = e == 1 ? label.style_label_up : label.style_label_down, color = HIDDEN_COLOR, textcolor = col, size = size.normal, tooltip = tip)
+        label.new(bar_index, e == 1 ? math.max(high, high[1], high[2]) : math.min(low, low[1], low[2]), 'Break', style = e == 1 ? label.style_label_down : label.style_label_up, color = col, textcolor = chart.bg_color, size = size.small, tooltip = tip)
+        if showTargetInput
+            p.targetLn := line.new(bar_index, p.target, bar_index, p.target, color = col, style = line.style_dashed)
+            p.targetLb := label.new(bar_index, p.target, 'Target ' + str.tostring(p.target, format.mintick), style = label.style_label_right, color = HIDDEN_COLOR, textcolor = col, size = size.small, tooltip = 'Head-to-neckline height projected from the break (measure rule)')
+        p.stopLn := line.new(bar_index, p.stop, bar_index, p.stop, color = neutralColorInput, style = line.style_dotted)
+        p.stopLb := label.new(bar_index, p.stop, 'Stop ' + str.tostring(p.stop, format.mintick), style = label.style_label_left, color = HIDDEN_COLOR, textcolor = neutralColorInput, size = size.small, tooltip = 'Beyond the nearest right shoulder')
+        evt := 1
+    evt
+
+// Advance a completed pattern: 0 = tracking, 1 = target, 2 = failed, 3 = retest, 4 = watch over
+trackActive(Pattern p) =>
+    int   evt  = 0
+    int   e    = -p.dir
+    float neck = p.neckAt(bar_index)
+    if not na(p.targetLn)
+        line.set_x2(p.targetLn, bar_index)
+    line.set_x2(p.stopLn, bar_index)
+    label.set_x(p.stopLb, bar_index)
+    line.set_xy2(p.neckLn, bar_index, neck)
+    bool targetHit = e == 1 ? low <= p.target : high >= p.target
+    bool stopHit   = e == 1 ? close > p.stop : close < p.stop
+    p.reclaims := e * (close - neck) > 0 ? p.reclaims + 1 : 0
+    if showTargetInput and targetHit
+        eventMark(bar_index, e == 1 ? low : high, 'Target', p.patternColor(), e == 1, 'Measured target ' + str.tostring(p.target, format.mintick) + ' reached')
+        evt := 1
+    else if stopHit or p.reclaims >= reclaimInput
+        if not na(p.targetLn)
+            line.delete(p.targetLn)
+            label.delete(p.targetLb)
+        eventMark(bar_index, e == 1 ? high : low, stopHit ? 'Stop' : 'Failed', neutralColorInput, e == -1, stopHit ? 'Close beyond the nearest right shoulder' : 'Neckline reclaimed: the break failed')
+        evt := 2
+    else if not p.retested and bar_index > p.breakBar and (e == 1 ? high >= neck and close < neck : low <= neck and close > neck)
+        p.retested := true
+        eventMark(bar_index, e == 1 ? high : low, 'Retest', p.patternColor(), e == -1, 'First return to the broken neckline')
+        evt := 3
+    else if bar_index - p.breakBar >= watchInput
+        evt := 4
+    evt
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Detection
+//---------------------------------------------------------------------------------------------------------------------{
+
+bool topFormingAlert     = false
+bool inverseFormingAlert = false
+bool topBreakAlert       = false
+bool inverseBreakAlert   = false
+bool topRetestAlert      = false
+bool inverseRetestAlert  = false
+bool topTargetAlert      = false
+bool inverseTargetAlert  = false
+bool topFailAlert        = false
+bool inverseFailAlert    = false
+
+if barstate.isconfirmed
+    if not na(pivotHigh)
+        if pushSwing(pivotHigh, bar_index - swingLengthInput, 1)
+            Pattern candidate = tryDetect(-1)
+            if not na(candidate)
+                if not na(topForming)
+                    topFormingAlert := topForming.headBar != candidate.headBar
+                    topForming.erase()
+                else
+                    topFormingAlert := true
+                topForming := candidate
+    if not na(pivotLow)
+        if pushSwing(pivotLow, bar_index - swingLengthInput, -1)
+            Pattern candidate = tryDetect(1)
+            if not na(candidate)
+                if not na(inverseForming)
+                    inverseFormingAlert := inverseForming.headBar != candidate.headBar
+                    inverseForming.erase()
+                else
+                    inverseFormingAlert := true
+                inverseForming := candidate
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Tracking
+//---------------------------------------------------------------------------------------------------------------------{
+
+if barstate.isconfirmed
+    if not na(topActive)
+        int evt = trackActive(topActive)
+        topTargetAlert := evt == 1
+        topFailAlert   := evt == 2
+        topRetestAlert := evt == 3
+        if evt == 1 or evt == 2 or evt == 4
+            topActive := na
+    if not na(inverseActive)
+        int evt = trackActive(inverseActive)
+        inverseTargetAlert := evt == 1
+        inverseFailAlert   := evt == 2
+        inverseRetestAlert := evt == 3
+        if evt == 1 or evt == 2 or evt == 4
+            inverseActive := na
+    if not na(topForming)
+        int evt = trackForming(topForming)
+        if evt == 1
+            topBreakAlert := true
+            topActive     := topForming
+            topForming    := na
+        else if evt == 2
+            topForming := na
+    if not na(inverseForming)
+        int evt = trackForming(inverseForming)
+        if evt == 1
+            inverseBreakAlert := true
+            inverseActive     := inverseForming
+            inverseForming    := na
+        else if evt == 2
+            inverseForming := na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(topFormingAlert, 'Complex H&S Forming', 'Complex head and shoulders top forming: several shoulders or a double head around a dominant head, awaiting a close below the neckline')
+alertcondition(inverseFormingAlert, 'Complex Inverse H&S Forming', 'Complex inverse head and shoulders forming: several shoulders or a double head around a dominant low, awaiting a close above the neckline')
+alertcondition(topBreakAlert, 'Complex H&S Neckline Break', 'Complex head and shoulders top completed: decisive close below the neckline')
+alertcondition(inverseBreakAlert, 'Complex Inverse H&S Neckline Break', 'Complex inverse head and shoulders completed: decisive close above the neckline')
+alertcondition(topRetestAlert, 'Complex H&S Retest', 'Complex head and shoulders top: broken neckline retested from below')
+alertcondition(inverseRetestAlert, 'Complex Inverse H&S Retest', 'Complex inverse head and shoulders: broken neckline retested from above')
+alertcondition(topTargetAlert, 'Complex H&S Target Reached', 'Complex head and shoulders top: measured target reached')
+alertcondition(inverseTargetAlert, 'Complex Inverse H&S Target Reached', 'Complex inverse head and shoulders: measured target reached')
+alertcondition(topFailAlert, 'Complex H&S Failed', 'Complex head and shoulders top failed: neckline reclaimed or right shoulder exceeded')
+alertcondition(inverseFailAlert, 'Complex Inverse H&S Failed', 'Complex inverse head and shoulders failed: neckline lost or right shoulder violated')
+
+//---------------------------------------------------------------------------------------------------------------------}

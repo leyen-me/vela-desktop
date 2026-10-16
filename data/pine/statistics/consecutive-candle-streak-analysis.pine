@@ -1,0 +1,301 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+//@version=6
+indicator("Consecutive Candle Streak Analysis", "Consecutive Candle Streak Analysis", overlay = true, max_boxes_count = 500, max_labels_count = 500, max_bars_back = 5000)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+color BULL_COLOR = #089981
+color BEAR_COLOR = #f23645
+color DATA       = #DBDBDB
+color HEADERS    = #808080
+color BACKGROUND = #161616
+color BORDERS    = #2E2E2E
+
+string TOP_RIGHT    = 'Top Right'
+string BOTTOM_RIGHT = 'Bottom Right'
+string BOTTOM_LEFT  = 'Bottom Left'
+
+string TINY   = 'Tiny'
+string SMALL  = 'Small'
+string NORMAL = 'Normal'
+string LARGE  = 'Large'
+string HUGE   = 'Huge'
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Inputs
+//---------------------------------------------------------------------------------------------------------------------{
+string DASHBOARD_GROUP = 'Dashboard'
+int lookbackInput      = input.int(10000, "Max Historical Streaks", minval = 100, group = "Calculations", tooltip = "The script processes all available history. This setting limits how many 'completed streaks' are used for benchmarking on the dashboard.")
+
+bool showHistHighlights= input.bool(true, "Highlight Matches", group = "Visuals", tooltip = "Highlights streaks in history (and the current streak) that are the same length or longer than the current streak.")
+bool showLongerStats   = input.bool(true, "Show 'Length & Longer' Stats", group = "Dashboard", tooltip = "Adds a section to the dashboard for streaks equal to or greater than the current length.")
+
+bool dashboardInput          = input.bool(true, 'Dashboard', group = DASHBOARD_GROUP)
+string dashboardPositionInput= input.string(TOP_RIGHT, 'Position', group = DASHBOARD_GROUP, options = [TOP_RIGHT, BOTTOM_RIGHT, BOTTOM_LEFT])
+string dashboardSizeInput    = input.string(SMALL, 'Size', group = DASHBOARD_GROUP, options = [TINY, SMALL, NORMAL, LARGE, HUGE])
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types & Global Functions
+//---------------------------------------------------------------------------------------------------------------------{
+type Streak
+    int   length
+    float startPrice
+    float pctChange
+    int   startIndex
+    int   endIndex
+    bool  isBullish
+    float highRange
+    float lowRange
+    int   startTime
+
+// Function to handle visual highlights
+addOverlay(int start, float hRange, int end, float lRange, int len, bool bull, color clr, box[] bArray, label[] lArray) =>
+    box nb = box.new(start, hRange, end, lRange, 
+         bgcolor       = color.new(clr, 85), 
+         border_color  = clr,
+         border_width  = 1,
+         xloc          = xloc.bar_index,
+         force_overlay = true)
+    bArray.push(nb)
+    
+    label nl = label.new(int(math.avg(start, end)), bull ? hRange : lRange,
+         text          = str.tostring(len),
+         style         = bull ? label.style_label_down : label.style_label_up,
+         color         = #00000000,
+         textcolor     = clr,
+         size          = size.small,
+         force_overlay = true)
+    lArray.push(nl)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+var streakArray = array.new<Streak>()
+var int currentStreakLen = 0
+var float streakStartPrice = na
+var int   streakStartTime  = 0
+var float streakHigh = na
+var float streakLow  = na
+
+// History Tracking Array to bypass history-referencing limits
+var float[] allCloses = array.new<float>()
+allCloses.push(close)
+
+// Streak based on return (Close vs Previous Close)
+int  dir     = close > close[1] ? 1 : close < close[1] ? -1 : 0
+bool changed = dir != dir[1]
+
+// Streak Detection Logic
+if changed
+    // Record completed streak
+    if currentStreakLen > 0 and dir[1] != 0
+        streakArray.push(Streak.new(
+             currentStreakLen, 
+             streakStartPrice,
+             (close[1] - streakStartPrice) / streakStartPrice * 100, 
+             bar_index - currentStreakLen, 
+             bar_index - 1, 
+             dir[1] == 1,
+             streakHigh,
+             streakLow,
+             streakStartTime
+             ))
+    
+    // Start new streak from the previous close
+    currentStreakLen := dir != 0 ? 1 : 0
+    streakStartPrice := close[1]
+    streakStartTime  := time[1]
+    streakHigh       := high
+    streakLow        := low
+else if dir != 0
+    // Continue streak
+    currentStreakLen += 1
+    streakHigh       := math.max(nz(streakHigh, high), high)
+    streakLow        := math.min(nz(streakLow, low), low)
+
+// Dashboard Stats Variables
+int   curLen        = 0
+float curPct        = 0.0
+bool  curBull       = false
+float continueProb  = 0.0
+float reversalProb  = 0.0
+
+// Stats for Stage (At current length)
+float avgMoveExact  = 0.0
+float maxMoveExact  = -1.0
+float minMoveExact  = 1.0e10
+int   countExact    = 0
+
+// Final Stats (For all streaks that reached at least current length)
+float avgMoveLonger = 0.0
+float maxMoveLonger = -1.0
+float minMoveLonger = 1.0e10
+int   countLonger   = 0
+string longestDate  = "N/A"
+
+if barstate.islast
+    curLen  := currentStreakLen
+    curBull := dir == 1
+    curPct  := dir != 0 ? (close - streakStartPrice) / streakStartPrice * 100 : 0.0
+    
+    int countReachingCur = 0
+    int countContinuing  = 0
+    float sumMoveExact   = 0.0
+    float sumMoveLonger  = 0.0
+    int maxLenInHistory  = 0
+    int maxLenIdx        = -1
+
+    // Analyze up to lookbackInput streaks from history
+    int startIdx = math.max(0, streakArray.size() - lookbackInput)
+    if streakArray.size() > 0 and curLen > 0
+        for i = startIdx to streakArray.size() - 1
+            Streak s = streakArray.get(i)
+            if s.isBullish == curBull
+                // Track absolute longest streak for date display
+                if s.length > maxLenInHistory
+                    maxLenInHistory := s.length
+                    maxLenIdx := i
+
+                // Benchmark stage stats
+                // Calculate historical price at current 'stage' (how much it had moved when it was at curLen)
+                int targetIndex = s.startIndex + curLen - 1
+                float histEndPrice = (targetIndex >= 0 and targetIndex < allCloses.size()) ? allCloses.get(targetIndex) : na
+                float histStartPrice = s.startPrice
+                
+                if not na(histEndPrice) and s.length >= curLen
+                    float moveAtLength   = math.abs((histEndPrice - histStartPrice) / histStartPrice * 100)
+                    float totalFinalMove = math.abs(s.pctChange)
+
+                    countReachingCur += 1
+                    
+                    // Benchmark stage stats
+                    countExact   += 1
+                    sumMoveExact += moveAtLength
+                    maxMoveExact := math.max(maxMoveExact, moveAtLength)
+                    minMoveExact := math.min(minMoveExact, moveAtLength)
+                    
+                    // Benchmark outcome stats
+                    countLonger   += 1
+                    sumMoveLonger += totalFinalMove
+                    maxMoveLonger := math.max(maxMoveLonger, totalFinalMove)
+                    minMoveLonger := math.min(minMoveLonger, totalFinalMove)
+
+                    if s.length > curLen
+                        countContinuing += 1
+        
+        // Retrieve date of longest historical run
+        if maxLenIdx != -1
+            Streak m = streakArray.get(maxLenIdx)
+            longestDate := str.format_time(m.startTime, "yyyy-MM-dd")
+
+    continueProb  := countReachingCur > 0 ? (float(countContinuing) / countReachingCur) * 100 : 0.0
+    reversalProb  := countReachingCur > 0 ? (float(countReachingCur - countContinuing) / countReachingCur) * 100 : 0.0
+    avgMoveExact  := countExact > 0 ? sumMoveExact / countExact : 0.0
+    avgMoveLonger := countLonger > 0 ? sumMoveLonger / countLonger : 0.0
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Overlays
+//---------------------------------------------------------------------------------------------------------------------{
+var box[]   boxArray   = array.new<box>()
+var label[] labelArray = array.new<label>()
+
+if barstate.islast and showHistHighlights and curLen > 0
+    // Cleanup old objects
+    for b in boxArray
+        b.delete()
+    for l in labelArray
+        l.delete()
+    boxArray.clear()
+    labelArray.clear()
+
+    // 1. Highlight Current Streak
+    color curCol = curBull ? BULL_COLOR : BEAR_COLOR
+    addOverlay(bar_index - curLen + 1, streakHigh, bar_index, streakLow, curLen, curBull, curCol, boxArray, labelArray)
+
+    // 2. Highlight Historical Matches
+    int startIdx = math.max(0, streakArray.size() - lookbackInput)
+    int boxCount = 0
+    if streakArray.size() > 0
+        for i = streakArray.size() - 1 to startIdx
+            Streak s = streakArray.get(i)
+            if s.isBullish == curBull and s.length >= curLen
+                color boxCol = curBull ? BULL_COLOR : BEAR_COLOR
+                addOverlay(s.startIndex, s.highRange, s.endIndex, s.lowRange, s.length, s.isBullish, boxCol, boxArray, labelArray)
+
+                boxCount += 1
+                if boxCount >= 100
+                    break
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var parsedDashboardPosition = switch dashboardPositionInput
+    TOP_RIGHT    => position.top_right
+    BOTTOM_RIGHT => position.bottom_right
+    BOTTOM_LEFT  => position.bottom_left
+
+var parsedDashboardSize = switch dashboardSizeInput
+    TINY   => size.tiny
+    SMALL  => size.small
+    NORMAL => size.normal
+    LARGE  => size.large
+    HUGE   => size.huge
+
+cell(table t, int c, int r, string txt, color clr = #FFFFFF, align = text.align_right, color bg = na) => 
+    t.cell(c, r, txt, text_color = clr, text_size = parsedDashboardSize, text_halign = align, bgcolor = bg)
+
+divider(table t, int r, int lastC) =>    
+    t.merge_cells(0, r, lastC, r)
+    cell(t, 0, r, "━━━━━━━━━━━━━━━━━━━━━━", align = text.align_center, bg = na, clr = BORDERS)
+
+if dashboardInput and barstate.islast
+    int rows = showLongerStats ? 19 : 12
+    var table t = table.new(parsedDashboardPosition, 2, rows, bgcolor = BACKGROUND, frame_color = BORDERS, frame_width = 1)
+    
+    color themeColor = curLen == 0 ? DATA : (curBull ? BULL_COLOR : BEAR_COLOR)
+    string trendName = curLen == 0 ? "Neutral" : (curBull ? "Up" : "Down")
+    bool unprecedented = countExact == 0 and curLen > 0
+
+    cell(t, 0, 0, "Historical Analysis", themeColor, text.align_center)
+    t.merge_cells(0, 0, 1, 0)
+    
+    divider(t, 1, 1)
+    cell(t, 0, 2, "Current Streak", HEADERS, text.align_left)
+    cell(t, 1, 2, trendName, themeColor)
+    cell(t, 0, 3, "Streak Length", HEADERS, text.align_left)
+    cell(t, 1, 3, str.tostring(curLen) + " bars", DATA)
+    cell(t, 0, 4, "Continue Prob.", HEADERS, text.align_left)
+    cell(t, 1, 4, unprecedented ? "N/A" : str.format("{0,number,#.##}%", continueProb), DATA)
+    cell(t, 0, 5, "Reversal Prob.", HEADERS, text.align_left)
+    cell(t, 1, 5, unprecedented ? "N/A" : str.format("{0,number,#.##}%", reversalProb), DATA)
+    
+    divider(t, 6, 1)
+    cell(t, 0, 7, "Current Streak Stats", themeColor, text.align_left)
+    t.merge_cells(0, 7, 1, 7)
+    cell(t, 0, 8, "Avg Stage %", HEADERS, text.align_left)
+    cell(t, 1, 8, unprecedented ? "UNPRECEDENTED" : str.format("{0,number,#.##}%", avgMoveExact), DATA)
+    cell(t, 0, 9, "Max Stage %", HEADERS, text.align_left)
+    cell(t, 1, 9, unprecedented ? "UNPRECEDENTED" : str.format("{0,number,#.##}%", maxMoveExact == -1 ? 0 : maxMoveExact), DATA)
+    cell(t, 0, 10, "Min Stage %", HEADERS, text.align_left)
+    cell(t, 1, 10, unprecedented ? "UNPRECEDENTED" : str.format("{0,number,#.##}%", minMoveExact == 1.0e10 ? 0 : minMoveExact), DATA)
+    cell(t, 0, 11, "Historical Count", HEADERS, text.align_left)
+    cell(t, 1, 11, str.tostring(countExact), DATA)
+
+    if showLongerStats
+        divider(t, 12, 1)
+        cell(t, 0, 13, "Continued Streak Outcomes (" + str.tostring(curLen) + "+)", themeColor, text.align_left)
+        t.merge_cells(0, 13, 1, 13)
+        cell(t, 0, 14, "Avg Outcome %", HEADERS, text.align_left)
+        cell(t, 1, 14, unprecedented ? "UNPRECEDENTED" : str.format("{0,number,#.##}%", avgMoveLonger), DATA)
+        cell(t, 0, 15, "Max Outcome %", HEADERS, text.align_left)
+        cell(t, 1, 15, unprecedented ? "UNPRECEDENTED" : str.format("{0,number,#.##}%", maxMoveLonger == -1 ? 0 : maxMoveLonger), DATA)
+        cell(t, 0, 16, "Min Outcome %", HEADERS, text.align_left)
+        cell(t, 1, 16, unprecedented ? "UNPRECEDENTED" : str.format("{0,number,#.##}%", minMoveLonger == 1.0e10 ? 0 : minMoveLonger), DATA)
+        cell(t, 0, 17, "Historical Count", HEADERS, text.align_left)
+        cell(t, 1, 17, str.tostring(countLonger), DATA)
+        cell(t, 0, 18, "Longest Detectable Streak Date", HEADERS, text.align_left)
+        cell(t, 1, 18, longestDate, DATA)
+
+//---------------------------------------------------------------------------------------------------------------------}

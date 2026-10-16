@@ -1,0 +1,368 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Rainbow MA Stack", shorttitle = "Rainbow MA Stack", overlay = true)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+MODE_RECURSIVE = "Recursive (Widner)"
+MODE_STEPPED   = "Stepped Lengths"
+MODE_FIB       = "Fibonacci Lengths"
+
+SMA_TYPE  = "SMA"
+EMA_TYPE  = "EMA"
+VWMA_TYPE = "VWMA"
+
+TOP_RIGHT    = "Top Right"
+TOP_LEFT     = "Top Left"
+BOTTOM_RIGHT = "Bottom Right"
+BOTTOM_LEFT  = "Bottom Left"
+
+TINY_SIZE   = "Tiny"
+SMALL_SIZE  = "Small"
+NORMAL_SIZE = "Normal"
+
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+NEUTRAL_COLOR = #787b86
+GOLD_COLOR    = #ffd700 // rainbow stop - shortest (fastest) line
+ORANGE_COLOR  = #ff9800 // rainbow stop
+PURPLE_COLOR  = #ab47bc // rainbow stop
+SLATE_COLOR   = #4c4f58 // rainbow stop - longest (slowest) line recedes into structure
+ACCENT_COLOR  = #ff9800 // dashboard highlight for compression / expansion extremes
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+constructionInput = input.string(MODE_RECURSIVE, "Construction", options = [MODE_RECURSIVE, MODE_STEPPED, MODE_FIB], group = "Settings",
+     tooltip = "How the rainbow is built. Recursive (Widner) follows the original 1997 Rainbow Charts: line 1 is a short simple average of the source and every further line re-smooths the previous line, so the inner lines hug price while the outer ones carry progressively longer effective lag. Stepped Lengths runs the selected average family over evenly spaced lookbacks. Fibonacci Lengths spaces the lookbacks on the Fibonacci sequence (2, 3, 5, 8, 13, 21, 34, 55, 89, 144).")
+
+countInput = input.int(10, "Number of Lines", minval = 2, maxval = 10, group = "Settings",
+     tooltip = "How many averages form the stack. Widner's original construction uses 10, and the count is a readability choice: fewer lines make crossings easier to see, more lines render compression and expansion more smoothly.")
+
+sourceInput = input.source(close, "Source", group = "Settings",
+     tooltip = "Price series every line of the stack is computed from.")
+
+recursiveLengthInput = input.int(2, "Recursive Smoothing Length", minval = 1, group = "Settings",
+     tooltip = "Period of the simple average applied at every recursion step of the Recursive (Widner) construction. The published construction starts from a 2-period average of price and smooths it again and again, so 2 is the default.")
+
+maTypeInput = input.string(SMA_TYPE, "Average Family", options = [SMA_TYPE, EMA_TYPE, VWMA_TYPE], group = "Settings",
+     tooltip = "Average family used by the Stepped and Fibonacci constructions. The whole stack stays same-type, since mixing families muddies the read: crossings would reflect construction differences as much as market behavior. EMA stacks turn faster at the short end; VWMA stacks discount low-participation drift. The Recursive construction is SMA-of-SMA by definition and ignores this setting.")
+
+shortestLengthInput = input.int(10, "Shortest Length", minval = 2, inline = "stepped", group = "Settings",
+     tooltip = "Lookback of the fastest line in the Stepped Lengths construction.")
+
+lengthStepInput = input.int(10, "Step", minval = 1, inline = "stepped", group = "Settings",
+     tooltip = "Lookback increment between consecutive lines in the Stepped Lengths construction. The defaults give the classic 10 through 100 set.")
+
+rankLookbackInput = input.int(200, "Width Rank Lookback", minval = 20, group = "Regime",
+     tooltip = "Number of past bars the band's current width (top line to bottom line, as a share of price) is ranked against. Compression and expansion extremes are defined on this percentile rank, so the read adapts to each market's own geometry.")
+
+compressionThresholdInput = input.int(10, "Compression Threshold %", minval = 1, maxval = 49, group = "Regime",
+     tooltip = "Width percentile at or below which the stack counts as knotted. Falling under it flags a compression extreme: consolidation, and the setup bars for a compression-breakout play.")
+
+expansionThresholdInput = input.int(90, "Expansion Threshold %", minval = 51, maxval = 99, group = "Regime",
+     tooltip = "Width percentile at or above which the fan counts as fully expanded: horizons in strong agreement, with the band stretched wide relative to its own recent history.")
+
+showDashboardInput = input.bool(true, "Show Dashboard", group = "Dashboard",
+     tooltip = "Displays the stack's three regime reads at a glance: alignment (are the lines in length order), band width (percentile rank of the fan's width) and where price sits relative to the band.")
+
+dashboardPositionInput = input.string(TOP_RIGHT, "Location", options = [TOP_RIGHT, TOP_LEFT, BOTTOM_RIGHT, BOTTOM_LEFT], inline = "dash", group = "Dashboard",
+     tooltip = "Chart corner the dashboard is anchored to.")
+
+dashboardSizeInput = input.string(SMALL_SIZE, "Size", options = [TINY_SIZE, SMALL_SIZE, NORMAL_SIZE], inline = "dash", group = "Dashboard",
+     tooltip = "Dashboard text size.")
+
+paletteColor1Input = input.color(GOLD_COLOR, "Rainbow Palette", inline = "palette", group = "Style",
+     tooltip = "First gradient stop, coloring the shortest (fastest) line. The palette runs hot to cold from the short end to the long end of the stack.")
+
+paletteColor2Input = input.color(ORANGE_COLOR, "", inline = "palette", group = "Style",
+     tooltip = "Second gradient stop.")
+
+paletteColor3Input = input.color(PURPLE_COLOR, "", inline = "palette", group = "Style",
+     tooltip = "Middle gradient stop.")
+
+paletteColor4Input = input.color(NEUTRAL_COLOR, "", inline = "palette", group = "Style",
+     tooltip = "Fourth gradient stop.")
+
+paletteColor5Input = input.color(SLATE_COLOR, "", inline = "palette", group = "Style",
+     tooltip = "Last gradient stop, coloring the longest (slowest) line.")
+
+bullishColorInput = input.color(BULL_COLOR, "Bullish", inline = "direction", group = "Style",
+     tooltip = "Dashboard color for bullish reads: a fully stacked bullish alignment and price above the whole band.")
+
+bearishColorInput = input.color(BEAR_COLOR, "Bearish", inline = "direction", group = "Style",
+     tooltip = "Dashboard color for bearish reads: a fully stacked bearish alignment and price below the whole band.")
+
+neutralColorInput = input.color(NEUTRAL_COLOR, "Neutral", inline = "direction", group = "Style",
+     tooltip = "Color of the ribbon fill while the lines are braided out of order, and of the width metrics in the data window.")
+
+showFillInput = input.bool(true, "Ribbon Fill", inline = "fill", group = "Style",
+     tooltip = "Fills the space between consecutive lines so the stack reads as a single band: bullish color while fully stacked bullish, bearish color while fully stacked bearish, neutral while the lines are braided.")
+
+fillTransparencyInput = input.int(50, "Transparency", minval = 0, maxval = 100, inline = "fill", group = "Style",
+     tooltip = "Transparency of the ribbon fill. Higher values are fainter.")
+
+lineWidthInput = input.int(1, "Line Width", minval = 1, maxval = 3, group = "Style",
+     tooltip = "Width of every line in the stack.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Piecewise gradient across the five palette stops. Position 0 is the shortest line, position 1 the longest
+rainbowColor(float gradientPosition) =>
+    float seg = gradientPosition * 4
+    seg <= 1 ? color.from_gradient(seg, 0, 1, paletteColor1Input, paletteColor2Input) :
+       seg <= 2 ? color.from_gradient(seg, 1, 2, paletteColor2Input, paletteColor3Input) :
+       seg <= 3 ? color.from_gradient(seg, 2, 3, paletteColor3Input, paletteColor4Input) :
+       color.from_gradient(seg, 3, 4, paletteColor4Input, paletteColor5Input)
+
+// Table corner from the dashboard position option
+tableLocation(string positionText) =>
+    switch
+        positionText == TOP_RIGHT    => position.top_right
+        positionText == TOP_LEFT     => position.top_left
+        positionText == BOTTOM_RIGHT => position.bottom_right
+        => position.bottom_left
+
+// Table text size from the dashboard size option
+tableTextSize(string sizeText) =>
+    switch
+        sizeText == TINY_SIZE  => size.tiny
+        sizeText == SMALL_SIZE => size.small
+        => size.normal
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+bool recursiveMode = constructionInput == MODE_RECURSIVE
+bool fibonacciMode = constructionInput == MODE_FIB
+
+// Widner recursive chain: line 1 smooths price, every further line re-smooths the previous line
+float recursive1  = ta.sma(sourceInput, recursiveLengthInput)
+float recursive2  = ta.sma(recursive1, recursiveLengthInput)
+float recursive3  = ta.sma(recursive2, recursiveLengthInput)
+float recursive4  = ta.sma(recursive3, recursiveLengthInput)
+float recursive5  = ta.sma(recursive4, recursiveLengthInput)
+float recursive6  = ta.sma(recursive5, recursiveLengthInput)
+float recursive7  = ta.sma(recursive6, recursiveLengthInput)
+float recursive8  = ta.sma(recursive7, recursiveLengthInput)
+float recursive9  = ta.sma(recursive8, recursiveLengthInput)
+float recursive10 = ta.sma(recursive9, recursiveLengthInput)
+
+// Graduated lookbacks: evenly stepped, or spaced on the Fibonacci sequence
+int length1  = fibonacciMode ? 2   : shortestLengthInput
+int length2  = fibonacciMode ? 3   : shortestLengthInput + lengthStepInput
+int length3  = fibonacciMode ? 5   : shortestLengthInput + lengthStepInput * 2
+int length4  = fibonacciMode ? 8   : shortestLengthInput + lengthStepInput * 3
+int length5  = fibonacciMode ? 13  : shortestLengthInput + lengthStepInput * 4
+int length6  = fibonacciMode ? 21  : shortestLengthInput + lengthStepInput * 5
+int length7  = fibonacciMode ? 34  : shortestLengthInput + lengthStepInput * 6
+int length8  = fibonacciMode ? 55  : shortestLengthInput + lengthStepInput * 7
+int length9  = fibonacciMode ? 89  : shortestLengthInput + lengthStepInput * 8
+int length10 = fibonacciMode ? 144 : shortestLengthInput + lengthStepInput * 9
+
+// Every average family is computed on every bar so the selected stack stays consistent across history
+float sma1  = ta.sma(sourceInput, length1)
+float sma2  = ta.sma(sourceInput, length2)
+float sma3  = ta.sma(sourceInput, length3)
+float sma4  = ta.sma(sourceInput, length4)
+float sma5  = ta.sma(sourceInput, length5)
+float sma6  = ta.sma(sourceInput, length6)
+float sma7  = ta.sma(sourceInput, length7)
+float sma8  = ta.sma(sourceInput, length8)
+float sma9  = ta.sma(sourceInput, length9)
+float sma10 = ta.sma(sourceInput, length10)
+
+float ema1  = ta.ema(sourceInput, length1)
+float ema2  = ta.ema(sourceInput, length2)
+float ema3  = ta.ema(sourceInput, length3)
+float ema4  = ta.ema(sourceInput, length4)
+float ema5  = ta.ema(sourceInput, length5)
+float ema6  = ta.ema(sourceInput, length6)
+float ema7  = ta.ema(sourceInput, length7)
+float ema8  = ta.ema(sourceInput, length8)
+float ema9  = ta.ema(sourceInput, length9)
+float ema10 = ta.ema(sourceInput, length10)
+
+float vwma1  = ta.vwma(sourceInput, length1)
+float vwma2  = ta.vwma(sourceInput, length2)
+float vwma3  = ta.vwma(sourceInput, length3)
+float vwma4  = ta.vwma(sourceInput, length4)
+float vwma5  = ta.vwma(sourceInput, length5)
+float vwma6  = ta.vwma(sourceInput, length6)
+float vwma7  = ta.vwma(sourceInput, length7)
+float vwma8  = ta.vwma(sourceInput, length8)
+float vwma9  = ta.vwma(sourceInput, length9)
+float vwma10 = ta.vwma(sourceInput, length10)
+
+float stepped1  = maTypeInput == EMA_TYPE ? ema1  : maTypeInput == VWMA_TYPE ? vwma1  : sma1
+float stepped2  = maTypeInput == EMA_TYPE ? ema2  : maTypeInput == VWMA_TYPE ? vwma2  : sma2
+float stepped3  = maTypeInput == EMA_TYPE ? ema3  : maTypeInput == VWMA_TYPE ? vwma3  : sma3
+float stepped4  = maTypeInput == EMA_TYPE ? ema4  : maTypeInput == VWMA_TYPE ? vwma4  : sma4
+float stepped5  = maTypeInput == EMA_TYPE ? ema5  : maTypeInput == VWMA_TYPE ? vwma5  : sma5
+float stepped6  = maTypeInput == EMA_TYPE ? ema6  : maTypeInput == VWMA_TYPE ? vwma6  : sma6
+float stepped7  = maTypeInput == EMA_TYPE ? ema7  : maTypeInput == VWMA_TYPE ? vwma7  : sma7
+float stepped8  = maTypeInput == EMA_TYPE ? ema8  : maTypeInput == VWMA_TYPE ? vwma8  : sma8
+float stepped9  = maTypeInput == EMA_TYPE ? ema9  : maTypeInput == VWMA_TYPE ? vwma9  : sma9
+float stepped10 = maTypeInput == EMA_TYPE ? ema10 : maTypeInput == VWMA_TYPE ? vwma10 : sma10
+
+// Active stack: chosen construction, na beyond the selected line count
+float stackMa1  = recursiveMode ? recursive1 : stepped1
+float stackMa2  = countInput >= 2  ? (recursiveMode ? recursive2  : stepped2)  : na
+float stackMa3  = countInput >= 3  ? (recursiveMode ? recursive3  : stepped3)  : na
+float stackMa4  = countInput >= 4  ? (recursiveMode ? recursive4  : stepped4)  : na
+float stackMa5  = countInput >= 5  ? (recursiveMode ? recursive5  : stepped5)  : na
+float stackMa6  = countInput >= 6  ? (recursiveMode ? recursive6  : stepped6)  : na
+float stackMa7  = countInput >= 7  ? (recursiveMode ? recursive7  : stepped7)  : na
+float stackMa8  = countInput >= 8  ? (recursiveMode ? recursive8  : stepped8)  : na
+float stackMa9  = countInput >= 9  ? (recursiveMode ? recursive9  : stepped9)  : na
+float stackMa10 = countInput >= 10 ? (recursiveMode ? recursive10 : stepped10) : na
+
+// Stack geometry: band extremes and the count of correctly ordered adjacent pairs
+float[] stackArray = array.from(stackMa1, stackMa2, stackMa3, stackMa4, stackMa5, stackMa6, stackMa7, stackMa8, stackMa9, stackMa10)
+
+float bandTop    = na
+float bandBottom = na
+int   bullPairs  = 0
+int   bearPairs  = 0
+bool  stackValid = true
+
+for i = 0 to countInput - 1
+    float lineValue = array.get(stackArray, i)
+    if na(lineValue)
+        stackValid := false
+    else
+        bandTop    := na(bandTop)    ? lineValue : math.max(bandTop, lineValue)
+        bandBottom := na(bandBottom) ? lineValue : math.min(bandBottom, lineValue)
+    if i < countInput - 1
+        float slowerLine = array.get(stackArray, i + 1)
+        if not na(lineValue) and not na(slowerLine)
+            if lineValue > slowerLine
+                bullPairs += 1
+            else if lineValue < slowerLine
+                bearPairs += 1
+
+if not stackValid
+    bandTop    := na
+    bandBottom := na
+
+// Band width as a share of price, ranked against its own recent history
+float bandWidthPct = stackValid ? (bandTop - bandBottom) / close * 100 : na
+float widthRank    = ta.percentrank(bandWidthPct, rankLookbackInput)
+
+// Full-stack alignment: every adjacent pair in length order
+bool fullBullStack = stackValid and bullPairs == countInput - 1
+bool fullBearStack = stackValid and bearPairs == countInput - 1
+
+// Key events
+bool bullishStackFormed = fullBullStack and not fullBullStack[1]
+bool bearishStackFormed = fullBearStack and not fullBearStack[1]
+bool alignmentLost      = not fullBullStack and not fullBearStack and (fullBullStack[1] or fullBearStack[1])
+
+bool compressionExtreme = ta.crossunder(widthRank, compressionThresholdInput)
+bool expansionExtreme   = ta.crossover(widthRank, expansionThresholdInput)
+bool closeAboveStack    = ta.crossover(close, bandTop)
+bool closeBelowStack    = ta.crossunder(close, bandBottom)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+float gradientSpan = math.max(countInput - 1, 1)
+
+color lineColor1  = rainbowColor(0 / gradientSpan)
+color lineColor2  = rainbowColor(1 / gradientSpan)
+color lineColor3  = rainbowColor(2 / gradientSpan)
+color lineColor4  = rainbowColor(3 / gradientSpan)
+color lineColor5  = rainbowColor(4 / gradientSpan)
+color lineColor6  = rainbowColor(5 / gradientSpan)
+color lineColor7  = rainbowColor(6 / gradientSpan)
+color lineColor8  = rainbowColor(7 / gradientSpan)
+color lineColor9  = rainbowColor(8 / gradientSpan)
+color lineColor10 = rainbowColor(9 / gradientSpan)
+
+color ribbonColor = fullBullStack ? bullishColorInput : fullBearStack ? bearishColorInput : neutralColorInput
+
+color fillColor1 = showFillInput and countInput >= 2  ? color.new(ribbonColor, fillTransparencyInput) : na
+color fillColor2 = showFillInput and countInput >= 3  ? color.new(ribbonColor, fillTransparencyInput) : na
+color fillColor3 = showFillInput and countInput >= 4  ? color.new(ribbonColor, fillTransparencyInput) : na
+color fillColor4 = showFillInput and countInput >= 5  ? color.new(ribbonColor, fillTransparencyInput) : na
+color fillColor5 = showFillInput and countInput >= 6  ? color.new(ribbonColor, fillTransparencyInput) : na
+color fillColor6 = showFillInput and countInput >= 7  ? color.new(ribbonColor, fillTransparencyInput) : na
+color fillColor7 = showFillInput and countInput >= 8  ? color.new(ribbonColor, fillTransparencyInput) : na
+color fillColor8 = showFillInput and countInput >= 9  ? color.new(ribbonColor, fillTransparencyInput) : na
+color fillColor9 = showFillInput and countInput >= 10 ? color.new(ribbonColor, fillTransparencyInput) : na
+
+ma1PlotId  = plot(stackMa1,  "MA 1 (Shortest)", color = lineColor1,  linewidth = lineWidthInput)
+ma2PlotId  = plot(stackMa2,  "MA 2",            color = lineColor2,  linewidth = lineWidthInput)
+ma3PlotId  = plot(stackMa3,  "MA 3",            color = lineColor3,  linewidth = lineWidthInput)
+ma4PlotId  = plot(stackMa4,  "MA 4",            color = lineColor4,  linewidth = lineWidthInput)
+ma5PlotId  = plot(stackMa5,  "MA 5",            color = lineColor5,  linewidth = lineWidthInput)
+ma6PlotId  = plot(stackMa6,  "MA 6",            color = lineColor6,  linewidth = lineWidthInput)
+ma7PlotId  = plot(stackMa7,  "MA 7",            color = lineColor7,  linewidth = lineWidthInput)
+ma8PlotId  = plot(stackMa8,  "MA 8",            color = lineColor8,  linewidth = lineWidthInput)
+ma9PlotId  = plot(stackMa9,  "MA 9",            color = lineColor9,  linewidth = lineWidthInput)
+ma10PlotId = plot(stackMa10, "MA 10 (Longest)", color = lineColor10, linewidth = lineWidthInput)
+
+fill(ma1PlotId, ma2PlotId,  color = fillColor1, title = "Ribbon Fill 1")
+fill(ma2PlotId, ma3PlotId,  color = fillColor2, title = "Ribbon Fill 2")
+fill(ma3PlotId, ma4PlotId,  color = fillColor3, title = "Ribbon Fill 3")
+fill(ma4PlotId, ma5PlotId,  color = fillColor4, title = "Ribbon Fill 4")
+fill(ma5PlotId, ma6PlotId,  color = fillColor5, title = "Ribbon Fill 5")
+fill(ma6PlotId, ma7PlotId,  color = fillColor6, title = "Ribbon Fill 6")
+fill(ma7PlotId, ma8PlotId,  color = fillColor7, title = "Ribbon Fill 7")
+fill(ma8PlotId, ma9PlotId,  color = fillColor8, title = "Ribbon Fill 8")
+fill(ma9PlotId, ma10PlotId, color = fillColor9, title = "Ribbon Fill 9")
+
+// Quantified regime reads, exposed in the data window for systems that consume the stack as an input
+plot(bandWidthPct, "Band Width % of Price", color = neutralColorInput, display = display.data_window)
+plot(widthRank, "Band Width Percentile", color = neutralColorInput, display = display.data_window)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dashboardTable = na
+
+if barstate.islast and showDashboardInput
+    if na(dashboardTable)
+        dashboardTable := table.new(tableLocation(dashboardPositionInput), 2, 3, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+    string textSize   = tableTextSize(dashboardSizeInput)
+    color  labelColor = DASH_HEADER
+
+    string alignmentText  = not stackValid ? "n/a" : (fullBullStack ? "Stacked Bullish " : fullBearStack ? "Stacked Bearish " : "Mixed ") + str.tostring(math.max(bullPairs, bearPairs)) + "/" + str.tostring(countInput - 1)
+    color  alignmentColor = fullBullStack ? bullishColorInput : fullBearStack ? bearishColorInput : DASH_TEXT
+
+    string widthText  = na(widthRank) ? "n/a" : (widthRank <= compressionThresholdInput ? "Knotted " : widthRank >= expansionThresholdInput ? "Fanned " : "Normal ") + str.tostring(widthRank, "#") + "%"
+    color  widthColor = not na(widthRank) and (widthRank <= compressionThresholdInput or widthRank >= expansionThresholdInput) ? ACCENT_COLOR : DASH_TEXT
+
+    float  bandSpan   = stackValid ? math.max(bandTop - bandBottom, syminfo.mintick) : na
+    float  priceDepth = stackValid ? (close - bandBottom) / bandSpan * 100 : na
+    string priceText  = not stackValid ? "n/a" : close > bandTop ? "Above Band" : close < bandBottom ? "Below Band" : str.tostring(priceDepth, "#") + "% of band"
+    color  priceColor = not stackValid ? DASH_TEXT : close > bandTop ? bullishColorInput : close < bandBottom ? bearishColorInput : DASH_TEXT
+
+    table.cell(dashboardTable, 0, 0, "Alignment", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 0, alignmentText, text_color = alignmentColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 1, "Band Width", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 1, widthText, text_color = widthColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 2, "Price", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 2, priceText, text_color = priceColor, text_size = textSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(bullishStackFormed, "Bullish Stack Formed", "Rainbow MA Stack: full bullish alignment gained - every line in length order with the shortest on top on {{ticker}} ({{interval}})")
+alertcondition(bearishStackFormed, "Bearish Stack Formed", "Rainbow MA Stack: full bearish alignment gained - every line in length order with the shortest on the bottom on {{ticker}} ({{interval}})")
+alertcondition(alignmentLost, "Full Stack Alignment Lost", "Rainbow MA Stack: full alignment lost - the lines are braiding out of length order on {{ticker}} ({{interval}})")
+alertcondition(compressionExtreme, "Compression Extreme", "Rainbow MA Stack: band width fell to a compression extreme - the stack is knotted, watch the first sustained expansion out of it on {{ticker}} ({{interval}})")
+alertcondition(expansionExtreme, "Expansion Extreme", "Rainbow MA Stack: band width reached an expansion extreme - the fan is fully spread on {{ticker}} ({{interval}})")
+alertcondition(closeAboveStack, "Price Crossed Above Stack", "Rainbow MA Stack: price closed through the entire stack to the upside on {{ticker}} ({{interval}})")
+alertcondition(closeBelowStack, "Price Crossed Below Stack", "Rainbow MA Stack: price closed through the entire stack to the downside on {{ticker}} ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

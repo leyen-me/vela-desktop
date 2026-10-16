@@ -1,0 +1,389 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Volatility Cones", "Volatility Cones", overlay = false, format = format.percent,
+  precision = 2, max_lines_count = 100, max_labels_count = 100)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR    = #089981 // depressed side of the cone - lower band, historically cheap volatility
+BEAR_COLOR    = #f23645 // rich side of the cone - upper band, historically expensive volatility
+NEUTRAL_COLOR = #787b86 // cone structure - percentile curves, median, tags
+CURRENT_COLOR = #ff9800 // the one accent - current realized volatility profile
+IV_COLOR      = #ab47bc // implied volatility entries, kept distinct from the realized profile
+HIDDEN_COLOR  = #00000000
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+OUTER_FILL_TRANSP = 90
+INNER_FILL_TRANSP = 88
+
+// Minimum rolling-volatility observations a horizon must collect before its percentiles are drawn
+MIN_SAMPLES = 10
+
+CONE_GROUP    = "Cone"
+CURRENT_GROUP = "Current Readings"
+DISPLAY_GROUP = "Display"
+STYLE_GROUP   = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+horizonTip = "Measurement horizon 'h' in bars (trading days on a daily chart). Rolling realized volatility is computed over this window, then summarized by percentiles to form one column of the cone. Published defaults are 20, 40, 60, 90 and 120."
+
+h1Input = input.int(20, "Horizon 1", minval = 2, maxval = 500, group = CONE_GROUP, tooltip = horizonTip)
+h2Input = input.int(40, "Horizon 2", minval = 2, maxval = 500, group = CONE_GROUP, tooltip = horizonTip)
+h3Input = input.int(60, "Horizon 3", minval = 2, maxval = 500, group = CONE_GROUP, tooltip = horizonTip)
+h4Input = input.int(90, "Horizon 4", minval = 2, maxval = 500, group = CONE_GROUP, tooltip = horizonTip)
+h5Input = input.int(120, "Horizon 5", minval = 2, maxval = 500, group = CONE_GROUP, tooltip = horizonTip)
+
+sampleInput = input.int(504, "Sample Length", minval = 30, maxval = 5000, group = CONE_GROUP,
+  tooltip = "Number of most recent rolling-volatility observations kept per horizon to build the percentiles. 504 daily bars is about two years; common practice is two to five years (504-1260). Rolling windows overlap, so the extreme percentiles are less statistically reliable than they look.")
+
+annualInput = input.float(252, "Annualization Factor", minval = 1, group = CONE_GROUP,
+  tooltip = "Periods per year used to annualize volatility. 252 fits daily bars; use 52 for weekly, 12 for monthly, or bars-per-session x 252 for intraday charts (mind session effects and overnight gaps).")
+
+demeanInput = input.bool(false, "Subtract Mean Return", group = CONE_GROUP,
+  tooltip = "Subtract the mean return inside each window (a variance-based estimate) instead of summing raw squared returns. Off matches the classic zero-mean construction.")
+
+lowerInput = input.float(25, "Lower Percentile", minval = 1, maxval = 49, group = CONE_GROUP,
+  tooltip = "Percentile drawn as the cone's lower band (25 = the classic lower quartile). Readings below it are historically depressed for their horizon.")
+
+upperInput = input.float(75, "Upper Percentile", minval = 51, maxval = 99, group = CONE_GROUP,
+  tooltip = "Percentile drawn as the cone's upper band (75 = the classic upper quartile). Readings above it are historically rich for their horizon.")
+
+showCurrentInput = input.bool(true, "Show Current Realized Volatility", group = CURRENT_GROUP,
+  tooltip = "Mark the latest realized volatility of each horizon as a point at its position inside the cone.")
+
+connectInput = input.bool(true, "Connect Current Readings", group = CURRENT_GROUP,
+  tooltip = "Join the current readings with a thin line so their profile across horizons is easier to compare.")
+
+showIvInput = input.bool(false, "Show Implied Volatility Entries", group = CURRENT_GROUP,
+  tooltip = "Overlay manually entered implied volatilities as diamonds - the classic options application. TradingView supplies no option-chain data, so the values are typed in below; a diamond near the cone top means premium is historically rich for that horizon, near the bottom cheap.")
+
+ivTip = "Annualized implied volatility, in percent, for options maturing near this horizon. Set 0 to hide the marker."
+
+iv1Input = input.float(0, "IV @ Horizon 1", minval = 0, step = 0.5, group = CURRENT_GROUP, tooltip = ivTip)
+iv2Input = input.float(0, "IV @ Horizon 2", minval = 0, step = 0.5, group = CURRENT_GROUP, tooltip = ivTip)
+iv3Input = input.float(0, "IV @ Horizon 3", minval = 0, step = 0.5, group = CURRENT_GROUP, tooltip = ivTip)
+iv4Input = input.float(0, "IV @ Horizon 4", minval = 0, step = 0.5, group = CURRENT_GROUP, tooltip = ivTip)
+iv5Input = input.float(0, "IV @ Horizon 5", minval = 0, step = 0.5, group = CURRENT_GROUP, tooltip = ivTip)
+
+coneWidthInput = input.int(120, "Cone Width (bars)", minval = 10, maxval = 480, group = DISPLAY_GROUP,
+  tooltip = "Horizontal size of the cone drawing, in bars. Horizons are spaced along this width proportionally to their length.")
+
+coneOffsetInput = input.int(0, "Rightward Offset (bars)", minval = 0, maxval = 300, group = DISPLAY_GROUP,
+  tooltip = "Shifts the cone's right edge into the empty space to the right of the last bar. 0 anchors the cone to the last bar.")
+
+showTableInput = input.bool(true, "Show Dashboard", group = DISPLAY_GROUP,
+  tooltip = "Summarize each horizon: sample size, current realized volatility, cone median, percentile rank of the current reading, and its position inside the cone.")
+
+tablePosInput = input.string("Top Right", "Dashboard Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"],
+  group = DISPLAY_GROUP, tooltip = "Corner of the pane holding the dashboard.")
+
+tableSizeInput = input.string("Small", "Dashboard Size", options = ["Tiny", "Small", "Normal"], group = DISPLAY_GROUP,
+  tooltip = "Text size of the dashboard.")
+
+coneColorInput    = input.color(NEUTRAL_COLOR, "Cone", group = STYLE_GROUP, inline = "cone")
+fillInput         = input.bool(true, "Fill", group = STYLE_GROUP, inline = "cone")
+currentColorInput = input.color(CURRENT_COLOR, "Current Readings", group = STYLE_GROUP)
+ivColorInput      = input.color(IV_COLOR, "Implied Volatility", group = STYLE_GROUP)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types & Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// One column of the cone: a horizon, its rolling-volatility sample, and its summary statistics
+type ConeRow
+    int          h
+    array<float> smp
+    float        iv     = na
+    float        rvNow  = na
+    float        rvPrev = na
+    float        mn     = na
+    float        q1     = na
+    float        md     = na
+    float        q3     = na
+    float        mx     = na
+
+// Annualized realized volatility over the `h` log returns ending at the current bar, in percent
+f_realizedVol(int h) =>
+    float logRet = math.log(close / close[1])
+    float meanSq = ta.sma(logRet * logRet, h)
+    float varRet = ta.variance(logRet, h)
+    float basis  = demeanInput ? varRet : meanSq
+    na(basis) ? na : math.sqrt(annualInput * math.max(basis, 0)) * 100
+
+// Percent of the sample at or below `v`
+f_percentRank(array<float> smp, float v) =>
+    int   n      = array.size(smp)
+    float rank   = na
+    if n > 0 and not na(v)
+        int below = 0
+        for x in smp
+            if x <= v
+                below += 1
+        rank := 100.0 * below / n
+    rank
+
+// Rows sorted by ascending horizon, duplicates removed, keeping only horizons with enough observations
+f_sortedRows(array<ConeRow> rowsArr) =>
+    array<ConeRow> sorted = array.new<ConeRow>()
+    int n = array.size(rowsArr)
+    array<bool> used = array.new_bool(n, false)
+    for _ = 0 to n - 1
+        int bestIdx = -1
+        int bestH   = 0
+        for j = 0 to n - 1
+            if not array.get(used, j)
+                ConeRow contender = array.get(rowsArr, j)
+                if bestIdx == -1 or contender.h < bestH
+                    bestIdx := j
+                    bestH   := contender.h
+        array.set(used, bestIdx, true)
+        ConeRow candidate = array.get(rowsArr, bestIdx)
+        bool duplicate = false
+        for prior in sorted
+            if prior.h == candidate.h
+                duplicate := true
+        if not duplicate and array.size(candidate.smp) >= MIN_SAMPLES
+            array.push(sorted, candidate)
+    sorted
+
+// Draws one percentile curve as connected segments, registers them for cleanup, and returns them for fills
+f_drawCurve(array<int> xs, array<float> ys, color lineColor, string lineStyle, int lineWidth, array<line> store) =>
+    array<line> segments = array.new<line>()
+    if array.size(xs) >= 2
+        for i = 0 to array.size(xs) - 2
+            line segment = line.new(array.get(xs, i), array.get(ys, i), array.get(xs, i + 1), array.get(ys, i + 1),
+              xloc = xloc.bar_index, color = lineColor, style = lineStyle, width = lineWidth)
+            array.push(store, segment)
+            array.push(segments, segment)
+    segments
+
+// Small text tag anchored to the right of a cone line's endpoint
+f_tag(int x, float y, string txt, color txtColor, array<label> store) =>
+    array.push(store, label.new(x, y, txt, xloc = xloc.bar_index, style = label.style_label_left, color = HIDDEN_COLOR,
+      textcolor = txtColor, size = size.tiny))
+
+// Location of the current reading inside the cone, in the page's vocabulary
+f_position(ConeRow row) =>
+    string positionTxt = "-"
+    if not na(row.rvNow) and not na(row.q1)
+        positionTxt := row.rvNow > row.mx ? "Above max" : row.rvNow > row.q3 ? "Rich" : row.rvNow < row.mn ? "Below min" :
+          row.rvNow < row.q1 ? "Depressed" : "Mid"
+    positionTxt
+
+f_fmt(float v) =>
+    na(v) ? "-" : str.tostring(v, "0.00") + "%"
+
+f_tablePos(string s) =>
+    switch s
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        "Bottom Left"  => position.bottom_left
+        => position.top_right
+
+f_textSize(string s) =>
+    switch s
+        "Tiny"   => size.tiny
+        "Normal" => size.normal
+        => size.small
+
+f_initRows() =>
+    array<ConeRow> rowsArr = array.new<ConeRow>()
+    array.push(rowsArr, ConeRow.new(h1Input, array.new_float(), iv1Input))
+    array.push(rowsArr, ConeRow.new(h2Input, array.new_float(), iv2Input))
+    array.push(rowsArr, ConeRow.new(h3Input, array.new_float(), iv3Input))
+    array.push(rowsArr, ConeRow.new(h4Input, array.new_float(), iv4Input))
+    array.push(rowsArr, ConeRow.new(h5Input, array.new_float(), iv5Input))
+    rowsArr
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+var array<ConeRow> coneRows = f_initRows()
+
+rv1 = f_realizedVol(h1Input)
+rv2 = f_realizedVol(h2Input)
+rv3 = f_realizedVol(h3Input)
+rv4 = f_realizedVol(h4Input)
+rv5 = f_realizedVol(h5Input)
+
+rvNowVals  = array.from(rv1, rv2, rv3, rv4, rv5)
+rvPrevVals = array.from(rv1[1], rv2[1], rv3[1], rv4[1], rv5[1])
+
+// The historical sample only collects confirmed bars, so realtime ticks never pollute the percentiles
+for [i, row] in coneRows
+    row.rvNow  := array.get(rvNowVals, i)
+    row.rvPrev := array.get(rvPrevVals, i)
+    if barstate.isconfirmed and not na(row.rvNow)
+        array.push(row.smp, row.rvNow)
+        while array.size(row.smp) > sampleInput
+            array.shift(row.smp)
+
+// Cone statistics and event detection - evaluated on the last bar and on realtime updates
+bool richCross      = false
+bool depressedCross = false
+bool aboveMaxCross  = false
+bool belowMinCross  = false
+
+if barstate.islast
+    for row in coneRows
+        if array.size(row.smp) >= MIN_SAMPLES
+            row.mn := array.min(row.smp)
+            row.mx := array.max(row.smp)
+            row.q1 := array.percentile_linear_interpolation(row.smp, lowerInput)
+            row.md := array.percentile_linear_interpolation(row.smp, 50)
+            row.q3 := array.percentile_linear_interpolation(row.smp, upperInput)
+            if not na(row.rvNow) and not na(row.rvPrev)
+                richCross      := richCross or row.rvNow > row.q3 and row.rvPrev <= row.q3
+                depressedCross := depressedCross or row.rvNow < row.q1 and row.rvPrev >= row.q1
+                aboveMaxCross  := aboveMaxCross or row.rvNow > row.mx and row.rvPrev <= row.mx
+                belowMinCross  := belowMinCross or row.rvNow < row.mn and row.rvPrev >= row.mn
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Cone Rendering & Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var array<line>     coneLines  = array.new<line>()
+var array<label>    coneLabels = array.new<label>()
+var array<linefill> coneFills  = array.new<linefill>()
+
+var table dashTable = showTableInput ? table.new(f_tablePos(tablePosInput), 6, 6, bgcolor = DASH_BG, border_width = 0,
+  frame_color = DASH_FRAME, frame_width = 1) : na
+
+if barstate.islast
+    for oldFill in coneFills
+        linefill.delete(oldFill)
+    array.clear(coneFills)
+    for oldLine in coneLines
+        line.delete(oldLine)
+    array.clear(coneLines)
+    for oldLabel in coneLabels
+        label.delete(oldLabel)
+    array.clear(coneLabels)
+
+    array<ConeRow> drawRows = f_sortedRows(coneRows)
+    int nRows = array.size(drawRows)
+
+    if nRows == 0
+        array.push(coneLabels, label.new(bar_index, 0.0, "Volatility cones: waiting for enough history",
+          xloc = xloc.bar_index, style = label.style_label_left, color = HIDDEN_COLOR,
+          textcolor = NEUTRAL_COLOR, size = size.small))
+    else
+        // Horizontal mapping: horizons are laid out proportionally along the cone width, ending at the offset anchor
+        ConeRow firstRow = array.first(drawRows)
+        ConeRow lastRow  = array.last(drawRows)
+        int hFirst   = firstRow.h
+        int hLast    = lastRow.h
+        int hSpan    = hLast - hFirst
+        int xEnd     = bar_index + coneOffsetInput
+        int effWidth = math.max(math.min(coneWidthInput, xEnd), 1)
+        int xStart   = xEnd - effWidth
+
+        array<int>   xsArr  = array.new_int()
+        array<float> mnVals = array.new_float()
+        array<float> q1Vals = array.new_float()
+        array<float> mdVals = array.new_float()
+        array<float> q3Vals = array.new_float()
+        array<float> mxVals = array.new_float()
+
+        for row in drawRows
+            array.push(xsArr, hSpan > 0 ? xStart + math.round(effWidth * (row.h - hFirst) / float(hSpan)) : (xStart + xEnd) / 2)
+            array.push(mnVals, row.mn)
+            array.push(q1Vals, row.q1)
+            array.push(mdVals, row.md)
+            array.push(q3Vals, row.q3)
+            array.push(mxVals, row.mx)
+
+        if nRows >= 2
+            array<line> mnSegs = f_drawCurve(xsArr, mnVals, color.new(coneColorInput, 25), line.style_dotted, 1, coneLines)
+            array<line> q1Segs = f_drawCurve(xsArr, q1Vals, color.new(coneColorInput, 10), line.style_dashed, 1, coneLines)
+            array<line> q3Segs = f_drawCurve(xsArr, q3Vals, color.new(coneColorInput, 10), line.style_dashed, 1, coneLines)
+            array<line> mxSegs = f_drawCurve(xsArr, mxVals, color.new(coneColorInput, 25), line.style_dotted, 1, coneLines)
+            array<line> mdSegs = f_drawCurve(xsArr, mdVals, coneColorInput, line.style_solid, 2, coneLines)
+
+            if fillInput
+                for i = 0 to array.size(mdSegs) - 1
+                    array.push(coneFills, linefill.new(array.get(mnSegs, i), array.get(q1Segs, i), color.new(BULL_COLOR, OUTER_FILL_TRANSP)))
+                    array.push(coneFills, linefill.new(array.get(q1Segs, i), array.get(q3Segs, i), color.new(coneColorInput, INNER_FILL_TRANSP)))
+                    array.push(coneFills, linefill.new(array.get(q3Segs, i), array.get(mxSegs, i), color.new(BEAR_COLOR, OUTER_FILL_TRANSP)))
+
+            int   xTag   = array.last(xsArr)
+            color tagCol = color.new(coneColorInput, 15)
+            f_tag(xTag, array.last(mxVals), "Max", tagCol, coneLabels)
+            f_tag(xTag, array.last(q3Vals), "P" + str.tostring(math.round(upperInput)), tagCol, coneLabels)
+            f_tag(xTag, array.last(mdVals), "Med", tagCol, coneLabels)
+            f_tag(xTag, array.last(q1Vals), "P" + str.tostring(math.round(lowerInput)), tagCol, coneLabels)
+            f_tag(xTag, array.last(mnVals), "Min", tagCol, coneLabels)
+
+        // Horizon axis annotations under the cone floor
+        for [i, row] in drawRows
+            array.push(coneLabels, label.new(array.get(xsArr, i), row.mn, str.tostring(row.h), xloc = xloc.bar_index,
+              style = label.style_label_up, color = HIDDEN_COLOR, textcolor = DASH_HEADER,
+              size = size.tiny, tooltip = "Horizon: " + str.tostring(row.h) + " bars"))
+
+        // Current realized volatility, one point per horizon, optionally joined into a profile
+        if showCurrentInput
+            int   prevX = -1
+            float prevY = na
+            for [i, row] in drawRows
+                if not na(row.rvNow)
+                    int xCur = array.get(xsArr, i)
+                    array.push(coneLabels, label.new(xCur, row.rvNow, "", xloc = xloc.bar_index, style = label.style_circle,
+                      color = currentColorInput, size = size.tiny,
+                      tooltip = "Current RV (" + str.tostring(row.h) + "): " + f_fmt(row.rvNow)))
+                    if connectInput and prevX >= 0
+                        array.push(coneLines, line.new(prevX, prevY, xCur, row.rvNow, xloc = xloc.bar_index,
+                          color = color.new(currentColorInput, 35), style = line.style_solid, width = 1))
+                    prevX := xCur
+                    prevY := row.rvNow
+
+        // Manually entered implied volatilities for maturities matching each horizon
+        if showIvInput
+            for [i, row] in drawRows
+                if row.iv > 0
+                    array.push(coneLabels, label.new(array.get(xsArr, i), row.iv, "", xloc = xloc.bar_index,
+                      style = label.style_diamond, color = ivColorInput, size = size.tiny,
+                      tooltip = "Implied volatility (" + str.tostring(row.h) + "): " + f_fmt(row.iv)))
+
+        if showTableInput
+            string txtSize = f_textSize(tableSizeInput)
+            table.cell(dashTable, 0, 0, "Horizon", text_color = DASH_HEADER, text_size = txtSize)
+            table.cell(dashTable, 1, 0, "Sample", text_color = DASH_HEADER, text_size = txtSize,
+              tooltip = "Rolling-volatility observations collected for this horizon")
+            table.cell(dashTable, 2, 0, "RV", text_color = DASH_HEADER, text_size = txtSize,
+              tooltip = "Current annualized realized volatility over this horizon")
+            table.cell(dashTable, 3, 0, "Median", text_color = DASH_HEADER, text_size = txtSize,
+              tooltip = "Historical median of the rolling volatility at this horizon")
+            table.cell(dashTable, 4, 0, "Rank", text_color = DASH_HEADER, text_size = txtSize,
+              tooltip = "Percent of the sample at or below the current reading")
+            table.cell(dashTable, 5, 0, "Position", text_color = DASH_HEADER, text_size = txtSize,
+              tooltip = "Location inside the cone: above the upper percentile is historically rich, below the lower percentile depressed")
+            for [i, row] in drawRows
+                float  rankPct  = f_percentRank(row.smp, row.rvNow)
+                string posTxt   = f_position(row)
+                // Rich readings sit on the bear side of the cone, depressed readings on the bull side
+                color  posColor = posTxt == "Rich" or posTxt == "Above max" ? BEAR_COLOR : posTxt == "Depressed" or posTxt == "Below min" ? BULL_COLOR : NEUTRAL_COLOR
+                color  rankColor = na(rankPct) ? DASH_TEXT : rankPct <= 50 ? color.from_gradient(rankPct, lowerInput, 50, BULL_COLOR, NEUTRAL_COLOR) : color.from_gradient(rankPct, 50, upperInput, NEUTRAL_COLOR, BEAR_COLOR)
+                table.cell(dashTable, 0, i + 1, str.tostring(row.h), text_color = DASH_TEXT, text_size = txtSize)
+                table.cell(dashTable, 1, i + 1, str.tostring(array.size(row.smp)), text_color = DASH_TEXT, text_size = txtSize)
+                table.cell(dashTable, 2, i + 1, f_fmt(row.rvNow), text_color = currentColorInput, text_size = txtSize)
+                table.cell(dashTable, 3, i + 1, f_fmt(row.md), text_color = DASH_TEXT, text_size = txtSize)
+                table.cell(dashTable, 4, i + 1, na(rankPct) ? "-" : str.tostring(rankPct, "#") + "%",
+                  text_color = rankColor, text_size = txtSize)
+                table.cell(dashTable, 5, i + 1, posTxt, text_color = posColor, text_size = txtSize)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(richCross, "Above Upper Percentile", "volatility cones: realized volatility crossed above its upper cone percentile (historically rich) for at least one horizon on {{ticker}} ({{interval}})")
+alertcondition(depressedCross, "Below Lower Percentile", "volatility cones: realized volatility crossed below its lower cone percentile (historically depressed) for at least one horizon on {{ticker}} ({{interval}})")
+alertcondition(aboveMaxCross, "Above Cone Maximum", "volatility cones: realized volatility exceeded its historical cone maximum for at least one horizon on {{ticker}} ({{interval}})")
+alertcondition(belowMinCross, "Below Cone Minimum", "volatility cones: realized volatility fell below its historical cone minimum for at least one horizon on {{ticker}} ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

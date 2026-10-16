@@ -1,0 +1,194 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Classic Bar Setups", "Classic Bar Setups", overlay = true, max_lines_count = 500, max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR = #089981
+BEAR_COLOR = #f23645
+BAND_COLOR = #5b9cf6
+
+OOPS_TXT   = "Oops"
+GIMMEE_TXT = "Gimmee"
+R8020_TXT  = "80-20"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+showOopsInput = input.bool(true, "Oops", group = "Oops", tooltip = "Detect Larry Williams' Oops setup: the session opens with a gap beyond the prior bar's extreme and the entry is a stop order back at that extreme, filled only if price trades back through it.")
+oopsGapInput  = input.float(0., "Minimum Gap %", minval = 0, step = 0.05, group = "Oops", tooltip = "Minimum opening gap beyond the prior bar's extreme, expressed as a percentage of that extreme's price. 0 accepts any open beyond the prior high/low.")
+
+showGimmeeInput   = input.bool(true, "Gimmee Bar", group = "Gimmee Bar", tooltip = "Detect Joe Ross' gimmee bar: inside a sideways market, a bar pressing into the range edge that closes against its own direction. Entry is a stop one tick beyond the bar's far side.")
+bbLengthInput     = input.int(20, "Bollinger Length", minval = 2, inline = "bb", group = "Gimmee Bar")
+bbMultInput       = input.float(2., "Mult", minval = 0.5, step = 0.1, inline = "bb", group = "Gimmee Bar", tooltip = "Bollinger Bands acting as the trading-range edges the gimmee bar must press into.")
+rangeFilterInput  = input.bool(true, "Sideways Market Filter", group = "Gimmee Bar", tooltip = "Only accept gimmee bars while the market is non-trending, enforcing the sideways-market context the setup requires.")
+adxLengthInput    = input.int(14, "ADX Length", minval = 1, inline = "adx", group = "Gimmee Bar")
+adxThresholdInput = input.float(20, "Threshold", minval = 5, maxval = 60, step = 1, inline = "adx", group = "Gimmee Bar", tooltip = "ADX length and the level below which the market is treated as range-bound.")
+
+show8020Input = input.bool(true, "80-20", group = "80-20", tooltip = "Detect 80-20 sessions: a full-range bar opening within the zone percentage of one extreme and closing within it of the opposite extreme. The next session is watched for a move back through the bar's far extreme.")
+zonePctInput  = input.float(20, "Open/Close Zone %", minval = 5, maxval = 40, step = 1, group = "80-20", tooltip = "Maximum distance of the open and close from their respective range extremes, as a percentage of the bar's range. The classic rule uses 10-20%.")
+
+windowInput = input.int(1, "Trigger Window (Bars)", minval = 1, maxval = 20, group = "Execution", tooltip = "Number of bars an entry stop stays working before it is cancelled - the time-stop. Oops orders work from their setup session onward, Gimmee and 80-20 orders start on the bar after the setup bar.")
+
+showLevelsInput = input.bool(true, "Show Entry Levels", group = "Style", tooltip = "Draw a dashed line at each setup's entry stop level for the life of the order.")
+showStopsInput  = input.bool(true, "Show Protective Stops", group = "Style", tooltip = "Draw a dotted line at each setup's protective stop, placed beyond the trap extreme.")
+showFillsInput  = input.bool(true, "Show Trigger Markers", group = "Style", tooltip = "Mark the bar where an entry stop is filled with a triangle.")
+showBandsInput  = input.bool(false, "Show Bollinger Channel", group = "Style", tooltip = "Display the Bollinger channel used to locate the range edges for gimmee bars.")
+bullColorInput  = input.color(BULL_COLOR, "Bullish", inline = "col", group = "Style")
+bearColorInput  = input.color(BEAR_COLOR, "Bearish", inline = "col", group = "Style", tooltip = "Colors of bullish and bearish setup labels, levels, and markers.")
+bandColorInput  = input.color(color.new(BAND_COLOR, 50), "Channel", inline = "col2", group = "Style", tooltip = "Color of the optional Bollinger channel.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Registers a setup, draws its label/levels, then works the entry stop until it fills or the time-stop cancels it.
+// - liveOnSetupBar: the order already works during the setup session itself (Oops)
+// - armFirst:       price must first trade beyond the entry level before the stop can fill (80-20)
+// Returns true on the bar where the entry stop is filled.
+manageSetup(bool setupNow, bool isBull, float entryLevel, float stopLevel, string setupName, color setupColor, int anchorOffset, bool liveOnSetupBar, bool armFirst) =>
+    var float lvl      = na
+    var float stp      = na
+    var int   left     = 0
+    var int   startBar = na
+    var bool  armed    = false
+    var line  trigLine = na
+    var line  stopLine = na
+    bool fillEvent = false
+    if barstate.isconfirmed
+        // Service an order placed on an earlier bar
+        if left > 0
+            bool hit = false
+            if armFirst
+                bool newlyArmed = not armed and (isBull ? low < lvl : high > lvl)
+                if armed
+                    hit := isBull ? high >= lvl : low <= lvl
+                else if newlyArmed
+                    hit := isBull ? (open <= lvl ? high >= lvl : close >= lvl) : (open >= lvl ? low <= lvl : close <= lvl)
+                armed := armed or newlyArmed
+            else
+                hit := isBull ? high >= lvl : low <= lvl
+            if hit
+                fillEvent := true
+                left      := 0
+                armed     := false
+                if not na(trigLine)
+                    trigLine.set_x2(bar_index)
+                if na(stp)
+                    // 80-20 stop only becomes defined at the fill: beyond the trigger-session extreme
+                    stp := isBull ? low : high
+                    if showStopsInput
+                        stopLine := line.new(startBar, stp, bar_index, stp, color = color.new(setupColor, 50), style = line.style_dotted)
+                else if not na(stopLine)
+                    stopLine.set_x2(bar_index)
+            else
+                left -= 1
+                if left == 0
+                    armed := false
+        // Register a new setup, replacing any order of the same kind still working
+        if setupNow
+            if left > 0
+                if not na(trigLine)
+                    trigLine.set_x2(bar_index)
+                if not na(stopLine)
+                    stopLine.set_x2(bar_index)
+            lvl      := entryLevel
+            stp      := stopLevel
+            armed    := false
+            left     := windowInput
+            startBar := bar_index - anchorOffset
+            int endBar = bar_index + (liveOnSetupBar ? windowInput - 1 : windowInput)
+            string lvlTxt = "Entry stop  " + str.tostring(lvl, format.mintick) + (na(stp) ? "\nProtective stop  beyond the trigger-session extreme" : "\nProtective stop  " + str.tostring(stp, format.mintick))
+            label.new(bar_index, float(na), setupName, yloc = isBull ? yloc.belowbar : yloc.abovebar, style = isBull ? label.style_label_up : label.style_label_down, color = setupColor, textcolor = chart.bg_color, size = size.small, tooltip = lvlTxt)
+            trigLine := showLevelsInput ? line.new(startBar, lvl, endBar, lvl, color = setupColor, style = line.style_dashed) : line(na)
+            stopLine := showStopsInput and not na(stp) ? line.new(startBar, stp, endBar, stp, color = color.new(setupColor, 50), style = line.style_dotted) : line(na)
+            if liveOnSetupBar
+                // The Oops stop is live during the gap session itself
+                bool hit0 = isBull ? high >= lvl : low <= lvl
+                if hit0
+                    fillEvent := true
+                    left      := 0
+                    if not na(trigLine)
+                        trigLine.set_x2(bar_index)
+                    if not na(stopLine)
+                        stopLine.set_x2(bar_index)
+                else
+                    left -= 1
+    fillEvent
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+float prevHigh = high[1]
+float prevLow  = low[1]
+
+// Oops - session opens with a gap beyond the prior bar's extreme
+bool oopsBullSetup = showOopsInput and not na(prevLow) and open < prevLow and (oopsGapInput == 0 or (prevLow > 0 and (prevLow - open) / prevLow * 100 >= oopsGapInput))
+bool oopsBearSetup = showOopsInput and not na(prevHigh) and open > prevHigh and (oopsGapInput == 0 or (prevHigh > 0 and (open - prevHigh) / prevHigh * 100 >= oopsGapInput))
+
+// Gimmee - press into a range edge that closes against its own direction
+float bbBasis = ta.sma(close, bbLengthInput)
+float bbDev   = bbMultInput * ta.stdev(close, bbLengthInput)
+float bbUpper = bbBasis + bbDev
+float bbLower = bbBasis - bbDev
+
+[diPlus, diMinus, adxValue] = ta.dmi(adxLengthInput, adxLengthInput)
+bool sideways = not rangeFilterInput or (not na(adxValue) and adxValue < adxThresholdInput)
+
+bool gimmeeBullSetup = showGimmeeInput and sideways and not na(bbLower) and not na(prevLow) and low <= bbLower and low < prevLow and close > open
+bool gimmeeBearSetup = showGimmeeInput and sideways and not na(bbUpper) and not na(prevHigh) and high >= bbUpper and high > prevHigh and close < open
+
+// 80-20 - full-range session opening at one extreme and closing at the other
+float barRange = high - low
+float openPos  = barRange > 0 ? (open - low) / barRange : na
+float closePos = barRange > 0 ? (close - low) / barRange : na
+float zoneFrac = zonePctInput / 100
+
+bool setup8020Bull = show8020Input and not na(openPos) and openPos >= 1 - zoneFrac and closePos <= zoneFrac
+bool setup8020Bear = show8020Input and not na(openPos) and openPos <= zoneFrac and closePos >= 1 - zoneFrac
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Setups & Trigger Orders
+//---------------------------------------------------------------------------------------------------------------------{
+float tick = syminfo.mintick
+
+// Oops        - entry stop back at the violated prior extreme, stop beyond the gap-session extreme
+// Gimmee      - entry stop one tick beyond the gimmee bar's far side, stop one tick beyond its press extreme
+// 80-20       - entry stop at the setup session's far extreme, armed once price first trades beyond it
+bool oopsBullFill   = manageSetup(oopsBullSetup, true, prevLow, low, OOPS_TXT, bullColorInput, 1, true, false)
+bool oopsBearFill   = manageSetup(oopsBearSetup, false, prevHigh, high, OOPS_TXT, bearColorInput, 1, true, false)
+bool gimmeeBullFill = manageSetup(gimmeeBullSetup, true, high + tick, low - tick, GIMMEE_TXT, bullColorInput, 0, false, false)
+bool gimmeeBearFill = manageSetup(gimmeeBearSetup, false, low - tick, high + tick, GIMMEE_TXT, bearColorInput, 0, false, false)
+bool bull8020Fill   = manageSetup(setup8020Bull, true, low, float(na), R8020_TXT, bullColorInput, 0, false, true)
+bool bear8020Fill   = manageSetup(setup8020Bear, false, high, float(na), R8020_TXT, bearColorInput, 0, false, true)
+
+bool anySetup    = oopsBullSetup or oopsBearSetup or gimmeeBullSetup or gimmeeBearSetup or setup8020Bull or setup8020Bear
+bool bullTrigger = oopsBullFill or gimmeeBullFill or bull8020Fill
+bool bearTrigger = oopsBearFill or gimmeeBearFill or bear8020Fill
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visuals
+//---------------------------------------------------------------------------------------------------------------------{
+plot(showBandsInput ? bbUpper : na, "Upper Band", bandColorInput, 1)
+plot(showBandsInput ? bbBasis : na, "Basis", color.new(bandColorInput, 80), 1)
+plot(showBandsInput ? bbLower : na, "Lower Band", bandColorInput, 1)
+
+plotshape(showFillsInput and bullTrigger, "Bullish Trigger", shape.triangleup, location.belowbar, bullColorInput, size = size.tiny)
+plotshape(showFillsInput and bearTrigger, "Bearish Trigger", shape.triangledown, location.abovebar, bearColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(oopsBullSetup, "Bullish Oops Setup", "Bullish Oops: the session opened below the prior bar's low - buy stop working at the prior low")
+alertcondition(oopsBearSetup, "Bearish Oops Setup", "Bearish Oops: the session opened above the prior bar's high - sell stop working at the prior high")
+alertcondition(gimmeeBullSetup, "Bullish Gimmee Bar", "Bullish Gimmee: press into the lower range edge closed against its own direction - buy stop one tick above the gimmee bar high")
+alertcondition(gimmeeBearSetup, "Bearish Gimmee Bar", "Bearish Gimmee: press into the upper range edge closed against its own direction - sell stop one tick below the gimmee bar low")
+alertcondition(setup8020Bull, "Bullish 80-20 Setup", "Bullish 80-20: full-range down session - watching the next session for a move back up through its low")
+alertcondition(setup8020Bear, "Bearish 80-20 Setup", "Bearish 80-20: full-range up session - watching the next session for a move back down through its high")
+alertcondition(anySetup, "Any Setup", "Classic bar setup detected - check the setup label for the working entry level")
+alertcondition(bullTrigger, "Bullish Entry Triggered", "Bullish classic bar setup entry stop filled")
+alertcondition(bearTrigger, "Bearish Entry Triggered", "Bearish classic bar setup entry stop filled")
+
+//---------------------------------------------------------------------------------------------------------------------}

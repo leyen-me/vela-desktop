@@ -1,0 +1,386 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Buyback Blackout Windows", shorttitle = "Buyback Blackout Windows", overlay = true, max_lines_count = 500, max_labels_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+color BULL_COLOR    = #089981 // lift - the corporate bid switches back on
+color BEAR_COLOR    = #f23645 // blackout entry and shading - the corporate bid is assumed off
+color NEUTRAL_COLOR = #787b86 // fiscal quarter-end references - structure
+color ACCENT_COLOR  = #ff9800 // listed earnings dates - the anchor event each lift is measured from
+color GRAY_COLOR    = #787b86
+color LABEL_BG      = #00000000
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+int DAY_MS             = 86400000
+int MONTHS_PER_QUARTER = 3
+int MONTHS_PER_YEAR    = 12
+int HEADER_TRANSP      = 75
+
+string CYCLE_STD  = "Mar / Jun / Sep / Dec"
+string CYCLE_OFF1 = "Jan / Apr / Jul / Oct"
+string CYCLE_OFF2 = "Feb / May / Aug / Nov"
+
+string POS_TOP_RIGHT    = "Top Right"
+string POS_TOP_LEFT     = "Top Left"
+string POS_BOTTOM_RIGHT = "Bottom Right"
+string POS_BOTTOM_LEFT  = "Bottom Left"
+
+string SIZE_TINY   = "Tiny"
+string SIZE_SMALL  = "Small"
+string SIZE_NORMAL = "Normal"
+
+string WINDOW_GROUP = "Blackout Window"
+string STYLE_GROUP  = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+fiscalCycleInput = input.string(CYCLE_STD, "Fiscal Quarter-End Months", options = [CYCLE_STD, CYCLE_OFF1, CYCLE_OFF2], group = WINDOW_GROUP, tooltip = "Months in which the company's fiscal quarters end. Most US companies close their books on the standard March / June / September / December calendar; off-cycle reporters (retailers with January fiscal year-ends, for example) should use the shifted cycle matching their fiscal calendar, since blackout entries are measured from fiscal quarter ends.")
+
+preDaysInput = input.int(14, "Entry: Days Before Quarter End", minval = 1, maxval = 60, group = WINDOW_GROUP, tooltip = "Blackout entry: each window opens this many calendar days before the fiscal quarter end. Typical corporate policies suspend discretionary repurchases roughly two weeks before the quarter closes, while results are being finalized.")
+
+endDaysInput = input.int(2, "Lift: Days After Earnings Release", minval = 0, maxval = 15, group = WINDOW_GROUP, tooltip = "Blackout lift: each window closes this many calendar days after the earnings release - listed or estimated. Most policies let discretionary buying resume a day or two after results are published.")
+
+estLagInput = input.int(28, "Estimated Report Lag (Days)", minval = 5, maxval = 90, group = WINDOW_GROUP, tooltip = "Assumed number of calendar days from fiscal quarter end to the earnings release, used for every window without a matching listed date. Typical US large caps report three to five weeks after quarter end. The projected lift of a pending window uses the same assumption.")
+
+earnDatesInput = input.string("", "Earnings Dates (Optional)", group = WINDOW_GROUP, tooltip = "Optional comma-separated earnings release dates in YYYY-MM-DD form, e.g. 2025-01-28, 2025-04-30. When a listed date falls inside a window's matching horizon, that window's lift anchors to the actual publication date instead of the estimated lag. TradingView marks past releases on the chart, so the list is quick to assemble; leave empty to run purely on the calendar estimate.")
+
+maxMatchInput = input.int(60, "Date Matching Horizon (Days)", minval = 10, maxval = 120, group = WINDOW_GROUP, tooltip = "A listed earnings date is assigned to a quarter only when it falls within this many days after that quarter's end. Dates beyond the horizon are treated as belonging to another quarter, and the window falls back to the estimated report lag.")
+
+highlightInput  = input.bool(true, "Blackout Shading", inline = "shade", group = STYLE_GROUP, tooltip = "Shade the chart background across every blackout window - the stretch when the discretionary corporate bid is assumed switched off. A flow tendency, not a timing signal: pre-set 10b5-1 programs keep executing through the blackout.")
+shadeColorInput = input.color(color.new(BEAR_COLOR, 88), "", inline = "shade", group = STYLE_GROUP)
+
+showLabelsInput = input.bool(true, "Entry / Lift Labels", inline = "labels", group = STYLE_GROUP, tooltip = "Compact markers on the bars where a window opens ('Blackout') and closes ('Lift'). Lifts read '(est)' when no listed earnings date anchored the window.")
+entryColorInput = input.color(BEAR_COLOR, "", inline = "labels", group = STYLE_GROUP)
+liftColorInput  = input.color(BULL_COLOR, "", inline = "labels", group = STYLE_GROUP)
+
+showEarnMarksInput = input.bool(true, "Earnings Date Markers", inline = "earn", group = STYLE_GROUP, tooltip = "Diamond under the bar of each listed earnings date - the anchor event each lift is measured from. Only shown when earnings dates are provided.")
+earnColorInput     = input.color(ACCENT_COLOR, "", inline = "earn", group = STYLE_GROUP)
+
+showQeLinesInput = input.bool(true, "Fiscal Quarter-End Lines", inline = "qe", group = STYLE_GROUP, tooltip = "Dotted vertical reference on each fiscal quarter-end boundary - the anchor blackout entries are measured from, and the date the aggregate blackout share of the market typically peaks around.")
+qeColorInput     = input.color(color.new(GRAY_COLOR, 50), "", inline = "qe", group = STYLE_GROUP)
+
+showProjInput = input.bool(true, "Next Event Projection", group = STYLE_GROUP, tooltip = "Dotted guide at the next expected transition: the scheduled or estimated lift while a window is active, otherwise the next blackout entry.")
+
+showDashInput     = input.bool(true, "Dashboard", inline = "dash", group = STYLE_GROUP, tooltip = "Summary panel: window state, the next entry or lift date, how lifts are anchored, window counts, the report lag in use, and how bar returns and volatility inside blackout windows compare with the rest of the sample.")
+dashPositionInput = input.string(POS_TOP_RIGHT, "", options = [POS_TOP_RIGHT, POS_TOP_LEFT, POS_BOTTOM_RIGHT, POS_BOTTOM_LEFT], inline = "dash", group = STYLE_GROUP)
+dashSizeInput     = input.string(SIZE_SMALL, "Dashboard Size", options = [SIZE_TINY, SIZE_SMALL, SIZE_NORMAL], group = STYLE_GROUP, tooltip = "Text size of the dashboard.")
+
+// Fiscal quarter-end month cycle as a month-number remainder (month % 3)
+int cycleRem = fiscalCycleInput == CYCLE_OFF1 ? 1 : fiscalCycleInput == CYCLE_OFF2 ? 2 : 0
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Table position constant from the style option
+getTablePosition(string positionName) =>
+    switch positionName
+        POS_TOP_LEFT     => position.top_left
+        POS_BOTTOM_RIGHT => position.bottom_right
+        POS_BOTTOM_LEFT  => position.bottom_left
+        => position.top_right
+
+// Text size constant from the style option
+getTextSize(string sizeName) =>
+    switch sizeName
+        SIZE_TINY   => size.tiny
+        SIZE_NORMAL => size.normal
+        => size.small
+
+// First instant after the last day of a fiscal quarter-end month
+qeBoundary(int qeYear, int qeMonth) =>
+    int boundaryYear  = qeMonth == MONTHS_PER_YEAR ? qeYear + 1 : qeYear
+    int boundaryMonth = qeMonth == MONTHS_PER_YEAR ? 1 : qeMonth + 1
+    timestamp(syminfo.timezone, boundaryYear, boundaryMonth, 1, 0, 0)
+
+// Most recent fiscal quarter-end boundary at or before timestamp t
+prevQeBoundary(int t) =>
+    int tMonth   = month(t, syminfo.timezone)
+    int tYear    = year(t, syminfo.timezone)
+    int boundary = na
+    for offset = 1 to MONTHS_PER_QUARTER
+        int mo = tMonth - offset
+        int yr = tYear
+        if mo < 1
+            mo += MONTHS_PER_YEAR
+            yr -= 1
+        if mo % MONTHS_PER_QUARTER == cycleRem
+            boundary := qeBoundary(yr, mo)
+            break
+    boundary
+
+// Nearest fiscal quarter-end boundary strictly after timestamp t
+nextQeBoundary(int t) =>
+    int tMonth   = month(t, syminfo.timezone)
+    int tYear    = year(t, syminfo.timezone)
+    int boundary = na
+    for offset = 0 to MONTHS_PER_QUARTER - 1
+        int mo = tMonth + offset
+        int yr = tYear
+        if mo > MONTHS_PER_YEAR
+            mo -= MONTHS_PER_YEAR
+            yr += 1
+        if mo % MONTHS_PER_QUARTER == cycleRem
+            boundary := qeBoundary(yr, mo)
+            break
+    boundary
+
+// Comma-separated YYYY-MM-DD list to sorted midnight timestamps (exchange time zone)
+parseDateList(string csvText) =>
+    array<int> result  = array.new<int>()
+    string     cleaned = str.replace_all(csvText, " ", "")
+    if str.length(cleaned) > 0
+        array<string> tokenArray = str.split(cleaned, ",")
+        for token in tokenArray
+            array<string> fieldArray = str.split(token, "-")
+            if array.size(fieldArray) == 3
+                float yearValue  = str.tonumber(array.get(fieldArray, 0))
+                float monthValue = str.tonumber(array.get(fieldArray, 1))
+                float dayValue   = str.tonumber(array.get(fieldArray, 2))
+                bool  fieldsOk   = not na(yearValue) and not na(monthValue) and not na(dayValue)
+                if fieldsOk and yearValue >= 1970 and yearValue <= 2100 and monthValue >= 1 and monthValue <= 12 and dayValue >= 1 and dayValue <= 31
+                    array.push(result, timestamp(syminfo.timezone, int(yearValue), int(monthValue), int(dayValue), 0, 0))
+    array.sort(result)
+    result
+
+// Report lags (days from fiscal quarter end to release) of every listed date
+buildLagArray(array<int> datesArray) =>
+    array<float> result     = array.new<float>()
+    int          datesCount = array.size(datesArray)
+    if datesCount > 0
+        for i = 0 to datesCount - 1
+            int releaseTs = array.get(datesArray, i)
+            int qeTs      = prevQeBoundary(releaseTs)
+            if not na(qeTs)
+                array.push(result, (releaseTs - qeTs) / DAY_MS)
+    result
+
+// Lift time of the window anchored at a quarter-end boundary, with its matched release date if any
+resolveWindow(array<int> datesArray, int qeTs) =>
+    int releaseTs  = na
+    int datesCount = array.size(datesArray)
+    if datesCount > 0
+        for i = 0 to datesCount - 1
+            int candidateTs = array.get(datesArray, i)
+            if candidateTs >= qeTs
+                if candidateTs < qeTs + maxMatchInput * DAY_MS
+                    releaseTs := candidateTs
+                break
+    int liftTs = na(releaseTs) ? qeTs + (estLagInput + endDaysInput) * DAY_MS : releaseTs + endDaysInput * DAY_MS
+    [liftTs, releaseTs]
+
+// Compact "Mmm d" date text in the exchange time zone
+monthText(int mo) =>
+    switch mo
+        1  => "Jan"
+        2  => "Feb"
+        3  => "Mar"
+        4  => "Apr"
+        5  => "May"
+        6  => "Jun"
+        7  => "Jul"
+        8  => "Aug"
+        9  => "Sep"
+        10 => "Oct"
+        11 => "Nov"
+        => "Dec"
+
+dateText(int ts) =>
+    monthText(month(ts, syminfo.timezone)) + " " + str.tostring(dayofmonth(ts, syminfo.timezone))
+
+// Signed percent text from a fractional per-bar value
+returnText(float value) =>
+    na(value) ? "n/a" : (value >= 0 ? "+" : "") + str.tostring(value * 100, "#.###") + "%"
+
+// Unsigned percent text from a fractional per-bar value
+volText(float value) =>
+    na(value) ? "n/a" : str.tostring(value * 100, "#.##") + "%"
+
+// Bull/bear color from the sign of a value, foreground when unavailable
+signColor(float value) =>
+    na(value) ? DASH_TEXT : value >= 0 ? liftColorInput : entryColorInput
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Window State Machine
+//---------------------------------------------------------------------------------------------------------------------{
+
+var array<int>   releaseDatesArray = parseDateList(earnDatesInput)
+var array<float> releaseLagArray   = buildLagArray(releaseDatesArray)
+
+int prevQeTs    = prevQeBoundary(time)
+int nextQeTs    = nextQeBoundary(time)
+int nextStartTs = nextQeTs - preDaysInput * DAY_MS
+
+var bool inBlackout      = false
+var int  windowQeTs      = na
+var int  windowLiftTs    = na
+var int  windowReleaseTs = na
+var int  lastDoneQeTs    = na
+var int  windowCount     = 0
+var int  confirmedCount  = 0
+
+bool entryEvent = false
+bool liftEvent  = false
+
+// A listed earnings date is crossed by this bar
+bool releaseCrossEvent = false
+if array.size(releaseDatesArray) > 0 and not na(time[1])
+    for releaseTs in releaseDatesArray
+        if releaseTs > time[1] and releaseTs <= time
+            releaseCrossEvent := true
+            break
+        if releaseTs > time
+            break
+
+// Entry - the pending quarter's window once its start date is reached, or the previous
+// quarter's still-open window when the chart history starts (or gaps) inside one
+if not inBlackout
+    int candidateQeTs = na
+    [prevLiftTs, prevReleaseTs] = resolveWindow(releaseDatesArray, prevQeTs)
+    if (na(lastDoneQeTs) or prevQeTs != lastDoneQeTs) and time < prevLiftTs
+        candidateQeTs := prevQeTs
+    else if time >= nextStartTs
+        candidateQeTs := nextQeTs
+    if not na(candidateQeTs)
+        [liftTs, releaseTs] = resolveWindow(releaseDatesArray, candidateQeTs)
+        inBlackout      := true
+        windowQeTs      := candidateQeTs
+        windowLiftTs    := liftTs
+        windowReleaseTs := releaseTs
+        windowCount     += 1
+        confirmedCount  += na(releaseTs) ? 0 : 1
+        entryEvent      := true
+
+// Lift - the first bar at or past the window's lift time trades outside the blackout
+if inBlackout and time >= windowLiftTs
+    inBlackout   := false
+    lastDoneQeTs := windowQeTs
+    liftEvent    := true
+
+bool windowConfirmed = not na(windowReleaseTs)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Blackout vs Open Sample Statistics
+//---------------------------------------------------------------------------------------------------------------------{
+
+var int   barsIn   = 0
+var int   barsOut  = 0
+var float sumIn    = 0.0
+var float sumOut   = 0.0
+var float sumSqIn  = 0.0
+var float sumSqOut = 0.0
+
+float barReturn = bar_index > 0 ? close / close[1] - 1 : na
+
+if not na(barReturn)
+    if inBlackout
+        barsIn  += 1
+        sumIn   += barReturn
+        sumSqIn += barReturn * barReturn
+    else
+        barsOut  += 1
+        sumOut   += barReturn
+        sumSqOut += barReturn * barReturn
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+
+bgcolor(highlightInput and inBlackout ? shadeColorInput : na, title = "Blackout Window Shade")
+
+plotshape(showEarnMarksInput and releaseCrossEvent, "Earnings Date", shape.diamond, location.belowbar, earnColorInput, size = size.tiny)
+
+// Fiscal quarter-end boundary reference
+bool qeCrossEvent = not na(time[1]) and time[1] < prevQeTs
+
+if showQeLinesInput and qeCrossEvent
+    line.new(prevQeTs, low, prevQeTs, high, xloc.bar_time, extend.both, qeColorInput, line.style_dotted)
+
+// Entry / lift markers
+if showLabelsInput and entryEvent
+    label.new(bar_index, high, "Blackout", color = LABEL_BG, textcolor = entryColorInput, style = label.style_label_down, size = size.tiny)
+
+if showLabelsInput and liftEvent
+    label.new(bar_index, high, windowConfirmed ? "Lift" : "Lift (est)", color = LABEL_BG, textcolor = liftColorInput, style = label.style_label_down, size = size.tiny)
+
+// Projection of the next transition
+int    nextEventTs   = inBlackout ? windowLiftTs : nextStartTs
+color  nextEventCol  = inBlackout ? liftColorInput : entryColorInput
+string nextEventText = inBlackout ? (windowConfirmed ? "Lift " : "Est. lift ") + dateText(nextEventTs) : "Blackout " + dateText(nextEventTs)
+
+var line  projLineId  = na
+var label projLabelId = na
+
+if barstate.islast and showProjInput
+    if not na(projLineId)
+        line.delete(projLineId)
+    if not na(projLabelId)
+        label.delete(projLabelId)
+    projLineId  := line.new(nextEventTs, low, nextEventTs, high, xloc.bar_time, extend.both, nextEventCol, line.style_dotted)
+    projLabelId := label.new(nextEventTs, close, nextEventText, xloc.bar_time, color = LABEL_BG, style = label.style_label_left, textcolor = nextEventCol, size = size.small)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+
+var table dashTable = table.new(getTablePosition(dashPositionInput), 2, 10, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+string dashTextSize = getTextSize(dashSizeInput)
+
+if barstate.islast and showDashInput
+    float meanIn   = barsIn > 0 ? sumIn / barsIn : na
+    float meanOut  = barsOut > 0 ? sumOut / barsOut : na
+    float volIn    = barsIn > 1 ? math.sqrt(math.max(sumSqIn / barsIn - meanIn * meanIn, 0)) : na
+    float volOut   = barsOut > 1 ? math.sqrt(math.max(sumSqOut / barsOut - meanOut * meanOut, 0)) : na
+    float shareIn  = barsIn + barsOut > 0 ? 100.0 * barsIn / (barsIn + barsOut) : na
+
+    bool   datesGiven = array.size(releaseDatesArray) > 0
+    string anchorText = datesGiven ? "Earnings dates (" + str.tostring(array.size(releaseDatesArray)) + ")" : "Calendar estimate"
+    string windowText = str.tostring(windowCount) + (datesGiven ? " (" + str.tostring(confirmedCount) + " date-anchored)" : "")
+    string lagText    = array.size(releaseLagArray) > 0 ? "median " + str.tostring(math.round(array.median(releaseLagArray))) + " d" : "assumed " + str.tostring(estLagInput) + " d"
+    string shareText  = na(shareIn) ? "n/a" : str.tostring(shareIn, "#.#") + "%"
+
+    table.cell(dashTable, 0, 0, "Buyback blackout", text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_left, tooltip = "Recurring windows in which companies voluntarily pause discretionary buybacks around earnings. Windows are approximations built from the fiscal calendar and typical policy - there is no official blackout feed.")
+    table.cell(dashTable, 1, 0, syminfo.ticker, text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 1, "Status", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left, tooltip = "Whether the estimated blackout window is active. Blackouts pause one source of demand; they are context, never a standalone signal - results and macro news dominate any given quarter.")
+    table.cell(dashTable, 1, 1, inBlackout ? "In blackout" : "No blackout", text_color = inBlackout ? entryColorInput : liftColorInput, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 2, "Next event", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left, tooltip = "Date of the upcoming transition: the active window's lift, or the next window's entry.")
+    table.cell(dashTable, 1, 2, nextEventText, text_color = nextEventCol, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 3, "Lift anchoring", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left, tooltip = "How window lifts are set: from the listed earnings dates when provided, otherwise from the estimated report lag after each fiscal quarter end.")
+    table.cell(dashTable, 1, 3, anchorText, text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 4, "Windows", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left, tooltip = "Blackout windows observed on the chart, and how many lifted on a listed earnings date rather than on the estimate.")
+    table.cell(dashTable, 1, 4, windowText, text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 5, "Report lag", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left, tooltip = "Median days from fiscal quarter end to the listed releases - or the assumed lag when no dates are provided. An unusually long median suggests the fiscal cycle setting does not match the symbol.")
+    table.cell(dashTable, 1, 5, lagText, text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 6, "Avg return / bar (in)", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left, tooltip = "Average bar return inside blackout windows. Evidence on blackout-period returns is mixed - treat differences as context, not signal.")
+    table.cell(dashTable, 1, 6, returnText(meanIn), text_color = signColor(meanIn), text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 7, "Avg return / bar (out)", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left, tooltip = "Average bar return outside blackout windows, the comparison the blackout tendency is judged against.")
+    table.cell(dashTable, 1, 7, returnText(meanOut), text_color = signColor(meanOut), text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 8, "Volatility (in / out)", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left, tooltip = "Standard deviation of bar returns inside vs outside blackout windows.")
+    table.cell(dashTable, 1, 8, volText(volIn) + " / " + volText(volOut), text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 9, "Time in blackout", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left, tooltip = "Share of chart bars inside a blackout window. With typical policies the blackout stretch covers a large minority of the calendar, which is why desks track the aggregate share of the market in blackout.")
+    table.cell(dashTable, 1, 9, shareText, text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+
+// Data window readouts
+plot(inBlackout ? 1 : 0, "In Blackout (1 = yes)", NEUTRAL_COLOR, display = display.data_window, editable = false)
+plot(inBlackout ? math.max((windowLiftTs - time) / DAY_MS, 0) : na, "Days To Lift", NEUTRAL_COLOR, display = display.data_window, editable = false)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(entryEvent, "Blackout Window Opened", "Buyback blackout: {{ticker}} entered its estimated buyback blackout window - discretionary repurchases are typically paused from about two weeks before quarter end until shortly after results")
+alertcondition(liftEvent, "Blackout Window Lifted", "Buyback blackout: the blackout window on {{ticker}} lifted - discretionary corporate repurchases can typically resume")
+alertcondition(releaseCrossEvent and inBlackout, "Earnings Date Inside Blackout", "Buyback blackout: {{ticker}} reached a listed earnings date inside its blackout window - the window lifts shortly after results")
+
+//---------------------------------------------------------------------------------------------------------------------}

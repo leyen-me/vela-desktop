@@ -1,0 +1,153 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Halftrend", shorttitle = "Halftrend", overlay = true)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+TREND_UP   =  1
+TREND_DOWN = -1
+
+BULL_COLOR = #089981
+BEAR_COLOR = #f23645
+
+FILL_PRICE_TRANSP   = 50  // gradient transparency at the price end of the trail fill
+FILL_STOP_TRANSP    = 100 // gradient transparency at the trend-line end of the trail fill
+CHANNEL_LINE_TRANSP = 65  // transparency of the channel edge lines
+CHANNEL_FILL_TRANSP = 90  // transparency of the channel interior fill
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+amplitudeInput = input.int(2, "Amplitude", minval = 1, group = "Settings",
+     tooltip = "Lookback of the highest-high / lowest-low tracking and of the simple averages of highs and lows that drive flips. 2 is the common default — larger values hold flatter shelves and flip less often but concede more at turns, smaller values follow price sooner and whipsaw more in ranges.")
+
+channelDeviationInput = input.float(2.0, "Channel Deviation", minval = 0, step = 0.1, group = "Settings",
+     tooltip = "Multiplier applied to half the ATR to size the channel wrapped around the trend line. The channel is the tolerance zone: wicks into it are noise by construction, and stops referenced beyond its far edge survive routine backfill toward the line.")
+
+atrLengthInput = input.int(100, "ATR Length", minval = 1, group = "Settings",
+     tooltip = "Averaging window of the ATR that sizes the channel and the flip-arrow offset. The construction conventionally reads volatility over a long window (100 by default) so the channel breathes slowly.")
+
+confirmCloseInput = input.bool(false, "Signal On Bar Close", group = "Settings",
+     tooltip = "Fire arrows and alerts only once the bar closes. Removes intrabar provisionality — a flip condition met mid-bar and withdrawn before the close never signals — so each printed signal is final.")
+
+showChannelInput = input.bool(true, "ATR Channel", group = "Style",
+     tooltip = "Show the half-ATR channel wrapped around the trend line with a soft interior fill. Wicks inside the channel are expected behavior rather than signals.")
+
+showMarkersInput = input.bool(true, "Flip Arrows", group = "Style",
+     tooltip = "Mark each state flip with an arrow offset half an ATR from the line — the crossing condition firing. Arrows are state changes, not automatic trades; in tight ranges they alternate quickly.")
+
+showFillInput = input.bool(true, "Gradient Trail Fill", group = "Style",
+     tooltip = "Fill the span between price and the trend line with a vertical gradient in the state color — fully transparent at the line, strongest near price — visualizing the room the trend enjoys before its flip condition can arm.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "state", group = "Style",
+     tooltip = "Color of the line, channel, fill and arrows while the state is up (line ratcheting the lowest lows beneath price).")
+
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "state", group = "Style",
+     tooltip = "Color of the line, channel, fill and arrows while the state is down (line ratcheting the highest highs above price).")
+
+lineWidthInput = input.int(2, "Line Width", minval = 1, maxval = 5, group = "Style",
+     tooltip = "Width of the stepped Halftrend line.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+// Amplitude-window building blocks: the running extremes the line ratchets on, and the simple averages of the
+// highs and lows whose cross of the tracked level arms a flip. Everything is nz-guarded so the young chart
+// cannot poison the recursion with na
+highestHigh = nz(ta.highest(high, amplitudeInput), high)
+lowestLow   = nz(ta.lowest(low, amplitudeInput), low)
+highAverage = nz(ta.sma(high, amplitudeInput), high)
+lowAverage  = nz(ta.sma(low, amplitudeInput), low)
+
+// Half of the ATR is the construction's volatility unit — it sizes the channel and offsets the flip arrows.
+// True range stands in until the ATR window has filled
+halfAtr      = nz(ta.atr(atrLengthInput), ta.tr(true)) / 2
+channelWidth = channelDeviationInput * halfAtr
+
+var int   trendState    = TREND_UP
+var bool  trackingFloor = false
+var float floorLevel    = low
+var float ceilingLevel  = high
+var float htLine        = na
+
+int prevState = trendState
+
+if trackingFloor
+    // Up state in force: ratchet the floor with the rising lowest low, then flip once the average high has
+    // crossed below that floor and price confirms with a close under the prior low
+    floorLevel := math.max(lowestLow, floorLevel)
+
+    if highAverage < floorLevel and close < nz(low[1], low)
+        trendState    := TREND_DOWN
+        trackingFloor := false
+        ceilingLevel  := highestHigh
+else
+    // Down state (or startup) in force: ratchet the ceiling with the falling highest high, then flip once the
+    // average low has crossed above that ceiling and price confirms with a close over the prior high
+    ceilingLevel := math.min(highestHigh, ceilingLevel)
+
+    if lowAverage > ceilingLevel and close > nz(high[1], high)
+        trendState    := TREND_UP
+        trackingFloor := true
+        floorLevel    := lowestLow
+
+bool flipBullish = trendState == TREND_UP   and prevState == TREND_DOWN
+bool flipBearish = trendState == TREND_DOWN and prevState == TREND_UP
+bool flipped     = flipBullish or flipBearish
+
+// The stepped trend line: held unchanged through a flip bar — each new state seeds at the prior state's last
+// level, so Halftrend stays continuous where jump-style trails gap — then moving only on new extremes, which is
+// what leaves the flat shelf through consolidation
+if trendState == TREND_UP
+    htLine := flipped ? nz(htLine, floorLevel) : math.max(floorLevel, nz(htLine, floorLevel))
+else
+    htLine := flipped ? nz(htLine, ceilingLevel) : math.min(ceilingLevel, nz(htLine, ceilingLevel))
+
+upperChannel = htLine + channelWidth
+lowerChannel = htLine - channelWidth
+
+// Optional close-confirmation gate — on historical bars every close is final, so it only disciplines live bars
+bool barConfirmed   = not confirmCloseInput or barstate.isconfirmed
+bool bullFlipSignal = flipBullish and barConfirmed
+bool bearFlipSignal = flipBearish and barConfirmed
+
+// Channel touches that immediately rejected: a wick into the tolerance zone closing back outside it, read as
+// continuation pressure in the direction of the standing state
+bool bullRejection = trendState == TREND_UP   and not flipped and low <= upperChannel  and close > upperChannel and barConfirmed
+bool bearRejection = trendState == TREND_DOWN and not flipped and high >= lowerChannel and close < lowerChannel and barConfirmed
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+color stateColor       = trendState == TREND_UP ? bullColorInput : bearColorInput
+color channelLineColor = color.new(stateColor, CHANNEL_LINE_TRANSP)
+color channelFillColor = color.new(stateColor, CHANNEL_FILL_TRANSP)
+
+// Vertical gradient between the trend line and price — fully transparent at the line, strongest near price
+color fillTopColor    = showFillInput ? (trendState == TREND_UP ? color.new(bullColorInput, FILL_PRICE_TRANSP) : color.new(bearColorInput, FILL_STOP_TRANSP)) : na
+color fillBottomColor = showFillInput ? (trendState == TREND_UP ? color.new(bullColorInput, FILL_STOP_TRANSP) : color.new(bearColorInput, FILL_PRICE_TRANSP)) : na
+
+htPlotId    = plot(htLine, "Halftrend", color = stateColor, linewidth = lineWidthInput)
+pricePlotId = plot(close, "Price Anchor", color = na, editable = false, display = display.none)
+
+upperPlotId = plot(showChannelInput ? upperChannel : na, "Upper Channel", color = channelLineColor, linewidth = 1)
+lowerPlotId = plot(showChannelInput ? lowerChannel : na, "Lower Channel", color = channelLineColor, linewidth = 1)
+
+fill(upperPlotId, lowerPlotId, color = channelFillColor, title = "Channel Fill")
+fill(htPlotId, pricePlotId, top_value = math.max(htLine, close), bottom_value = math.min(htLine, close), top_color = fillTopColor, bottom_color = fillBottomColor, title = "Trail Gradient Fill")
+
+plotshape(showMarkersInput and bullFlipSignal ? htLine - halfAtr : na, "Bullish Flip", shape.triangleup, location.absolute, color = bullColorInput, size = size.tiny)
+plotshape(showMarkersInput and bearFlipSignal ? htLine + halfAtr : na, "Bearish Flip", shape.triangledown, location.absolute, color = bearColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(bullFlipSignal, "Bullish Flip", "Halftrend flipped bullish on {{ticker}} ({{interval}}) — the average low crossed above the tracked ceiling with a close over the prior high; the line now ratchets the lowest lows beneath price")
+alertcondition(bearFlipSignal, "Bearish Flip", "Halftrend flipped bearish on {{ticker}} ({{interval}}) — the average high crossed below the tracked floor with a close under the prior low; the line now ratchets the highest highs above price")
+alertcondition(bullFlipSignal or bearFlipSignal, "Any Flip", "Halftrend flipped on {{ticker}} ({{interval}}) — the trend state reversed")
+alertcondition(bullRejection, "Bullish Channel Rejection", "Halftrend channel rejection on {{ticker}} ({{interval}}) — price wicked into the up-state tolerance zone and closed back above it")
+alertcondition(bearRejection, "Bearish Channel Rejection", "Halftrend channel rejection on {{ticker}} ({{interval}}) — price wicked into the down-state tolerance zone and closed back below it")
+
+//---------------------------------------------------------------------------------------------------------------------}

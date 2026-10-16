@@ -1,0 +1,673 @@
+// This work is licensed under Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("ARIMA Forecasts", "ARIMA", overlay = true, format = format.price, max_lines_count = 500, max_labels_count = 500, max_polylines_count = 100)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+ACCENT_COLOR  = #ff9800 // the one accent - the live model forecast
+NEUTRAL_COLOR = #787b86
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+MAX_P = 5
+MAX_Q = 5
+
+ORDER_AUTO   = "Auto (AIC)"
+ORDER_MANUAL = "Manual"
+
+GRP_MODEL = "Model"
+GRP_FC    = "Forecast"
+GRP_EVAL  = "Out-of-sample Track"
+GRP_STYLE = "Style"
+GRP_DASH  = "Dashboard"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+srcInput = input.source(close, "Source", group = GRP_MODEL
+  , tooltip = "Series the model is fitted to. Only closed bars enter the fit: on a live bar the model and its forecast stay anchored to the last closed bar until the bar closes.")
+
+logInput = input.bool(true, "Model Log Price", group = GRP_MODEL
+  , tooltip = "Fit the model to the natural log of price, so one differencing gives log returns and the forecast band widens in percentage terms. Turn off to model raw price units.")
+
+orderModeInput = input.string(ORDER_AUTO, "Order Selection", options = [ORDER_AUTO, ORDER_MANUAL], group = GRP_MODEL
+  , tooltip = "Auto fits every ARIMA(p, d, q) with p and q up to the maximum and keeps the one with the lowest AIC (Akaike information criterion), the automated version of the Box-Jenkins identification step. Manual uses the orders below. The differencing order d is always set by hand.")
+
+maxOrderInput = input.int(2, "Max p and q (Auto)", minval = 0, maxval = 3, inline = "auto", group = GRP_MODEL)
+selectEveryInput = input.int(20, "Re-select Every (bars)", minval = 1, maxval = 500, inline = "auto", group = GRP_MODEL
+  , tooltip = "Highest AR and MA order the Auto mode tries, and how often it re-runs the selection. Coefficients are still refitted on the Refit clock in between.")
+
+pInput = input.int(1, "AR Order (p)", minval = 0, maxval = MAX_P, inline = "order", group = GRP_MODEL)
+dInput = input.int(1, "d", minval = 0, maxval = 2, inline = "order", group = GRP_MODEL)
+qInput = input.int(1, "MA Order (q)", minval = 0, maxval = MAX_Q, inline = "order", group = GRP_MODEL
+  , tooltip = "ARIMA(p, d, q): the series is differenced d times (1 turns prices into returns), then modelled as p autoregressive terms on its own past values plus q moving-average terms on past forecast errors. p and q apply in Manual mode; d applies in both. Low orders are the norm for price data, and the ACF and PACF of the differenced series are the classic guide for choosing them.")
+
+constInput = input.bool(true, "Include Constant (Drift)", group = GRP_MODEL
+  , tooltip = "Estimate a constant term. With d = 1 it is the average drift per bar over the fit window, which tilts the forecast in the direction of that window's trend. Turn off to assume no drift.")
+
+windowInput = input.int(250, "Fit Window (bars)", minval = 60, maxval = 1000, group = GRP_MODEL
+  , tooltip = "Closed bars the model is estimated on, refitted on a rolling basis. Longer windows give steadier coefficients; shorter ones adapt faster and are noisier.")
+
+refitInput = input.int(1, "Refit Every (bars)", minval = 1, maxval = 50, group = GRP_MODEL
+  , tooltip = "How often the coefficients are re-estimated. Between refits the last coefficients keep producing forecasts from the newest data, which stays causal.")
+
+horizonInput = input.int(20, "Forecast Horizon (bars)", minval = 1, maxval = 60, group = GRP_FC
+  , tooltip = "Bars the forecast is projected past the last closed bar.")
+
+conf1Input = input.float(80, "Inner Band (%)", minval = 50, maxval = 99, inline = "conf", group = GRP_FC)
+conf2Input = input.float(95, "Outer Band (%)", minval = 50, maxval = 99.9, inline = "conf", group = GRP_FC
+  , tooltip = "Prediction intervals from the model's own error variance, assuming normally distributed errors. They widen with the horizon as the uncertainty of the integrated forecast accumulates.")
+
+calcBarsInput = input.int(500, "Track Length (bars)", minval = 50, maxval = 3000, group = GRP_EVAL
+  , tooltip = "Most recent bars on which the model runs bar by bar, producing the one-bar-ahead forecast track and the out-of-sample statistics in the dashboard.")
+
+showTrackInput = input.bool(true, "One-bar-ahead Forecast Track", group = GRP_EVAL
+  , tooltip = "Plots, at each bar, the forecast the model made one bar earlier with its inner band. Every value was fixed before the bar it forecasts opened, so the track shows exactly how the model would have fared live.")
+
+showPastInput = input.bool(true, "Past Forecasts", group = GRP_EVAL
+  , tooltip = "Keeps earlier full-horizon forecasts on the chart as faint fans, so the forecast can be compared with what price actually did.")
+
+pastEveryInput = input.int(40, "Every (bars)", minval = 5, maxval = 500, inline = "past", group = GRP_EVAL)
+pastCountInput = input.int(2, "Show", minval = 1, maxval = 10, inline = "past", group = GRP_EVAL
+  , tooltip = "Spacing, in bars, between stored forecasts and how many of the most recent ones stay on the chart.")
+
+fcColorInput    = input.color(ACCENT_COLOR, "Forecast", inline = "c1", group = GRP_STYLE)
+trackColorInput = input.color(NEUTRAL_COLOR, "Track / Past", inline = "c1", group = GRP_STYLE)
+upColorInput    = input.color(BULL_COLOR, "Up", inline = "c2", group = GRP_STYLE)
+dnColorInput    = input.color(BEAR_COLOR, "Down", inline = "c2", group = GRP_STYLE)
+
+showDashInput = input.bool(true, "Show Dashboard", group = GRP_DASH
+  , tooltip = "Model specification and coefficients, the forecast with its inner band, and out-of-sample diagnostics: error against a no-change forecast, band coverage and a residual whiteness test.")
+dashPosInput  = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], inline = "dash", group = GRP_DASH)
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], inline = "dash", group = GRP_DASH)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+getSize(string s) =>
+    switch s
+        "Tiny"   => size.tiny
+        "Normal" => size.normal
+        =>          size.small
+
+getPosition(string pos) =>
+    switch pos
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        =>                position.bottom_left
+
+fmtPct(float x) =>
+    na(x) ? "-" : (x >= 0 ? "+" : "") + str.tostring(x, "0.00") + "%"
+
+// Standard normal quantile (Acklam's rational approximation), for the band multipliers
+normInv(float pr) =>
+    float a1 = -3.969683028665376e+01
+    float a2 = 2.209460984245205e+02
+    float a3 = -2.759285104469687e+02
+    float a4 = 1.383577518672690e+02
+    float a5 = -3.066479806614716e+01
+    float a6 = 2.506628277459239e+00
+    float b1 = -5.447609879822406e+01
+    float b2 = 1.615858368580409e+02
+    float b3 = -1.556989798598866e+02
+    float b4 = 6.680131188771972e+01
+    float b5 = -1.328068155288572e+01
+    float c1 = -7.784894002430293e-03
+    float c2 = -3.223964580411365e-01
+    float c3 = -2.400758277161838e+00
+    float c4 = -2.549732539343734e+00
+    float c5 = 4.374664141464968e+00
+    float c6 = 2.938163982698783e+00
+    float d1 = 7.784695709041462e-03
+    float d2 = 3.224671290700398e-01
+    float d3 = 2.445134137142996e+00
+    float d4 = 3.754408661907416e+00
+    float x = 0.0
+    if pr < 0.02425
+        q = math.sqrt(-2 * math.log(pr))
+        x := (((((c1 * q + c2) * q + c3) * q + c4) * q + c5) * q + c6) / ((((d1 * q + d2) * q + d3) * q + d4) * q + 1)
+    else if pr > 1 - 0.02425
+        q = math.sqrt(-2 * math.log(1 - pr))
+        x := -(((((c1 * q + c2) * q + c3) * q + c4) * q + c5) * q + c6) / ((((d1 * q + d2) * q + d3) * q + d4) * q + 1)
+    else
+        q = pr - 0.5
+        r = q * q
+        x := (((((a1 * r + a2) * r + a3) * r + a4) * r + a5) * r + a6) * q / (((((b1 * r + b2) * r + b3) * r + b4) * r + b5) * r + 1)
+    x
+
+// Standard normal CDF (Abramowitz-Stegun 26.2.17)
+normCdf(float z) =>
+    float t = 1 / (1 + 0.2316419 * math.abs(z))
+    float d = 0.3989422804014327 * math.exp(-z * z / 2)
+    float pr = d * t * (0.319381530 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))))
+    z > 0 ? 1 - pr : pr
+
+// Stationarity of x(t) = a1 x(t-1) + ... + ak x(t-k): all reflection coefficients of the step-down recursion inside (-1, 1)
+isStable(array<float> coeffs) =>
+    int k = array.size(coeffs)
+    bool ok = true
+    if k > 0
+        a = array.copy(coeffs)
+        int m = k
+        while m > 0 and ok
+            float kap = array.get(a, m - 1)
+            if math.abs(kap) >= 0.999
+                ok := false
+            else
+                b = array.new_float(m - 1, 0.0)
+                if m > 1
+                    for j = 1 to m - 1
+                        array.set(b, j - 1, (array.get(a, j - 1) + kap * array.get(a, m - j - 1)) / (1 - kap * kap))
+                a := b
+                m -= 1
+    ok
+
+// Solves the symmetric system M x = v (n x n, row-major) by Gauss-Jordan elimination with partial pivoting
+solve(array<float> mIn, array<float> vIn, int n) =>
+    m = array.copy(mIn)
+    v = array.copy(vIn)
+    bool ok = true
+    for c = 0 to n - 1
+        int   piv  = c
+        float best = math.abs(array.get(m, c * n + c))
+        if c < n - 1
+            for r = c + 1 to n - 1
+                float val = math.abs(array.get(m, r * n + c))
+                if val > best
+                    best := val
+                    piv  := r
+        if best < 1e-14
+            ok := false
+            break
+        if piv != c
+            for l = 0 to n - 1
+                float tmp = array.get(m, c * n + l)
+                array.set(m, c * n + l, array.get(m, piv * n + l))
+                array.set(m, piv * n + l, tmp)
+            float tv = array.get(v, c)
+            array.set(v, c, array.get(v, piv))
+            array.set(v, piv, tv)
+        float dd = array.get(m, c * n + c)
+        for l = 0 to n - 1
+            array.set(m, c * n + l, array.get(m, c * n + l) / dd)
+        array.set(v, c, array.get(v, c) / dd)
+        for r = 0 to n - 1
+            if r != c
+                float f = array.get(m, r * n + c)
+                if f != 0
+                    for l = 0 to n - 1
+                        array.set(m, r * n + l, array.get(m, r * n + l) - f * array.get(m, c * n + l))
+                    array.set(v, r, array.get(v, r) - f * array.get(v, c))
+    [v, ok]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Working Series
+//---------------------------------------------------------------------------------------------------------------------{
+float yLvl = logInput ? math.log(srcInput) : srcInput
+float wVal = dInput == 0 ? yLvl : dInput == 1 ? yLvl - yLvl[1] : yLvl - 2 * yLvl[1] + yLvl[2]
+
+bool inTrack = last_bar_index - bar_index <= calcBarsInput + windowInput
+bool closed  = barstate.isconfirmed
+
+var array<float> wWin = array.new_float()   // differenced series over the fit window, oldest first
+if closed and not na(wVal) and inTrack
+    array.push(wWin, wVal)
+    if array.size(wWin) > windowInput
+        array.shift(wWin)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Estimation (Hannan-Rissanen) on closed bars only
+//---------------------------------------------------------------------------------------------------------------------{
+// Fits ARMA(pp, qq) to the differenced window by Hannan-Rissanen: least squares of w(t) on [1, w(t-1..t-pp),
+// e(t-1..t-qq)], where e are the residuals of a long autoregression. Falls back to the Yule-Walker AR(pp) when the
+// fit is not stationary or not invertible. Returns the coefficients, the conditional residuals over the window and
+// their sum of squares from sseStart on.
+fitArma(int pp, int qq, float mu, array<float> e, int mLong, array<float> ywAll, int sseStart) =>
+    int n  = array.size(wWin)
+    int c0 = constInput ? 1 : 0
+    int kk = c0 + pp + qq
+    bool ok = false
+    phiNew   = array.new_float(pp, 0.0)
+    thetaNew = array.new_float(qq, 0.0)
+    float cNew = 0.0
+    if kk > 0
+        xtx  = array.new_float(kk * kk, 0.0)
+        xty  = array.new_float(kk, 0.0)
+        xrow = array.new_float(kk, 0.0)
+        int start = math.max(pp, mLong + qq)
+        for i = start to n - 1
+            if c0 == 1
+                array.set(xrow, 0, 1.0)
+            if pp > 0
+                for j = 1 to pp
+                    array.set(xrow, c0 + j - 1, array.get(wWin, i - j))
+            if qq > 0
+                for j = 1 to qq
+                    array.set(xrow, c0 + pp + j - 1, array.get(e, i - j))
+            float yv = array.get(wWin, i)
+            for u = 0 to kk - 1
+                float xu = array.get(xrow, u)
+                array.set(xty, u, array.get(xty, u) + xu * yv)
+                for v2 = u to kk - 1
+                    array.set(xtx, u * kk + v2, array.get(xtx, u * kk + v2) + xu * array.get(xrow, v2))
+        for u = 0 to kk - 1
+            for v2 = 0 to u
+                array.set(xtx, u * kk + v2, array.get(xtx, v2 * kk + u))
+        [beta, solved] = solve(xtx, xty, kk)
+        ok := solved
+        if ok
+            cNew := c0 == 1 ? array.get(beta, 0) : 0.0
+            if pp > 0
+                for j = 0 to pp - 1
+                    array.set(phiNew, j, array.get(beta, c0 + j))
+            if qq > 0
+                for j = 0 to qq - 1
+                    array.set(thetaNew, j, array.get(beta, c0 + pp + j))
+    else
+        ok := true
+    negTheta = array.new_float(qq, 0.0)
+    if qq > 0
+        for j = 0 to qq - 1
+            array.set(negTheta, j, -array.get(thetaNew, j))
+    bool fb = not ok or not isStable(phiNew) or not isStable(negTheta)
+    if fb
+        phiNew   := array.new_float(pp, 0.0)
+        thetaNew := array.new_float(qq, 0.0)
+        float sumPhi = 0.0
+        if pp > 0
+            for j = 0 to pp - 1
+                float v = array.get(ywAll, (pp - 1) * mLong + j)
+                array.set(phiNew, j, v)
+                sumPhi += v
+        cNew := constInput ? mu * (1 - sumPhi) : 0.0
+    // conditional residuals of the fitted model over the window
+    epsNew = array.new_float(n, 0.0)
+    float sse = 0.0
+    int   cnt = 0
+    int   s0  = math.max(pp, qq)
+    for i = s0 to n - 1
+        float fc = cNew
+        if pp > 0
+            for j = 1 to pp
+                fc += array.get(phiNew, j - 1) * array.get(wWin, i - j)
+        if qq > 0
+            for j = 1 to qq
+                fc += array.get(thetaNew, j - 1) * array.get(epsNew, i - j)
+        float ev = array.get(wWin, i) - fc
+        array.set(epsNew, i, ev)
+        if i >= sseStart
+            sse += ev * ev
+            cnt += 1
+    [phiNew, thetaNew, cNew, epsNew, sse, cnt, fb]
+
+var array<float> phi   = array.new_float()
+var array<float> theta = array.new_float()
+var float cst      = 0.0
+var float sigma2   = na
+var bool  fitted   = false
+var bool  fallback = false
+var int   lastFit  = na
+var int   lastSel  = na
+var float lbP      = na
+var float aicVal   = na
+var array<float> epsWin = array.new_float() // in-sample one-step errors of the current fit, aligned with wWin
+
+bool autoOrder = orderModeInput == ORDER_AUTO
+var int p = autoOrder ? 0 : pInput
+var int q = autoOrder ? 0 : qInput
+
+bool doFit = closed and array.size(wWin) == windowInput and (na(lastFit) or bar_index - lastFit >= refitInput)
+
+if doFit
+    int n = windowInput
+    float mu = array.avg(wWin)
+    int maxP = autoOrder ? maxOrderInput : pInput
+    int maxQ = autoOrder ? maxOrderInput : qInput
+    // 1. long autoregression by Levinson-Durbin on the sample autocovariances, keeping every order's solution
+    int mLong = math.min(10 + maxP + maxQ, n / 4)
+    r = array.new_float(mLong + 1, 0.0)
+    for k = 0 to mLong
+        float acc = 0.0
+        for i = k to n - 1
+            acc += (array.get(wWin, i) - mu) * (array.get(wWin, i - k) - mu)
+        array.set(r, k, acc / n)
+    a     = array.new_float(mLong, 0.0)
+    ywAll = array.new_float(mLong * mLong, 0.0)
+    float err = array.get(r, 0)
+    for k = 1 to mLong
+        float num = array.get(r, k)
+        if k > 1
+            for j = 1 to k - 1
+                num -= array.get(a, j - 1) * array.get(r, k - j)
+        float kap = err > 0 ? num / err : 0.0
+        prev = array.copy(a)
+        array.set(a, k - 1, kap)
+        if k > 1
+            for j = 1 to k - 1
+                array.set(a, j - 1, array.get(prev, j - 1) - kap * array.get(prev, k - j - 1))
+        err *= (1 - kap * kap)
+        for j = 0 to k - 1
+            array.set(ywAll, (k - 1) * mLong + j, array.get(a, j))
+    // 2. residuals of the long autoregression stand in for the unobserved shocks
+    e = array.new_float(n, 0.0)
+    for i = mLong to n - 1
+        float v = array.get(wWin, i) - mu
+        for j = 1 to mLong
+            v -= array.get(a, j - 1) * (array.get(wWin, i - j) - mu)
+        array.set(e, i, v)
+    int sseStart = math.max(maxP, maxQ) + 10
+    int c0 = constInput ? 1 : 0
+    // 3. order: the user's, or the lowest AIC over every (p, q) up to the maximum, re-selected on its own clock
+    if autoOrder and (na(lastSel) or bar_index - lastSel >= selectEveryInput)
+        float best = na
+        for pp = 0 to maxP
+            for qq = 0 to maxQ
+                [ph0, th0, cc0, ep0, sse0, cnt0, fb0] = fitArma(pp, qq, mu, e, mLong, ywAll, sseStart)
+                float aic = cnt0 > 0 and sse0 > 0 ? cnt0 * math.log(sse0 / cnt0) + 2 * (pp + qq + c0 + 1) : na
+                if not na(aic) and not fb0 and (na(best) or aic < best)
+                    best := aic
+                    p    := pp
+                    q    := qq
+        lastSel := bar_index
+    // 4. the fit used for forecasting
+    [ph, th, cc, ep, sse, cnt, fb] = fitArma(p, q, mu, e, mLong, ywAll, sseStart)
+    int kk = c0 + p + q
+    phi      := ph
+    theta    := th
+    cst      := cc
+    epsWin   := ep
+    fallback := fb
+    sigma2   := cnt > kk ? sse / (cnt - kk) : na
+    aicVal   := cnt > 0 and sse > 0 ? cnt * math.log(sse / cnt) + 2 * (kk + 1) : na
+    fitted   := not na(sigma2) and sigma2 > 0
+    lastFit  := bar_index
+    // 5. Ljung-Box test on the residuals, 10 lags
+    int   L  = 10
+    float m0 = 0.0
+    for i = sseStart to n - 1
+        m0 += array.get(epsWin, i)
+    m0 /= cnt
+    float c0v = 0.0
+    for i = sseStart to n - 1
+        c0v += math.pow(array.get(epsWin, i) - m0, 2)
+    float qStat = 0.0
+    for k = 1 to L
+        float ck = 0.0
+        for i = sseStart + k to n - 1
+            ck += (array.get(epsWin, i) - m0) * (array.get(epsWin, i - k) - m0)
+        float rho = c0v > 0 ? ck / c0v : 0.0
+        qStat += rho * rho / (cnt - k)
+    qStat *= cnt * (cnt + 2)
+    int df = math.max(1, L - p - q)
+    // Wilson-Hilferty approximation of the chi-square upper tail
+    float z = (math.pow(qStat / df, 1.0 / 3) - (1 - 2.0 / (9 * df))) / math.sqrt(2.0 / (9 * df))
+    lbP := 1 - normCdf(z)
+else if closed and fitted and not na(wVal) and inTrack
+    // between refits, extend the residual history with the newest closed bar
+    float fc = cst
+    int n = array.size(wWin)
+    if p > 0
+        for j = 1 to p
+            fc += array.get(phi, j - 1) * array.get(wWin, n - 1 - j)
+    if q > 0
+        for j = 1 to q
+            fc += array.get(theta, j - 1) * array.get(epsWin, array.size(epsWin) - j)
+    array.push(epsWin, array.get(wWin, n - 1) - fc)
+    if array.size(epsWin) > windowInput
+        array.shift(epsWin)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Forecast from the last closed bar
+//---------------------------------------------------------------------------------------------------------------------{
+// h-step forecasts of the level and their standard errors, from the ARMA recursion on the differenced series,
+// integrated d times, with psi weights for the error variance
+forecastPath(int h) =>
+    path = array.new_float(h, na)
+    se   = array.new_float(h, na)
+    int n = array.size(wWin)
+    if fitted and n > p and array.size(epsWin) >= q
+        wf = array.new_float(0)
+        for s = 1 to h
+            float fc = cst
+            if p > 0
+                for j = 1 to p
+                    int idx = s - j
+                    fc += array.get(phi, j - 1) * (idx >= 1 ? array.get(wf, idx - 1) : array.get(wWin, n - 1 + idx))
+            if q >= s
+                for j = s to q
+                    fc += array.get(theta, j - 1) * array.get(epsWin, array.size(epsWin) - 1 - (j - s))
+            array.push(wf, fc)
+        // integrate the differenced forecasts back to the level
+        float lvl  = yLvl
+        float dlt  = yLvl - nz(yLvl[1], yLvl)
+        for s = 1 to h
+            float ws = array.get(wf, s - 1)
+            if dInput == 0
+                lvl := ws
+            else if dInput == 1
+                lvl += ws
+            else
+                dlt += ws
+                lvl += dlt
+            array.set(path, s - 1, lvl)
+        // psi weights of the ARMA part, then cumulated once per difference
+        psi = array.new_float(h, 0.0)
+        array.set(psi, 0, 1.0)
+        if h > 1
+            for j = 1 to h - 1
+                float v = j <= q ? array.get(theta, j - 1) : 0.0
+                if p > 0
+                    for i = 1 to math.min(j, p)
+                        v += array.get(phi, i - 1) * array.get(psi, j - i)
+                array.set(psi, j, v)
+        if dInput > 0
+            for rep = 1 to dInput
+                float run = 0.0
+                for j = 0 to h - 1
+                    run += array.get(psi, j)
+                    array.set(psi, j, run)
+        float acc = 0.0
+        for s = 1 to h
+            acc += math.pow(array.get(psi, s - 1), 2)
+            array.set(se, s - 1, math.sqrt(sigma2 * acc))
+    [path, se]
+
+toPrice(float v) =>
+    logInput ? math.exp(v) : v
+
+float z1 = normInv(0.5 + conf1Input / 200)
+float z2 = normInv(0.5 + conf2Input / 200)
+
+// one-bar-ahead forecast for the next bar, fixed at this bar's close
+float nextFc = na
+float nextSe = na
+if closed and fitted and inTrack
+    [p1, s1] = forecastPath(1)
+    nextFc := array.get(p1, 0)
+    nextSe := array.get(s1, 0)
+
+var float pendFc = na
+var float pendSe = na
+float trackFc = na
+float trackSe = na
+bool  missUp  = false
+bool  missDn  = false
+
+// out-of-sample statistics: the forecast made at the previous close against this close
+var float sseModel = 0.0
+var float sseNaive = 0.0
+var int   nEval    = 0
+var int   in1      = 0
+var int   in2      = 0
+
+if closed and not na(pendFc)
+    trackFc := pendFc
+    trackSe := pendSe
+    float errM = yLvl - pendFc
+    float errN = yLvl - nz(yLvl[1])
+    sseModel += errM * errM
+    sseNaive += errN * errN
+    nEval    += 1
+    in1      += math.abs(errM) <= z1 * pendSe ? 1 : 0
+    in2      += math.abs(errM) <= z2 * pendSe ? 1 : 0
+    missUp   := errM > z2 * pendSe
+    missDn   := errM < -z2 * pendSe
+
+if closed
+    pendFc := nextFc
+    pendSe := nextSe
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Track Plots
+//---------------------------------------------------------------------------------------------------------------------{
+float trackMid = showTrackInput and not na(trackFc) ? toPrice(trackFc) : na
+float trackUp  = showTrackInput and not na(trackFc) ? toPrice(trackFc + z1 * trackSe) : na
+float trackDn  = showTrackInput and not na(trackFc) ? toPrice(trackFc - z1 * trackSe) : na
+
+pUp  = plot(trackUp, "1-Bar Forecast Upper", color.new(trackColorInput, 70), style = plot.style_linebr)
+pDn  = plot(trackDn, "1-Bar Forecast Lower", color.new(trackColorInput, 70), style = plot.style_linebr)
+fill(pUp, pDn, color.new(trackColorInput, 90), "1-Bar Forecast Band")
+plot(trackMid, "1-Bar Forecast", color.new(trackColorInput, 20), style = plot.style_linebr)
+
+plotshape(showTrackInput and missUp, "Close Above Outer Band", shape.circle, location.abovebar, color.new(upColorInput, 30), size = size.tiny)
+plotshape(showTrackInput and missDn, "Close Below Outer Band", shape.circle, location.belowbar, color.new(dnColorInput, 30), size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Forecast Fans
+//---------------------------------------------------------------------------------------------------------------------{
+type Fan
+    int          origin
+    float        anchor
+    array<float> mid
+    array<float> lo
+    array<float> hi
+
+var array<Fan> pastFans = array.new<Fan>()
+var Fan        liveFan  = na
+
+makeFan(int h) =>
+    [path, se] = forecastPath(h)
+    mid = array.new_float(h, na)
+    lo  = array.new_float(h, na)
+    hi  = array.new_float(h, na)
+    for s = 0 to h - 1
+        float v = array.get(path, s)
+        float e = array.get(se, s)
+        array.set(mid, s, toPrice(v))
+        array.set(lo, s, toPrice(v - z1 * e))
+        array.set(hi, s, toPrice(v + z1 * e))
+    Fan.new(bar_index, srcInput, mid, lo, hi)
+
+if closed and fitted and inTrack
+    if showPastInput and bar_index % pastEveryInput == 0 and last_bar_index - bar_index >= horizonInput
+        array.push(pastFans, makeFan(horizonInput))
+        if array.size(pastFans) > pastCountInput
+            array.shift(pastFans)
+    liveFan := makeFan(horizonInput)
+
+var array<polyline> drawn = array.new<polyline>()
+var label fcLabel = na
+var line  originLine = na
+
+drawFan(Fan f, color c, int fillTransp, bool live) =>
+    int h = array.size(f.mid)
+    band = array.new<chart.point>()
+    band.push(chart.point.from_index(f.origin, f.anchor))
+    for s = 0 to h - 1
+        band.push(chart.point.from_index(f.origin + s + 1, array.get(f.hi, s)))
+    for s = h - 1 to 0
+        band.push(chart.point.from_index(f.origin + s + 1, array.get(f.lo, s)))
+    array.push(drawn, polyline.new(band, closed = true, line_color = color.new(c, live ? 60 : 80), fill_color = color.new(c, fillTransp)))
+    midPts = array.new<chart.point>()
+    midPts.push(chart.point.from_index(f.origin, f.anchor))
+    for s = 0 to h - 1
+        midPts.push(chart.point.from_index(f.origin + s + 1, array.get(f.mid, s)))
+    array.push(drawn, polyline.new(midPts, line_color = color.new(c, live ? 0 : 40), line_style = line.style_dashed, line_width = live ? 2 : 1))
+
+if barstate.islast
+    for pl in drawn
+        polyline.delete(pl)
+    array.clear(drawn)
+    label.delete(fcLabel)
+    line.delete(originLine)
+    if showPastInput
+        for f in pastFans
+            drawFan(f, trackColorInput, 92, false)
+    if not na(liveFan)
+        drawFan(liveFan, fcColorInput, 82, true)
+        int   h    = array.size(liveFan.mid)
+        float endV = array.get(liveFan.mid, h - 1)
+        originLine := line.new(liveFan.origin, low, liveFan.origin, high, extend = extend.both, color = color.new(fcColorInput, 75), style = line.style_dotted)
+        int   hm   = math.max(0, h / 2 - 1)
+        fcLabel := label.new(liveFan.origin + hm + 1, array.get(liveFan.lo, hm)
+          , "Model forecast\nARIMA(" + str.tostring(p) + "," + str.tostring(dInput) + "," + str.tostring(q) + "), " + str.tostring(conf1Input, "#") + "% band"
+          , style = label.style_label_up, color = color.new(DASH_BG, 10), textcolor = fcColorInput, size = size.small
+          , tooltip = "Model output, not a prediction of what price will do: the conditional mean of a linear model fitted to the last " + str.tostring(windowInput) + " closed bars, with the " + str.tostring(conf1Input, "#") + "% interval implied by its own error variance under normal errors. The dotted line marks the forecast origin, the last closed bar.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dash = table.new(getPosition(dashPosInput), 2, 8, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+coefText(array<float> arr, string sym) =>
+    string t = ""
+    int n = array.size(arr)
+    if n > 0
+        for j = 0 to n - 1
+            t += (j > 0 ? "  " : "") + sym + str.tostring(j + 1) + " " + str.tostring(array.get(arr, j), "0.000")
+    t
+
+if barstate.islast and showDashInput
+    ts = getSize(dashSizeInput)
+    string spec = "ARIMA(" + str.tostring(p) + "," + str.tostring(dInput) + "," + str.tostring(q) + ")" + (constInput ? " + c" : "") + (autoOrder ? ", AIC" : "") + (fallback ? ", AR fallback" : "")
+    table.cell(dash, 0, 0, "Model", text_color = DASH_HEADER, text_halign = text.align_left, text_size = ts
+      , tooltip = "Specification fitted by the Hannan-Rissanen method (a long autoregression estimates the shocks, then least squares), a standard two-stage estimator that stands in for full maximum likelihood. AIC marks an automatically selected order. AR fallback means the last fit was not stationary or invertible and a Yule-Walker AR(p) was used instead.")
+    table.cell(dash, 1, 0, spec, text_color = fcColorInput, text_halign = text.align_right, text_size = ts)
+    string coefs = coefText(phi, "φ") + (array.size(phi) > 0 and array.size(theta) > 0 ? "  " : "") + coefText(theta, "θ")
+    if constInput
+        string cTxt = "c " + (logInput and dInput == 1 ? fmtPct(cst * 100) : str.tostring(cst, "0.0000"))
+        coefs := coefs == "" ? cTxt : coefs + "  " + cTxt
+    table.cell(dash, 0, 1, "Coefficients", text_color = DASH_HEADER, text_halign = text.align_left, text_size = ts)
+    table.cell(dash, 1, 1, coefs == "" ? "-" : coefs, text_color = DASH_TEXT, text_halign = text.align_right, text_size = ts)
+    table.cell(dash, 0, 2, "σ per bar", text_color = DASH_HEADER, text_halign = text.align_left, text_size = ts
+      , tooltip = "Standard deviation of the model's one-step errors in the fit window" + (logInput ? ", in percent (log units)." : ", in price units."))
+    table.cell(dash, 1, 2, na(sigma2) ? "-" : logInput ? str.tostring(math.sqrt(sigma2) * 100, "0.00") + "%" : str.tostring(math.sqrt(sigma2), format.mintick), text_color = DASH_TEXT, text_halign = text.align_right, text_size = ts)
+    string fcText   = "-"
+    string bandText = "-"
+    if not na(liveFan)
+        int h = array.size(liveFan.mid)
+        fcText   := fmtPct((array.get(liveFan.mid, h - 1) / liveFan.anchor - 1) * 100) + " in " + str.tostring(h) + " bars"
+        bandText := str.tostring(array.get(liveFan.lo, h - 1), format.mintick) + " to " + str.tostring(array.get(liveFan.hi, h - 1), format.mintick)
+    table.cell(dash, 0, 3, "Forecast", text_color = DASH_HEADER, text_halign = text.align_left, text_size = ts
+      , tooltip = "Change of the forecast path from the last close to the end of the horizon. Compare it with the band: a forecast change well inside the band is not distinguishable from no change.")
+    table.cell(dash, 1, 3, fcText, text_color = fcColorInput, text_halign = text.align_right, text_size = ts)
+    table.cell(dash, 0, 4, str.tostring(conf1Input, "#") + "% Band", text_color = DASH_HEADER, text_halign = text.align_left, text_size = ts
+      , tooltip = "Inner prediction interval at the end of the horizon.")
+    table.cell(dash, 1, 4, bandText, text_color = DASH_TEXT, text_halign = text.align_right, text_size = ts)
+    float theilU = sseNaive > 0 ? math.sqrt(sseModel / sseNaive) : na
+    table.cell(dash, 0, 5, "RMSE vs No-change", text_color = DASH_HEADER, text_halign = text.align_left, text_size = ts
+      , tooltip = "Out-of-sample one-bar error of the model divided by that of a no-change forecast (Theil's U) over the track. Below 1 the model beat the no-change forecast on this chart; at or above 1 it added nothing.")
+    table.cell(dash, 1, 5, na(theilU) ? "-" : str.tostring(theilU, "0.000") + (theilU < 1 ? " (better)" : " (no edge)"), text_color = na(theilU) ? DASH_HEADER : theilU < 1 ? upColorInput : DASH_TEXT, text_halign = text.align_right, text_size = ts)
+    table.cell(dash, 0, 6, "Band Coverage", text_color = DASH_HEADER, text_halign = text.align_left, text_size = ts
+      , tooltip = "Share of closes that landed inside the one-bar-ahead bands, against their nominal levels. Coverage well below nominal means the model understates risk, typically through fat tails or volatility clustering.")
+    table.cell(dash, 1, 6, nEval == 0 ? "-" : str.tostring(in1 * 100.0 / nEval, "0") + "% / " + str.tostring(in2 * 100.0 / nEval, "0") + "% (n " + str.tostring(nEval) + ")", text_color = DASH_TEXT, text_halign = text.align_right, text_size = ts)
+    table.cell(dash, 0, 7, "Residuals", text_color = DASH_HEADER, text_halign = text.align_left, text_size = ts
+      , tooltip = "Ljung-Box test on the last fit's residuals over 10 lags. A p-value above 0.05 is consistent with white noise; below it, autocorrelation is left in the residuals and a different order may fit better.")
+    table.cell(dash, 1, 7, na(lbP) ? "-" : "Ljung-Box p " + str.tostring(lbP, "0.000") + (lbP > 0.05 ? " (white)" : " (structure left)"), text_color = DASH_TEXT, text_halign = text.align_right, text_size = ts)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(missUp, "Close Above Outer Band", "{{ticker}} closed above the ARIMA one-bar-ahead outer band ({{interval}}): a move larger than the model expected")
+alertcondition(missDn, "Close Below Outer Band", "{{ticker}} closed below the ARIMA one-bar-ahead outer band ({{interval}}): a move larger than the model expected")
+
+//---------------------------------------------------------------------------------------------------------------------}

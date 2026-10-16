@@ -1,0 +1,330 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Central Pivot Range", shorttitle = "Central Pivot Range", overlay = true, format = format.price, max_lines_count = 500, max_boxes_count = 500, max_labels_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+string GROUP_SETTINGS  = "Settings"
+string GROUP_DASHBOARD = "Dashboard"
+string GROUP_STYLE     = "Style"
+
+int   MAX_VIRGIN    = 100
+color BULL_COLOR    = #089981 // bottom central - support side of the range
+color BEAR_COLOR    = #f23645 // top central - resistance side of the range
+color NEUTRAL_COLOR = #787b86 // central pivot - structure
+color ACCENT_COLOR  = #ff9800 // virgin CPRs - untested ranges carried forward, the one highlight
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+anchorInput = input.string("Daily", "Anchor Period"
+  , options = ["Daily", "Weekly", "Monthly"]
+  , group   = GROUP_SETTINGS
+  , tooltip = "Completed prior period supplying the high, low and close that build the range. Daily is the standard choice for intraday charts, weekly or monthly provide swing context. The three lines roll at each new period and stay fixed until the next roll, so the range is known before its session starts.")
+
+widthLookbackInput = input.int(20, "Width Comparison Window"
+  , minval  = 2
+  , maxval  = 250
+  , group   = GROUP_SETTINGS
+  , tooltip = "Number of recent completed periods whose Width% values form the reference distribution used to classify each new range as narrow or wide.")
+
+widthPercentileInput = input.int(25, "Narrow / Wide Percentile"
+  , minval  = 1
+  , maxval  = 49
+  , group   = GROUP_SETTINGS
+  , tooltip = "A new range is flagged Narrow when its Width% sits at or below this percentile of recent widths, and Wide when it sits at or above the mirrored (100 - percentile) rank. Narrow ranges follow balanced sessions and are watched for expansion, wide ranges follow directional sessions and set expectations for rotation.")
+
+virginInput = input.bool(true, "Track Virgin CPRs"
+  , group   = GROUP_SETTINGS
+  , tooltip = "A range price never traded into during its own session becomes a virgin CPR. It is carried forward to the right as an untested reference and frozen at the bar where price finally trades into it.")
+
+showDashInput = input.bool(true, "Show Dashboard"
+  , group   = GROUP_DASHBOARD
+  , tooltip = "Compact summary of the current range: Width% and its narrow/wide read, the relationship with the prior range, where price is trading relative to the range, and the number of untested virgin CPRs.")
+
+dashLocInput = input.string("Top Right", "Location"
+  , options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"]
+  , inline  = "dash"
+  , group   = GROUP_DASHBOARD
+  , tooltip = "Dashboard position on the chart and text size.")
+
+dashSizeInput = input.string("Small", ""
+  , options = ["Tiny", "Small", "Normal"]
+  , inline  = "dash"
+  , group   = GROUP_DASHBOARD)
+
+pivotColorInput = input.color(NEUTRAL_COLOR, "Pivot"
+  , group   = GROUP_STYLE
+  , tooltip = "Central pivot line, P = (H + L + C) / 3 of the prior period, the classic floor-trader pivot.")
+
+tcColorInput = input.color(BEAR_COLOR, "Top Central (TC)"
+  , group   = GROUP_STYLE
+  , tooltip = "Upper boundary of the range, TC = 2 * P - BC (always drawn on top).")
+
+bcColorInput = input.color(BULL_COLOR, "Bottom Central (BC)"
+  , group   = GROUP_STYLE
+  , tooltip = "Lower boundary of the range, BC = (H + L) / 2, the prior period's range midpoint.")
+
+fillInput = input.bool(true, "Range Gradient Fill"
+  , group   = GROUP_STYLE
+  , tooltip = "Fill the range with vertical gradients fading out from the central pivot toward TC and BC.")
+
+virginColorInput = input.color(ACCENT_COLOR, "Virgin CPR"
+  , group   = GROUP_STYLE
+  , tooltip = "Color of carried-forward virgin CPRs, drawn as dashed boxes with a dotted central pivot line.")
+
+lineWidthInput = input.int(1, "Line Width"
+  , minval  = 1
+  , maxval  = 5
+  , group   = GROUP_STYLE
+  , tooltip = "Line width of the three range lines.")
+
+showLabelsInput = input.bool(true, "Level Labels"
+  , group   = GROUP_STYLE
+  , tooltip = "Show a name and price label for each line of the current range, next to the most recent bar.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+string anchorTf = switch anchorInput
+    "Daily"  => "D"
+    "Weekly" => "W"
+    =>          "M"
+
+// prior completed period high, low and close — the [1] offset with lookahead returns the finished period's values
+// from the first bar of the new period without repainting
+[priorHigh, priorLow, priorClose] = request.security(syminfo.tickerid, anchorTf, [high[1], low[1], close[1]], lookahead = barmerge.lookahead_on)
+
+// the anchor period must be greater than or equal to the chart timeframe to be meaningful
+bool anchorTooSmall = timeframe.in_seconds(anchorTf) < timeframe.in_seconds(timeframe.period)
+bool anchorIsChart  = timeframe.in_seconds(anchorTf) == timeframe.in_seconds(timeframe.period)
+
+// first chart bar of a new anchor period, where the range rolls to fresh values
+bool newPeriod = timeframe.change(anchorTf)
+bool rollBar   = newPeriod and not anchorIsChart
+
+// Pivot = (H + L + C) / 3, BC = (H + L) / 2, TC = 2 * Pivot - BC — when TC computes below BC the two swap,
+// so TC is always the upper boundary of the range
+float cprPivot = anchorTooSmall ? na : (priorHigh + priorLow + priorClose) / 3
+float rangeMid = anchorTooSmall ? na : (priorHigh + priorLow) / 2
+float mirrored = 2 * cprPivot - rangeMid
+
+float cprTC = math.max(rangeMid, mirrored)
+float cprBC = math.min(rangeMid, mirrored)
+
+// Width% = abs(TC - BC) / Pivot * 100, the range width as a percentage of the pivot price
+float widthPct = cprPivot != 0 ? math.abs(cprTC - cprBC) / cprPivot * 100 : na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Width Analysis, Two-Period Relationship & Virgin CPRs
+//---------------------------------------------------------------------------------------------------------------------{
+var float[] widthHistoryArray = array.new_float()
+var box[]   virginBoxArray    = array.new_box()
+var line[]  virginLineArray   = array.new_line()
+
+var bool   sessionTouched = false
+var bool   isNarrow       = false
+var bool   isWide         = false
+var string widthClassTxt  = "-"
+var string relationTxt    = "-"
+
+if newPeriod
+    // range of the session that just ended
+    float endedTC    = cprTC[1]
+    float endedBC    = cprBC[1]
+    float endedPivot = cprPivot[1]
+
+    // a range price never traded into during its own session is carried forward as a virgin CPR
+    if virginInput and not na(endedTC) and not sessionTouched
+        array.push(virginBoxArray, box.new(bar_index, endedTC, bar_index, endedBC
+          , border_color = color.new(virginColorInput, 40)
+          , border_width = 1
+          , border_style = line.style_dashed
+          , extend       = extend.right
+          , bgcolor      = color.new(virginColorInput, 92)))
+
+        array.push(virginLineArray, line.new(bar_index, endedPivot, bar_index + 1, endedPivot
+          , extend = extend.right
+          , color  = color.new(virginColorInput, 40)
+          , style  = line.style_dotted))
+
+        // cap the number of still-untested virgin CPRs kept alive
+        if array.size(virginBoxArray) > MAX_VIRGIN
+            box.delete(array.shift(virginBoxArray))
+            line.delete(array.shift(virginLineArray))
+
+    // classify the fresh range width against recent completed periods
+    isNarrow      := false
+    isWide        := false
+    widthClassTxt := "-"
+
+    if not na(widthPct) and array.size(widthHistoryArray) >= 2
+        float narrowThreshold = array.percentile_linear_interpolation(widthHistoryArray, widthPercentileInput)
+        float wideThreshold   = array.percentile_linear_interpolation(widthHistoryArray, 100 - widthPercentileInput)
+
+        isNarrow      := widthPct <= narrowThreshold
+        isWide        := widthPct >= wideThreshold and not isNarrow
+        widthClassTxt := isNarrow ? "Narrow" : isWide ? "Wide" : "Average"
+
+    if not na(widthPct)
+        array.push(widthHistoryArray, widthPct)
+
+        while array.size(widthHistoryArray) > widthLookbackInput
+            array.shift(widthHistoryArray)
+
+    // two-period relationship: a range printing entirely above the prior one leans continuation higher,
+    // entirely below leans lower, heavy overlap suggests a developing trading range
+    relationTxt := "-"
+
+    if not na(cprTC) and not na(endedTC)
+        relationTxt := cprBC > endedTC ? "Higher" : cprTC < endedBC ? "Lower" : "Overlap"
+
+    sessionTouched := false
+
+// price trading into the live range disqualifies it as a future virgin CPR
+if not na(cprTC) and high >= cprBC and low <= cprTC
+    sessionTouched := true
+
+// freeze any virgin CPR at the bar where price finally trades into it
+bool virginTouch = false
+
+if array.size(virginBoxArray) > 0
+    for i = array.size(virginBoxArray) - 1 to 0
+        box virginBox = array.get(virginBoxArray, i)
+
+        if high >= box.get_bottom(virginBox) and low <= box.get_top(virginBox)
+            line virginLine = array.get(virginLineArray, i)
+
+            box.set_extend(virginBox, extend.none)
+            box.set_right(virginBox, bar_index)
+            line.set_extend(virginLine, extend.none)
+            line.set_x2(virginLine, bar_index)
+            array.remove(virginBoxArray, i)
+            array.remove(virginLineArray, i)
+
+            virginTouch := true
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Plots
+//---------------------------------------------------------------------------------------------------------------------{
+// levels hold flat within each period, breaking at every roll so each range displays as its own horizontal segment
+float tcPlotValue    = rollBar ? na : cprTC
+float pivotPlotValue = rollBar ? na : cprPivot
+float bcPlotValue    = rollBar ? na : cprBC
+
+tcPlotId    = plot(tcPlotValue,    "Top Central (TC)",    tcColorInput,    lineWidthInput, plot.style_linebr)
+pivotPlotId = plot(pivotPlotValue, "Pivot",               pivotColorInput, lineWidthInput, plot.style_linebr)
+bcPlotId    = plot(bcPlotValue,    "Bottom Central (BC)", bcColorInput,    lineWidthInput, plot.style_linebr)
+plot(widthPct, "CPR Width %", NEUTRAL_COLOR, display = display.data_window)
+
+// vertical gradients fading out from the central pivot toward each boundary
+color tcEdgeColor = fillInput ? color.new(tcColorInput, 80)  : na
+color tcFadeColor = fillInput ? color.new(tcColorInput, 100) : na
+color bcEdgeColor = fillInput ? color.new(bcColorInput, 80)  : na
+color bcFadeColor = fillInput ? color.new(bcColorInput, 100) : na
+
+fill(tcPlotId, pivotPlotId, top_value = tcPlotValue, bottom_value = pivotPlotValue, top_color = tcEdgeColor, bottom_color = tcFadeColor, title = "Upper Range Gradient")
+fill(pivotPlotId, bcPlotId, top_value = pivotPlotValue, bottom_value = bcPlotValue, top_color = bcFadeColor, bottom_color = bcEdgeColor, title = "Lower Range Gradient")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Labels & Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var label[] levelLabelArray = array.new<label>()
+
+if barstate.islast and showLabelsInput and not anchorTooSmall
+    for eachLabel in levelLabelArray
+        label.delete(eachLabel)
+    array.clear(levelLabelArray)
+
+    if not na(cprTC)
+        array.push(levelLabelArray, label.new(bar_index, cprTC, "TC  " + str.tostring(cprTC, format.mintick)
+          , color     = #00000000
+          , textcolor = tcColorInput
+          , style     = label.style_label_left
+          , size      = size.small))
+
+        array.push(levelLabelArray, label.new(bar_index, cprPivot, "P  " + str.tostring(cprPivot, format.mintick)
+          , color     = #00000000
+          , textcolor = pivotColorInput
+          , style     = label.style_label_left
+          , size      = size.small))
+
+        array.push(levelLabelArray, label.new(bar_index, cprBC, "BC  " + str.tostring(cprBC, format.mintick)
+          , color     = #00000000
+          , textcolor = bcColorInput
+          , style     = label.style_label_left
+          , size      = size.small))
+
+dashPosition = switch dashLocInput
+    "Top Right"    => position.top_right
+    "Top Left"     => position.top_left
+    "Bottom Right" => position.bottom_right
+    =>                position.bottom_left
+
+dashTextSize = switch dashSizeInput
+    "Tiny"  => size.tiny
+    "Small" => size.small
+    =>         size.normal
+
+var table dashTable = na
+
+if showDashInput and barstate.islast and not anchorTooSmall
+    if na(dashTable)
+        dashTable := table.new(dashPosition, 2, 5
+          , bgcolor      = DASH_BG
+          , border_width = 0
+          , frame_color  = DASH_FRAME
+          , frame_width  = 1)
+
+    color labelColor = DASH_HEADER
+
+    string widthTxt   = na(widthPct) ? "-" : str.tostring(widthPct, "#.###") + "%"
+    string priceTxt   = na(cprTC) ? "-" : close > cprTC ? "Above" : close < cprBC ? "Below" : "Inside"
+    color  priceColor = priceTxt == "Above" ? BULL_COLOR : priceTxt == "Below" ? BEAR_COLOR : DASH_TEXT
+    color  relColor   = relationTxt == "Higher" ? BULL_COLOR : relationTxt == "Lower" ? BEAR_COLOR : DASH_TEXT
+    color  classColor = (widthClassTxt == "Narrow" or widthClassTxt == "Wide") ? virginColorInput : DASH_TEXT
+
+    table.cell(dashTable, 0, 0, "CPR Width",   text_color = labelColor,     text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 0, widthTxt,      text_color = DASH_TEXT,      text_size = dashTextSize)
+    table.cell(dashTable, 0, 1, "Width Read",  text_color = labelColor,     text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 1, widthClassTxt, text_color = classColor,     text_size = dashTextSize)
+    table.cell(dashTable, 0, 2, "vs Prior",    text_color = labelColor,     text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 2, relationTxt,   text_color = relColor,       text_size = dashTextSize)
+    table.cell(dashTable, 0, 3, "Price",       text_color = labelColor,     text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 3, priceTxt,      text_color = priceColor,     text_size = dashTextSize)
+    table.cell(dashTable, 0, 4, "Virgin CPRs", text_color = labelColor,     text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 4, str.tostring(array.size(virginBoxArray)), text_color = array.size(virginBoxArray) > 0 ? virginColorInput : DASH_TEXT, text_size = dashTextSize)
+
+// warn when the selected anchor period is lower than the chart timeframe
+if barstate.islast and anchorTooSmall
+    var table warnTable = table.new(position.top_right, 1, 1, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+    table.cell(warnTable, 0, 0, "Central Pivot Range: anchor period must be greater than or equal to the chart timeframe"
+      , text_color = BEAR_COLOR
+      , text_size  = size.small)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+// crosses on the roll bar itself are ignored, since they compare price against the previous period's range
+bool acceptedAbove = ta.crossover(close, cprTC)  and not rollBar
+bool acceptedBelow = ta.crossunder(close, cprBC) and not rollBar
+
+bool insideRange = not na(cprTC) and close <= cprTC and close >= cprBC
+bool insidePrev  = not na(cprTC[1]) and close[1] <= cprTC[1] and close[1] >= cprBC[1]
+bool backInside  = insideRange and not insidePrev and not rollBar
+
+alertcondition(newPeriod and isNarrow,               "Narrow CPR",                "New CPR is narrow relative to recent periods - the prior session closed near its midpoint, watch for expansion or a trend day")
+alertcondition(newPeriod and isWide,                 "Wide CPR",                  "New CPR is wide relative to recent periods - the prior session closed near an extreme, rotation tendencies favored")
+alertcondition(acceptedAbove,                        "Price Accepted Above CPR",  "Price closed above the top central pivot (TC) - bullish bias while trade is sustained above the range")
+alertcondition(acceptedBelow,                        "Price Accepted Below CPR",  "Price closed below the bottom central pivot (BC) - bearish bias while trade is sustained below the range")
+alertcondition(backInside,                           "Price Back Inside CPR",     "Price closed back inside the range - balance, where traders more often fade the band's edges than chase")
+alertcondition(newPeriod and relationTxt == "Higher", "Higher Value CPR",         "New CPR printed entirely above the prior one - two-period relationship supports a continuation lean higher")
+alertcondition(newPeriod and relationTxt == "Lower",  "Lower Value CPR",          "New CPR printed entirely below the prior one - two-period relationship supports a continuation lean lower")
+alertcondition(virginTouch,                          "Virgin CPR Tested",         "Price traded into a virgin CPR - a previously untested range is being tested")
+
+//---------------------------------------------------------------------------------------------------------------------}

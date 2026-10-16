@@ -1,0 +1,508 @@
+// This work is licensed under Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Internal & External Range Liquidity", "IRL / ERL", overlay = true, max_boxes_count = 200, max_lines_count = 200, max_labels_count = 200)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+color GREEN  = #089981
+color RED    = #f23645
+color GRAY   = #787b86
+color BLUE   = #2157f3
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+int BULL = 1
+int BEAR = -1
+
+//rotation state: what was taken last, which sets the next draw
+int ST_NONE    = 0
+int ST_RAID_HI = 1   //buy-side ERL raided and rejected: draw inward to IRL below
+int ST_RAID_LO = 2   //sell-side ERL raided and rejected: draw inward to IRL above
+int ST_IRL_HI  = 3   //IRL taken: draw outward to the buy-side ERL
+int ST_IRL_LO  = 4   //IRL taken: draw outward to the sell-side ERL
+int ST_RUN_HI  = 5   //buy-side ERL taken with acceptance: expansion, range to be redrawn
+int ST_RUN_LO  = 6   //sell-side ERL taken with acceptance
+
+string FILL_TOUCH = "Touch"
+string FILL_CE    = "CE (50%)"
+string FILL_FULL  = "Full"
+
+string SIZE_TINY   = "Tiny"
+string SIZE_SMALL  = "Small"
+string SIZE_NORMAL = "Normal"
+
+string POS_TR = "Top Right"
+string POS_TL = "Top Left"
+string POS_BR = "Bottom Right"
+string POS_BL = "Bottom Left"
+
+string GRP_RANGE = "Dealing Range (ERL)"
+string GRP_IRL   = "Internal Liquidity (IRL)"
+string GRP_DRAW  = "Rotation"
+string GRP_DASH  = "Dashboard"
+string GRP_STYLE = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+rangeLenInput = input.int(20, "Range Swing Length"
+  , minval  = 5
+  , maxval  = 100
+  , group   = GRP_RANGE
+  , tooltip = "Bars on each side a swing must dominate to anchor the dealing range. The range runs from the latest major swing low to the latest major swing high; their extremes hold the external range liquidity (buy stops above the high, sell stops below the low). Use a length that stands for the higher timeframe you read the range on: around 20 on the chart timeframe approximates a range one or two degrees up.")
+
+acceptInput = input.int(3, "Acceptance Closes"
+  , minval  = 1
+  , maxval  = 20
+  , group   = GRP_RANGE
+  , tooltip = "After price trades beyond a range extreme, a close back inside within this many bars confirms a raid (rejection) and turns the draw inward. If every one of these closes stays beyond the extreme, the move is read as a breakout (acceptance) and the range waits to be redrawn from the next major swing.")
+
+showEqInput = input.bool(true, "Equilibrium"
+  , group   = GRP_RANGE
+  , tooltip = "Dotted 50% line of the dealing range, so internal liquidity reads as sitting in premium or discount.")
+
+gapSizeInput = input.float(0.25, "Minimum Gap Size (ATR)"
+  , minval  = 0
+  , step    = 0.05
+  , group   = GRP_IRL
+  , tooltip = "Fair value gaps smaller than this multiple of ATR(14) are ignored. Unfilled gaps inside the dealing range are the internal liquidity the rotation draws toward.")
+
+fillInput = input.string(FILL_CE, "Fill Rule"
+  , options = [FILL_TOUCH, FILL_CE, FILL_FULL]
+  , group   = GRP_IRL
+  , tooltip = "When an internal gap counts as taken. Touch: price enters the gap. CE: price reaches its 50% consequent encroachment. Full: price trades through the whole gap.")
+
+maxGapsInput = input.int(12, "Max Tracked Gaps"
+  , minval  = 1
+  , maxval  = 40
+  , group   = GRP_IRL
+  , tooltip = "Most recent unfilled gaps kept in the inventory. Only those inside the current dealing range are drawn as IRL.")
+
+keepFilledInput = input.int(4, "Keep Filled Gaps"
+  , minval  = 0
+  , maxval  = 20
+  , group   = GRP_IRL
+  , tooltip = "Filled gaps stay on the chart, faded, up to this count.")
+
+showDrawInput = input.bool(true, "Show Next Draw"
+  , group   = GRP_DRAW
+  , tooltip = "Plot the level the rotation points to next. After a raid of one extreme the draw is the nearest unfilled internal gap back inside the range; once that internal liquidity is taken the draw is the untouched extreme. With neither extreme taken, a gap filled from above points to the buy-side extreme and a gap filled from below to the sell-side extreme.")
+
+showEventsInput = input.bool(true, "Event Labels"
+  , group   = GRP_DRAW
+  , tooltip = "Label the rotation events: ERL raid (extreme taken, then rejected), ERL run (extreme taken with acceptance) and IRL (the internal gap the rotation was drawing to was taken).")
+
+showDashInput = input.bool(true, "Show Dashboard"
+  , group   = GRP_DASH)
+
+dashPosInput = input.string(POS_TR, "Position"
+  , options = [POS_TR, POS_TL, POS_BR, POS_BL]
+  , group   = GRP_DASH)
+
+dashSizeInput = input.string(SIZE_SMALL, "Size"
+  , options = [SIZE_TINY, SIZE_SMALL, SIZE_NORMAL]
+  , group   = GRP_DASH)
+
+bslColorInput = input.color(GREEN, "Buy-side ERL",  inline = "erl", group = GRP_STYLE)
+sslColorInput = input.color(RED,   "Sell-side ERL", inline = "erl", group = GRP_STYLE)
+irlColorInput = input.color(BLUE,  "IRL",           inline = "irl", group = GRP_STYLE)
+eqColorInput  = input.color(GRAY,  "Equilibrium",   inline = "irl", group = GRP_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+textSize(string s) =>
+    switch s
+        SIZE_TINY   => size.tiny
+        SIZE_NORMAL => size.normal
+        => size.small
+
+tablePos(string s) =>
+    switch s
+        POS_TL => position.top_left
+        POS_BR => position.bottom_right
+        POS_BL => position.bottom_left
+        => position.top_right
+
+// @function    price level that must trade for a gap to count as taken
+fillLevel(float top, float bottom, int dir) =>
+    switch fillInput
+        FILL_TOUCH => dir == BULL ? top : bottom
+        FILL_FULL  => dir == BULL ? bottom : top
+        => math.avg(top, bottom)
+
+stateText(int st) =>
+    switch st
+        1 => "Buy-side ERL raid"
+        2 => "Sell-side ERL raid"
+        3 => "IRL taken"
+        4 => "IRL taken"
+        5 => "Buy-side ERL run"
+        6 => "Sell-side ERL run"
+        => "Waiting"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dealing range (external liquidity)
+//---------------------------------------------------------------------------------------------------------------------{
+float atr = ta.atr(14)
+float ph  = ta.pivothigh(high, rangeLenInput, rangeLenInput)
+float pl  = ta.pivotlow(low, rangeLenInput, rangeLenInput)
+
+var float rHi      = na
+var int   rHiBar   = na
+var bool  hiTaken  = false
+var float rLo      = na
+var int   rLoBar   = na
+var bool  loTaken  = false
+
+var line  hiLine  = na
+var line  loLine  = na
+var line  eqLine  = na
+
+var int   pendHi   = 0     //bars spent beyond the high since it was first traded, 0 when idle
+var int   pendLo   = 0
+var int   state    = ST_NONE
+
+bool newHiAnchor = false
+bool newLoAnchor = false
+
+if not na(ph)
+    // a replaced extreme that was never taken leaves no record; a taken one stays, dotted, ending where it was taken
+    if not na(hiLine)
+        if hiTaken
+            hiLine.set_style(line.style_dotted)
+            hiLine.set_color(color.new(bslColorInput, 40))
+        else
+            hiLine.delete()
+    rHi      := ph
+    rHiBar   := bar_index - rangeLenInput
+    hiTaken  := false
+    pendHi   := 0
+    hiLine   := line.new(rHiBar, rHi, bar_index, rHi, color = bslColorInput, width = 2)
+    newHiAnchor := true
+    if state == ST_RUN_HI
+        state := ST_NONE
+
+if not na(pl)
+    if not na(loLine)
+        if loTaken
+            loLine.set_style(line.style_dotted)
+            loLine.set_color(color.new(sslColorInput, 40))
+        else
+            loLine.delete()
+    rLo      := pl
+    rLoBar   := bar_index - rangeLenInput
+    loTaken  := false
+    pendLo   := 0
+    loLine   := line.new(rLoBar, rLo, bar_index, rLo, color = sslColorInput, width = 2)
+    newLoAnchor := true
+    if state == ST_RUN_LO
+        state := ST_NONE
+
+bool hasRange = not na(rHi) and not na(rLo) and rHi > rLo
+float eqLvl   = hasRange ? math.avg(rHi, rLo) : na
+
+// external liquidity taken: a close back inside within the acceptance window is a raid (rejection);
+// the acceptance count of consecutive closes beyond the extreme, at any time after it was taken, is a run (breakout)
+var int  hiAbove  = 0
+var int  loBelow  = 0
+var bool hiRunned = false
+var bool loRunned = false
+if newHiAnchor
+    hiAbove  := 0
+    hiRunned := false
+if newLoAnchor
+    loBelow  := 0
+    loRunned := false
+
+bool raidHi = false
+bool raidLo = false
+bool runHi  = false
+bool runLo  = false
+
+if hasRange
+    if not hiTaken and high > rHi
+        hiTaken := true
+        pendHi  := 1
+        hiLine.set_x2(bar_index)
+    else if pendHi > 0
+        pendHi += 1
+    if hiTaken
+        hiAbove := close > rHi ? hiAbove + 1 : 0
+    if pendHi > 0
+        if close <= rHi
+            raidHi := true
+            pendHi := 0
+        else if pendHi >= acceptInput
+            pendHi := 0
+    if hiTaken and not hiRunned and hiAbove >= acceptInput
+        runHi    := true
+        hiRunned := true
+
+    if not loTaken and low < rLo
+        loTaken := true
+        pendLo  := 1
+        loLine.set_x2(bar_index)
+    else if pendLo > 0
+        pendLo += 1
+    if loTaken
+        loBelow := close < rLo ? loBelow + 1 : 0
+    if pendLo > 0
+        if close >= rLo
+            raidLo := true
+            pendLo := 0
+        else if pendLo >= acceptInput
+            pendLo := 0
+    if loTaken and not loRunned and loBelow >= acceptInput
+        runLo    := true
+        loRunned := true
+
+
+// keep live extremes extended while untaken
+if not na(hiLine) and not hiTaken
+    hiLine.set_x2(bar_index + 3)
+if not na(loLine) and not loTaken
+    loLine.set_x2(bar_index + 3)
+
+if hasRange and showEqInput
+    int eqLeft = math.min(rHiBar, rLoBar)
+    if na(eqLine)
+        eqLine := line.new(eqLeft, eqLvl, bar_index + 3, eqLvl, color = color.new(eqColorInput, 30), style = line.style_dotted)
+    else
+        eqLine.set_xy1(eqLeft, eqLvl)
+        eqLine.set_xy2(bar_index + 3, eqLvl)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Internal liquidity (fair value gaps)
+//---------------------------------------------------------------------------------------------------------------------{
+//open gaps are held in parallel arrays (top, bottom, direction, first bar, drawing)
+var array<float> gTop  = array.new<float>()
+var array<float> gBot  = array.new<float>()
+var array<int>   gDir  = array.new<int>()
+var array<int>   gLeft = array.new<int>()
+var array<box>   gBox  = array.new<box>()
+var array<box>   fBox  = array.new<box>()   //filled gaps kept for review
+
+bool bullGap = bar_index > 2 and low > high[2] and (low - high[2]) >= gapSizeInput * nz(atr)
+bool bearGap = bar_index > 2 and high < low[2] and (low[2] - high) >= gapSizeInput * nz(atr)
+
+if bullGap
+    gTop.push(low)
+    gBot.push(high[2])
+    gDir.push(BULL)
+    gLeft.push(bar_index - 2)
+    gBox.push(box.new(bar_index - 2, low, bar_index, high[2], border_color = color(na), bgcolor = color(na), text = "", text_size = size.tiny, text_halign = text.align_right))
+if bearGap
+    gTop.push(low[2])
+    gBot.push(high)
+    gDir.push(BEAR)
+    gLeft.push(bar_index - 2)
+    gBox.push(box.new(bar_index - 2, low[2], bar_index, high, border_color = color(na), bgcolor = color(na), text = "", text_size = size.tiny, text_halign = text.align_right))
+while gTop.size() > maxGapsInput
+    gTop.shift()
+    gBot.shift()
+    gDir.shift()
+    gLeft.shift()
+    box.delete(gBox.shift())
+
+isInside(float ce) => hasRange and ce < rHi and ce > rLo
+
+// @function    index of the nearest unfilled internal gap on one side of a reference price, -1 when none
+pickIrl(int side, float ref) =>
+    int   best  = -1
+    float bestD = na
+    if gTop.size() > 0
+        for k = 0 to gTop.size() - 1
+            float ce = math.avg(gTop.get(k), gBot.get(k))
+            bool onSide = side == BULL ? ce > ref : ce < ref
+            if isInside(ce) and onSide
+                float d = math.abs(ce - ref)
+                if na(bestD) or d < bestD
+                    bestD := d
+                    best  := k
+    best
+
+// the IRL the rotation draws to, as it stood at the previous close
+int drawIdx  = -1
+int drawLeft = na
+float drawTop = na
+int prevState = state
+if prevState == ST_RAID_HI or prevState == ST_RAID_LO
+    drawIdx := pickIrl(prevState == ST_RAID_LO ? BULL : BEAR, close[1])
+    if drawIdx >= 0
+        drawLeft := gLeft.get(drawIdx)
+        drawTop  := gTop.get(drawIdx)
+
+// fills
+bool irlTaken = false
+int  takenDir = 0
+int i = 0
+while i < gTop.size()
+    float top = gTop.get(i)
+    float bot = gBot.get(i)
+    int   gd  = gDir.get(i)
+    float lvl = fillLevel(top, bot, gd)
+    bool hit = gd == BULL ? low <= lvl : high >= lvl
+    if hit and gLeft.get(i) < bar_index - 2
+        bool isTarget = drawIdx >= 0 and gLeft.get(i) == drawLeft and top == drawTop
+        bool inside   = isInside(math.avg(top, bot))
+        if isTarget or (prevState == ST_NONE and inside and not irlTaken)
+            irlTaken := true
+            takenDir := gd
+        box bx = gBox.get(i)
+        bx.set_right(bar_index)
+        bx.set_bgcolor(inside ? color.new(irlColorInput, 88) : color(na))
+        bx.set_border_color(color(na))
+        bx.set_text("")
+        fBox.push(bx)
+        gTop.remove(i)
+        gBot.remove(i)
+        gDir.remove(i)
+        gLeft.remove(i)
+        gBox.remove(i)
+        while fBox.size() > keepFilledInput
+            box.delete(fBox.shift())
+    else
+        i += 1
+
+if irlTaken
+    // the untouched extreme is the next draw; with neither (or both) taken, the side the gap was filled from
+    if hiTaken and not loTaken
+        state := ST_IRL_LO
+    else if loTaken and not hiTaken
+        state := ST_IRL_HI
+    else
+        state := takenDir == BULL ? ST_IRL_HI : ST_IRL_LO
+
+// external events of this bar take precedence over an internal fill on the same bar
+if raidHi
+    state := ST_RAID_HI
+if raidLo
+    state := ST_RAID_LO
+if runHi
+    state := ST_RUN_HI
+if runLo
+    state := ST_RUN_LO
+
+// refresh drawn gaps: only those inside the current range are internal liquidity; the one the rotation draws to is named
+int targetIdx = state == ST_RAID_HI or state == ST_RAID_LO ? pickIrl(state == ST_RAID_LO ? BULL : BEAR, close) : -1
+if gTop.size() > 0
+    for k = 0 to gTop.size() - 1
+        bool inside = isInside(math.avg(gTop.get(k), gBot.get(k)))
+        box bx = gBox.get(k)
+        bx.set_right(bar_index + 3)
+        bx.set_bgcolor(inside ? color.new(irlColorInput, k == targetIdx ? 62 : 75) : color(na))
+        bx.set_border_color(color(na))
+        bx.set_text(inside and k == targetIdx ? "IRL" : "")
+        bx.set_text_color(irlColorInput)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Events & draw path
+//---------------------------------------------------------------------------------------------------------------------{
+if showEventsInput
+    if raidHi
+        label.new(bar_index, high, "ERL raid", color = color(na), textcolor = bslColorInput, style = label.style_label_down, size = size.small)
+    if raidLo
+        label.new(bar_index, low, "ERL raid", color = color(na), textcolor = sslColorInput, style = label.style_label_up, size = size.small)
+    if runHi
+        label.new(bar_index, high, "ERL run", color = color(na), textcolor = bslColorInput, style = label.style_label_down, size = size.small)
+    if runLo
+        label.new(bar_index, low, "ERL run", color = color(na), textcolor = sslColorInput, style = label.style_label_up, size = size.small)
+    if irlTaken
+        bool fromAbove = takenDir == BULL
+        label.new(bar_index, fromAbove ? low : high, "IRL", color = color(na), textcolor = irlColorInput, style = fromAbove ? label.style_label_up : label.style_label_down, size = size.small)
+
+// draw level as seen at the close of the bar (after this bar's events)
+float pathLevel = na
+color pathColor = na
+if state == ST_RAID_HI or state == ST_RAID_LO
+    pathLevel := targetIdx >= 0 ? math.avg(gTop.get(targetIdx), gBot.get(targetIdx)) : eqLvl
+    pathColor := irlColorInput
+else if state == ST_IRL_HI
+    pathLevel := rHi
+    pathColor := bslColorInput
+else if state == ST_IRL_LO
+    pathLevel := rLo
+    pathColor := sslColorInput
+
+//the path breaks for a bar whenever the target changes, so each segment reads as one objective
+bool  pathJump = pathLevel != pathLevel[1]
+plot(showDrawInput and not pathJump ? pathLevel : na, "Next Draw", color = pathColor, style = plot.style_linebr, linewidth = 1)
+
+var label drawTag = label.new(na, na, "", color = color(na), style = label.style_label_left, size = size.small)
+var label hiTag   = label.new(na, na, "", color = color(na), style = label.style_label_left, size = size.small)
+var label loTag   = label.new(na, na, "", color = color(na), style = label.style_label_left, size = size.small)
+if barstate.islast
+    bool drawHi = showDrawInput and state == ST_IRL_HI
+    bool drawLo = showDrawInput and state == ST_IRL_LO
+    if hasRange
+        hiTag.set_xy(bar_index + 4, rHi)
+        hiTag.set_text(hiTaken ? "" : drawHi ? "BSL · ERL · next draw" : "BSL · ERL")
+        hiTag.set_textcolor(bslColorInput)
+        loTag.set_xy(bar_index + 4, rLo)
+        loTag.set_text(loTaken ? "" : drawLo ? "SSL · ERL · next draw" : "SSL · ERL")
+        loTag.set_textcolor(sslColorInput)
+    if showDrawInput and not na(pathLevel) and not drawHi and not drawLo
+        drawTag.set_xy(bar_index + 4, pathLevel)
+        drawTag.set_text(targetIdx >= 0 ? "IRL · next draw" : "EQ · next draw")
+        drawTag.set_textcolor(pathColor)
+    else
+        drawTag.set_text("")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dash = table.new(tablePos(dashPosInput), 2, 5, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+if barstate.islast and showDashInput and hasRange
+    string sz = textSize(dashSizeInput)
+    int above = 0
+    int below = 0
+    if gTop.size() > 0
+        for k = 0 to gTop.size() - 1
+            float ce = math.avg(gTop.get(k), gBot.get(k))
+            if ce < rHi and ce > rLo
+                if ce > close
+                    above += 1
+                else
+                    below += 1
+    string drawTxt = "-"
+    color  drawCss = DASH_TEXT
+    if state == ST_RAID_HI or state == ST_RAID_LO
+        drawTxt := "IRL " + str.tostring(pathLevel, format.mintick)
+        drawCss := irlColorInput
+    else if state == ST_IRL_HI
+        drawTxt := "ERL BSL " + str.tostring(rHi, format.mintick)
+        drawCss := bslColorInput
+    else if state == ST_IRL_LO
+        drawTxt := "ERL SSL " + str.tostring(rLo, format.mintick)
+        drawCss := sslColorInput
+    else if state == ST_RUN_HI or state == ST_RUN_LO
+        drawTxt := "Expansion, new range pending"
+    float pos = 100 * (close - rLo) / (rHi - rLo)
+    table.cell(dash, 0, 0, "Range Liquidity", text_color = DASH_TEXT, text_halign = text.align_left, text_size = sz)
+    table.cell(dash, 1, 0, str.tostring(pos, "#") + "% " + (pos > 50 ? "Premium" : "Discount"), text_color = pos > 50 ? sslColorInput : bslColorInput, text_halign = text.align_right, text_size = sz)
+    table.cell(dash, 0, 1, "ERL High / Low", text_color = DASH_HEADER, text_halign = text.align_left, text_size = sz)
+    table.cell(dash, 1, 1, str.tostring(rHi, format.mintick) + (hiTaken ? " (taken)" : "") + " / " + str.tostring(rLo, format.mintick) + (loTaken ? " (taken)" : ""), text_color = DASH_TEXT, text_halign = text.align_right, text_size = sz)
+    table.cell(dash, 0, 2, "Last Taken", text_color = DASH_HEADER, text_halign = text.align_left, text_size = sz)
+    table.cell(dash, 1, 2, stateText(state), text_color = DASH_TEXT, text_halign = text.align_right, text_size = sz)
+    table.cell(dash, 0, 3, "Next Draw", text_color = DASH_HEADER, text_halign = text.align_left, text_size = sz)
+    table.cell(dash, 1, 3, drawTxt, text_color = drawCss, text_halign = text.align_right, text_size = sz)
+    table.cell(dash, 0, 4, "Open IRL", text_color = DASH_HEADER, text_halign = text.align_left, text_size = sz)
+    table.cell(dash, 1, 4, "▲ " + str.tostring(above) + "  ▼ " + str.tostring(below), text_color = irlColorInput, text_halign = text.align_right, text_size = sz)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(raidHi,   "Buy-side ERL Raid",  "Buy-side external range liquidity was raided and rejected on {{ticker}}: the draw turns to internal liquidity below")
+alertcondition(raidLo,   "Sell-side ERL Raid", "Sell-side external range liquidity was raided and rejected on {{ticker}}: the draw turns to internal liquidity above")
+alertcondition(runHi,    "Buy-side ERL Run",   "Price accepted above the dealing range high on {{ticker}}: breakout, the range will be redrawn")
+alertcondition(runLo,    "Sell-side ERL Run",  "Price accepted below the dealing range low on {{ticker}}: breakout, the range will be redrawn")
+alertcondition(irlTaken, "IRL Taken",          "The internal liquidity the rotation was drawing to was taken on {{ticker}}: the draw turns to external liquidity")
+
+//---------------------------------------------------------------------------------------------------------------------}

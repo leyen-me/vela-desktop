@@ -1,0 +1,337 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("V-top/V-bottom", "V-top/V-bottom", overlay = true, max_lines_count = 500, max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+BULL_COLOR = #089981
+BEAR_COLOR = #f23645
+CLEAR      = #00000000
+
+// Minimum share of the tip bar's range taken by the exhaustion tail
+WICK_RATIO = 0.5
+
+DET = "Detection"
+EVD = "Climax Evidence"
+CNF = "Confirmation"
+STY = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+legLenInput = input.int(20, "Leg Window (bars)", minval = 5, maxval = 200, group = DET
+  , tooltip = "Lookback window used to measure the final leg into a prospective tip. The leg origin is the window's opposite extreme: the highest high for a V-bottom, the lowest low for a V-top.")
+
+minLegBarsInput = input.int(4, "Minimum Leg Duration (bars)", minval = 2, maxval = 50, group = DET
+  , tooltip = "Minimum number of bars between the leg origin and the tip. Rejects isolated one/two-bar spikes that grow out of no prior leg.")
+
+minLegAtrInput = input.float(3.0, "Minimum Leg Travel (×ATR)", minval = 0.5, step = 0.5, group = DET
+  , tooltip = "Minimum total travel of the final leg, as a multiple of ATR. Keeps detections to violent legs rather than quiet drifts.")
+
+legSpeedInput = input.float(0.4, "Minimum Leg Speed (ATR/bar)", minval = 0.0, step = 0.1, group = DET
+  , tooltip = "Minimum average speed of the final leg, in ATR per bar. Higher values demand steeper, more climactic legs.")
+
+accelInput = input.bool(true, "Require Accelerating Leg", group = DET
+  , tooltip = "Requires the final leg to accelerate: at the temporal midpoint of the leg, price must still be within the first half of the leg's range, so most of the travel happened in the later portion (parabolic-style finish).")
+
+atrLenInput = input.int(14, "ATR Length", minval = 1, group = DET
+  , tooltip = "ATR length used to normalize leg travel, leg speed, and the wide-range bar test.")
+
+minEvidenceInput = input.int(1, "Minimum Climax Evidence", minval = 1, maxval = 3, group = EVD
+  , tooltip = "Minimum number of climax signatures required on the tip bar, out of three: a volume spike, an unusually wide-range bar, and a gap that immediately fails.")
+
+volLenInput = input.int(20, "Volume Average Length", minval = 1, group = EVD
+  , tooltip = "Length of the volume moving average used by the volume-spike test.")
+
+volMultInput = input.float(2.0, "Volume Spike (×Average)", minval = 1.0, step = 0.25, group = EVD
+  , tooltip = "A tip bar's volume must exceed this multiple of average volume to count as a volume spike. Ignored on symbols without volume data.")
+
+rangeMultInput = input.float(2.0, "Wide Range Bar (×ATR)", minval = 1.0, step = 0.25, group = EVD
+  , tooltip = "A tip bar's range must exceed this multiple of ATR to count as a wide-range bar.")
+
+tipEventInput = input.bool(true, "Require Tip Reversal Event", group = EVD
+  , tooltip = "Additionally requires a discrete reversal event at the tip: a key-reversal close, a long exhaustion tail, or the next bar immediately closing back beyond the tip bar's opposite extreme (which also covers islands left by twin gaps).")
+
+retracePctInput = input.float(80, "Recovery Retrace (%)", minval = 25, maxval = 200, step = 5, group = CNF
+  , tooltip = "Percentage of the final leg that the return leg must retrace for the V to be confirmed.")
+
+speedMultInput = input.float(1.5, "Maximum Recovery Time (×Leg Bars)", minval = 0.25, step = 0.25, group = CNF
+  , tooltip = "Maximum time allowed to complete the retrace, as a multiple of the final leg's duration. If the reversal is slower and pauses to build structure instead, the candidate is dropped — that is a different, more tradable pattern.")
+
+refBarsInput = input.int(100, "Reference Extension (bars)", minval = 10, maxval = 500, group = CNF
+  , tooltip = "How long the working reference levels of a confirmed V (spike extreme, leg origin, leg midpoint) stay active, in bars. Invalidation — price taking out the extreme of the spike — is monitored over the same window.")
+
+showShapeInput = input.bool(true, "Show V Shape", group = STY
+  , tooltip = "Draws the two legs of a confirmed V: leg origin to tip, then tip to the confirmation point.")
+
+showLabelsInput = input.bool(true, "Show Pattern Labels", group = STY
+  , tooltip = "Shows a V-top / V-bottom label at the confirmed tip.")
+
+showClimaxInput = input.bool(true, "Show Climax Markers", group = STY
+  , tooltip = "Marks bars showing climax evidence at the extreme of an accelerating leg — the real-time exhaustion signal at a potential tip. The honest stop is beyond the marked bar's extreme.")
+
+showPullbackInput = input.bool(true, "Show Pullback Signals", group = STY
+  , tooltip = "Marks the first pullback that resolves back in the reversal's direction after a confirmed V — the 'ride the recovery' entry.")
+
+showRefsInput = input.bool(true, "Show Reference Levels", group = STY
+  , tooltip = "Draws the working reference levels of a confirmed V: the spike extreme (dashed, the invalidation level), the final-leg origin, and the leg midpoint (dotted).")
+
+bullColorInput = input.color(BULL_COLOR, "V-bottom", group = STY)
+bearColorInput = input.color(BEAR_COLOR, "V-top", group = STY)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Unconfirmed tip candidate (climax detected, waiting for the return leg)
+type CandState
+    bool  active = false
+    bool  tipOk  = false
+    int   tipBar
+    float tipPrice
+    float tipExt
+    int   originBar
+    float originPrice
+    float target
+    int   deadline
+
+// Confirmed pattern being tracked (references, first pullback, invalidation)
+type PatState
+    bool  active  = false
+    int   pbState = 0
+    int   confirmBar
+    float extreme
+    int   windowEnd
+    line  extremeLn
+    line  originLn
+    line  midLn
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Registers a fresh tip candidate on the current bar
+registerCandidate(CandState cand, float tip, float tipExtreme, int legBars, float legDepth, float legOrigin, bool tipEvent, int dirSign) =>
+    cand.active      := true
+    cand.tipOk       := tipEvent
+    cand.tipBar      := bar_index
+    cand.tipPrice    := tip
+    cand.tipExt      := tipExtreme
+    cand.originBar   := bar_index - legBars
+    cand.originPrice := legOrigin
+    cand.target      := tip + dirSign * retracePctInput / 100 * legDepth
+    cand.deadline    := bar_index + math.max(1, math.round(speedMultInput * legBars))
+
+// Draws a confirmed V and promotes the candidate to a tracked pattern
+confirmPattern(PatState pat, CandState cand, bool isBottom, color dirColor) =>
+    if showShapeInput
+        line.new(cand.originBar, cand.originPrice, cand.tipBar, cand.tipPrice, color = dirColor, width = 2)
+        line.new(cand.tipBar, cand.tipPrice, bar_index, cand.target, color = dirColor, width = 2)
+    if showLabelsInput
+        label.new(cand.tipBar, cand.tipPrice
+          , isBottom ? "V-bottom" : "V-top"
+          , style     = isBottom ? label.style_label_up : label.style_label_down
+          , color     = CLEAR
+          , textcolor = dirColor
+          , size      = size.small)
+    float midLevel = (cand.tipPrice + cand.originPrice) / 2
+    pat.active     := true
+    pat.pbState    := 0
+    pat.confirmBar := bar_index
+    pat.extreme    := cand.tipPrice
+    pat.windowEnd  := bar_index + refBarsInput
+    if showRefsInput
+        pat.extremeLn := line.new(cand.tipBar, cand.tipPrice, bar_index, cand.tipPrice, color = dirColor, style = line.style_dashed)
+        pat.originLn  := line.new(cand.tipBar, cand.originPrice, bar_index, cand.originPrice, color = color.new(dirColor, 50), style = line.style_dotted)
+        pat.midLn     := line.new(cand.tipBar, midLevel, bar_index, midLevel, color = color.new(dirColor, 50), style = line.style_dotted)
+    else
+        pat.extremeLn := line(na)
+        pat.originLn  := line(na)
+        pat.midLn     := line(na)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Detection
+//---------------------------------------------------------------------------------------------------------------------{
+
+max_bars_back(low, 250)
+max_bars_back(high, 250)
+
+atrValue = ta.atr(atrLenInput)
+volAvg   = ta.sma(volume, volLenInput)
+
+highestHigh = ta.highest(high, legLenInput)
+lowestLow   = ta.lowest(low, legLenInput)
+highOffset  = ta.highestbars(high, legLenInput)
+lowOffset   = ta.lowestbars(low, legLenInput)
+
+atrPrev  = atrValue[1]
+barRange = high - low
+
+// Climax evidence on the prospective tip bar
+volSpike    = not na(volume) and not na(volAvg[1]) and volume > volMultInput * volAvg[1]
+wideRange   = not na(atrPrev) and barRange > rangeMultInput * atrPrev
+gapFailBull = open < nz(low[1], open) and close > nz(low[1], close)
+gapFailBear = open > nz(high[1], open) and close < nz(high[1], close)
+
+evidenceBull = (volSpike ? 1 : 0) + (wideRange ? 1 : 0) + (gapFailBull ? 1 : 0)
+evidenceBear = (volSpike ? 1 : 0) + (wideRange ? 1 : 0) + (gapFailBear ? 1 : 0)
+
+// Discrete reversal events on the prospective tip bar
+keyRevBull = low < nz(low[1], low) and close > nz(close[1], close)
+keyRevBear = high > nz(high[1], high) and close < nz(close[1], close)
+wickBull   = barRange > 0 and math.min(open, close) - low >= WICK_RATIO * barRange
+wickBear   = barRange > 0 and high - math.max(open, close) >= WICK_RATIO * barRange
+
+// Final leg metrics
+legBarsBull  = -nz(highOffset, 0)
+legBarsBear  = -nz(lowOffset, 0)
+legDepthBull = highestHigh - low
+legDepthBear = high - lowestLow
+
+legOkBull = legBarsBull >= minLegBarsInput and not na(atrPrev) and not na(highestHigh) and legDepthBull >= minLegAtrInput * atrPrev and legDepthBull / legBarsBull >= legSpeedInput * atrPrev
+legOkBear = legBarsBear >= minLegBarsInput and not na(atrPrev) and not na(lowestLow) and legDepthBear >= minLegAtrInput * atrPrev and legDepthBear / legBarsBear >= legSpeedInput * atrPrev
+
+// Acceleration: at the temporal midpoint of the leg, price is still within the leg's first half
+int midOffBull    = math.max(1, math.floor(nz(legBarsBull, 2) / 2.0))
+int midOffBear    = math.max(1, math.floor(nz(legBarsBear, 2) / 2.0))
+float midLowBull  = low[midOffBull]
+float midHighBear = high[midOffBear]
+
+accelOkBull = not accelInput or (not na(midLowBull) and not na(highestHigh) and midLowBull > (highestHigh + low) / 2)
+accelOkBear = not accelInput or (not na(midHighBear) and not na(lowestLow) and midHighBear < (lowestLow + high) / 2)
+
+// Climax at the extreme of an accelerating leg — the prospective V tip
+climaxBull = low <= lowestLow and legOkBull and accelOkBull and evidenceBull >= minEvidenceInput
+climaxBear = high >= highestHigh and legOkBear and accelOkBear and evidenceBear >= minEvidenceInput
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Pattern Logic
+//---------------------------------------------------------------------------------------------------------------------{
+
+var CandState bullCand = CandState.new()
+var CandState bearCand = CandState.new()
+var PatState  bullPat  = PatState.new()
+var PatState  bearPat  = PatState.new()
+
+bool bullClimax       = false
+bool bearClimax       = false
+bool vBottomConfirmed = false
+bool vTopConfirmed    = false
+bool bullPullback     = false
+bool bearPullback     = false
+bool vBottomInvalid   = false
+bool vTopInvalid      = false
+
+// V-bottom candidate: drop it if the spike low is taken out or the recovery stalls, confirm it on a fast retrace
+if bullCand.active
+    if low < bullCand.tipPrice
+        bullCand.active := false
+    else
+        if tipEventInput and not bullCand.tipOk
+            if bar_index == bullCand.tipBar + 1 and close > bullCand.tipExt
+                bullCand.tipOk := true
+            else
+                bullCand.active := false
+        if bullCand.active and (not tipEventInput or bullCand.tipOk)
+            if high >= bullCand.target
+                vBottomConfirmed := true
+                confirmPattern(bullPat, bullCand, true, bullColorInput)
+                bullCand.active := false
+            else if bar_index >= bullCand.deadline
+                bullCand.active := false
+
+// V-top candidate (mirror)
+if bearCand.active
+    if high > bearCand.tipPrice
+        bearCand.active := false
+    else
+        if tipEventInput and not bearCand.tipOk
+            if bar_index == bearCand.tipBar + 1 and close < bearCand.tipExt
+                bearCand.tipOk := true
+            else
+                bearCand.active := false
+        if bearCand.active and (not tipEventInput or bearCand.tipOk)
+            if low <= bearCand.target
+                vTopConfirmed := true
+                confirmPattern(bearPat, bearCand, false, bearColorInput)
+                bearCand.active := false
+            else if bar_index >= bearCand.deadline
+                bearCand.active := false
+
+// Confirmed V-bottom: extend references, watch the first pullback, invalidate on a break of the spike low
+if bullPat.active and bar_index > bullPat.confirmBar
+    if not na(bullPat.extremeLn)
+        line.set_x2(bullPat.extremeLn, bar_index)
+        line.set_x2(bullPat.originLn, bar_index)
+        line.set_x2(bullPat.midLn, bar_index)
+    if low < bullPat.extreme
+        vBottomInvalid := true
+        bullPat.active := false
+    else
+        if bullPat.pbState == 0 and close < close[1]
+            bullPat.pbState := 1
+        else if bullPat.pbState == 1 and close > high[1]
+            bullPullback    := true
+            bullPat.pbState := 2
+        if bar_index >= bullPat.windowEnd
+            bullPat.active := false
+
+// Confirmed V-top (mirror)
+if bearPat.active and bar_index > bearPat.confirmBar
+    if not na(bearPat.extremeLn)
+        line.set_x2(bearPat.extremeLn, bar_index)
+        line.set_x2(bearPat.originLn, bar_index)
+        line.set_x2(bearPat.midLn, bar_index)
+    if high > bearPat.extreme
+        vTopInvalid    := true
+        bearPat.active := false
+    else
+        if bearPat.pbState == 0 and close > close[1]
+            bearPat.pbState := 1
+        else if bearPat.pbState == 1 and close < low[1]
+            bearPullback    := true
+            bearPat.pbState := 2
+        if bar_index >= bearPat.windowEnd
+            bearPat.active := false
+
+// New candidates from fresh climax bars
+if climaxBull and not bullCand.active and not vBottomConfirmed
+    registerCandidate(bullCand, low, high, legBarsBull, legDepthBull, highestHigh, keyRevBull or wickBull, 1)
+    bullClimax := true
+
+if climaxBear and not bearCand.active and not vTopConfirmed
+    registerCandidate(bearCand, high, low, legBarsBear, legDepthBear, lowestLow, keyRevBear or wickBear, -1)
+    bearClimax := true
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+
+plotshape(showClimaxInput and bullClimax, "Bullish Climax", shape.triangleup, location.belowbar, bullColorInput, size = size.tiny)
+plotshape(showClimaxInput and bearClimax, "Bearish Climax", shape.triangledown, location.abovebar, bearColorInput, size = size.tiny)
+
+plotshape(showPullbackInput and bullPullback, "V-bottom Pullback", shape.circle, location.belowbar, bullColorInput, size = size.tiny)
+plotshape(showPullbackInput and bearPullback, "V-top Pullback", shape.circle, location.abovebar, bearColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(bullClimax, "Bullish Climax", "Bullish climax on {{ticker}} — potential V-bottom tip: exhaustion evidence at the low of an accelerating decline. Invalidation is the spike low.")
+alertcondition(bearClimax, "Bearish Climax", "Bearish climax on {{ticker}} — potential V-top tip: exhaustion evidence at the high of an accelerating advance. Invalidation is the spike high.")
+
+alertcondition(vBottomConfirmed, "V-bottom Confirmed", "V-bottom confirmed on {{ticker}} — the recovery leg retraced the final decline at comparable speed.")
+alertcondition(vTopConfirmed, "V-top Confirmed", "V-top confirmed on {{ticker}} — the decline retraced the final advance at comparable speed.")
+
+alertcondition(bullPullback, "V-bottom First Pullback", "First pullback after a confirmed V-bottom on {{ticker}} resolved upward.")
+alertcondition(bearPullback, "V-top First Pullback", "First pullback after a confirmed V-top on {{ticker}} resolved downward.")
+
+alertcondition(vBottomInvalid, "V-bottom Invalidated", "V-bottom invalidated on {{ticker}} — price took out the extreme of the spike.")
+alertcondition(vTopInvalid, "V-top Invalidated", "V-top invalidated on {{ticker}} — price took out the extreme of the spike.")
+
+//---------------------------------------------------------------------------------------------------------------------}

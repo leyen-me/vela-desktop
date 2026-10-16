@@ -1,0 +1,421 @@
+// This work is licensed under Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Period Opens"
+  , shorttitle       = "Period Opens"
+  , overlay          = true
+  , format           = format.price
+  , max_lines_count  = 500
+  , max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+color BULL_COLOR    = #089981
+color BEAR_COLOR    = #f23645
+color NEUTRAL_COLOR = #787b86
+color LABEL_BG      = #00000000
+
+color DAY_COLOR     = #787b86
+color WEEK_COLOR    = #2157f3
+color MONTH_COLOR   = #ff9800
+color QUARTER_COLOR = #9c27b0
+color YEAR_COLOR    = #00bcd4
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+// Period lengths in seconds (Pine Script® convention: a month is 2628003 seconds)
+int SEC_DAY     = 86400
+int SEC_WEEK    = 604800
+int SEC_MONTH   = 2628003
+int SEC_QUARTER = 7884009
+int SEC_YEAR    = 31536036
+
+// Distance, in ATR, price must clear the signal open by before another test of it counts
+float REARM_ATR = 0.5
+
+string SIG_AUTO = "Auto"
+
+string GROUP_PERIODS = "Periods"
+string GROUP_UNTESTED = "Untested Opens"
+string GROUP_SIGNALS = "Interactions"
+string GROUP_DASH    = "Dashboard"
+string GROUP_STYLE   = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+horizonInput = input.string("Auto", "Periods Shown", options = ["Auto", "Custom"], group = GROUP_PERIODS
+  , tooltip = "Auto matches the opens to the chart's horizon: the three shortest periods spanning at least 20 chart bars, so daily, weekly and monthly opens on intraday charts and monthly, quarterly and yearly opens on a daily chart. Custom shows the periods ticked below.")
+
+showDayInput = input.bool(true, "Daily", inline = "d", group = GROUP_PERIODS
+  , tooltip = "Periods shown in Custom mode. Each open is the first traded price of its calendar period, held flat until the period ends, and past opens stay on the chart over the period they belonged to. Periods at or below the chart timeframe are always hidden. Boundaries follow the symbol's own calendar and timezone, so weekly opens differ between markets.")
+dayColorInput = input.color(DAY_COLOR, "", inline = "d", group = GROUP_PERIODS)
+showWeekInput = input.bool(true, "Weekly", inline = "w", group = GROUP_PERIODS)
+weekColorInput = input.color(WEEK_COLOR, "", inline = "w", group = GROUP_PERIODS)
+showMonthInput = input.bool(true, "Monthly", inline = "m", group = GROUP_PERIODS)
+monthColorInput = input.color(MONTH_COLOR, "", inline = "m", group = GROUP_PERIODS)
+showQuarterInput = input.bool(true, "Quarterly", inline = "q", group = GROUP_PERIODS)
+quarterColorInput = input.color(QUARTER_COLOR, "", inline = "q", group = GROUP_PERIODS)
+showYearInput = input.bool(true, "Yearly", inline = "y", group = GROUP_PERIODS)
+yearColorInput = input.color(YEAR_COLOR, "", inline = "y", group = GROUP_PERIODS)
+
+untestedInput = input.bool(true, "Track Untested Opens", group = GROUP_UNTESTED
+  , tooltip = "An open that price left on the period's first bar and never traded back to before the period ended is untested. Its level is extended as a dotted line until the first revisit, the reaction traders watch for. Tracked for the signal period and every longer enabled period.")
+
+untestedMaxInput = input.int(2, "Keep Last (Per Period)", minval = 1, maxval = 10, group = GROUP_UNTESTED
+  , tooltip = "How many untested opens of each period stay on the chart; the oldest is dropped first.")
+
+signalPeriodInput = input.string(SIG_AUTO, "Signal Period", options = [SIG_AUTO, "Daily", "Weekly", "Monthly", "Quarterly", "Yearly"], group = GROUP_SIGNALS
+  , tooltip = "The open whose interactions are labeled and scored. Auto picks the shortest enabled period spanning at least 20 chart bars: the daily open on intraday charts, the monthly open on a daily chart.")
+
+bufferInput = input.float(0.1, "Acceptance Buffer (ATR)", minval = 0, maxval = 2, step = 0.05, group = GROUP_SIGNALS
+  , tooltip = "A close must clear the open by this fraction of the 14-bar ATR to count as acceptance on the other side. Closes through the level count for more than wicks; the buffer filters closes that barely cross it.")
+
+followInput = input.float(1, "Follow-Through (ATR)", minval = 0.1, maxval = 10, step = 0.1, group = GROUP_SIGNALS
+  , tooltip = "An interaction counts as followed through when price travels this many ATR away from the open in the signal's direction before a close back through the level.")
+
+followBarsInput = input.int(20, "Follow-Through Window", minval = 1, maxval = 500, group = GROUP_SIGNALS
+  , tooltip = "Bars an interaction has to follow through. Unresolved interactions are scored as not followed through.")
+
+showEventsInput = input.bool(true, "Interaction Labels", group = GROUP_SIGNALS
+  , tooltip = "Hold: a test from above that closed back above the open. Reject: a test from below that closed back below. Reclaim and Lose: closes that accepted price on the other side of the open, flipping the period's bias.")
+
+showDashInput = input.bool(true, "Show Dashboard", group = GROUP_DASH
+  , tooltip = "Every live open with the change since it printed (the yearly row is the YTD change), the side price trades on, and the follow-through record of the signal period's interactions.")
+
+dashPosInput = input.string("Top Right", "Position", options = ["Top Right", "Bottom Right", "Bottom Left", "Top Left"], group = GROUP_DASH)
+
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = GROUP_DASH)
+
+showLabelsInput = input.bool(true, "Level Labels", group = GROUP_STYLE
+  , tooltip = "Name each live open at the right edge. Opens closer than the confluence distance share one label, since two references landing together are watched harder than either alone.")
+
+confluenceInput = input.float(0.25, "Confluence Distance (ATR)", minval = 0, maxval = 5, step = 0.05, group = GROUP_STYLE)
+
+lineWidthInput = input.int(2, "Line Width", minval = 1, maxval = 4, group = GROUP_STYLE)
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "colors", group = GROUP_STYLE)
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "colors", group = GROUP_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types
+//---------------------------------------------------------------------------------------------------------------------{
+// Live state of one calendar period
+type Period
+    string name
+    string tag
+    int    seconds
+    color  col
+    bool   enabled
+    float  price
+    int    startBar
+    bool   tested
+
+// An untested open extended until its first revisit
+type Untested
+    int   periodIndex
+    float price
+    line  ln
+    label tag
+
+// An interaction with the signal open, followed until it travels or fails
+type Interaction
+    int   dir
+    float level
+    float entry
+    float atr
+    int   bar
+    bool  isTest
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+float atrValue = ta.atr(14)
+int chartSeconds = timeframe.in_seconds()
+
+// New-period flags, evaluated on every bar; the first bar of the dataset never starts a period, so no partial opens
+bool newDay     = bar_index > 0 and timeframe.change("D")
+bool newWeek    = bar_index > 0 and timeframe.change("W")
+bool newMonth   = bar_index > 0 and timeframe.change("M")
+bool newQuarter = bar_index > 0 and timeframe.change("3M")
+bool newYear    = bar_index > 0 and timeframe.change("12M")
+
+var array<Period> periods = array.from(
+   Period.new("Daily", "D", SEC_DAY, dayColorInput, showDayInput, na, na, false)
+ , Period.new("Weekly", "W", SEC_WEEK, weekColorInput, showWeekInput, na, na, false)
+ , Period.new("Monthly", "M", SEC_MONTH, monthColorInput, showMonthInput, na, na, false)
+ , Period.new("Quarterly", "Q", SEC_QUARTER, quarterColorInput, showQuarterInput, na, na, false)
+ , Period.new("Yearly", "Y", SEC_YEAR, yearColorInput, showYearInput, na, na, false))
+
+// Resolve which periods are shown: never at or below the chart timeframe; in Auto, the three shortest periods
+// spanning at least 20 chart bars
+if barstate.isfirst
+    int autoCount = 0
+    for i = 0 to 4
+        Period p = array.get(periods, i)
+        bool longer = p.seconds > chartSeconds
+        if horizonInput == "Auto"
+            bool pick = longer and p.seconds >= 20 * chartSeconds and autoCount < 3
+            p.enabled := pick
+            if pick
+                autoCount += 1
+        else
+            p.enabled := p.enabled and longer
+
+// Signal period: explicit, or the shortest enabled period spanning at least 20 chart bars
+var int signalIndex = -1
+if barstate.isfirst
+    for i = 0 to 4
+        Period p = array.get(periods, i)
+        if signalPeriodInput == SIG_AUTO
+            if signalIndex == -1 and p.enabled and p.seconds >= 20 * chartSeconds
+                signalIndex := i
+        else if p.name == signalPeriodInput and p.enabled
+            signalIndex := i
+    if signalIndex == -1
+        for i = 4 to 0
+            if array.get(periods, i).enabled
+                signalIndex := i
+                break
+
+var array<Untested> untested = array.new<Untested>()
+
+bool revisitEvent = false
+
+// Untested opens: extend, or close at the first revisit
+if array.size(untested) > 0
+    for i = array.size(untested) - 1 to 0
+        Untested u = array.get(untested, i)
+        line.set_x2(u.ln, bar_index)
+        if not na(u.tag)
+            label.set_x(u.tag, bar_index)
+        if low <= u.price and high >= u.price
+            revisitEvent := true
+            label.delete(u.tag)
+            label.new(bar_index, u.price, "Revisit", style = label.style_label_left, color = LABEL_BG, textcolor = array.get(periods, u.periodIndex).col, size = size.small
+              , tooltip = "First revisit of the untested " + array.get(periods, u.periodIndex).name + " open at " + str.tostring(u.price, format.mintick))
+            array.remove(untested, i)
+
+// Roll each period on its first bar, retiring the previous open as untested when price never came back to it
+for i = 0 to 4
+    Period p = array.get(periods, i)
+    bool isNew = i == 0 ? newDay : i == 1 ? newWeek : i == 2 ? newMonth : i == 3 ? newQuarter : newYear
+    if isNew and p.enabled
+        if untestedInput and signalIndex >= 0 and i >= signalIndex and not na(p.price) and not p.tested
+            line ln = line.new(p.startBar, p.price, bar_index, p.price, color = color.new(p.col, 20), style = line.style_dotted, width = 1)
+            label tg = label.new(bar_index, p.price, "Untested " + p.tag + " Open", style = label.style_label_left, color = LABEL_BG, textcolor = p.col, size = size.small)
+            array.push(untested, Untested.new(i, p.price, ln, tg))
+            // Keep only the most recent untested opens of this period
+            int kept = 0
+            for j = array.size(untested) - 1 to 0
+                Untested u = array.get(untested, j)
+                if u.periodIndex == i
+                    kept += 1
+                    if kept > untestedMaxInput
+                        line.delete(u.ln)
+                        label.delete(u.tag)
+                        array.remove(untested, j)
+        p.price    := open
+        p.startBar := bar_index
+        p.tested   := false
+    else if p.enabled and not na(p.price) and bar_index > p.startBar and low <= p.price and high >= p.price
+        p.tested := true
+
+// Stepped levels: one plot per period, broken at each roll
+Period pDay     = array.get(periods, 0)
+Period pWeek    = array.get(periods, 1)
+Period pMonth   = array.get(periods, 2)
+Period pQuarter = array.get(periods, 3)
+Period pYear    = array.get(periods, 4)
+
+// The new open starts drawing on its second bar so consecutive periods never join
+levelValue(Period p, bool isNew) =>
+    p.enabled and not isNew ? p.price : na
+
+plot(levelValue(pDay, newDay), "Daily Open", dayColorInput, lineWidthInput, plot.style_linebr)
+plot(levelValue(pWeek, newWeek), "Weekly Open", weekColorInput, lineWidthInput, plot.style_linebr)
+plot(levelValue(pMonth, newMonth), "Monthly Open", monthColorInput, lineWidthInput, plot.style_linebr)
+plot(levelValue(pQuarter, newQuarter), "Quarterly Open", quarterColorInput, lineWidthInput, plot.style_linebr)
+plot(levelValue(pYear, newYear), "Yearly Open", yearColorInput, lineWidthInput, plot.style_linebr)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Interactions
+//---------------------------------------------------------------------------------------------------------------------{
+var array<Interaction> interactions = array.new<Interaction>()
+var int  bias  = 0
+var bool armed = true
+
+var int countTests   = 0
+var int followTests  = 0
+var int countFlips   = 0
+var int followFlips  = 0
+
+bool holdEvent    = false
+bool rejectEvent  = false
+bool reclaimEvent = false
+bool loseEvent    = false
+
+// Score open interactions: travel first, or a close back through the level first
+if array.size(interactions) > 0
+    for i = array.size(interactions) - 1 to 0
+        Interaction e = array.get(interactions, i)
+        float buffer = e.atr * bufferInput
+        bool travelled = e.dir == 1 ? high >= e.entry + e.atr * followInput : low <= e.entry - e.atr * followInput
+        bool failed    = e.dir == 1 ? close < e.level - buffer : close > e.level + buffer
+        bool expired   = bar_index - e.bar >= followBarsInput
+        if travelled or failed or expired
+            if travelled and not failed
+                if e.isTest
+                    followTests += 1
+                else
+                    followFlips += 1
+            array.remove(interactions, i)
+
+if signalIndex >= 0 and barstate.isconfirmed
+    Period s = array.get(periods, signalIndex)
+    bool isNew = signalIndex == 0 ? newDay : signalIndex == 1 ? newWeek : signalIndex == 2 ? newMonth : signalIndex == 3 ? newQuarter : newYear
+    if isNew
+        bias  := close > s.price ? 1 : close < s.price ? -1 : 0
+        armed := true
+    else if not na(s.price) and not na(atrValue)
+        float buffer = atrValue * bufferInput
+        // A new test only counts once price has moved clear of the level since the last one
+        if not armed and (bias == 1 ? low > s.price + atrValue * REARM_ATR : high < s.price - atrValue * REARM_ATR)
+            armed := true
+        int   dir    = 0
+        string kind  = ""
+        bool  isTest = false
+        if bias <= 0 and close > s.price + buffer
+            if bias == -1
+                dir := 1
+                kind := "Reclaim"
+                reclaimEvent := true
+            bias  := 1
+            armed := false
+        else if bias >= 0 and close < s.price - buffer
+            if bias == 1
+                dir := -1
+                kind := "Lose"
+                loseEvent := true
+            bias  := -1
+            armed := false
+        else if armed and bias == 1 and low[1] > s.price and low <= s.price and close > s.price
+            dir := 1
+            kind := "Hold"
+            isTest := true
+            holdEvent := true
+            armed := false
+        else if armed and bias == -1 and high[1] < s.price and high >= s.price and close < s.price
+            dir := -1
+            kind := "Reject"
+            isTest := true
+            rejectEvent := true
+            armed := false
+        if dir != 0
+            if isTest
+                countTests += 1
+            else
+                countFlips += 1
+            array.push(interactions, Interaction.new(dir, s.price, close, atrValue, bar_index, isTest))
+            if showEventsInput
+                label.new(bar_index, na, kind
+                  , yloc      = dir == 1 ? yloc.belowbar : yloc.abovebar
+                  , style     = dir == 1 ? label.style_label_up : label.style_label_down
+                  , color     = isTest ? (dir == 1 ? bullColorInput : bearColorInput) : LABEL_BG
+                  , textcolor = isTest ? color.white : (dir == 1 ? bullColorInput : bearColorInput)
+                  , size      = size.small
+                  , tooltip   = kind + " at the " + s.name + " open " + str.tostring(s.price, format.mintick) + (isTest ? ": a test that closed back on the period's side, the level defended" : ": a close accepting price on the other side of the open, the period's bias flips"))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Level Labels
+//---------------------------------------------------------------------------------------------------------------------{
+var array<label> levelLabels = array.new<label>()
+
+if barstate.islast and showLabelsInput
+    while array.size(levelLabels) > 0
+        label.delete(array.pop(levelLabels))
+    float tolerance = nz(atrValue) * confluenceInput
+    array<bool> merged = array.new<bool>(5, false)
+    // Longest periods first: a shorter open within the confluence distance joins the longer open's label
+    for i = 4 to 0
+        Period p = array.get(periods, i)
+        if p.enabled and not na(p.price) and not array.get(merged, i)
+            string txt = p.tag
+            if i > 0
+                for j = i - 1 to 0
+                    Period q = array.get(periods, j)
+                    if q.enabled and not na(q.price) and not array.get(merged, j) and math.abs(q.price - p.price) <= tolerance
+                        txt += " + " + q.tag
+                        array.set(merged, j, true)
+            array.push(levelLabels, label.new(bar_index, p.price, txt + " Open", style = label.style_label_left, color = LABEL_BG, textcolor = p.col, size = size.small
+              , tooltip = p.name + " open " + str.tostring(p.price, format.mintick)))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var string dashPos = switch dashPosInput
+    "Bottom Right" => position.bottom_right
+    "Bottom Left"  => position.bottom_left
+    "Top Left"     => position.top_left
+    => position.top_right
+
+var string dashSize = switch dashSizeInput
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    => size.small
+
+var table dash = table.new(dashPos, 4, 10, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+dashCell(int col, int row, string txt, color textColor, string align) =>
+    table.cell(dash, col, row, txt, text_color = textColor, text_size = dashSize, text_halign = align)
+
+pctText(float value) =>
+    (value >= 0 ? "+" : "") + str.tostring(value, "#.##") + "%"
+
+if showDashInput and barstate.islast
+    dashCell(0, 0, "Open", DASH_HEADER, text.align_left)
+    dashCell(1, 0, "Price", DASH_HEADER, text.align_right)
+    dashCell(2, 0, "Change", DASH_HEADER, text.align_right)
+    dashCell(3, 0, "Side", DASH_HEADER, text.align_right)
+    int row = 1
+    for i = 0 to 4
+        Period p = array.get(periods, i)
+        if p.enabled and not na(p.price)
+            float change = (close - p.price) / p.price * 100
+            bool  above  = close >= p.price
+            dashCell(0, row, p.name + (i == 4 ? " (YTD)" : "") + (i == signalIndex ? " *" : ""), p.col, text.align_left)
+            dashCell(1, row, str.tostring(p.price, format.mintick), DASH_TEXT, text.align_right)
+            dashCell(2, row, pctText(change), above ? bullColorInput : bearColorInput, text.align_right)
+            dashCell(3, row, above ? "Above" : "Below", above ? bullColorInput : bearColorInput, text.align_right)
+            row += 1
+    if signalIndex >= 0
+        string sigTag = array.get(periods, signalIndex).tag
+        dashCell(0, row, "* " + sigTag + " Open Signals", DASH_HEADER, text.align_left)
+        dashCell(1, row, "Count", DASH_HEADER, text.align_right)
+        dashCell(2, row, "Followed", DASH_HEADER, text.align_right)
+        dashCell(3, row, "Share", DASH_HEADER, text.align_right)
+        dashCell(0, row + 1, "Hold / Reject", DASH_TEXT, text.align_left)
+        dashCell(1, row + 1, str.tostring(countTests), DASH_TEXT, text.align_right)
+        dashCell(2, row + 1, str.tostring(followTests), DASH_TEXT, text.align_right)
+        dashCell(3, row + 1, countTests > 0 ? str.tostring(math.round(followTests * 100.0 / countTests)) + "%" : "-", DASH_TEXT, text.align_right)
+        dashCell(0, row + 2, "Reclaim / Lose", DASH_TEXT, text.align_left)
+        dashCell(1, row + 2, str.tostring(countFlips), DASH_TEXT, text.align_right)
+        dashCell(2, row + 2, str.tostring(followFlips), DASH_TEXT, text.align_right)
+        dashCell(3, row + 2, countFlips > 0 ? str.tostring(math.round(followFlips * 100.0 / countFlips)) + "%" : "-", DASH_TEXT, text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(holdEvent, "Open Held", "Signal period open held on {{ticker}} ({{interval}}): a test from above closed back above the open")
+alertcondition(rejectEvent, "Open Rejected", "Signal period open rejected on {{ticker}} ({{interval}}): a test from below closed back below the open")
+alertcondition(reclaimEvent, "Open Reclaimed", "Signal period open reclaimed on {{ticker}} ({{interval}}): price accepted back above it, the period turns green")
+alertcondition(loseEvent, "Open Lost", "Signal period open lost on {{ticker}} ({{interval}}): price accepted below it, the period turns red")
+alertcondition(revisitEvent, "Untested Open Revisited", "Price on {{ticker}} ({{interval}}) revisited an untested period open")
+alertcondition(newMonth, "New Monthly Open", "A new month opened on {{ticker}} ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

@@ -1,0 +1,418 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Trendline Liquidity", "Trendline Liquidity", overlay = true, max_lines_count = 500, max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+int PIVOT_MEM     = 8
+int MAX_SPAN      = 1500
+int MAX_ACTIVE    = 3
+int CANDIDATE_TTL = 500
+
+int STATE_ACTIVE    = 0
+int STATE_BREACHED  = 1
+int STATE_SWEPT     = 2
+int STATE_CONFIRMED = 3
+int STATE_BROKEN    = 4
+int STATE_EXPIRED   = 5
+
+color BULL_COLOR   = #089981
+color BEAR_COLOR   = #f23645
+color TRANSP_COLOR = #00000000
+
+string DETECT_GROUP = 'Trendline Detection'
+string BAND_GROUP   = 'Liquidity Band'
+string CLASS_GROUP  = 'Sweep vs Break Classification'
+string STYLE_GROUP  = 'Style'
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Inputs
+//---------------------------------------------------------------------------------------------------------------------{
+
+swingLengthInput = input.int(10, 'Swing Length', minval = 2, group = DETECT_GROUP, tooltip = 'Pivot length used to detect the swing lows and highs that anchor candidate trendlines. Larger values isolate the widely watched lines that attract the most resting order flow.')
+minTouchesInput  = input.int(3, 'Minimum Touches', minval = 2, group = DETECT_GROUP, tooltip = 'Respected touches required before a trendline is treated as carrying liquidity. The reference definition looks for a clean line with three or more touches, since each touch recruits more participants.')
+touchTolInput    = input.float(0.25, 'Touch Tolerance (ATR)', minval = 0.01, step = 0.05, group = DETECT_GROUP, tooltip = 'Maximum distance from the line, as an ATR multiple, for a wick to register as a touch. The same tolerance decides when price has pierced the line into the resting orders beyond it.')
+atrLengthInput   = input.int(200, 'ATR Normalization Length', minval = 10, group = DETECT_GROUP, tooltip = 'ATR length used to normalize the touch tolerance, band depth and displacement threshold, so the same settings adapt across symbols and timeframes.')
+
+showBandInput  = input.bool(true, 'Show Liquidity Band', group = BAND_GROUP, tooltip = 'Draw the diagonal band of inferred resting orders beyond the trendline: stops from trendline buyers plus breakout entries below a rising support line, and the mirror image above a falling resistance line.')
+bandWidthInput = input.float(0.5, 'Band Depth (ATR)', minval = 0.1, step = 0.1, group = BAND_GROUP, tooltip = 'Depth of the estimated stop and breakout-order band beyond the line, as an ATR multiple. The fill deepens with every additional touch, reflecting that a mature, frequently touched line carries more liquidity.')
+
+reclaimWindowInput = input.int(8, 'Reclaim Window (Bars)', minval = 1, group = CLASS_GROUP, tooltip = 'Bars allowed after the first pierce for price to stall and reclaim the line. A reclaim inside this window resolves the event as a liquidity sweep; ending the window beyond the line resolves it as a break.')
+acceptBarsInput    = input.int(3, 'Acceptance Closes', minval = 1, group = CLASS_GROUP, tooltip = 'Consecutive closes beyond the line that confirm acceptance, resolving the event as a genuine break rather than a sweep. Keep this at or below the reclaim window.')
+dispMultInput      = input.float(1.0, 'Displacement Multiplier (ATR)', minval = 0.0, step = 0.25, group = CLASS_GROUP, tooltip = 'Minimum true range of the reclaim candle, as an ATR multiple, for the reclaim to count as displacement back through the line and resolve the sweep early. Set to 0 to accept any reclaim candle.')
+shiftWindowInput   = input.int(20, 'Structure Shift Window (Bars)', minval = 1, group = CLASS_GROUP, tooltip = 'Bars after a sweep during which a close beyond the latest opposite swing point marks a structural shift in the sweep direction, upgrading the event to a confirmed sweep.')
+
+bullColorInput  = input.color(BULL_COLOR, 'Rising Support', group = STYLE_GROUP, inline = 'colors')
+bearColorInput  = input.color(BEAR_COLOR, 'Falling Resistance', group = STYLE_GROUP, inline = 'colors')
+lineStyleInput  = input.string('Solid', 'Line Style', options = ['Solid', 'Dashed', 'Dotted'], group = STYLE_GROUP, tooltip = 'Style of qualified trendlines while their liquidity pool is intact. Swept or broken lines are re-styled dotted to show the pool has been consumed.')
+showTagInput    = input.bool(true, 'Show Touch Counter', group = STYLE_GROUP)
+showEventsInput = input.bool(true, 'Show Sweep / Break Labels', group = STYLE_GROUP)
+historyInput    = input.int(8, 'Resolved Lines Kept', minval = 0, maxval = 40, group = STYLE_GROUP, tooltip = 'Number of resolved (swept or broken) trendlines kept on the chart before the oldest are removed.')
+
+qualifiedLineStyle = switch lineStyleInput
+    'Solid'  => line.style_solid
+    'Dashed' => line.style_dashed
+    => line.style_dotted
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types & Storage
+//---------------------------------------------------------------------------------------------------------------------{
+
+type Trendline
+    int      dir
+    int      x1
+    float    y1
+    float    slope
+    int      touches
+    int      createdBar
+    bool     qualified   = false
+    int      state       = 0
+    int      breachBar   = 0
+    int      eventBar    = 0
+    float    extreme     = na
+    float    structLevel = na
+    int      beyondCount = 0
+    line     lnId        = na
+    line     edgeId      = na
+    linefill fillId      = na
+    label    tagId       = na
+    label    evtId       = na
+
+var array<float> lowArray  = array.new<float>()
+var array<float> highArray = array.new<float>()
+var array<float> atrArray  = array.new<float>()
+
+var array<int>   plBarArray   = array.new<int>()
+var array<float> plPriceArray = array.new<float>()
+var array<int>   phBarArray   = array.new<int>()
+var array<float> phPriceArray = array.new<float>()
+
+var array<Trendline> tlArray = array.new<Trendline>()
+
+var float lastPivotHigh = na
+var float lastPivotLow  = na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions & Methods
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Line value at a given bar index
+method valueAt(Trendline tl, int barIdx) =>
+    tl.y1 + tl.slope * (barIdx - tl.x1)
+
+// Band fill transparency graded by touch count: each successive touch adds participants, so the pool deepens
+method fillTransp(Trendline tl) =>
+    math.max(60, 92 - tl.touches * 6)
+
+// Delete every drawing owned by a trendline
+method wipe(Trendline tl) =>
+    line.delete(tl.lnId)
+    line.delete(tl.edgeId)
+    linefill.delete(tl.fillId)
+    label.delete(tl.tagId)
+    label.delete(tl.evtId)
+
+// Create the drawings of a trendline that reached the minimum touch count
+method render(Trendline tl, float atrValue, color col) =>
+    float valNow = tl.valueAt(bar_index)
+    tl.lnId := line.new(tl.x1, tl.y1, bar_index, valNow, color = col, style = qualifiedLineStyle, width = 1)
+    if showBandInput
+        float bandOffset = bandWidthInput * atrValue
+        tl.edgeId := line.new(tl.x1, tl.y1 - tl.dir * bandOffset, bar_index, valNow - tl.dir * bandOffset, color = color.new(col, 70), style = line.style_dotted)
+        tl.fillId := linefill.new(tl.lnId, tl.edgeId, color.new(col, tl.fillTransp()))
+    if showTagInput
+        tl.tagId := label.new(bar_index, valNow, str.tostring(tl.touches) + '×', style = label.style_label_left, color = TRANSP_COLOR, textcolor = col, size = size.small)
+    tl.qualified := true
+
+// Try to build the best candidate trendline pairing a fresh pivot with stored older pivots.
+// Valid lines slope with the trend (never horizontal), are unviolated across their span, and count debounced touches.
+tryBuild(int dir, int pivotBar, float pivotPrice, float atrValue) =>
+    array<int>   barsArray   = dir == 1 ? plBarArray : phBarArray
+    array<float> pricesArray = dir == 1 ? plPriceArray : phPriceArray
+    array<float> srcArray    = dir == 1 ? lowArray : highArray
+    int   bestB1      = -1
+    float bestP1      = na
+    float bestSlope   = na
+    int   bestTouches = 0
+    int   minSpan     = swingLengthInput * 2
+    if array.size(barsArray) > 0
+        for k = 0 to array.size(barsArray) - 1
+            int   b1   = array.get(barsArray, k)
+            float p1   = array.get(pricesArray, k)
+            int   span = pivotBar - b1
+            // require a distinctly rising support / falling resistance line — horizontal pools belong to equal highs/lows
+            if span >= minSpan and span <= MAX_SPAN and dir * (pivotPrice - p1) > 2 * touchTolInput * atrValue
+                float slopeK   = (pivotPrice - p1) / span
+                bool  validK   = true
+                int   touchesK = 0
+                bool  prevIn   = false
+                for i = b1 to bar_index
+                    float lineV = p1 + slopeK * (i - b1)
+                    float tolI  = touchTolInput * array.get(atrArray, i)
+                    float srcI  = array.get(srcArray, i)
+                    if dir * (srcI - lineV) < -tolI
+                        validK := false
+                        break
+                    bool inBand = math.abs(srcI - lineV) <= tolI
+                    if inBand and not prevIn
+                        touchesK += 1
+                    prevIn := inBand
+                if validK and touchesK > bestTouches
+                    bestTouches := touchesK
+                    bestB1      := b1
+                    bestP1      := p1
+                    bestSlope   := slopeK
+    Trendline result = na
+    if bestTouches >= 2
+        float valNow = bestP1 + bestSlope * (bar_index - bestB1)
+        bool  dupe   = false
+        if array.size(tlArray) > 0
+            for j = 0 to array.size(tlArray) - 1
+                Trendline other = array.get(tlArray, j)
+                if other.dir == dir and other.state <= STATE_BREACHED and math.abs(other.valueAt(bar_index) - valNow) <= 2 * touchTolInput * atrValue
+                    dupe := true
+                    break
+        if not dupe
+            result := Trendline.new(dir = dir, x1 = bestB1, y1 = bestP1, slope = bestSlope, touches = bestTouches, createdBar = bar_index)
+    result
+
+// Keep at most MAX_ACTIVE unresolved lines per direction — the most recent, most obvious ones
+enforceCap(int dir) =>
+    int unresolved = 0
+    if array.size(tlArray) > 0
+        for j = 0 to array.size(tlArray) - 1
+            Trendline held = array.get(tlArray, j)
+            if held.dir == dir and held.state <= STATE_BREACHED
+                unresolved += 1
+    if unresolved > MAX_ACTIVE
+        for j = 0 to array.size(tlArray) - 1
+            Trendline held = array.get(tlArray, j)
+            if held.dir == dir and held.state <= STATE_BREACHED
+                held.wipe()
+                array.remove(tlArray, j)
+                break
+
+// Handle a freshly confirmed pivot: build a candidate line and report whether it qualified immediately
+onPivot(int dir, int pivotBar, float pivotPrice, float atrValue, color col) =>
+    bool createdQualified = false
+    Trendline built = tryBuild(dir, pivotBar, pivotPrice, atrValue)
+    if not na(built)
+        array.push(tlArray, built)
+        if built.touches >= minTouchesInput
+            built.render(atrValue, col)
+            createdQualified := true
+        enforceCap(dir)
+    createdQualified
+
+// Store a confirmed pivot in the pairing memory
+storePivot(int dir, int pivotBar, float pivotPrice) =>
+    array<int>   barsArray   = dir == 1 ? plBarArray : phBarArray
+    array<float> pricesArray = dir == 1 ? plPriceArray : phPriceArray
+    array.push(barsArray, pivotBar)
+    array.push(pricesArray, pivotPrice)
+    if array.size(barsArray) > PIVOT_MEM
+        array.shift(barsArray)
+        array.shift(pricesArray)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+
+trueRangeValue = ta.tr(true)
+atrValue       = nz(ta.atr(atrLengthInput), trueRangeValue)
+
+array.push(lowArray, low)
+array.push(highArray, high)
+array.push(atrArray, atrValue)
+
+float pivotLow  = ta.pivotlow(swingLengthInput, swingLengthInput)
+float pivotHigh = ta.pivothigh(swingLengthInput, swingLengthInput)
+
+// per-bar event flags
+bool newPoolFlag     = false
+bool touchFlag       = false
+bool tapSellSideFlag = false
+bool tapBuySideFlag  = false
+bool sweepBullFlag   = false
+bool sweepBearFlag   = false
+bool shiftBullFlag   = false
+bool shiftBearFlag   = false
+bool breakDownFlag   = false
+bool breakUpFlag     = false
+
+// new confirmed pivots anchor new candidate lines and update structure references
+if not na(pivotLow)
+    lastPivotLow := pivotLow
+    if onPivot(1, bar_index - swingLengthInput, pivotLow, atrValue, bullColorInput)
+        newPoolFlag := true
+    storePivot(1, bar_index - swingLengthInput, pivotLow)
+
+if not na(pivotHigh)
+    lastPivotHigh := pivotHigh
+    if onPivot(-1, bar_index - swingLengthInput, pivotHigh, atrValue, bearColorInput)
+        newPoolFlag := true
+    storePivot(-1, bar_index - swingLengthInput, pivotHigh)
+
+// per-bar state machine over tracked trendlines
+array<int> removeIdxArray = array.new<int>()
+
+if array.size(tlArray) > 0
+    for i = 0 to array.size(tlArray) - 1
+        Trendline tl = array.get(tlArray, i)
+        if bar_index > tl.createdBar
+            float val    = tl.valueAt(bar_index)
+            float tolNow = touchTolInput * atrValue
+            color col    = tl.dir == 1 ? bullColorInput : bearColorInput
+
+            // extend drawings while the pool is intact or being tapped
+            if tl.qualified and tl.state <= STATE_BREACHED
+                line.set_xy2(tl.lnId, bar_index, val)
+                if not na(tl.edgeId)
+                    float bandOffset = bandWidthInput * atrValue
+                    line.set_y1(tl.edgeId, tl.y1 - tl.dir * bandOffset)
+                    line.set_xy2(tl.edgeId, bar_index, val - tl.dir * bandOffset)
+                if not na(tl.tagId)
+                    label.set_xy(tl.tagId, bar_index, val)
+
+            // ---- intact line: count touches, detect the pierce into the pool
+            if tl.state == STATE_ACTIVE
+                if not tl.qualified and bar_index - tl.createdBar > CANDIDATE_TTL
+                    tl.state := STATE_EXPIRED
+                    array.push(removeIdxArray, i)
+                else
+                    float edgePrice = tl.dir == 1 ? low : high
+                    if tl.dir * (edgePrice - val) < -tolNow
+                        if tl.qualified
+                            tl.state       := STATE_BREACHED
+                            tl.breachBar   := bar_index
+                            tl.extreme     := edgePrice
+                            tl.structLevel := tl.dir == 1 ? lastPivotHigh : lastPivotLow
+                            tl.beyondCount := 0
+                            if tl.dir == 1
+                                tapSellSideFlag := true
+                            else
+                                tapBuySideFlag := true
+                        else
+                            tl.state := STATE_EXPIRED
+                            array.push(removeIdxArray, i)
+                    else
+                        float prevVal  = val - tl.slope
+                        float prevEdge = tl.dir == 1 ? low[1] : high[1]
+                        bool  inBand   = math.abs(edgePrice - val) <= tolNow
+                        bool  wasIn    = math.abs(prevEdge - prevVal) <= tolNow
+                        if inBand and not wasIn
+                            tl.touches += 1
+                            if tl.qualified
+                                touchFlag := true
+                                if not na(tl.tagId)
+                                    label.set_text(tl.tagId, str.tostring(tl.touches) + '×')
+                                if not na(tl.fillId)
+                                    linefill.set_color(tl.fillId, color.new(col, tl.fillTransp()))
+                            else if tl.touches >= minTouchesInput
+                                tl.render(atrValue, col)
+                                newPoolFlag := true
+
+            // ---- pierced line: resolve as sweep (stall + reclaim) or genuine break (acceptance)
+            if tl.state == STATE_BREACHED
+                tl.extreme := tl.dir == 1 ? math.min(tl.extreme, low) : math.max(tl.extreme, high)
+                bool beyond    = tl.dir * (close - val) < 0
+                bool reclaimed = tl.dir * (close - val) > 0
+                tl.beyondCount := beyond ? tl.beyondCount + 1 : 0
+                bool impulsive   = reclaimed and tl.dir * (close - open) > 0 and trueRangeValue >= dispMultInput * atrValue
+                int  sinceBreach = bar_index - tl.breachBar
+                if tl.beyondCount >= acceptBarsInput or (sinceBreach >= reclaimWindowInput and not reclaimed)
+                    // acceptance beyond the line — an actual breakdown / breakout
+                    tl.state := STATE_BROKEN
+                    line.set_color(tl.lnId, color.new(col, 60))
+                    line.set_style(tl.lnId, line.style_dotted)
+                    if not na(tl.edgeId)
+                        line.set_color(tl.edgeId, color.new(col, 85))
+                    if not na(tl.fillId)
+                        linefill.set_color(tl.fillId, color.new(col, 94))
+                    color breakCol = tl.dir == 1 ? bearColorInput : bullColorInput
+                    if showEventsInput
+                        tl.evtId := label.new(bar_index, val, 'Break', style = tl.dir == 1 ? label.style_label_down : label.style_label_up, color = TRANSP_COLOR, textcolor = breakCol, size = size.small)
+                    if tl.dir == 1
+                        breakDownFlag := true
+                    else
+                        breakUpFlag := true
+                else if impulsive or (sinceBreach >= reclaimWindowInput and reclaimed)
+                    // the poke stalled and price reclaimed the line — trendline liquidity swept
+                    bool immediateShift = not na(tl.structLevel) and tl.dir * (close - tl.structLevel) > 0
+                    tl.state    := immediateShift ? STATE_CONFIRMED : STATE_SWEPT
+                    tl.eventBar := bar_index
+                    line.set_style(tl.lnId, line.style_dotted)
+                    if not na(tl.fillId)
+                        linefill.set_color(tl.fillId, color.new(col, 90))
+                    if not na(tl.edgeId)
+                        line.set_color(tl.edgeId, color.new(col, 85))
+                    if showEventsInput
+                        tl.evtId := label.new(bar_index, tl.extreme, immediateShift ? 'Sweep ✓' : 'Sweep', style = tl.dir == 1 ? label.style_label_up : label.style_label_down, color = TRANSP_COLOR, textcolor = col, size = size.small)
+                    if tl.dir == 1
+                        sweepBullFlag := true
+                        shiftBullFlag := immediateShift or shiftBullFlag
+                    else
+                        sweepBearFlag := true
+                        shiftBearFlag := immediateShift or shiftBearFlag
+
+            // ---- swept line: watch for the structural shift that confirms a completed sweep
+            else if tl.state == STATE_SWEPT
+                if not na(tl.structLevel) and tl.dir * (close - tl.structLevel) > 0
+                    tl.state := STATE_CONFIRMED
+                    if not na(tl.evtId)
+                        label.set_text(tl.evtId, 'Sweep ✓')
+                    if tl.dir == 1
+                        shiftBullFlag := true
+                    else
+                        shiftBearFlag := true
+                else if bar_index - tl.eventBar >= shiftWindowInput
+                    tl.state := STATE_EXPIRED
+
+// drop invalidated or stale candidates (indices pushed ascending, removed descending)
+while array.size(removeIdxArray) > 0
+    int idx = array.pop(removeIdxArray)
+    Trendline gone = array.get(tlArray, idx)
+    gone.wipe()
+    array.remove(tlArray, idx)
+
+// trim fully resolved lines beyond the history budget (sweeps still awaiting confirmation are kept)
+int resolvedCount = 0
+if array.size(tlArray) > 0
+    for i = 0 to array.size(tlArray) - 1
+        Trendline tl = array.get(tlArray, i)
+        if tl.state >= STATE_CONFIRMED
+            resolvedCount += 1
+
+bool trimmed = true
+while resolvedCount > historyInput and trimmed
+    trimmed := false
+    if array.size(tlArray) > 0
+        for i = 0 to array.size(tlArray) - 1
+            Trendline tl = array.get(tlArray, i)
+            if tl.state >= STATE_CONFIRMED
+                tl.wipe()
+                array.remove(tlArray, i)
+                resolvedCount -= 1
+                trimmed := true
+                break
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(newPoolFlag,     'New Trendline Liquidity',        'Trendline liquidity: a trendline reached the minimum touch count — a diagonal liquidity pool is now tracked')
+alertcondition(touchFlag,       'Trendline Touch',                'Trendline liquidity: a qualified trendline was touched again — the pool deepened as new participants joined')
+alertcondition(tapSellSideFlag, 'Sell-Side Liquidity Tapped',     'Trendline liquidity: price pierced a rising support line — the sell-side pool beneath it is being filled')
+alertcondition(tapBuySideFlag,  'Buy-Side Liquidity Tapped',      'Trendline liquidity: price pierced a falling resistance line — the buy-side pool above it is being filled')
+alertcondition(sweepBullFlag,   'Bullish Trendline Sweep',        'Trendline liquidity: a rising support line was swept and reclaimed — potential bullish reversal against trapped breakout sellers')
+alertcondition(sweepBearFlag,   'Bearish Trendline Sweep',        'Trendline liquidity: a falling resistance line was swept and reclaimed — potential bearish reversal against trapped breakout buyers')
+alertcondition(shiftBullFlag,   'Bullish Sweep Confirmed',        'Trendline liquidity: structure shifted up after a support-line sweep — completed sweep confirmed')
+alertcondition(shiftBearFlag,   'Bearish Sweep Confirmed',        'Trendline liquidity: structure shifted down after a resistance-line sweep — completed sweep confirmed')
+alertcondition(breakDownFlag,   'Genuine Breakdown',              'Trendline liquidity: acceptance below a rising support line — the break shows follow-through rather than a sweep')
+alertcondition(breakUpFlag,     'Genuine Breakout',               'Trendline liquidity: acceptance above a falling resistance line — the break shows follow-through rather than a sweep')
+
+//---------------------------------------------------------------------------------------------------------------------}

@@ -1,0 +1,204 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Elegant Oscillator"
+  , shorttitle = "Elegant Oscillator"
+  , overlay    = false
+  , format     = format.price
+  , precision  = 2)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+float FILTER_K    = 1.414 // Ehlers' published pole-placement constant (approximation of sqrt(2))
+float UPPER_BOUND = 1.0   // Upper asymptote of the inverse Fisher transform
+float LOWER_BOUND = -1.0  // Lower asymptote of the inverse Fisher transform
+
+int FULL_TRANSP = 100
+int HALF_TRANSP = 50
+int GLOW_TRANSP = 55
+
+string GROUP_OSC    = "Oscillator"
+string GROUP_EVENTS = "Levels & Events"
+string GROUP_STYLE  = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+sourceInput = input.source(close, "Source"
+  , group   = GROUP_OSC
+  , tooltip = "Price series fed to the momentum derivative. The classic recipe uses the close.")
+
+derivSpanInput = input.int(2, "Derivative Span"
+  , minval  = 1
+  , maxval  = 100
+  , group   = GROUP_OSC
+  , tooltip = "Number of bars spanned by the price derivative (source minus the source that many bars earlier). The classic recipe uses a two-bar span.")
+
+rmsLengthInput = input.int(50, "RMS Window"
+  , minval  = 2
+  , maxval  = 500
+  , group   = GROUP_OSC
+  , tooltip = "Number of bars in the root-mean-square average of the derivative. Dividing the derivative by its own RMS puts every market on a comparable scale; around 50 bars is the common setting.")
+
+smoothPeriodInput = input.int(20, "SuperSmoother Period"
+  , minval  = 4
+  , maxval  = 200
+  , group   = GROUP_OSC
+  , tooltip = "Critical period of Ehlers' two-pole SuperSmoother applied as the final smoothing stage. Longer periods give a cleaner but laggier line.")
+
+railLevelInput = input.float(0.9, "Rail Proximity Level"
+  , minval  = 0.5
+  , maxval  = 0.99
+  , step    = 0.05
+  , group   = GROUP_EVENTS
+  , tooltip = "Absolute reading treated as being at a rail. Readings beyond it mark established one-sided momentum; the level also anchors the rail-reach, rail-fade and exhaustion events.")
+
+extremeLookbackInput = input.int(50, "Exhaustion Price Lookback"
+  , minval  = 2
+  , maxval  = 500
+  , group   = GROUP_EVENTS
+  , tooltip = "Window used to flag fresh price extremes. An exhaustion event fires when price pushes to a new extreme over this window while the oscillator, having previously reached the matching rail, fails to return to it.")
+
+glowInput = input.bool(true, "Rail Glow"
+  , group   = GROUP_STYLE
+  , tooltip = "Adds a glow around the oscillator line that intensifies as readings approach the -1/+1 rails, highlighting established momentum states.")
+
+showCrossMarkersInput = input.bool(false, "Zero Cross Markers"
+  , group   = GROUP_STYLE
+  , tooltip = "Shows circles on the zero line at bullish/bearish zero crossings. The alerts cover these events even when markers are hidden.")
+
+showExhaustMarkersInput = input.bool(false, "Exhaustion Markers"
+  , group   = GROUP_STYLE
+  , tooltip = "Shows diamonds when price pushes to a fresh extreme while the oscillator fails to return to its rail. The alerts cover these events even when markers are hidden.")
+
+bullColorInput = input.color(#089981, "Bullish Color", group = GROUP_STYLE)
+
+bearColorInput = input.color(#f23645, "Bearish Color", group = GROUP_STYLE)
+
+levelsColorInput = input.color(#787b86, "Levels Color", group = GROUP_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Ehlers' two-pole SuperSmoother low-lag filter with critical period `period`.
+// The output is seeded to the input until the recursion has two prior values.
+superSmoother(float src, simple int period) =>
+    a1 = math.exp(-FILTER_K * math.pi / period)
+    b1 = 2 * a1 * math.cos(FILTER_K * math.pi / period)
+    c2 = b1
+    c3 = -a1 * a1
+    c1 = 1 - c2 - c3
+    var float smoothed = na
+    if na(src[1]) or na(smoothed[1]) or na(smoothed[2])
+        smoothed := src
+    else
+        smoothed := c1 * (src + src[1]) / 2 + c2 * smoothed[1] + c3 * smoothed[2]
+    smoothed
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Price derivative (two-bar momentum term by default)
+float deriv = sourceInput - sourceInput[derivSpanInput]
+
+// Root mean square of the derivative over the normalization window
+float rms = math.sqrt(ta.sma(deriv * deriv, rmsLengthInput))
+
+// Normalized derivative, roughly unit-scaled, guarded against a flat window
+float normDeriv = na
+if not na(rms)
+    normDeriv := rms > 0 ? deriv / rms : 0
+
+// Inverse Fisher transform, compressing readings toward the -1/+1 rails
+float expTwice      = math.exp(2 * normDeriv)
+float inverseFisher = (expTwice - 1) / (expTwice + 1)
+
+// Final SuperSmoother pass removing residual noise
+float osc = superSmoother(inverseFisher, smoothPeriodInput)
+
+// Zero-line and rail transitions
+bool bullCross     = ta.crossover(osc, 0)
+bool bearCross     = ta.crossunder(osc, 0)
+bool upperRailHit  = ta.crossover(osc, railLevelInput)
+bool lowerRailHit  = ta.crossunder(osc, -railLevelInput)
+bool upperRailFade = ta.crossunder(osc, railLevelInput)
+bool lowerRailFade = ta.crossover(osc, -railLevelInput)
+
+// Rail memory: has the oscillator reached a rail since its last zero cross?
+var bool reachedUpperRail = false
+var bool reachedLowerRail = false
+
+if bearCross
+    reachedUpperRail := false
+if bullCross
+    reachedLowerRail := false
+if osc >= railLevelInput
+    reachedUpperRail := true
+if osc <= -railLevelInput
+    reachedLowerRail := true
+
+// Exhaustion: price pushes to a fresh extreme while the oscillator fails to return to its rail
+float highestHigh = ta.highest(high, extremeLookbackInput)
+float lowestLow   = ta.lowest(low, extremeLookbackInput)
+
+bool bearExhaustState = high >= highestHigh and reachedUpperRail and osc > 0 and osc < railLevelInput
+bool bullExhaustState = low <= lowestLow and reachedLowerRail and osc < 0 and osc > -railLevelInput
+
+bool bearExhaust = bearExhaustState and not bearExhaustState[1]
+bool bullExhaust = bullExhaustState and not bullExhaustState[1]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+
+color oscColor = osc > 0 ? bullColorInput : bearColorInput
+
+// Glow flaring as readings approach the rails
+color glowColor = glowInput
+  ? color.from_gradient(math.abs(osc), 0, UPPER_BOUND, color.new(oscColor, FULL_TRANSP), color.new(oscColor, GLOW_TRANSP))
+  : color(na)
+
+plot(osc, "Glow", glowColor, 4)
+
+oscPlotId  = plot(osc, "Elegant Oscillator", oscColor, 1)
+zeroPlotId = plot(0, "Zero Anchor", editable = false, display = display.none)
+
+fill(oscPlotId, zeroPlotId
+  , top_value    = math.max(osc, 0)
+  , bottom_value = math.min(osc, 0)
+  , top_color    = osc > 0 ? color.new(bullColorInput, HALF_TRANSP) : color.new(bearColorInput, FULL_TRANSP)
+  , bottom_color = osc > 0 ? color.new(bullColorInput, FULL_TRANSP) : color.new(bearColorInput, HALF_TRANSP)
+  , title        = "Gradient Fill")
+
+hline(UPPER_BOUND, "Upper Bound", levelsColorInput, hline.style_dotted)
+hline(railLevelInput, "Upper Rail", levelsColorInput, hline.style_dashed)
+hline(0, "Zero Line", levelsColorInput, hline.style_dotted)
+hline(-railLevelInput, "Lower Rail", levelsColorInput, hline.style_dashed)
+hline(LOWER_BOUND, "Lower Bound", levelsColorInput, hline.style_dotted)
+
+plot(showCrossMarkersInput and bullCross ? 0.0 : na, "Bullish Zero Cross", bullColorInput, 3, plot.style_circles)
+plot(showCrossMarkersInput and bearCross ? 0.0 : na, "Bearish Zero Cross", bearColorInput, 3, plot.style_circles)
+
+plotshape(showExhaustMarkersInput and bearExhaust, "Bearish Exhaustion", shape.diamond, location.top, bearColorInput, size = size.tiny)
+plotshape(showExhaustMarkersInput and bullExhaust, "Bullish Exhaustion", shape.diamond, location.bottom, bullColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(bullCross, "Bullish Zero Cross", "Elegant Oscillator crossed above zero on {{ticker}} ({{interval}})")
+alertcondition(bearCross, "Bearish Zero Cross", "Elegant Oscillator crossed below zero on {{ticker}} ({{interval}})")
+alertcondition(upperRailHit, "Upper Rail Reached", "Elegant Oscillator reached its upper rail on {{ticker}} ({{interval}})")
+alertcondition(lowerRailHit, "Lower Rail Reached", "Elegant Oscillator reached its lower rail on {{ticker}} ({{interval}})")
+alertcondition(upperRailFade, "Upper Rail Fade", "Elegant Oscillator faded back below its upper rail on {{ticker}} ({{interval}})")
+alertcondition(lowerRailFade, "Lower Rail Fade", "Elegant Oscillator faded back above its lower rail on {{ticker}} ({{interval}})")
+alertcondition(bearExhaust, "Bearish Exhaustion", "New price high with the Elegant Oscillator failing to return to its upper rail on {{ticker}} ({{interval}})")
+alertcondition(bullExhaust, "Bullish Exhaustion", "New price low with the Elegant Oscillator failing to return to its lower rail on {{ticker}} ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

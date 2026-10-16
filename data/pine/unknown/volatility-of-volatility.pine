@@ -1,0 +1,236 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Volatility of Volatility", shorttitle = "Volatility of Volatility", overlay = false, format = format.price, precision = 3)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+STABLE_COLOR   = #5b9cf6 // non-directional volatility metric color, bottom of the percentile scale
+ELEVATED_COLOR = #ff9800 // middle of the percentile scale
+UNSTABLE_COLOR = #f23645 // top of the percentile scale - volatility estimates going stale quickly
+LEVEL_COLOR    = #787b86 // optional percentile reference levels
+
+FILL_VALUE_TRANSP = 50 // gradient transparency at the vol-of-vol value
+FILL_ZERO_TRANSP  = 100 // gradient transparency at zero
+REGIME_BG_TRANSP  = 88 // unstable-regime background shading transparency
+
+MID_PERCENTILE = 50 // midpoint of the percentile scale for the two-stage line gradient
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+volBasisInput = input.string("Realized Volatility", "Volatility Basis", options = ["Realized Volatility", "ATR", "Implied Index"], group = "First-Stage Volatility",
+     tooltip = "First-stage volatility series whose own instability is measured. 'Realized Volatility' is the rolling standard deviation of close-to-close log returns in percent - per bar, unannualized, since annualization is a constant factor that cancels out of the log changes anyway. 'ATR' is Wilder's Average True Range in price units, letting gaps and bar ranges into the definition. 'Implied Index' reads the closing value of the symbol below, running the study on a published implied series such as the VIX. The basis only changes what counts as volatility - the second-stage math is identical.")
+
+volLengthInput = input.int(20, "Volatility Length", minval = 2, group = "First-Stage Volatility",
+     tooltip = "Window of the first-stage estimator - the realized volatility lookback or the ATR smoothing length. This window defines what counts as volatility: shorter settings produce a livelier volatility series and therefore more measured instability. Ignored when the basis is an implied index, which arrives already computed.")
+
+impliedSymbolInput = input.symbol("CBOE:VIX", "Implied Index Symbol", group = "First-Stage Volatility",
+     tooltip = "Symbol read when the volatility basis is 'Implied Index', requested on the chart timeframe. Any published volatility index works - the VIX family, GVZ, OVX, or a crypto implied index. If the symbol returns no data, a notice is shown and the pane stays empty rather than erroring.")
+
+changeBasisInput = input.string("Log Change", "Change Basis", options = ["Log Change", "Simple Change"], group = "Vol-of-Vol",
+     tooltip = "How the volatility series is differenced before its dispersion is measured, so the volatility level does not dominate the statistic. 'Log Change' uses bar-to-bar log changes of the volatility series, in percent - scale-free, so readings are comparable across instruments and across calm and stormy levels. 'Simple Change' uses raw bar-to-bar differences in the units of the volatility series itself.")
+
+vovLengthInput = input.int(20, "Vol-of-Vol Length", minval = 2, group = "Vol-of-Vol",
+     tooltip = "Second-stage window: volatility of volatility is the rolling standard deviation of the volatility changes over this many bars. Shorter windows catch regime breaks faster at the cost of noise. There is no published standard - consistency matters more than the specific choice, and the percentile treatment below softens the dependence on any single setting.")
+
+percentileLengthInput = input.int(252, "Percentile Lookback", minval = 10, group = "Percentile Context",
+     tooltip = "Bars used to percentile-rank the current vol-of-vol against its own history. Raw dispersion values are not comparable across instruments or settings, so the regime status, background shading, and alerts all run on this rank - it shows whether current instability is unusual for the instrument. 252 daily bars is the one-year convention. The rank stays empty until a full lookback of history exists.")
+
+highPercentileInput = input.float(80, "High Percentile", minval = 50, maxval = 100, step = 1, inline = "percentile", group = "Percentile Context",
+     tooltip = "Percentile rank at or above which the volatility series counts as unstable: volatility estimates go stale quickly, so ATR stops, volatility-targeted position sizes, and freshly recalculated band widths are calibrated to a number that keeps moving. Crossing it fires the 'Unstable Volatility Regime' alert.")
+
+lowPercentileInput = input.float(20, "Low Percentile", minval = 0, maxval = 50, step = 1, inline = "percentile", group = "Percentile Context",
+     tooltip = "Percentile rank at or below which the volatility series counts as stable and sticky - trailing calibrations can be trusted the most, and quiet-phase setups such as squeezes rest on the stable footing they presume. Crossing under it fires the 'Stable Volatility Regime' alert.")
+
+showLevelsInput = input.bool(false, "Show Percentile Levels", group = "Percentile Context",
+     tooltip = "Plots the vol-of-vol values sitting at the high and low percentiles of the lookback as reference levels, making threshold crossings visible in the pane. Off by default to keep the pane clean - the regime logic and the alerts work either way.")
+
+showDashInput = input.bool(true, "Show Dashboard", group = "Dashboard",
+     tooltip = "Displays the current first-stage volatility reading, the vol-of-vol value, its percentile rank, the regime status, and - when the comparison below is enabled - VVIX, VIX, and their ratio.")
+
+dashPosInput = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], inline = "dash", group = "Dashboard",
+     tooltip = "Corner of the pane the dashboard is anchored to.")
+
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], inline = "dash", group = "Dashboard",
+     tooltip = "Dashboard text size.")
+
+showVvixInput = input.bool(true, "VVIX / VIX Comparison", group = "Dashboard",
+     tooltip = "Adds VVIX, VIX, and their ratio to the dashboard. VVIX is the listed vol-of-vol benchmark for US index volatility - the expected 30-day volatility of the VIX itself, derived from VIX option prices - so it provides the implied counterpart to this chart's statistical reading. VVIX elevated relative to VIX flags expensive volatility convexity, which some traders read as hedging demand. Symbols that return no data are reported as such without affecting the rest of the study.")
+
+vvixSymbolInput = input.symbol("CBOE:VVIX", "VVIX Symbol", group = "Dashboard",
+     tooltip = "Symbol of the implied vol-of-vol index used by the comparison. Cboe's VVIX is the published measure of the VIX's own expected movement.")
+
+vixSymbolInput = input.symbol("CBOE:VIX", "VIX Symbol", group = "Dashboard",
+     tooltip = "Symbol of the first-order implied index the comparison divides by. Cboe's VIX is the standard companion to VVIX.")
+
+stableColorInput = input.color(STABLE_COLOR, "Stable", inline = "gradient", group = "Style",
+     tooltip = "Color of the vol-of-vol line and gradient at the bottom of the percentile scale - the volatility estimate is holding steady.")
+
+elevatedColorInput = input.color(ELEVATED_COLOR, "Elevated", inline = "gradient", group = "Style",
+     tooltip = "Color of the vol-of-vol line and gradient at the middle of the percentile scale.")
+
+unstableColorInput = input.color(UNSTABLE_COLOR, "Unstable", inline = "gradient", group = "Style",
+     tooltip = "Color of the vol-of-vol line and gradient at the top of the percentile scale - volatility lurching between calm and panic rather than drifting.")
+
+gradientInput = input.bool(true, "Gradient Fill", group = "Style",
+     tooltip = "Fills the area between zero and the vol-of-vol line with a vertical gradient - fully transparent at zero, strongest at the current value.")
+
+highlightRegimeInput = input.bool(true, "Highlight Unstable Regime", group = "Style",
+     tooltip = "Shades the pane background while the vol-of-vol percentile is at or above the high threshold - the stretches where anything calibrated to a trailing volatility window goes stale quickest.")
+
+levelColorInput = input.color(LEVEL_COLOR, "Percentile Levels", group = "Style",
+     tooltip = "Color of the optional high and low percentile reference levels.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+getTablePosition(positionText) =>
+    switch positionText
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        => position.bottom_left
+
+getTextSize(sizeText) =>
+    switch sizeText
+        "Tiny"  => size.tiny
+        "Small" => size.small
+        => size.normal
+
+formatValue(float value) =>
+    na(value) ? "—" : str.tostring(value, math.abs(value) >= 1 ? "#.##" : "#.####")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+// External series - every request executes unconditionally on every bar, on the chart timeframe as-is,
+// and unresolvable symbols return na instead of erroring
+float impliedVol = request.security(impliedSymbolInput, timeframe.period, close, ignore_invalid_symbol = true)
+float vvixValue  = request.security(vvixSymbolInput, timeframe.period, close, ignore_invalid_symbol = true)
+float vixValue   = request.security(vixSymbolInput, timeframe.period, close, ignore_invalid_symbol = true)
+
+// Stage one - the volatility series itself. Realized volatility is the rolling standard deviation of
+// close-to-close log returns in percent (per bar); ATR is Wilder's Average True Range in price units;
+// the implied basis reads a published index. Guards keep missing or non-positive prices out of the log
+float logReturn   = close > 0 and not na(close[1]) and close[1] > 0 ? math.log(close / close[1]) : na
+float realizedVol = ta.stdev(logReturn, volLengthInput) * 100
+float atrVol      = ta.atr(volLengthInput)
+
+float firstStageVol = switch volBasisInput
+    "Realized Volatility" => realizedVol
+    "ATR"                 => atrVol
+    =>                       impliedVol
+
+// Stage two - difference the volatility series so its level does not dominate the statistic. Log changes
+// (in percent) are scale-free; simple changes stay in the units of the volatility series
+float logVolChange    = firstStageVol > 0 and firstStageVol[1] > 0 ? 100 * math.log(firstStageVol / firstStageVol[1]) : na
+float simpleVolChange = firstStageVol - firstStageVol[1]
+float volChange       = changeBasisInput == "Log Change" ? logVolChange : simpleVolChange
+
+// Volatility of volatility - a rolling standard deviation of the volatility changes. Two markets can carry
+// the same average volatility while only one lurches between calm and panic; this is the number separating them
+float volOfVol = ta.stdev(volChange, vovLengthInput)
+
+// Percentile context - rank the reading against its own history so 'unusually unstable' is defined per
+// instrument, not by an absolute cutoff. The interpolated percentile values double as plottable levels
+float vovPercentile = ta.percentrank(volOfVol, percentileLengthInput)
+float highLevel     = ta.percentile_linear_interpolation(volOfVol, percentileLengthInput, highPercentileInput)
+float lowLevel      = ta.percentile_linear_interpolation(volOfVol, percentileLengthInput, lowPercentileInput)
+
+bool unstableRegime = not na(vovPercentile) and vovPercentile >= highPercentileInput
+bool stableRegime   = not na(vovPercentile) and vovPercentile <= lowPercentileInput
+
+// VVIX / VIX - the listed implied comparison for US index volatility
+float vvixRatio = not na(vvixValue) and not na(vixValue) and vixValue > 0 ? vvixValue / vixValue : na
+
+// Threshold crossings consumed by the alerts
+bool instabilityEvent = ta.crossover(vovPercentile, highPercentileInput)
+bool easingEvent      = ta.crossunder(vovPercentile, highPercentileInput)
+bool risingEvent      = ta.crossover(vovPercentile, lowPercentileInput)
+bool stabilityEvent   = ta.crossunder(vovPercentile, lowPercentileInput)
+
+// Data availability - drives the graceful no-data notice for the implied basis
+bool impliedMissing = volBasisInput == "Implied Index" and na(impliedVol)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+// Value-based coloring across the percentile scale - stable through elevated to unstable
+color vovColor = na(vovPercentile) ? stableColorInput : vovPercentile <= MID_PERCENTILE ? color.from_gradient(vovPercentile, 0, MID_PERCENTILE, stableColorInput, elevatedColorInput) : color.from_gradient(vovPercentile, MID_PERCENTILE, 100, elevatedColorInput, unstableColorInput)
+
+vovPlotId  = plot(volOfVol, "Vol-of-Vol", color = vovColor, linewidth = 2)
+zeroPlotId = plot(0, "Zero Line", color = color.new(chart.fg_color, 90), linewidth = 1)
+
+fill(vovPlotId, zeroPlotId, top_value = math.max(nz(volOfVol), 0), bottom_value = 0, top_color = gradientInput ? color.new(vovColor, FILL_VALUE_TRANSP) : na, bottom_color = gradientInput ? color.new(vovColor, FILL_ZERO_TRANSP) : na, title = "Vol-of-Vol Gradient Fill")
+
+plot(showLevelsInput ? highLevel : na, "High Percentile Level", color = color.new(levelColorInput, 30), linewidth = 1, style = plot.style_circles)
+plot(showLevelsInput ? lowLevel : na, "Low Percentile Level", color = color.new(levelColorInput, 30), linewidth = 1, style = plot.style_circles)
+
+// Auxiliary readings exposed to the data window without cluttering the pane scale
+plot(firstStageVol, "First-Stage Volatility", color = color.new(chart.fg_color, 50), display = display.data_window, editable = false)
+plot(vovPercentile, "Vol-of-Vol Percentile", color = vovColor, display = display.data_window, editable = false)
+
+// Unstable-regime interval shading - the stretches where volatility-calibrated numbers go stale quickest
+bgcolor(highlightRegimeInput and unstableRegime ? color.new(unstableColorInput, REGIME_BG_TRANSP) : na, title = "Unstable Regime Background")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dashboardTable = showDashInput ? table.new(getTablePosition(dashPosInput), 2, 8, bgcolor = color.new(chart.bg_color, 25), frame_color = color.new(chart.fg_color, 85), frame_width = 1, border_color = color.new(chart.fg_color, 90), border_width = 1) : na
+
+if showDashInput and barstate.islast and not na(dashboardTable)
+    string dashTextSize = getTextSize(dashSizeInput)
+    color  labelColor   = color.new(chart.fg_color, 20)
+
+    string basisText  = volBasisInput == "Realized Volatility" ? "RV " + str.tostring(volLengthInput) : volBasisInput == "ATR" ? "ATR " + str.tostring(volLengthInput) : impliedSymbolInput + (na(impliedVol) ? " (no data)" : "")
+    string volText    = formatValue(firstStageVol) + (not na(firstStageVol) and volBasisInput == "Realized Volatility" ? "%" : "")
+    string vovText    = formatValue(volOfVol) + (not na(volOfVol) and changeBasisInput == "Log Change" ? "%" : "")
+    string rankText   = na(vovPercentile) ? "—" : str.tostring(vovPercentile, "#.#")
+    string regimeText = na(vovPercentile) ? "—" : unstableRegime ? "Unstable" : stableRegime ? "Stable" : "Normal"
+    color  rankColor  = na(vovPercentile) ? chart.fg_color : vovColor
+    color  regimeCol  = unstableRegime ? unstableColorInput : stableRegime ? stableColorInput : chart.fg_color
+    string vvixText   = na(vvixValue) ? "no data" : str.tostring(vvixValue, "#.##")
+    string vixText    = na(vixValue) ? "no data" : str.tostring(vixValue, "#.##")
+    string ratioText  = na(vvixRatio) ? "—" : str.tostring(vvixRatio, "#.##")
+
+    table.cell(dashboardTable, 0, 0, "Basis", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 0, basisText, text_color = chart.fg_color, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 1, "Volatility", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 1, volText, text_color = chart.fg_color, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 2, "Vol-of-Vol (" + str.tostring(vovLengthInput) + ")", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 2, vovText, text_color = vovColor, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 3, "Percentile (" + str.tostring(percentileLengthInput) + ")", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 3, rankText, text_color = rankColor, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 4, "Regime", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 4, regimeText, text_color = regimeCol, text_size = dashTextSize, text_halign = text.align_right)
+    if showVvixInput
+        table.cell(dashboardTable, 0, 5, "VVIX", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+        table.cell(dashboardTable, 1, 5, vvixText, text_color = chart.fg_color, text_size = dashTextSize, text_halign = text.align_right)
+        table.cell(dashboardTable, 0, 6, "VIX", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+        table.cell(dashboardTable, 1, 6, vixText, text_color = chart.fg_color, text_size = dashTextSize, text_halign = text.align_right)
+        table.cell(dashboardTable, 0, 7, "VVIX / VIX", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+        table.cell(dashboardTable, 1, 7, ratioText, text_color = chart.fg_color, text_size = dashTextSize, text_halign = text.align_right)
+
+// Graceful no-data notice - shown when the selected implied index never resolved on this chart
+var table noticeTable = na
+
+if barstate.islast
+    if impliedMissing
+        if na(noticeTable)
+            noticeTable := table.new(position.middle_center, 1, 1, bgcolor = color.new(chart.bg_color, 15), frame_color = color.new(chart.fg_color, 70), frame_width = 1)
+        table.cell(noticeTable, 0, 0, "No implied index data\n'" + impliedSymbolInput + "' returned no data on this chart.\nPick another symbol or switch the volatility basis in the settings.", text_color = color.new(chart.fg_color, 20), text_size = size.small, text_halign = text.align_center)
+    else if not na(noticeTable)
+        table.delete(noticeTable)
+        noticeTable := na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(instabilityEvent, "Unstable Volatility Regime", "Volatility of Volatility on {{ticker}} - the vol-of-vol percentile crossed above its high threshold: the volatility estimate itself is on the move, so ATR stops, volatility-targeted sizes, and freshly recalculated band widths go stale quickly ({{interval}})")
+alertcondition(easingEvent, "Instability Easing", "Volatility of Volatility on {{ticker}} - the vol-of-vol percentile crossed back below its high threshold: the volatility series is settling ({{interval}})")
+alertcondition(risingEvent, "Instability Rising", "Volatility of Volatility on {{ticker}} - the vol-of-vol percentile crossed above its low threshold, leaving the stable zone: keep an eye on volatility-calibrated inputs ({{interval}})")
+alertcondition(stabilityEvent, "Stable Volatility Regime", "Volatility of Volatility on {{ticker}} - the vol-of-vol percentile crossed below its low threshold: volatility is holding steady, so trailing calibrations and quiet-phase setups rest on their firmest footing ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

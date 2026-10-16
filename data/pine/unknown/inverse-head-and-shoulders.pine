@@ -1,0 +1,347 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Inverse Head & Shoulders"
+  , shorttitle       = "Inverse Head & Shoulders"
+  , overlay          = true
+  , max_lines_count  = 500
+  , max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+int MAX_PIVOTS  = 60
+int TRACK_LIMIT = 500
+
+color BULL_COLOR    = #089981
+color NEUTRAL_COLOR = #787b86 // neckline and measured target - structure, grey
+color NO_COLOR      = #00000000
+
+string DETECTION_GROUP    = 'Detection'
+string CONFIRMATION_GROUP = 'Confirmation & Signals'
+string STYLE_GROUP        = 'Style'
+
+string VOL_OFF      = 'Off'
+string VOL_BREAKOUT = 'Breakout Volume'
+string VOL_TEMPLATE = 'Full Template'
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+int swingLengthInput = input.int(10, 'Swing Length', minval = 2, maxval = 100, group = DETECTION_GROUP
+  , tooltip = 'Pivot width used to detect troughs and rally highs: a swing must be the extreme of this many bars on each side. Larger values return larger, cleaner patterns; smaller values return more, noisier ones.')
+
+bool requireTrendInput = input.bool(true, 'Preceding Downtrend', group = DETECTION_GROUP
+  , tooltip = 'Only accept patterns whose head prints the lowest low of the downtrend lookback, ensuring there is a genuine downtrend to reverse.')
+
+int trendLookbackInput = input.int(100, 'Downtrend Lookback', minval = 10, maxval = 1000, group = DETECTION_GROUP
+  , tooltip = 'Number of bars the head must undercut to qualify as the terminal low of a preceding downtrend.')
+
+float headDepthInput = input.float(15, 'Min Head Depth %', minval = 0, maxval = 100, step = 5, group = DETECTION_GROUP
+  , tooltip = 'Minimum distance both shoulders must bottom above the head, as a percentage of the pattern height (head to neckline). Ensures the middle trough is clearly the lowest.')
+
+float shoulderDiffInput = input.float(100, 'Max Shoulder Imbalance %', minval = 0, maxval = 100, step = 5, group = DETECTION_GROUP
+  , tooltip = 'Maximum difference between the two shoulder lows, as a percentage of the pattern height. Lower values enforce stricter shoulder symmetry; 100 leaves rough symmetry unenforced.')
+
+int breakoutWindowInput = input.int(2, 'Breakout Window', minval = 1, maxval = 10, group = DETECTION_GROUP
+  , tooltip = 'A forming pattern expires if price has not broken the neckline within this many pattern widths after the right shoulder.')
+
+string volFilterInput = input.string(VOL_OFF, 'Volume Filter', options = [VOL_OFF, VOL_BREAKOUT, VOL_TEMPLATE], group = CONFIRMATION_GROUP
+  , tooltip = 'Volume requirement for confirmation. Breakout Volume demands expanding volume on the neckline break. Full Template additionally requires the classical template: a quieter decline into the head than into the left shoulder and firmer volume on the rally off the head. Ignored on symbols without volume data.')
+
+int volLengthInput = input.int(20, 'Volume Average Length', minval = 1, maxval = 500, group = CONFIRMATION_GROUP
+  , tooltip = 'Length of the volume moving average used as the breakout expansion baseline.')
+
+float volMultInput = input.float(1, 'Breakout Volume Multiplier', minval = 0, step = 0.1, group = CONFIRMATION_GROUP
+  , tooltip = 'Breakout volume must exceed this multiple of its average for the break to count as expanding.')
+
+bool showFormingInput = input.bool(true, 'Show Forming Patterns', group = CONFIRMATION_GROUP
+  , tooltip = 'Draw the pattern with a dashed neckline as soon as the right shoulder is in place, before the breakout confirms it. Useful for anticipated entries within the right shoulder, with a stop under the head.')
+
+bool showTargetInput = input.bool(true, 'Measured Target', group = CONFIRMATION_GROUP
+  , tooltip = 'Project the head-to-neckline height upward from the breakout point (measure rule) and track it with a dotted level.')
+
+bool showRetestInput = input.bool(true, 'Neckline Retests', group = CONFIRMATION_GROUP
+  , tooltip = 'Mark successful retests of the broken neckline from above, a common second entry after the breakout.')
+
+color bullColorInput = input.color(BULL_COLOR, 'Pattern', group = STYLE_GROUP)
+
+color neckColorInput = input.color(NEUTRAL_COLOR, 'Neckline / Target', group = STYLE_GROUP)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// value at bar x of the straight line passing through (x1, y1) and (x2, y2)
+neckAt(int x1, float y1, int x2, float y2, int x) =>
+    y1 + (y2 - y1) * (x - x1) / (x2 - x1)
+
+// average per-bar volume of the segment between two pivots, from stored cumulative totals
+segmentVolume(float cumFrom, int barFrom, float cumTo, int barTo) =>
+    barTo > barFrom ? (cumTo - cumFrom) / (barTo - barFrom) : na
+
+// draw the five-point pattern outline with its S-H-S markers
+drawShape(int x1, float y1, int x2, float y2, int x3, float y3, int x4, float y4, int x5, float y5, color shapeColor, array<line> lineArray, array<label> labelArray) =>
+    array.push(lineArray, line.new(x1, y1, x2, y2, color = shapeColor))
+    array.push(lineArray, line.new(x2, y2, x3, y3, color = shapeColor))
+    array.push(lineArray, line.new(x3, y3, x4, y4, color = shapeColor))
+    array.push(lineArray, line.new(x4, y4, x5, y5, color = shapeColor))
+    array.push(labelArray, label.new(x1, y1, 'S', style = label.style_label_up, color = NO_COLOR, textcolor = shapeColor, size = size.tiny))
+    array.push(labelArray, label.new(x3, y3, 'H', style = label.style_label_up, color = NO_COLOR, textcolor = shapeColor, size = size.tiny))
+    array.push(labelArray, label.new(x5, y5, 'S', style = label.style_label_up, color = NO_COLOR, textcolor = shapeColor, size = size.tiny))
+
+// delete a forming pattern's drawings
+clearDrawings(array<line> lineArray, array<label> labelArray) =>
+    if array.size(lineArray) > 0
+        for i = 0 to array.size(lineArray) - 1
+            line.delete(array.get(lineArray, i))
+        array.clear(lineArray)
+    if array.size(labelArray) > 0
+        for i = 0 to array.size(labelArray) - 1
+            label.delete(array.get(labelArray, i))
+        array.clear(labelArray)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Pivot detection & state
+//---------------------------------------------------------------------------------------------------------------------{
+float pivotHigh = ta.pivothigh(swingLengthInput, swingLengthInput)
+float pivotLow  = ta.pivotlow(swingLengthInput, swingLengthInput)
+
+float trendLowest   = ta.lowest(low, trendLookbackInput)
+float trendLowRef   = trendLowest[swingLengthInput]
+float volumeAverage = ta.sma(nz(volume), volLengthInput)
+
+var float cumVolume = 0.0
+cumVolume += nz(volume)
+float cumVolRef = cumVolume[swingLengthInput]
+
+var array<float> phPriceArray = array.new_float()
+var array<int>   phBarArray   = array.new_int()
+var array<float> phCumArray   = array.new_float()
+
+var array<float> plPriceArray = array.new_float()
+var array<int>   plBarArray   = array.new_int()
+var array<float> plCumArray   = array.new_float()
+var array<bool>  plTrendArray = array.new_bool()
+
+// pending (forming) pattern state
+var bool  pendingActive = false
+var int   lsBar         = na
+var float lsLow         = na
+var int   lhBar         = na
+var float lhHigh        = na
+var int   headBar       = na
+var float headLow       = na
+var int   rhBar         = na
+var float rhHigh        = na
+var int   rsBar         = na
+var float rsLow         = na
+var float patternHeight = na
+var line  neckLineId    = na
+var array<line>  patternLineArray  = array.new_line()
+var array<label> patternLabelArray = array.new_label()
+
+// confirmed pattern tracking state (breakout -> retest / target / stop)
+var bool  trackedActive     = false
+var int   trackedLhBar      = na
+var float trackedLhHigh     = na
+var int   trackedRhBar      = na
+var float trackedRhHigh     = na
+var float trackedRsLow      = na
+var float trackedTarget     = na
+var int   trackedBreakBar   = na
+var bool  trackedRetested   = false
+var line  trackedTargetLine = na
+
+bool detectedEvent = false
+bool breakoutEvent = false
+bool retestEvent   = false
+bool targetEvent   = false
+bool invalidEvent  = false
+
+if not na(pivotHigh)
+    array.push(phPriceArray, pivotHigh)
+    array.push(phBarArray, bar_index - swingLengthInput)
+    array.push(phCumArray, cumVolRef)
+    if array.size(phPriceArray) > MAX_PIVOTS
+        array.shift(phPriceArray)
+        array.shift(phBarArray)
+        array.shift(phCumArray)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Pattern scan — three troughs with the middle one lowest
+//---------------------------------------------------------------------------------------------------------------------{
+if not na(pivotLow)
+    array.push(plPriceArray, pivotLow)
+    array.push(plBarArray, bar_index - swingLengthInput)
+    array.push(plCumArray, cumVolRef)
+    array.push(plTrendArray, na(trendLowRef) or pivotLow <= trendLowRef)
+    if array.size(plPriceArray) > MAX_PIVOTS
+        array.shift(plPriceArray)
+        array.shift(plBarArray)
+        array.shift(plCumArray)
+        array.shift(plTrendArray)
+
+    int lowCount = array.size(plPriceArray)
+    if lowCount >= 3 and array.size(phPriceArray) >= 2
+        float rsCandidate      = array.get(plPriceArray, lowCount - 1)
+        int   rsCandidateBar   = array.get(plBarArray,   lowCount - 1)
+        float headCandidate    = array.get(plPriceArray, lowCount - 2)
+        int   headCandidateBar = array.get(plBarArray,   lowCount - 2)
+        float headCandidateCum = array.get(plCumArray,   lowCount - 2)
+        bool  headTrendOk      = array.get(plTrendArray, lowCount - 2)
+        float lsCandidate      = array.get(plPriceArray, lowCount - 3)
+        int   lsCandidateBar   = array.get(plBarArray,   lowCount - 3)
+        float lsCandidateCum   = array.get(plCumArray,   lowCount - 3)
+
+        // rally highs separating the troughs (highest pivot high within each gap)
+        float lhCandidate    = na
+        int   lhCandidateBar = na
+        float lhCandidateCum = na
+        float rhCandidate    = na
+        int   rhCandidateBar = na
+        float rhCandidateCum = na
+        int   preHighBar     = na
+        float preHighCum     = na
+
+        for i = 0 to array.size(phPriceArray) - 1
+            int   highBar   = array.get(phBarArray,   i)
+            float highPrice = array.get(phPriceArray, i)
+            float highCum   = array.get(phCumArray,   i)
+            if highBar < lsCandidateBar
+                preHighBar := highBar
+                preHighCum := highCum
+            else if highBar > lsCandidateBar and highBar < headCandidateBar
+                if na(lhCandidate) or highPrice > lhCandidate
+                    lhCandidate    := highPrice
+                    lhCandidateBar := highBar
+                    lhCandidateCum := highCum
+            else if highBar > headCandidateBar and highBar < rsCandidateBar
+                if na(rhCandidate) or highPrice > rhCandidate
+                    rhCandidate    := highPrice
+                    rhCandidateBar := highBar
+                    rhCandidateCum := highCum
+
+        bool structureOk = not na(lhCandidate) and not na(rhCandidate) and headCandidate < lsCandidate and headCandidate < rsCandidate and lhCandidate > lsCandidate and rhCandidate > rsCandidate
+
+        if structureOk
+            float neckAtHead      = neckAt(lhCandidateBar, lhCandidate, rhCandidateBar, rhCandidate, headCandidateBar)
+            float candidateHeight = neckAtHead - headCandidate
+
+            bool geometryOk = candidateHeight > 0 and lsCandidate < neckAt(lhCandidateBar, lhCandidate, rhCandidateBar, rhCandidate, lsCandidateBar) and rsCandidate < neckAt(lhCandidateBar, lhCandidate, rhCandidateBar, rhCandidate, rsCandidateBar)
+            bool depthOk    = math.min(lsCandidate, rsCandidate) - headCandidate >= headDepthInput / 100 * candidateHeight
+            bool symmetryOk = math.abs(lsCandidate - rsCandidate) <= shoulderDiffInput / 100 * candidateHeight
+            bool trendOk    = not requireTrendInput or headTrendOk
+
+            bool templateOk = true
+            if volFilterInput == VOL_TEMPLATE and cumVolume > 0
+                float headDeclineVolume = segmentVolume(lhCandidateCum, lhCandidateBar, headCandidateCum, headCandidateBar)
+                float lsDeclineVolume   = na(preHighBar) ? na : segmentVolume(preHighCum, preHighBar, lsCandidateCum, lsCandidateBar)
+                float rallyVolume       = segmentVolume(headCandidateCum, headCandidateBar, rhCandidateCum, rhCandidateBar)
+                templateOk := (na(lsDeclineVolume) or headDeclineVolume < lsDeclineVolume) and rallyVolume > headDeclineVolume
+
+            if geometryOk and depthOk and symmetryOk and trendOk and templateOk and close > rsCandidate
+                // a newer valid candidate replaces any earlier forming pattern
+                clearDrawings(patternLineArray, patternLabelArray)
+                if not na(neckLineId)
+                    line.delete(neckLineId)
+                    neckLineId := na
+                lsBar         := lsCandidateBar
+                lsLow         := lsCandidate
+                lhBar         := lhCandidateBar
+                lhHigh        := lhCandidate
+                headBar       := headCandidateBar
+                headLow       := headCandidate
+                rhBar         := rhCandidateBar
+                rhHigh        := rhCandidate
+                rsBar         := rsCandidateBar
+                rsLow         := rsCandidate
+                patternHeight := candidateHeight
+                pendingActive := true
+                detectedEvent := true
+                if showFormingInput
+                    drawShape(lsBar, lsLow, lhBar, lhHigh, headBar, headLow, rhBar, rhHigh, rsBar, rsLow, bullColorInput, patternLineArray, patternLabelArray)
+                    neckLineId := line.new(lhBar, lhHigh, rhBar, rhHigh, color = neckColorInput, style = line.style_dashed, extend = extend.right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Pattern lifecycle — breakout, invalidation, retest, target
+//---------------------------------------------------------------------------------------------------------------------{
+if pendingActive
+    float neckNow          = neckAt(lhBar, lhHigh, rhBar, rhHigh, bar_index)
+    bool  breakoutVolumeOk = volFilterInput == VOL_OFF or na(volume) or volume > volMultInput * volumeAverage
+
+    if close < rsLow
+        // a close below the right shoulder low invalidates the bottoming case
+        pendingActive := false
+        invalidEvent  := true
+        clearDrawings(patternLineArray, patternLabelArray)
+        if not na(neckLineId)
+            line.delete(neckLineId)
+            neckLineId := na
+    else if close > neckNow and breakoutVolumeOk
+        // decisive close above the neckline completes the pattern
+        pendingActive := false
+        breakoutEvent := true
+        if array.size(patternLineArray) == 0
+            drawShape(lsBar, lsLow, lhBar, lhHigh, headBar, headLow, rhBar, rhHigh, rsBar, rsLow, bullColorInput, patternLineArray, patternLabelArray)
+        if na(neckLineId)
+            neckLineId := line.new(lhBar, lhHigh, bar_index, neckNow, color = neckColorInput)
+        else
+            line.set_xy2(neckLineId, bar_index, neckNow)
+            line.set_style(neckLineId, line.style_solid)
+            line.set_extend(neckLineId, extend.none)
+        label.new(bar_index, neckNow, 'IH&S', style = label.style_label_up, color = bullColorInput, textcolor = chart.bg_color, size = size.small)
+        // release references so the confirmed drawings persist
+        array.clear(patternLineArray)
+        array.clear(patternLabelArray)
+        neckLineId := na
+        // measured-move tracking: head-to-neckline height projected up from the break
+        trackedActive     := true
+        trackedLhBar      := lhBar
+        trackedLhHigh     := lhHigh
+        trackedRhBar      := rhBar
+        trackedRhHigh     := rhHigh
+        trackedRsLow      := rsLow
+        trackedTarget     := neckNow + patternHeight
+        trackedBreakBar   := bar_index
+        trackedRetested   := false
+        trackedTargetLine := na
+        if showTargetInput
+            trackedTargetLine := line.new(bar_index, trackedTarget, bar_index + 1, trackedTarget, color = neckColorInput, style = line.style_dotted)
+            label.new(bar_index, trackedTarget, 'Target', style = label.style_label_down, color = NO_COLOR, textcolor = neckColorInput, size = size.tiny)
+    else if bar_index - rsBar > breakoutWindowInput * (rsBar - lsBar)
+        // no breakout within the allowed window: the setup goes stale
+        pendingActive := false
+        clearDrawings(patternLineArray, patternLabelArray)
+        if not na(neckLineId)
+            line.delete(neckLineId)
+            neckLineId := na
+
+if trackedActive
+    float neckNow = neckAt(trackedLhBar, trackedLhHigh, trackedRhBar, trackedRhHigh, bar_index)
+    if not na(trackedTargetLine)
+        line.set_x2(trackedTargetLine, bar_index + 1)
+    if not trackedRetested and bar_index > trackedBreakBar and low <= neckNow and close > neckNow
+        trackedRetested := true
+        retestEvent     := true
+        if showRetestInput
+            label.new(bar_index, low, 'R', style = label.style_label_up, color = NO_COLOR, textcolor = neckColorInput, size = size.tiny)
+    if high >= trackedTarget
+        targetEvent   := true
+        trackedActive := false
+    else if close < trackedRsLow
+        invalidEvent  := true
+        trackedActive := false
+    else if bar_index - trackedBreakBar > TRACK_LIMIT
+        trackedActive := false
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(detectedEvent, 'Pattern Detected', 'Inverse head & shoulders forming: right shoulder in place, awaiting a neckline breakout')
+alertcondition(breakoutEvent, 'Neckline Breakout', 'Inverse head & shoulders confirmed: decisive close above the neckline')
+alertcondition(retestEvent,   'Neckline Retest', 'Broken neckline successfully retested from above')
+alertcondition(targetEvent,   'Target Reached', 'Inverse head & shoulders measured objective reached')
+alertcondition(invalidEvent,  'Pattern Invalidated', 'Close below the right shoulder low: pattern invalidated / stop breached')
+
+//---------------------------------------------------------------------------------------------------------------------}

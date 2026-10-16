@@ -1,0 +1,331 @@
+// This work is licensed under Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Volume Price Confirmation Indicator", "VPCI", overlay = false, format = format.price, precision = 3, max_labels_count = 500, max_lines_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR    = #089981 // volume confirms the advance
+BEAR_COLOR    = #f23645 // volume confirms the decline
+ACCENT_COLOR  = #ff9800 // the one accent - volume contradicts the price trend
+NEUTRAL_COLOR = #787b86
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+STATE_NONE      = 0
+STATE_CONF_UP   = 1
+STATE_CONTRA_UP = 2
+STATE_CONF_DN   = 3
+STATE_CONTRA_DN = 4
+
+SIDE_BOTH = "Long & Short"
+SIDE_LONG = "Long Only"
+SIDE_OFF  = "Off"
+
+EXIT_CROSS = "VPCI Crosses Smoothed"
+EXIT_ZERO  = "VPCI Crosses Zero"
+
+GRP_VPCI  = "VPCI (Dormeier)"
+GRP_SIG   = "Confirmation Signals"
+GRP_DIV   = "Contradictions"
+GRP_STYLE = "Style"
+GRP_DASH  = "Dashboard"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+srcInput = input.source(close, "Source", group = GRP_VPCI
+  , tooltip = "Price series fed to the four moving averages behind the VPCI. Dormeier's construction uses the close.")
+
+shortLenInput = input.int(5, "Short-term Length", minval = 2, group = GRP_VPCI
+  , tooltip = "Short window for the Volume Price Ratio (VPR = short VWMA / short SMA) and the numerator of the Volume Multiplier (VM = short average volume / long average volume). 5 with a long length of 20 are the parameters of Dormeier's article; 10 and 50 suit slower, position-trading reads.")
+
+longLenInput = input.int(20, "Long-term Length", minval = 3, group = GRP_VPCI
+  , tooltip = "Long window for the Volume Price Confirmation/Contradiction (VPC = long VWMA - long SMA) and the denominator of the Volume Multiplier. Also defines the price trend: the close above the long SMA is an advance, below it a decline.")
+
+smoothLenInput = input.int(20, "Smoothing Length", minval = 1, group = GRP_VPCI
+  , tooltip = "Length of VPCI Smoothed, the signal line. Following Dormeier, the VPCI is smoothed with a volume-weighted moving average rather than a simple one, so heavy sessions carry more weight in the signal line too.")
+
+showBandsInput = input.bool(true, "Bollinger Bands on VPCI", inline = "bb", group = GRP_VPCI
+  , tooltip = "Bands at the chosen number of standard deviations of the VPCI around VPCI Smoothed. Dormeier pairs the VPCI with Bollinger Bands to spot climactic volume-price readings: a VPCI outside the bands is an extreme of confirmation or contradiction.")
+bandMultInput = input.float(2.0, "", minval = 0.5, step = 0.25, inline = "bb", group = GRP_VPCI)
+
+sideInput = input.string(SIDE_LONG, "Signals", options = [SIDE_BOTH, SIDE_LONG, SIDE_OFF], group = GRP_SIG
+  , tooltip = "Confirmation entries follow the crossover rule published with the VPCI: a long when the VPCI crosses above VPCI Smoothed while price trades above the long SMA, a short when it crosses below while price trades under it. Only one position is tracked at a time. Long Only is the default because Dormeier later revised his own reading of the falling-price cases: test short signals on your market before relying on them.")
+
+requireSignInput = input.bool(true, "Require VPC Sign Agreement", group = GRP_SIG
+  , tooltip = "Also demand that the VPCI sits on the trend's side of zero at the cross: above zero (VPC+, volume-weighted price above the simple average) for longs, below zero for shorts. Filters crosses where volume improves but still contradicts the trend.")
+
+exitModeInput = input.string(EXIT_CROSS, "Exit Rule", options = [EXIT_CROSS, EXIT_ZERO], group = GRP_SIG
+  , tooltip = "When an open position ends. VPCI Crosses Smoothed exits as soon as confirmation fades (the VPCI falls back through its signal line), the tighter of the two. VPCI Crosses Zero holds until volume flips to outright contradiction of the position.")
+
+showDivInput = input.bool(true, "Volume-Price Contradictions", group = GRP_DIV
+  , tooltip = "Flags price swings that the VPCI does not confirm: a higher price high made with a lower VPCI high (bearish contradiction), or a lower price low made with a higher VPCI low (bullish contradiction). Swings are confirmed after the right-hand bars close, so the flags arrive with that delay and never repaint.")
+
+pivotLenInput = input.int(5, "Swing Length", minval = 2, maxval = 30, group = GRP_DIV
+  , tooltip = "Bars on each side that a price high or low must dominate to count as a swing.")
+
+maxGapInput = input.int(60, "Max Bars Between Swings", minval = 5, maxval = 300, group = GRP_DIV
+  , tooltip = "Two swings further apart than this are not compared.")
+
+showHistInput = input.bool(true, "Histogram (VPCI - Smoothed)", group = GRP_STYLE
+  , tooltip = "Columns of the VPCI minus its smoothed line: bright while the gap widens, faded once it narrows.")
+
+colorBarsInput = input.bool(false, "Color Price Bars by State", group = GRP_STYLE
+  , tooltip = "Paints the price bars with the confirmation state palette.")
+
+showTradesInput = input.bool(true, "Trades on Price Chart", group = GRP_STYLE
+  , tooltip = "Draws each confirmation entry, the line held while the position is open and the exit with the price change from entry to exit on the main chart.")
+
+bullColorInput   = input.color(BULL_COLOR, "Confirmed Advance", inline = "c1", group = GRP_STYLE)
+bearColorInput   = input.color(BEAR_COLOR, "Confirmed Decline", inline = "c1", group = GRP_STYLE)
+accentColorInput = input.color(ACCENT_COLOR, "Contradiction", inline = "c2", group = GRP_STYLE)
+neutralInput     = input.color(NEUTRAL_COLOR, "Smoothed / Bands", inline = "c2", group = GRP_STYLE)
+
+showDashInput = input.bool(true, "Show Dashboard", group = GRP_DASH
+  , tooltip = "Breaks the current VPCI into Dormeier's three components so you can see what drives a reading: VPC (does volume concentrate at the trend's prices), VPR (short-term volume tilt) and VM (is participation expanding).")
+dashPosInput  = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], inline = "dash", group = GRP_DASH)
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], inline = "dash", group = GRP_DASH)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Volume-weighted moving average: sum(price x volume) / sum(volume), falling back to the simple mean without volume
+vwmaOf(float src, simple int length) =>
+    vol    = nz(volume)
+    volSum = math.sum(vol, length)
+    volSum > 0 ? math.sum(src * vol, length) / volSum : ta.sma(src, length)
+
+getSize(string s) =>
+    switch s
+        "Tiny"   => size.tiny
+        "Normal" => size.normal
+        =>          size.small
+
+getPosition(string p) =>
+    switch p
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        "Bottom Left"  => position.bottom_left
+        =>                position.top_right
+
+stateName(int s) =>
+    switch s
+        STATE_CONF_UP   => "Confirmed ▲"
+        STATE_CONTRA_UP => "Contradicted ▲"
+        STATE_CONF_DN   => "Confirmed ▼"
+        STATE_CONTRA_DN => "Contradicted ▼"
+        =>                 "-"
+
+fmtPct(float x) =>
+    na(x) ? "-" : (x >= 0 ? "+" : "") + str.tostring(x, "#.##") + "%"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// VPCI
+//---------------------------------------------------------------------------------------------------------------------{
+float cumVolume = ta.cum(nz(volume))
+if barstate.islast and cumVolume == 0
+    runtime.error("No volume is available for this symbol. The VPCI requires volume data.")
+
+smaLong  = ta.sma(srcInput, longLenInput)
+smaShort = ta.sma(srcInput, shortLenInput)
+vwmaLong  = vwmaOf(srcInput, longLenInput)
+vwmaShort = vwmaOf(srcInput, shortLenInput)
+volShort = ta.sma(nz(volume), shortLenInput)
+volLong  = ta.sma(nz(volume), longLenInput)
+
+// Volume Price Confirmation/Contradiction: positive when volume concentrates at the higher prices of the long window
+vpc = vwmaLong - smaLong
+// Volume Price Ratio: the short-term volume tilt, above 1 when heavy bars printed the higher closes
+vpr = smaShort != 0 ? vwmaShort / smaShort : na
+// Volume Multiplier: overweights the reading while participation expands, underweights it while volume dries up
+vm = volLong > 0 ? volShort / volLong : na
+
+vpci  = vpc * vpr * vm
+vpcis = ta.vwma(vpci, smoothLenInput)
+vpciDev   = ta.stdev(vpci, smoothLenInput)
+upperBand = vpcis + bandMultInput * vpciDev
+lowerBand = vpcis - bandMultInput * vpciDev
+
+// Price trend from the same long SMA the VPC is built on
+trendUp = srcInput > smaLong
+trendDn = srcInput < smaLong
+
+int state = STATE_NONE
+if not na(vpci) and not na(vpcis)
+    state := trendUp ? (vpci > vpcis ? STATE_CONF_UP : STATE_CONTRA_UP) : trendDn ? (vpci < vpcis ? STATE_CONF_DN : STATE_CONTRA_DN) : STATE_NONE
+
+stateColor(int s) =>
+    switch s
+        STATE_CONF_UP   => bullColorInput
+        STATE_CONF_DN   => bearColorInput
+        STATE_CONTRA_UP => accentColorInput
+        STATE_CONTRA_DN => accentColorInput
+        =>                 neutralInput
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Confirmation Signals
+//---------------------------------------------------------------------------------------------------------------------{
+// label anchors clear of the neighbouring candles
+float topAnchor = ta.highest(high, 5)
+float botAnchor = ta.lowest(low, 5)
+
+crossUp   = ta.crossover(vpci, vpcis)
+crossDn   = ta.crossunder(vpci, vpcis)
+zeroUp    = ta.crossover(vpci, 0)
+zeroDn    = ta.crossunder(vpci, 0)
+
+var int   position   = 0
+var float entryPrice = na
+var int   entryBar   = na
+var line  tradeLine  = na
+
+bool longEntry  = false
+bool shortEntry = false
+bool longExit   = false
+bool shortExit  = false
+float exitChange = na
+
+labelSize = size.small
+
+if sideInput != SIDE_OFF and barstate.isconfirmed
+    // exits first, so a fading confirmation can hand over to an opposite entry on the same bar
+    if position == 1 and (exitModeInput == EXIT_CROSS ? crossDn : zeroDn)
+        longExit   := true
+        exitChange := (close - entryPrice) / entryPrice * 100
+    if position == -1 and (exitModeInput == EXIT_CROSS ? crossUp : zeroUp)
+        shortExit  := true
+        exitChange := (entryPrice - close) / entryPrice * 100
+    if longExit or shortExit
+        if showTradesInput
+            line.set_x2(tradeLine, bar_index)
+            line.set_y2(tradeLine, close)
+            label.new(bar_index, longExit ? topAnchor : botAnchor, "Exit " + fmtPct(exitChange)
+              , style = longExit ? label.style_label_down : label.style_label_up, color = color.new(neutralInput, 20)
+              , textcolor = DASH_TEXT, size = labelSize, force_overlay = true
+              , tooltip = "Confirmation faded: " + (exitModeInput == EXIT_CROSS ? "the VPCI crossed back through VPCI Smoothed." : "the VPCI crossed zero against the position.") + " Close-to-close change from entry: " + fmtPct(exitChange))
+        position := 0
+
+    longEntry  := position == 0 and crossUp and trendUp and (not requireSignInput or vpci > 0)
+    shortEntry := position == 0 and sideInput == SIDE_BOTH and crossDn and trendDn and (not requireSignInput or vpci < 0)
+
+    if longEntry or shortEntry
+        position   := longEntry ? 1 : -1
+        entryPrice := close
+        entryBar   := bar_index
+        if showTradesInput
+            color c = longEntry ? bullColorInput : bearColorInput
+            tradeLine := line.new(bar_index, close, bar_index, close, color = c, width = 2, style = line.style_dashed, force_overlay = true)
+            label.new(bar_index, longEntry ? botAnchor : topAnchor, longEntry ? "VPCI Long" : "VPCI Short"
+              , style = longEntry ? label.style_label_up : label.style_label_down, color = c, textcolor = color.white
+              , size = labelSize, force_overlay = true
+              , tooltip = (longEntry ? "Volume confirms the advance: " : "Volume confirms the decline: ") + "the VPCI crossed " + (longEntry ? "above" : "below") + " VPCI Smoothed with price " + (longEntry ? "above" : "below") + " the long SMA. VPC " + str.tostring(vpc, "#.###") + ", VPR " + str.tostring(vpr, "#.###") + ", VM " + str.tostring(vm, "#.##") + "x")
+
+// keep the open trade's line on the current close
+if position != 0 and showTradesInput and not na(tradeLine)
+    line.set_x2(tradeLine, bar_index)
+    line.set_y2(tradeLine, close)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Contradictions (divergences between price swings and VPCI swings)
+//---------------------------------------------------------------------------------------------------------------------{
+ph = ta.pivothigh(high, pivotLenInput, pivotLenInput)
+pl = ta.pivotlow(low, pivotLenInput, pivotLenInput)
+
+var float prevPh     = na
+var float prevPhVpci = na
+var int   prevPhBar  = na
+var float prevPl     = na
+var float prevPlVpci = na
+var int   prevPlBar  = na
+
+bool bearContra = false
+bool bullContra = false
+
+if not na(ph)
+    float v   = vpci[pivotLenInput]
+    int   bar = bar_index - pivotLenInput
+    if showDivInput and not na(prevPh) and not na(v) and not na(prevPhVpci) and bar - prevPhBar <= maxGapInput and ph > prevPh and v < prevPhVpci
+        bearContra := true
+        line.new(prevPhBar, prevPhVpci, bar, v, color = accentColorInput, width = 1, style = line.style_dashed)
+        label.new(bar, ph, "▼", style = label.style_none, textcolor = accentColorInput, size = size.small, force_overlay = true
+          , tooltip = "Bearish volume-price contradiction: this swing high is higher than the previous one while the VPCI high is lower.")
+        label.new(bar, v, "Contradiction", style = label.style_label_down, color = color.new(accentColorInput, 0), textcolor = color.white, size = size.tiny
+          , tooltip = "Price made a higher high while the VPCI made a lower high: the advance is not confirmed by volume.")
+    prevPh     := ph
+    prevPhVpci := v
+    prevPhBar  := bar
+
+if not na(pl)
+    float v   = vpci[pivotLenInput]
+    int   bar = bar_index - pivotLenInput
+    if showDivInput and not na(prevPl) and not na(v) and not na(prevPlVpci) and bar - prevPlBar <= maxGapInput and pl < prevPl and v > prevPlVpci
+        bullContra := true
+        line.new(prevPlBar, prevPlVpci, bar, v, color = accentColorInput, width = 1, style = line.style_dashed)
+        label.new(bar, pl, "▲", style = label.style_none, textcolor = accentColorInput, size = size.small, force_overlay = true
+          , tooltip = "Bullish volume-price contradiction: this swing low is lower than the previous one while the VPCI low is higher.")
+        label.new(bar, v, "Contradiction", style = label.style_label_up, color = color.new(accentColorInput, 0), textcolor = color.white, size = size.tiny
+          , tooltip = "Price made a lower low while the VPCI made a higher low: the decline is not confirmed by volume.")
+    prevPl     := pl
+    prevPlVpci := v
+    prevPlBar  := bar
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Plots
+//---------------------------------------------------------------------------------------------------------------------{
+color vpciColor = stateColor(state)
+hist = vpci - vpcis
+histExpanding = hist >= 0 ? hist > nz(hist[1]) : hist < nz(hist[1])
+color histColor = color.new(hist >= 0 ? bullColorInput : bearColorInput, histExpanding ? 55 : 80)
+
+plot(showHistInput ? hist : na, "Histogram", histColor, style = plot.style_columns)
+hline(0, "Zero Line", color.new(neutralInput, 50), hline.style_dashed)
+plot(showBandsInput ? upperBand : na, "Upper Band", color.new(neutralInput, 60), style = plot.style_line)
+plot(showBandsInput ? lowerBand : na, "Lower Band", color.new(neutralInput, 60), style = plot.style_line)
+plot(vpcis, "VPCI Smoothed", color.new(neutralInput, 0), 1)
+plot(vpci, "VPCI", vpciColor, 2)
+
+barcolor(colorBarsInput and state != STATE_NONE ? vpciColor : na, title = "State Bar Coloring")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dash = table.new(getPosition(dashPosInput), 2, 5, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+if barstate.islast and showDashInput
+    ts = getSize(dashSizeInput)
+    table.cell(dash, 0, 0, "State", text_color = DASH_HEADER, text_halign = text.align_left, text_size = ts
+      , tooltip = "Price trend (close against the long SMA) read against the VPCI's position relative to VPCI Smoothed.")
+    table.cell(dash, 1, 0, stateName(state), text_color = vpciColor, text_halign = text.align_right, text_size = ts)
+    table.cell(dash, 0, 1, "VPC", text_color = DASH_HEADER, text_halign = text.align_left, text_size = ts
+      , tooltip = "Long VWMA minus long SMA, in price units. Positive (VPC+) when volume concentrated at the higher prices of the long window.")
+    table.cell(dash, 1, 1, (vpc >= 0 ? "+" : "") + str.tostring(vpc, "#.###"), text_color = vpc >= 0 ? bullColorInput : bearColorInput, text_halign = text.align_right, text_size = ts)
+    table.cell(dash, 0, 2, "VPR", text_color = DASH_HEADER, text_halign = text.align_left, text_size = ts
+      , tooltip = "Short VWMA divided by short SMA. Above 1 when the heavier recent bars printed the higher closes.")
+    table.cell(dash, 1, 2, str.tostring(vpr, "0.0000"), text_color = DASH_TEXT, text_halign = text.align_right, text_size = ts)
+    table.cell(dash, 0, 3, "VM", text_color = DASH_HEADER, text_halign = text.align_left, text_size = ts
+      , tooltip = "Short average volume divided by long average volume. Above 1 while participation expands.")
+    table.cell(dash, 1, 3, str.tostring(vm, "0.00") + "x", text_color = vm >= 1 ? DASH_TEXT : DASH_HEADER, text_halign = text.align_right, text_size = ts)
+    table.cell(dash, 0, 4, "Position", text_color = DASH_HEADER, text_halign = text.align_left, text_size = ts)
+    string posText = position == 1 ? "Long " + fmtPct((close - entryPrice) / entryPrice * 100) : position == -1 ? "Short " + fmtPct((entryPrice - close) / entryPrice * 100) : "Flat"
+    table.cell(dash, 1, 4, posText, text_color = position == 1 ? bullColorInput : position == -1 ? bearColorInput : DASH_HEADER, text_halign = text.align_right, text_size = ts)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(longEntry, "VPCI Long", "VPCI confirmation long on {{ticker}} ({{interval}}): the VPCI crossed above VPCI Smoothed with price above the long SMA")
+alertcondition(shortEntry, "VPCI Short", "VPCI confirmation short on {{ticker}} ({{interval}}): the VPCI crossed below VPCI Smoothed with price below the long SMA")
+alertcondition(longExit or shortExit, "VPCI Exit", "VPCI exit on {{ticker}} ({{interval}}): volume confirmation of the open position faded")
+alertcondition(crossUp, "VPCI Cross Above Smoothed", "VPCI crossed above VPCI Smoothed on {{ticker}} ({{interval}})")
+alertcondition(crossDn, "VPCI Cross Below Smoothed", "VPCI crossed below VPCI Smoothed on {{ticker}} ({{interval}})")
+alertcondition(zeroUp, "VPC+ (Zero Cross Up)", "VPCI crossed above zero on {{ticker}} ({{interval}}): volume now concentrates at higher prices")
+alertcondition(zeroDn, "VPC- (Zero Cross Down)", "VPCI crossed below zero on {{ticker}} ({{interval}}): volume now concentrates at lower prices")
+alertcondition(bearContra, "Bearish Contradiction", "Bearish volume-price contradiction on {{ticker}} ({{interval}}): higher price high, lower VPCI high")
+alertcondition(bullContra, "Bullish Contradiction", "Bullish volume-price contradiction on {{ticker}} ({{interval}}): lower price low, higher VPCI low")
+
+//---------------------------------------------------------------------------------------------------------------------}

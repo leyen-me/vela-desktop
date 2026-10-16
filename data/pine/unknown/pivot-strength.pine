@@ -1,0 +1,291 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Pivot Strength", "Pivot Strength", overlay = true, format = format.price, max_labels_count = 500, max_lines_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+//Visual tuning
+DELAY_TRANSPARENCY       = 50
+PROVISIONAL_TRANSPARENCY = 25
+
+//Dashboard empty-value placeholder
+NO_VALUE = "—"
+
+//Dashboard palette
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+MUTED_COLOR = #787b86
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+phLeftInput = input.int(10, "Highs - Left", minval = 1, maxval = 250, inline = "ph", group = "Pivot Strength",
+  tooltip = "Left bars for pivot highs: how many earlier bars the candidate high must exceed. Raising it demands a longer structure before the turn, so fewer and more significant pivots survive.")
+
+phRightInput = input.int(10, "Right", minval = 1, maxval = 250, inline = "ph", group = "Pivot Strength",
+  tooltip = "Right bars for pivot highs: how many later bars must fail to exceed the candidate before it is confirmed. Raising it demands stronger confirmation afterward and adds exactly that many bars of delay to the label.")
+
+plLeftInput = input.int(10, "Lows - Left", minval = 1, maxval = 250, inline = "pl", group = "Pivot Strength",
+  tooltip = "Left bars for pivot lows: how many earlier bars the candidate low must undercut. The mirror of the pivot-high rule.")
+
+plRightInput = input.int(10, "Right", minval = 1, maxval = 250, inline = "pl", group = "Pivot Strength",
+  tooltip = "Right bars for pivot lows: how many later bars must fail to undercut the candidate before it is confirmed - the confirmation delay for lows.")
+
+showPriceInput = input.bool(true, "Pivot Price Labels", group = "Display",
+  tooltip = "Print the pivot price inside each confirmed label, so pivots are ready to anchor structure levels, trendlines, retracement grids, and structure-based stops.")
+
+showDelayInput = input.bool(true, "Confirmation Delay Trace", group = "Display",
+  tooltip = "Dotted trace from each confirmed pivot to the bar that confirmed it. The pivot printed at the left end but was only knowable at the right end - the structural lag bought by the Right setting. It keeps replayed history honest: a label drawn back at the pivot bar was never available there.")
+
+showProvisionalInput = input.bool(true, "Provisional Pivot Markers", group = "Display",
+  tooltip = "Hollow marker on the newest still-unconfirmed candidate: a bar that already exceeds its full left window and every bar printed after it so far. The counter shows right-side bars printed versus required. Provisional markers can move or vanish until the window completes; only filled labels are final.")
+
+showDashboardInput = input.bool(true, "Show Dashboard", group = "Dashboard",
+  tooltip = "Compact readout of the strength setting and its consequences: confirmation delay, confirmed pivot counts, average bars per pivot (the scale being mapped), the last confirmed pivots, and the progress of any provisional candidates.")
+
+dashPositionInput = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = "Dashboard",
+  tooltip = "Corner of the chart holding the dashboard.")
+
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = "Dashboard",
+  tooltip = "Dashboard text size.")
+
+phColorInput = input.color(#f23645, "Pivot Highs", inline = "colors", group = "Style",
+  tooltip = "Color of confirmed pivot-high labels, their confirmation-delay traces, and the provisional pivot-high marker.")
+
+plColorInput = input.color(#089981, "Pivot Lows", inline = "colors", group = "Style",
+  tooltip = "Color of confirmed pivot-low labels, their confirmation-delay traces, and the provisional pivot-low marker.")
+
+labelSizeInput = input.string("Small", "Label Size", options = ["Tiny", "Small", "Normal"], group = "Style",
+  tooltip = "Text size of confirmed and provisional pivot labels.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+//Maps a size option to a built-in text size
+textSizeFor(string sizeOption) =>
+    switch sizeOption
+        "Tiny"  => size.tiny
+        "Small" => size.small
+        => size.normal
+
+//Bar offset of the oldest still-unconfirmed candidate pivot, -1 when none qualifies.
+//A candidate at offset `o` already exceeds (undercuts, for lows) all `leftBars` bars to its left and
+//every bar printed after it so far, but fewer than `rightBars` bars have printed on its right side -
+//it is provisional by construction and can move or vanish until that window completes.
+provisionalOffset(int leftBars, int rightBars, bool isHigh) =>
+    int candidateOffset = -1
+    for barOffset = 0 to rightBars - 1
+        float candidateValue = isHigh ? high[barOffset] : low[barOffset]
+        bool qualifies = not na(candidateValue)
+        if qualifies
+            for leftStep = 1 to leftBars
+                float leftValue = isHigh ? high[barOffset + leftStep] : low[barOffset + leftStep]
+                if na(leftValue) or (isHigh ? leftValue >= candidateValue : leftValue <= candidateValue)
+                    qualifies := false
+                    break
+        if qualifies and barOffset > 0
+            for rightStep = 0 to barOffset - 1
+                float rightValue = isHigh ? high[rightStep] : low[rightStep]
+                if na(rightValue) or (isHigh ? rightValue >= candidateValue : rightValue <= candidateValue)
+                    qualifies := false
+                    break
+        if qualifies
+            candidateOffset := barOffset
+    candidateOffset
+
+//---------------------------------------------------------------------------------------------------------------------}
+// State
+//---------------------------------------------------------------------------------------------------------------------{
+//Confirmed-pivot bookkeeping
+var int   pivotHighCount     = 0
+var int   pivotLowCount      = 0
+var float lastPivotHighPrice = na
+var int   lastPivotHighBar   = na
+var float lastPivotLowPrice  = na
+var int   lastPivotLowBar    = na
+
+//Provisional marker objects, rebuilt on every update of the last bar
+var label provisionalHighLabel = na
+var line  provisionalHighLine  = na
+var label provisionalLowLabel  = na
+var line  provisionalLowLine   = na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Pivot Detection
+//---------------------------------------------------------------------------------------------------------------------{
+//Provisional scanning indexes up to left + right bars back
+max_bars_back(high, 501)
+max_bars_back(low, 501)
+
+//Bar-count rule: a pivot high of strength (Left, Right) is a bar whose high exceeds the highs of the
+//Left bars before it and the Right bars after it - mirror definition for pivot lows. Ties disqualify.
+//The candidate sits Right bars back: it only becomes decidable once its full right-side window has printed.
+float leftWindowHigh  = ta.highest(high, phLeftInput)
+float rightWindowHigh = ta.highest(high, phRightInput)
+float leftWindowLow   = ta.lowest(low, plLeftInput)
+float rightWindowLow  = ta.lowest(low, plRightInput)
+
+float pivotHighPrice    = high[phRightInput]
+float pivotLowPrice     = low[plRightInput]
+float leftMaxBeforeHigh = leftWindowHigh[phRightInput + 1]
+float leftMinBeforeLow  = leftWindowLow[plRightInput + 1]
+
+bool pivotHighFound = not na(pivotHighPrice) and not na(leftMaxBeforeHigh) and not na(rightWindowHigh)
+  and pivotHighPrice > leftMaxBeforeHigh and pivotHighPrice > rightWindowHigh
+
+bool pivotLowFound = not na(pivotLowPrice) and not na(leftMinBeforeLow) and not na(rightWindowLow)
+  and pivotLowPrice < leftMinBeforeLow and pivotLowPrice < rightWindowLow
+
+//A pivot is confirmed only once the last right-side bar has closed - acting earlier leaks future information
+bool pivotHighConfirmed = pivotHighFound and barstate.isconfirmed
+bool pivotLowConfirmed  = pivotLowFound and barstate.isconfirmed
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Confirmed Pivots
+//---------------------------------------------------------------------------------------------------------------------{
+string pivotLabelSize = textSizeFor(labelSizeInput)
+
+if pivotHighConfirmed
+    int pivotBar = bar_index - phRightInput
+    pivotHighCount     += 1
+    lastPivotHighPrice := pivotHighPrice
+    lastPivotHighBar   := pivotBar
+    if showDelayInput
+        line.new(pivotBar, pivotHighPrice, bar_index, pivotHighPrice
+          , color = color.new(phColorInput, DELAY_TRANSPARENCY)
+          , style = line.style_dotted)
+    label.new(pivotBar, pivotHighPrice, showPriceInput ? str.tostring(pivotHighPrice, format.mintick) : ""
+      , style     = label.style_label_down
+      , color     = phColorInput
+      , textcolor = chart.bg_color
+      , size      = pivotLabelSize
+      , tooltip   = "Pivot high, strength " + str.tostring(phLeftInput) + "/" + str.tostring(phRightInput)
+      + " - confirmed " + str.tostring(phRightInput) + " bars after printing. Once confirmed it never moves.")
+
+if pivotLowConfirmed
+    int pivotBar = bar_index - plRightInput
+    pivotLowCount     += 1
+    lastPivotLowPrice := pivotLowPrice
+    lastPivotLowBar   := pivotBar
+    if showDelayInput
+        line.new(pivotBar, pivotLowPrice, bar_index, pivotLowPrice
+          , color = color.new(plColorInput, DELAY_TRANSPARENCY)
+          , style = line.style_dotted)
+    label.new(pivotBar, pivotLowPrice, showPriceInput ? str.tostring(pivotLowPrice, format.mintick) : ""
+      , style     = label.style_label_up
+      , color     = plColorInput
+      , textcolor = chart.bg_color
+      , size      = pivotLabelSize
+      , tooltip   = "Pivot low, strength " + str.tostring(plLeftInput) + "/" + str.tostring(plRightInput)
+      + " - confirmed " + str.tostring(plRightInput) + " bars after printing. Once confirmed it never moves.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Provisional Candidates
+//---------------------------------------------------------------------------------------------------------------------{
+bool wantCandidates = showProvisionalInput or showDashboardInput
+
+int pivotHighCandidateOffset = barstate.islast and wantCandidates ? provisionalOffset(phLeftInput, phRightInput, true) : -1
+int pivotLowCandidateOffset  = barstate.islast and wantCandidates ? provisionalOffset(plLeftInput, plRightInput, false) : -1
+
+if barstate.islast
+    if not na(provisionalHighLabel)
+        label.delete(provisionalHighLabel)
+        provisionalHighLabel := na
+    if not na(provisionalHighLine)
+        line.delete(provisionalHighLine)
+        provisionalHighLine := na
+    if not na(provisionalLowLabel)
+        label.delete(provisionalLowLabel)
+        provisionalLowLabel := na
+    if not na(provisionalLowLine)
+        line.delete(provisionalLowLine)
+        provisionalLowLine := na
+    if showProvisionalInput
+        if pivotHighCandidateOffset >= 0
+            int   candidateBar   = bar_index - pivotHighCandidateOffset
+            float candidatePrice = high[pivotHighCandidateOffset]
+            if pivotHighCandidateOffset > 0
+                provisionalHighLine := line.new(candidateBar, candidatePrice, bar_index, candidatePrice
+                  , color = color.new(phColorInput, PROVISIONAL_TRANSPARENCY)
+                  , style = line.style_dashed)
+            provisionalHighLabel := label.new(candidateBar, candidatePrice
+              , str.tostring(pivotHighCandidateOffset) + "/" + str.tostring(phRightInput)
+              , style     = label.style_label_down
+              , color     = #00000000
+              , textcolor = phColorInput
+              , size      = pivotLabelSize
+              , tooltip   = "Provisional pivot high - right-side bars printed versus required. It can move or vanish until the full right-side window closes.")
+        if pivotLowCandidateOffset >= 0
+            int   candidateBar   = bar_index - pivotLowCandidateOffset
+            float candidatePrice = low[pivotLowCandidateOffset]
+            if pivotLowCandidateOffset > 0
+                provisionalLowLine := line.new(candidateBar, candidatePrice, bar_index, candidatePrice
+                  , color = color.new(plColorInput, PROVISIONAL_TRANSPARENCY)
+                  , style = line.style_dashed)
+            provisionalLowLabel := label.new(candidateBar, candidatePrice
+              , str.tostring(pivotLowCandidateOffset) + "/" + str.tostring(plRightInput)
+              , style     = label.style_label_up
+              , color     = #00000000
+              , textcolor = plColorInput
+              , size      = pivotLabelSize
+              , tooltip   = "Provisional pivot low - right-side bars printed versus required. It can move or vanish until the full right-side window closes.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+string dashboardPosition = switch dashPositionInput
+    "Top Right"    => position.top_right
+    "Top Left"     => position.top_left
+    "Bottom Right" => position.bottom_right
+    => position.bottom_left
+
+string dashboardTextSize = textSizeFor(dashSizeInput)
+
+var table dashboardTable = showDashboardInput ? table.new(dashboardPosition, 2, 8, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1) : na
+
+if showDashboardInput and barstate.islast
+    color titleColor = DASH_TEXT
+    color labelColor = DASH_HEADER
+    color valueColor = DASH_TEXT
+    color mutedColor = MUTED_COLOR
+    int   totalPivots     = pivotHighCount + pivotLowCount
+    float avgBarsPerPivot = totalPivots > 0 ? (bar_index + 1) / totalPivots : na
+    string highCandidateText = pivotHighCandidateOffset >= 0 ? str.tostring(pivotHighCandidateOffset) + "/" + str.tostring(phRightInput) : NO_VALUE
+    string lowCandidateText  = pivotLowCandidateOffset >= 0 ? str.tostring(pivotLowCandidateOffset) + "/" + str.tostring(plRightInput) : NO_VALUE
+    table.cell(dashboardTable, 0, 0, "Pivot Strength", text_color = titleColor, text_size = dashboardTextSize, text_halign = text.align_left,
+      tooltip = "Bar-count rule: a pivot high of strength Left/Right exceeds the Left bars before it and the Right bars after it, with the mirror rule for lows. Larger settings keep fewer, more significant pivots.")
+    table.cell(dashboardTable, 1, 0, "H " + str.tostring(phLeftInput) + "/" + str.tostring(phRightInput) + " · L " + str.tostring(plLeftInput) + "/" + str.tostring(plRightInput), text_color = titleColor, text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 1, "Confirmation delay", text_color = labelColor, text_size = dashboardTextSize, text_halign = text.align_left,
+      tooltip = "A pivot is only knowable once its right-side bars close, so labels arrive exactly Right bars after the pivot prints. Higher strength does not repaint less - it confirms later.")
+    table.cell(dashboardTable, 1, 1, str.tostring(phRightInput) + " · " + str.tostring(plRightInput) + " bars", text_color = valueColor, text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 2, "Confirmed pivots", text_color = labelColor, text_size = dashboardTextSize, text_halign = text.align_left,
+      tooltip = "Pivots whose full right-side window closed without being exceeded. Once confirmed they never change.")
+    table.cell(dashboardTable, 1, 2, str.tostring(pivotHighCount) + " H · " + str.tostring(pivotLowCount) + " L", text_color = valueColor, text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 3, "Avg bars per pivot", text_color = labelColor, text_size = dashboardTextSize, text_halign = text.align_left,
+      tooltip = "Chart bars per confirmed pivot at this strength - the scale dial made visible. Low strength maps fine swing grammar, high strength maps the major legs; mismatched settings are why two traders can disagree about the same structure.")
+    table.cell(dashboardTable, 1, 3, na(avgBarsPerPivot) ? NO_VALUE : str.tostring(avgBarsPerPivot, "#.#"), text_color = valueColor, text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 4, "Last pivot high", text_color = labelColor, text_size = dashboardTextSize, text_halign = text.align_left,
+      tooltip = "Most recent confirmed pivot high - its price and how many bars ago it printed.")
+    table.cell(dashboardTable, 1, 4, na(lastPivotHighPrice) ? NO_VALUE : str.tostring(lastPivotHighPrice, format.mintick) + " · " + str.tostring(bar_index - lastPivotHighBar) + " bars ago", text_color = na(lastPivotHighPrice) ? mutedColor : valueColor, text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 5, "Last pivot low", text_color = labelColor, text_size = dashboardTextSize, text_halign = text.align_left,
+      tooltip = "Most recent confirmed pivot low - its price and how many bars ago it printed.")
+    table.cell(dashboardTable, 1, 5, na(lastPivotLowPrice) ? NO_VALUE : str.tostring(lastPivotLowPrice, format.mintick) + " · " + str.tostring(bar_index - lastPivotLowBar) + " bars ago", text_color = na(lastPivotLowPrice) ? mutedColor : valueColor, text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 6, "Provisional high", text_color = labelColor, text_size = dashboardTextSize, text_halign = text.align_left,
+      tooltip = "Right-side bars printed versus required for the current unconfirmed pivot-high candidate. Provisional means it can still move or vanish.")
+    table.cell(dashboardTable, 1, 6, highCandidateText, text_color = pivotHighCandidateOffset >= 0 ? phColorInput : mutedColor, text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 7, "Provisional low", text_color = labelColor, text_size = dashboardTextSize, text_halign = text.align_left,
+      tooltip = "Right-side bars printed versus required for the current unconfirmed pivot-low candidate. Provisional means it can still move or vanish.")
+    table.cell(dashboardTable, 1, 7, lowCandidateText, text_color = pivotLowCandidateOffset >= 0 ? plColorInput : mutedColor, text_size = dashboardTextSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(pivotHighConfirmed, "Pivot High Confirmed", "Pivot high confirmed - its full right-side window closed without a higher high")
+alertcondition(pivotLowConfirmed, "Pivot Low Confirmed", "Pivot low confirmed - its full right-side window closed without a lower low")
+alertcondition(pivotHighConfirmed or pivotLowConfirmed, "Any Pivot Confirmed", "New pivot confirmed at the configured strength")
+
+//---------------------------------------------------------------------------------------------------------------------}

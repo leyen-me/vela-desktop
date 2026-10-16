@@ -1,0 +1,163 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Demand Index", "Demand Index", overlay = false, format = format.price, precision = 2, max_lines_count = 500, max_labels_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+// Sibbet's construction weights the percentage change of the weighted price by 3 * close / average two-bar range
+SIBBET_SCALE = 3.0
+RANGE_BARS   = 2
+EXP_CLAMP    = 88.0
+
+BULL_COLOR  = #089981
+BEAR_COLOR  = #f23645
+LEVEL_COLOR = #787b86
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+pressureLengthInput   = input.int(10, "Pressure Window",             minval = 1, group = "Settings", tooltip = "Number of bars over which the buying pressure and selling pressure components are maintained (averaged) before their ratio is taken. Longer windows emphasize sustained shifts in the demand/supply balance.")
+volumeLengthInput     = input.int(10, "Volume Normalization Length", minval = 1, group = "Settings", tooltip = "Bars used to average volume. Each bar's volume is divided by this average so participation is measured relative to recent activity, keeping instruments and eras comparable.")
+volatilityLengthInput = input.int(10, "Volatility Length",           minval = 1, group = "Settings", tooltip = "Bars used to average the two-bar high-low range. This volatility term scales the percentage change of the weighted price, so the size of a move is judged against recent volatility.")
+
+smoothingTypeInput   = input.string("EMA", "Smoothing Method", options = ["SMA", "EMA", "RMA", "WMA"], group = "Settings", tooltip = "Moving average type applied to the raw buying/selling pressure ratio to produce the final Demand Index.")
+smoothingLengthInput = input.int(3, "Smoothing Length", minval = 1, group = "Settings", tooltip = "Length of the final smoothing applied to the raw ratio. A value of 1 disables the extra smoothing.")
+
+upperExtremeInput = input.float(3.0, "Upper Extreme Level",  minval = 0, step = 0.25, group = "Extreme Levels", tooltip = "Reading treated as an extreme buying-pressure spike. Following Sibbet's rules, extreme peaks tend to be followed by a later retest or new price high rather than marking the final top.")
+lowerExtremeInput = input.float(-3.0, "Lower Extreme Level", maxval = 0, step = 0.25, group = "Extreme Levels", tooltip = "Reading treated as an extreme selling-pressure spike, the mirror of the upper extreme for lows.")
+
+showDivergencesInput = input.bool(false, "Show Divergences",       group = "Divergences", tooltip = "Draw regular bullish/bearish divergences between price and the Demand Index on the oscillator pane. Divergence alerts remain available even when drawing is disabled.")
+pivotLeftInput       = input.int(5, "Pivot Lookback Left",  minval = 1, group = "Divergences", tooltip = "Bars to the left of a swing that must be higher (for lows) or lower (for highs) for the oscillator swing to count as a pivot.")
+pivotRightInput      = input.int(5, "Pivot Lookback Right", minval = 1, group = "Divergences", tooltip = "Bars to the right required to confirm an oscillator pivot. Larger values confirm later but filter noise.")
+
+bullColorInput  = input.color(BULL_COLOR, "Bullish Color", group = "Style")
+bearColorInput  = input.color(BEAR_COLOR, "Bearish Color", group = "Style")
+levelColorInput = input.color(LEVEL_COLOR, "Levels Color", group = "Style")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Selected moving average; every ta.* call executes on all bars so the internal series stay consistent
+smoothed(series float source, simple int length, simple string maType) =>
+    smaValue = ta.sma(source, length)
+    emaValue = ta.ema(source, length)
+    rmaValue = ta.rma(source, length)
+    wmaValue = ta.wma(source, length)
+    switch maType
+        "SMA" => smaValue
+        "RMA" => rmaValue
+        "WMA" => wmaValue
+        => emaValue
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Demand Index Calculation
+//---------------------------------------------------------------------------------------------------------------------{
+// Weighted price and its percentage change
+weightedPrice = (high + low + 2 * close) / 4
+priceChange   = weightedPrice[1] > 0 ? (weightedPrice - weightedPrice[1]) / weightedPrice[1] : 0.0
+
+// Weighted price change: the percentage change scaled by a recent volatility term
+rangeSpan      = ta.highest(high, RANGE_BARS) - ta.lowest(low, RANGE_BARS)
+volatilityAvg  = ta.sma(rangeSpan, volatilityLengthInput)
+weightedChange = volatilityAvg > 0 ? priceChange * SIBBET_SCALE * close / volatilityAvg : 0.0
+pressureShift  = na(weightedChange) ? 0.0 : math.max(-EXP_CLAMP, math.min(EXP_CLAMP, weightedChange))
+
+// Bar volume normalized by an average of recent volume
+volumeAvg  = ta.sma(volume, volumeLengthInput)
+normVolume = volumeAvg > 0 ? volume / volumeAvg : na
+
+// Volume split into buying and selling pressure, the opposing side damped exponentially with the size of the move
+buyPressure  = pressureShift >= 0 ? normVolume : normVolume / math.exp(-pressureShift)
+sellPressure = pressureShift >= 0 ? normVolume / math.exp(pressureShift) : normVolume
+
+// Maintained pressure components and their signed ratio: BP / SP when net positive, -(SP / BP) when net negative
+buyComponent  = ta.sma(buyPressure, pressureLengthInput)
+sellComponent = ta.sma(sellPressure, pressureLengthInput)
+
+float rawIndex = na
+rawIndex := buyComponent > 0 and sellComponent > 0 ? (buyComponent >= sellComponent ? buyComponent / sellComponent : -(sellComponent / buyComponent)) : rawIndex[1]
+
+demandIndex = smoothed(rawIndex, smoothingLengthInput, smoothingTypeInput)
+
+// Key events
+crossAboveZero    = ta.crossover(demandIndex, 0)
+crossBelowZero    = ta.crossunder(demandIndex, 0)
+enterUpperExtreme = ta.crossover(demandIndex, upperExtremeInput)
+enterLowerExtreme = ta.crossunder(demandIndex, lowerExtremeInput)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Divergences
+//---------------------------------------------------------------------------------------------------------------------{
+oscillatorPivotLow  = ta.pivotlow(demandIndex, pivotLeftInput, pivotRightInput)
+oscillatorPivotHigh = ta.pivothigh(demandIndex, pivotLeftInput, pivotRightInput)
+
+var float previousLowValue  = na
+var int   previousLowBar    = na
+var float previousLowPrice  = na
+var float previousHighValue = na
+var int   previousHighBar   = na
+var float previousHighPrice = na
+
+bool bullishDivergence = false
+bool bearishDivergence = false
+
+if not na(oscillatorPivotLow)
+    pivotBar   = bar_index - pivotRightInput
+    pivotPrice = low[pivotRightInput]
+
+    if not na(previousLowValue) and pivotPrice < previousLowPrice and oscillatorPivotLow > previousLowValue
+        bullishDivergence := true
+
+        if showDivergencesInput
+            line.new(previousLowBar, previousLowValue, pivotBar, oscillatorPivotLow, color = bullColorInput, style = line.style_dashed)
+            label.new(pivotBar, oscillatorPivotLow, "Bull", style = label.style_label_up, color = #00000000, textcolor = bullColorInput, size = size.tiny)
+
+    previousLowValue := oscillatorPivotLow
+    previousLowBar   := pivotBar
+    previousLowPrice := pivotPrice
+
+if not na(oscillatorPivotHigh)
+    pivotBar   = bar_index - pivotRightInput
+    pivotPrice = high[pivotRightInput]
+
+    if not na(previousHighValue) and pivotPrice > previousHighPrice and oscillatorPivotHigh < previousHighValue
+        bearishDivergence := true
+
+        if showDivergencesInput
+            line.new(previousHighBar, previousHighValue, pivotBar, oscillatorPivotHigh, color = bearColorInput, style = line.style_dashed)
+            label.new(pivotBar, oscillatorPivotHigh, "Bear", style = label.style_label_down, color = #00000000, textcolor = bearColorInput, size = size.tiny)
+
+    previousHighValue := oscillatorPivotHigh
+    previousHighBar   := pivotBar
+    previousHighPrice := pivotPrice
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+diPlotId   = plot(demandIndex, "Demand Index", color = demandIndex > 0 ? bullColorInput : bearColorInput)
+zeroPlotId = plot(0, "Zero Anchor", color = na, editable = false, display = display.none)
+
+// Centered-oscillator gradient: transparent at the zero line, 50% at the value, green above / red below
+fillTopValue    = math.max(demandIndex, 0)
+fillBottomValue = math.min(demandIndex, 0)
+fillTopColor    = demandIndex > 0 ? color.new(bullColorInput, 50) : color.new(bearColorInput, 100)
+fillBottomColor = demandIndex > 0 ? color.new(bullColorInput, 100) : color.new(bearColorInput, 50)
+fill(diPlotId, zeroPlotId, fillTopValue, fillBottomValue, fillTopColor, fillBottomColor, title = "Pressure Gradient")
+
+hline(0, "Zero Line", color = levelColorInput, linestyle = hline.style_dotted)
+hline(upperExtremeInput, "Upper Extreme", color = levelColorInput, linestyle = hline.style_dashed)
+hline(lowerExtremeInput, "Lower Extreme", color = levelColorInput, linestyle = hline.style_dashed)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(crossAboveZero,    "Zero Line Cross Up",   "Demand Index crossed above zero - buying pressure has become dominant")
+alertcondition(crossBelowZero,    "Zero Line Cross Down", "Demand Index crossed below zero - selling pressure has become dominant")
+alertcondition(enterUpperExtreme, "Upper Extreme Reached", "Demand Index rose above its upper extreme level - extreme buying pressure, often followed by a later retest or new price high")
+alertcondition(enterLowerExtreme, "Lower Extreme Reached", "Demand Index fell below its lower extreme level - extreme selling pressure, often followed by a later retest or new price low")
+alertcondition(bullishDivergence, "Bullish Divergence",   "Regular bullish divergence - price made a lower low while the Demand Index made a higher low")
+alertcondition(bearishDivergence, "Bearish Divergence",   "Regular bearish divergence - price made a higher high while the Demand Index made a lower high")
+
+//---------------------------------------------------------------------------------------------------------------------}

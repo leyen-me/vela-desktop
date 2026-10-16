@@ -1,0 +1,405 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Measured Move", shorttitle = "Measured Move", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+color BULL_COLOR        = #089981
+color BEAR_COLOR        = #f23645
+color TRANSPARENT_COLOR = #00000000
+
+int STATE_ACTIVE  = 0
+int STATE_DONE    = 1
+int STATE_INVALID = 2
+
+int MAX_SWINGS      = 8
+int MAX_FUTURE_BARS = 490
+
+string POINTS_MODE     = "Points"
+string PERCENTAGE_MODE = "Percentage"
+
+string SETUP_GROUP      = "Measured Move"
+string PROJECTION_GROUP = "Projection"
+string STYLE_GROUP      = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+swingLengthInput = input.int(10, "Swing Length", minval = 2, group = SETUP_GROUP, tooltip = "Number of bars to the left and right required to confirm a swing high or swing low. The legs are anchored on these objective swing points — larger values build the construction on bigger structural swings, smaller values on minor ones.")
+
+minRetraceInput = input.float(33.3, "Min Retracement %", minval = 0, maxval = 99, step = 0.1, group = SETUP_GROUP, tooltip = "Minimum share of the first leg the pullback must retrace to count as a proportional correction. The classic region is one-third to two-thirds of the leg.")
+
+maxRetraceInput = input.float(66.7, "Max Retracement %", minval = 1, maxval = 99.9, step = 0.1, group = SETUP_GROUP, tooltip = "Maximum share of the first leg the pullback may retrace. Deeper pullbacks are not treated as proportional corrections, and a correction that retraces the entire first leg always voids the construction.")
+
+projectionModeInput = input.string(POINTS_MODE, "Projection Method", options = ["Points", "Percentage"], group = PROJECTION_GROUP, tooltip = "Points projects the first leg's point distance from the anchor: C + (B − A). Percentage projects the leg's ratio instead: C × (B / A), preferred on log-scale charts and for large moves where point symmetry distorts.")
+
+projectionMultipleInput = input.float(1.0, "Projection Multiple", minval = 0.1, maxval = 10, step = 0.1, group = PROJECTION_GROUP, tooltip = "Share of the first leg projected from the anchor. 1 is the classic symmetric measured move; fractions or multiples (for example 0.618 or 1.272) project part of the leg or an extension of it.")
+
+zoneWidthInput = input.float(10, "Target Zone Width %", minval = 0, maxval = 100, step = 1, group = PROJECTION_GROUP, tooltip = "Height of the target zone as a percentage of the projected distance, centered on the target. Leg symmetry is approximate, so the target is treated as a zone rather than an exact level.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "colors", group = STYLE_GROUP)
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "colors", group = STYLE_GROUP)
+
+showLegsInput = input.bool(true, "Show Legs", group = STYLE_GROUP)
+
+showLabelsInput = input.bool(true, "Show Swing & Target Labels", group = STYLE_GROUP, tooltip = "Marks the A, B and C swing points and labels the projected target with its price and the reward-to-risk ratio implied by an entry at the anchor with a stop at the leg origin.")
+
+showRatioInput = input.bool(true, "Show Second Leg %", group = STYLE_GROUP, tooltip = "Once the second leg terminates on a confirmed swing, label its size as a percentage of the projection. Legs well short of the projection suggest fading momentum; legs beyond it, a strong trend.")
+
+maxPatternsInput = input.int(20, "Shown Patterns", minval = 1, maxval = 100, group = STYLE_GROUP, tooltip = "Maximum number of measured move constructions kept on the chart; the oldest drawings are removed first.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types & Variables
+//---------------------------------------------------------------------------------------------------------------------{
+
+// A confirmed swing point of the alternating structure
+type Swing
+    int   barIdx
+    float price
+    bool  isHigh
+
+// One measured move construction: A→B first leg, B→C correction, target projected from C
+type MMove
+    bool  isBull
+    int   aBar
+    float aPrice
+    int   bBar
+    float bPrice
+    int   cBar
+    float cPrice
+    float targetPrice
+    float zoneTop
+    float zoneBottom
+    float rrValue
+    int   state
+    bool  touched
+    int   dBar
+    float dPrice
+    line  abLine
+    line  bcLine
+    line  projLine
+    box   zoneBox
+    label aLabel
+    label bLabel
+    label cLabel
+    label targetLabel
+    label resultLabel
+
+var array<Swing> swingArray = array.new<Swing>()
+var array<MMove> moveArray  = array.new<MMove>()
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Arithmetic target C + (B − A) × multiple, or ratio target C × (B / A) ^ multiple for the percentage variant
+computeTarget(bool isBull, float aPrice, float bPrice, float cPrice) =>
+    float pointTarget = isBull ? cPrice + (bPrice - aPrice) * projectionMultipleInput : cPrice - (aPrice - bPrice) * projectionMultipleInput
+    float ratioTarget = na
+    if aPrice > 0 and bPrice > 0 and cPrice > 0
+        ratioTarget := cPrice * math.pow(bPrice / aPrice, projectionMultipleInput)
+    projectionModeInput == PERCENTAGE_MODE and not na(ratioTarget) ? ratioTarget : pointTarget
+
+// Reward-to-risk of an entry at the anchor C with the stop at the leg origin A (the invalidation point)
+computeRr(bool isBull, float aPrice, float cPrice, float targetPrice) =>
+    isBull ? (targetPrice - cPrice) / (cPrice - aPrice) : (cPrice - targetPrice) / (aPrice - cPrice)
+
+targetText(float targetPrice, float rrValue) =>
+    "Target " + str.tostring(targetPrice, format.mintick) + " · RR " + str.tostring(rrValue, "#.##")
+
+// Second leg extent as a share of the projected distance — the trend-health reading
+ratioText(MMove m) =>
+    float projDistance = math.abs(m.targetPrice - m.cPrice)
+    float legDistance  = m.isBull ? m.dPrice - m.cPrice : m.cPrice - m.dPrice
+    projDistance > 0 ? str.tostring(legDistance / projDistance * 100, "#") + "% of projection" : ""
+
+deleteMove(MMove m) =>
+    if not na(m.abLine)
+        line.delete(m.abLine)
+    if not na(m.bcLine)
+        line.delete(m.bcLine)
+    if not na(m.projLine)
+        line.delete(m.projLine)
+    if not na(m.zoneBox)
+        box.delete(m.zoneBox)
+    if not na(m.aLabel)
+        label.delete(m.aLabel)
+    if not na(m.bLabel)
+        label.delete(m.bLabel)
+    if not na(m.cLabel)
+        label.delete(m.cLabel)
+    if not na(m.targetLabel)
+        label.delete(m.targetLabel)
+    if not na(m.resultLabel)
+        label.delete(m.resultLabel)
+
+// Void the construction: mute the forward-looking drawings and mark the spot
+voidMove(MMove m) =>
+    color mutedColor = color.new(chart.fg_color, 70)
+    m.state := STATE_INVALID
+    box.set_right(m.zoneBox, bar_index)
+    box.set_border_color(m.zoneBox, mutedColor)
+    box.set_bgcolor(m.zoneBox, color.new(chart.fg_color, 95))
+    line.set_color(m.projLine, mutedColor)
+    if not na(m.targetLabel)
+        label.set_textcolor(m.targetLabel, mutedColor)
+    m.resultLabel := label.new(bar_index, m.aPrice, "✕", style = label.style_label_center, color = TRANSPARENT_COLOR, textcolor = chart.fg_color, size = size.small)
+
+markTouched(MMove m) =>
+    m.touched := true
+    box.set_border_style(m.zoneBox, line.style_solid)
+
+// Maintain the alternating swing structure; returns whether the swing extended it or replaced the previous one
+addSwing(bool isHigh, int newBar, float price) =>
+    bool pushed   = false
+    bool replaced = false
+    int  oldBar   = na
+    if array.size(swingArray) == 0
+        array.push(swingArray, Swing.new(newBar, price, isHigh))
+        pushed := true
+    else
+        Swing lastSwing = array.get(swingArray, array.size(swingArray) - 1)
+        if lastSwing.isHigh == isHigh
+            bool moreExtreme = isHigh ? price >= lastSwing.price : price <= lastSwing.price
+            if moreExtreme
+                oldBar := lastSwing.barIdx
+                lastSwing.barIdx := newBar
+                lastSwing.price  := price
+                replaced := true
+        else
+            array.push(swingArray, Swing.new(newBar, price, isHigh))
+            pushed := true
+    if array.size(swingArray) > MAX_SWINGS
+        array.shift(swingArray)
+    [pushed, replaced, oldBar]
+
+// Attempt a new construction from the last three alternating swings (A, B, C)
+tryCreate(bool isBull, float extremeSincePivot) =>
+    bool created    = false
+    bool touchEvent = false
+    if array.size(swingArray) >= 3
+        Swing swingC = array.get(swingArray, array.size(swingArray) - 1)
+        Swing swingB = array.get(swingArray, array.size(swingArray) - 2)
+        Swing swingA = array.get(swingArray, array.size(swingArray) - 3)
+        bool sequenceOk = isBull ? not swingA.isHigh and swingB.isHigh and not swingC.isHigh : swingA.isHigh and not swingB.isHigh and swingC.isHigh
+        bool activeExists = false
+        for existing in moveArray
+            if existing.state == STATE_ACTIVE and existing.isBull == isBull
+                activeExists := true
+                break
+        if sequenceOk and not activeExists
+            float legHeight   = isBull ? swingB.price - swingA.price : swingA.price - swingB.price
+            float retraceAmt  = isBull ? swingB.price - swingC.price : swingC.price - swingB.price
+            bool  aboveOrigin = isBull ? swingC.price > swingA.price : swingC.price < swingA.price
+            if legHeight > 0 and retraceAmt > 0 and aboveOrigin
+                float retraceRatio = retraceAmt / legHeight
+                if retraceRatio >= minRetraceInput / 100 and retraceRatio <= maxRetraceInput / 100
+                    float targetPrice = computeTarget(isBull, swingA.price, swingB.price, swingC.price)
+                    float halfZone    = math.abs(targetPrice - swingC.price) * zoneWidthInput / 200
+                    float rrValue     = computeRr(isBull, swingA.price, swingC.price, targetPrice)
+                    color dirColor    = isBull ? bullColorInput : bearColorInput
+                    int   projEndBar  = math.min(swingC.barIdx + (swingB.barIdx - swingA.barIdx), bar_index + MAX_FUTURE_BARS)
+                    MMove newMove = MMove.new()
+                    newMove.isBull      := isBull
+                    newMove.aBar        := swingA.barIdx
+                    newMove.aPrice      := swingA.price
+                    newMove.bBar        := swingB.barIdx
+                    newMove.bPrice      := swingB.price
+                    newMove.cBar        := swingC.barIdx
+                    newMove.cPrice      := swingC.price
+                    newMove.targetPrice := targetPrice
+                    newMove.zoneTop     := targetPrice + halfZone
+                    newMove.zoneBottom  := targetPrice - halfZone
+                    newMove.rrValue     := rrValue
+                    newMove.state       := STATE_ACTIVE
+                    newMove.touched     := false
+                    newMove.abLine      := showLegsInput ? line.new(swingA.barIdx, swingA.price, swingB.barIdx, swingB.price, color = dirColor) : line(na)
+                    newMove.bcLine      := showLegsInput ? line.new(swingB.barIdx, swingB.price, swingC.barIdx, swingC.price, color = dirColor) : line(na)
+                    newMove.projLine    := line.new(swingC.barIdx, swingC.price, projEndBar, targetPrice, color = dirColor, style = line.style_dotted)
+                    newMove.zoneBox     := box.new(bar_index, targetPrice + halfZone, bar_index, targetPrice - halfZone, border_color = color.new(dirColor, 40), border_style = line.style_dashed, bgcolor = color.new(dirColor, 85))
+                    newMove.aLabel      := showLabelsInput ? label.new(swingA.barIdx, swingA.price, "A", style = isBull ? label.style_label_up : label.style_label_down, color = TRANSPARENT_COLOR, textcolor = dirColor, size = size.small) : label(na)
+                    newMove.bLabel      := showLabelsInput ? label.new(swingB.barIdx, swingB.price, "B", style = isBull ? label.style_label_down : label.style_label_up, color = TRANSPARENT_COLOR, textcolor = dirColor, size = size.small) : label(na)
+                    newMove.cLabel      := showLabelsInput ? label.new(swingC.barIdx, swingC.price, "C", style = isBull ? label.style_label_up : label.style_label_down, color = TRANSPARENT_COLOR, textcolor = dirColor, size = size.small) : label(na)
+                    newMove.targetLabel := showLabelsInput ? label.new(projEndBar, targetPrice, targetText(targetPrice, rrValue), style = label.style_label_left, color = TRANSPARENT_COLOR, textcolor = dirColor, size = size.small) : label(na)
+                    array.push(moveArray, newMove)
+                    created := true
+                    // Price may already have tagged the zone between the anchor swing and its confirmation
+                    if isBull ? extremeSincePivot >= newMove.zoneBottom : extremeSincePivot <= newMove.zoneTop
+                        markTouched(newMove)
+                        touchEvent := true
+                    if array.size(moveArray) > maxPatternsInput
+                        deleteMove(array.shift(moveArray))
+    [created, touchEvent]
+
+// A confirmed opposite swing after the anchor terminates the second leg — measure it against the projection
+finalizeMoves(bool isHigh, int swingBar, float swingPrice) =>
+    bool touchEvent = false
+    for m in moveArray
+        if m.state == STATE_ACTIVE and m.isBull == isHigh and swingBar > m.cBar
+            m.state  := STATE_DONE
+            m.dBar   := swingBar
+            m.dPrice := swingPrice
+            if not m.touched and (m.isBull ? swingPrice >= m.zoneBottom : swingPrice <= m.zoneTop)
+                markTouched(m)
+                touchEvent := true
+            box.set_right(m.zoneBox, swingBar)
+            if showRatioInput
+                m.resultLabel := label.new(swingBar, swingPrice, ratioText(m), style = m.isBull ? label.style_label_down : label.style_label_up, color = TRANSPARENT_COLOR, textcolor = m.isBull ? bullColorInput : bearColorInput, size = size.tiny)
+    touchEvent
+
+// The terminal swing extended to a new extreme — refresh the second-leg reading
+updateTerminal(bool isHigh, int oldBar, int newBar, float newPrice) =>
+    bool touchEvent = false
+    for m in moveArray
+        if m.state == STATE_DONE and m.isBull == isHigh and m.dBar == oldBar
+            m.dBar   := newBar
+            m.dPrice := newPrice
+            box.set_right(m.zoneBox, newBar)
+            if not m.touched and (m.isBull ? newPrice >= m.zoneBottom : newPrice <= m.zoneTop)
+                markTouched(m)
+                touchEvent := true
+            if not na(m.resultLabel)
+                label.set_xy(m.resultLabel, newBar, newPrice)
+                label.set_text(m.resultLabel, ratioText(m))
+    touchEvent
+
+// The correction deepened to a new extreme before turning: re-anchor at the terminal swing, or void the construction
+reanchorMoves(bool isHigh, int oldBar, int newBar, float newPrice, float extremeSincePivot) =>
+    bool invalidEvent = false
+    bool touchEvent   = false
+    for m in moveArray
+        if m.state == STATE_ACTIVE and m.isBull != isHigh and m.cBar == oldBar and not m.touched
+            float legHeight    = m.isBull ? m.bPrice - m.aPrice : m.aPrice - m.bPrice
+            float retraceAmt   = m.isBull ? m.bPrice - newPrice : newPrice - m.bPrice
+            float retraceRatio = legHeight > 0 ? retraceAmt / legHeight : na
+            bool  aboveOrigin  = m.isBull ? newPrice > m.aPrice : newPrice < m.aPrice
+            bool  boundsOk     = not na(retraceRatio) and retraceRatio >= minRetraceInput / 100 and retraceRatio <= maxRetraceInput / 100
+            if aboveOrigin and boundsOk
+                float targetPrice = computeTarget(m.isBull, m.aPrice, m.bPrice, newPrice)
+                float halfZone    = math.abs(targetPrice - newPrice) * zoneWidthInput / 200
+                int   projEndBar  = math.min(newBar + (m.bBar - m.aBar), bar_index + MAX_FUTURE_BARS)
+                m.cBar        := newBar
+                m.cPrice      := newPrice
+                m.targetPrice := targetPrice
+                m.zoneTop     := targetPrice + halfZone
+                m.zoneBottom  := targetPrice - halfZone
+                m.rrValue     := computeRr(m.isBull, m.aPrice, newPrice, targetPrice)
+                if not na(m.bcLine)
+                    line.set_xy2(m.bcLine, newBar, newPrice)
+                line.set_xy1(m.projLine, newBar, newPrice)
+                line.set_xy2(m.projLine, projEndBar, targetPrice)
+                box.set_top(m.zoneBox, m.zoneTop)
+                box.set_bottom(m.zoneBox, m.zoneBottom)
+                if not na(m.cLabel)
+                    label.set_xy(m.cLabel, newBar, newPrice)
+                if not na(m.targetLabel)
+                    label.set_xy(m.targetLabel, projEndBar, targetPrice)
+                    label.set_text(m.targetLabel, targetText(targetPrice, m.rrValue))
+                if m.isBull ? extremeSincePivot >= m.zoneBottom : extremeSincePivot <= m.zoneTop
+                    markTouched(m)
+                    touchEvent := true
+            else
+                voidMove(m)
+                if not aboveOrigin
+                    invalidEvent := true
+    [invalidEvent, touchEvent]
+
+// Bar-by-bar tracking of active constructions: extend the zone, catch target touches and full-leg invalidations
+updateMoves() =>
+    bool bullTouchEvent   = false
+    bool bearTouchEvent   = false
+    bool bullInvalidEvent = false
+    bool bearInvalidEvent = false
+    for m in moveArray
+        if m.state == STATE_ACTIVE
+            box.set_right(m.zoneBox, bar_index)
+            if not m.touched and (m.isBull ? low < m.aPrice : high > m.aPrice)
+                voidMove(m)
+                if m.isBull
+                    bullInvalidEvent := true
+                else
+                    bearInvalidEvent := true
+            if m.state == STATE_ACTIVE and not m.touched and (m.isBull ? high >= m.zoneBottom : low <= m.zoneTop)
+                markTouched(m)
+                if m.isBull
+                    bullTouchEvent := true
+                else
+                    bearTouchEvent := true
+    [bullTouchEvent, bearTouchEvent, bullInvalidEvent, bearInvalidEvent]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+
+float pivotHighPrice    = ta.pivothigh(swingLengthInput, swingLengthInput)
+float pivotLowPrice     = ta.pivotlow(swingLengthInput, swingLengthInput)
+float highestSincePivot = ta.highest(high, swingLengthInput)
+float lowestSincePivot  = ta.lowest(low, swingLengthInput)
+int   pivotBarIndex     = bar_index - swingLengthInput
+
+bool bullNewEvent     = false
+bool bearNewEvent     = false
+bool bullTargetEvent  = false
+bool bearTargetEvent  = false
+bool bullInvalidEvent = false
+bool bearInvalidEvent = false
+
+if barstate.isconfirmed
+    if not na(pivotHighPrice)
+        [pushedHigh, replacedHigh, oldHighBar] = addSwing(true, pivotBarIndex, pivotHighPrice)
+        if pushedHigh
+            bool finalizeTouch = finalizeMoves(true, pivotBarIndex, pivotHighPrice)
+            bullTargetEvent := bullTargetEvent or finalizeTouch
+            [createdBear, bearBirthTouch] = tryCreate(false, lowestSincePivot)
+            bearNewEvent    := bearNewEvent or createdBear
+            bearTargetEvent := bearTargetEvent or bearBirthTouch
+        if replacedHigh
+            bool terminalTouch = updateTerminal(true, oldHighBar, pivotBarIndex, pivotHighPrice)
+            bullTargetEvent := bullTargetEvent or terminalTouch
+            [bearReInvalid, bearReTouch] = reanchorMoves(true, oldHighBar, pivotBarIndex, pivotHighPrice, lowestSincePivot)
+            bearInvalidEvent := bearInvalidEvent or bearReInvalid
+            bearTargetEvent  := bearTargetEvent or bearReTouch
+            [createdBear, bearBirthTouch] = tryCreate(false, lowestSincePivot)
+            bearNewEvent    := bearNewEvent or createdBear
+            bearTargetEvent := bearTargetEvent or bearBirthTouch
+    if not na(pivotLowPrice)
+        [pushedLow, replacedLow, oldLowBar] = addSwing(false, pivotBarIndex, pivotLowPrice)
+        if pushedLow
+            bool finalizeTouch = finalizeMoves(false, pivotBarIndex, pivotLowPrice)
+            bearTargetEvent := bearTargetEvent or finalizeTouch
+            [createdBull, bullBirthTouch] = tryCreate(true, highestSincePivot)
+            bullNewEvent    := bullNewEvent or createdBull
+            bullTargetEvent := bullTargetEvent or bullBirthTouch
+        if replacedLow
+            bool terminalTouch = updateTerminal(false, oldLowBar, pivotBarIndex, pivotLowPrice)
+            bearTargetEvent := bearTargetEvent or terminalTouch
+            [bullReInvalid, bullReTouch] = reanchorMoves(false, oldLowBar, pivotBarIndex, pivotLowPrice, highestSincePivot)
+            bullInvalidEvent := bullInvalidEvent or bullReInvalid
+            bullTargetEvent  := bullTargetEvent or bullReTouch
+            [createdBull, bullBirthTouch] = tryCreate(true, highestSincePivot)
+            bullNewEvent    := bullNewEvent or createdBull
+            bullTargetEvent := bullTargetEvent or bullBirthTouch
+
+[bullTouchUpdate, bearTouchUpdate, bullInvalidUpdate, bearInvalidUpdate] = updateMoves()
+
+bullTargetEvent  := bullTargetEvent or bullTouchUpdate
+bearTargetEvent  := bearTargetEvent or bearTouchUpdate
+bullInvalidEvent := bullInvalidEvent or bullInvalidUpdate
+bearInvalidEvent := bearInvalidEvent or bearInvalidUpdate
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(bullNewEvent, "Bullish Measured Move", "Bullish measured move on {{ticker}}: correction anchored and upside target zone projected")
+alertcondition(bearNewEvent, "Bearish Measured Move", "Bearish measured move on {{ticker}}: correction anchored and downside target zone projected")
+alertcondition(bullTargetEvent, "Bullish Target Reached", "Price reached the bullish measured move target zone on {{ticker}}")
+alertcondition(bearTargetEvent, "Bearish Target Reached", "Price reached the bearish measured move target zone on {{ticker}}")
+alertcondition(bullInvalidEvent, "Bullish Measured Move Invalidated", "Bullish measured move voided on {{ticker}}: the correction retraced the entire first leg")
+alertcondition(bearInvalidEvent, "Bearish Measured Move Invalidated", "Bearish measured move voided on {{ticker}}: the correction retraced the entire first leg")
+
+//---------------------------------------------------------------------------------------------------------------------}

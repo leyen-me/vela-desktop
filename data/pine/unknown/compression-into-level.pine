@@ -1,0 +1,377 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Compression Into Level", shorttitle = "Compression Into Level", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 250)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+ATR_LEN         = 200
+ZZ_MAX          = 30
+TARGET_MAX_SPAN = 100
+GRADE_HIGH      = 67
+GRADE_MODERATE  = 34
+
+BASE_TIP   = "Consumed base — a shallow pause spent on the approach. Supply & demand reads grade it low quality on a retest."
+TARGET_TIP = "Compression origin — reference target when the level holds: the bases between price and here were consumed on the way in."
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+swingLengthInput = input.int(5, "Swing Length", minval = 2, group = "Detection", tooltip = "Bars to the left and right of a swing point required to confirm it. Larger values read bigger structure, smaller values catch tighter coils.")
+minTouchesInput  = input.int(2, "Minimum Level Tests", minval = 2, group = "Detection", tooltip = "Swing touches required for the destination level to count as proven. Touches made before the compression begins count as the level's prior reactions.")
+minSwingsInput   = input.int(3, "Minimum Shrinking Swings", minval = 2, group = "Detection", tooltip = "Length of the shrinking swing series required to call it compression: each pullback from the level shallower than the one before. Three is the commonly cited minimum.")
+toleranceInput   = input.float(0.5, "Level Tolerance", minval = 0.05, step = 0.05, group = "Detection", tooltip = "Maximum distance, in ATR multiples, between the swing points clustered into one level. Also caps the thickness of the drawn level zone.")
+ratioInput       = input.float(1.0, "Contraction Ratio", minval = 0.5, maxval = 1.0, step = 0.05, group = "Detection", tooltip = "Each pullback depth must be less than this fraction of the previous one. 1 accepts any shallower pullback, lower values demand a tighter squeeze.")
+approachInput    = input.float(1.0, "Minimum Approach Depth", minval = 0.25, step = 0.25, group = "Detection", tooltip = "Distance, in ATR multiples, the compression origin must sit beyond the level, so the structure genuinely approaches from outside the zone rather than flickering inside it.")
+
+showZoneInput    = input.bool(true, "Level Zone", group = "Structure Elements", tooltip = "Box over the destination level, drawn from its first counted test. Its outer edge is the break trigger.")
+showWedgeInput   = input.bool(true, "Compression Wedge", group = "Structure Elements", tooltip = "Trendline from the compression origin through the latest stair-step swing, filled against the level — the tightening coil.")
+showBasesInput   = input.bool(true, "Consumed Bases", group = "Structure Elements", tooltip = "Dots on the shallow pullback swings left behind on the approach — the overlapping mini-bases spent on the way in.")
+showTriggerInput = input.bool(true, "Failure Trigger Line", group = "Structure Elements", tooltip = "Dashed line at the most recent stair-step swing — the price whose loss resolves the structure as a rejection.")
+showGradeInput   = input.bool(true, "Pressure Grade", group = "Structure Elements", tooltip = "Live label grading the squeeze from its contraction, level tests and shrinking-swing count. Hover it for the measured details and both resolution triggers.")
+showTargetInput  = input.bool(true, "Rejection Target", group = "Structure Elements", tooltip = "When the level holds and the structure fails, a dotted line marks the compression origin — the consumed path behind price offers little support before it.")
+showMarkersInput = input.bool(true, "Resolution Markers", group = "Structure Elements", tooltip = "Labels on the bar that resolves the structure: Break through the level, or Reject back through the last stair-step swing.")
+
+bullColorInput    = input.color(#089981, "Bullish", inline = "colors", group = "Style", tooltip = "Bullish color: upward pressure wedges, support levels and upward resolutions.")
+bearColorInput    = input.color(#f23645, "Bearish", inline = "colors", group = "Style", tooltip = "Bearish color: downward pressure wedges, resistance levels and downward resolutions.")
+neutralColorInput = input.color(#787b86, "Neutral", inline = "colors", group = "Style", tooltip = "Neutral color: consumed-base dots and the rejection target line.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types & Variables
+//---------------------------------------------------------------------------------------------------------------------{
+type Structure
+    int      direction
+    float    zoneTop
+    float    zoneBot
+    int      zoneStart
+    float    originPrice
+    int      originBar
+    float    stairPrice
+    int      stairBar
+    float    depthFirst
+    float    depthLast
+    int      touches
+    int      swings
+    box      zoneBx
+    line     prsLine
+    line     edgLine
+    linefill wdgFill
+    line     trgLine
+    label    grdLabel
+
+// zigzag storage: alternating swing points (price, bar, is-high flag)
+var array<float> zzP = array.new<float>()
+var array<int>   zzB = array.new<int>()
+var array<bool>  zzT = array.new<bool>()
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// append a confirmed swing point, keeping strict high/low alternation (same-side points keep the more extreme)
+pushPivot(bool isHigh, float price, int bIdx) =>
+    int n = array.size(zzP)
+    if n > 0 and array.get(zzT, n - 1) == isHigh
+        bool moreExtreme = isHigh ? price >= array.get(zzP, n - 1) : price <= array.get(zzP, n - 1)
+        if moreExtreme
+            array.set(zzP, n - 1, price)
+            array.set(zzB, n - 1, bIdx)
+    else
+        array.push(zzP, price)
+        array.push(zzB, bIdx)
+        array.push(zzT, isHigh)
+    if array.size(zzP) > ZZ_MAX
+        array.shift(zzP)
+        array.shift(zzB)
+        array.shift(zzT)
+
+// scan the zigzag for a directional squeeze against a proven level
+// bullish = compression into resistance (higher lows under a ceiling), otherwise mirrored into support
+detect(bool bullish, float tol, float minApproach, int lastEnd) =>
+    bool  ok      = false
+    float zTop    = na
+    float zBot    = na
+    int   zStart  = na
+    float oP      = na
+    int   oB      = na
+    float sP      = na
+    int   sB      = na
+    float d0      = na
+    int   touches = 0
+    int   swings  = 0
+    array<float> basePArr = array.new<float>()
+    array<int>   baseBArr = array.new<int>()
+    int n = array.size(zzP)
+    if n >= 4
+        // most recent touch-side swing (highs for resistance, lows for support)
+        int iT = array.get(zzT, n - 1) == bullish ? n - 1 : n - 2
+        if iT >= 3
+            // cluster consecutive touch-side swings into one level, bounded in thickness by the tolerance
+            float cMax   = array.get(zzP, iT)
+            float cMin   = cMax
+            int   iFirst = iT
+            int   j      = iT - 2
+            while j >= 0
+                float p    = array.get(zzP, j)
+                float nMax = math.max(cMax, p)
+                float nMin = math.min(cMin, p)
+                if nMax - nMin <= tol
+                    cMax   := nMax
+                    cMin   := nMin
+                    iFirst := j
+                    j      -= 2
+                else
+                    break
+            if iFirst >= 1
+                // stair-side swings: the one before the first test (origin candidate) plus every one between tests
+                array<float> loP = array.new<float>()
+                array<int>   loB = array.new<int>()
+                int k = iFirst - 1
+                while k <= n - 1
+                    array.push(loP, array.get(zzP, k))
+                    array.push(loB, array.get(zzB, k))
+                    k += 2
+                int m = array.size(loP)
+                if m >= 2
+                    // longest suffix stepping toward the level with each depth shrinking versus the last
+                    int idx = m - 1
+                    while idx >= 1
+                        float dNow     = bullish ? cMax - array.get(loP, idx)     : array.get(loP, idx)     - cMin
+                        float dPrev    = bullish ? cMax - array.get(loP, idx - 1) : array.get(loP, idx - 1) - cMin
+                        bool  stepping = bullish ? array.get(loP, idx) > array.get(loP, idx - 1) : array.get(loP, idx) < array.get(loP, idx - 1)
+                        if stepping and dNow > 0 and dPrev > 0 and dNow < dPrev * ratioInput
+                            idx -= 1
+                        else
+                            break
+                    int   chain         = m - idx
+                    int   clusterTouches = (iT - iFirst) / 2 + 1
+                    float depth0        = bullish ? cMax - array.get(loP, idx) : array.get(loP, idx) - cMin
+                    float lastStairP    = array.get(loP, m - 1)
+                    bool  unresolved    = bullish ? close < cMax and close > lastStairP : close > cMin and close < lastStairP
+                    if chain >= minSwingsInput and clusterTouches >= minTouchesInput and depth0 >= minApproach and array.get(loB, idx) > lastEnd and unresolved
+                        ok      := true
+                        zTop    := cMax
+                        zBot    := cMin
+                        zStart  := array.get(zzB, iFirst)
+                        oP      := array.get(loP, idx)
+                        oB      := array.get(loB, idx)
+                        sP      := lastStairP
+                        sB      := array.get(loB, m - 1)
+                        d0      := depth0
+                        touches := clusterTouches
+                        swings  := chain
+                        for q = idx + 1 to m - 1
+                            array.push(basePArr, array.get(loP, q))
+                            array.push(baseBArr, array.get(loB, q))
+    [ok, zTop, zBot, zStart, oP, oB, sP, sB, d0, touches, swings, basePArr, baseBArr]
+
+// pressure grade: contraction of the coil + level tests + shrinking-swing count, each read from the page's criteria
+gradeOf(Structure s) =>
+    float tight = s.depthFirst > 0 ? math.max(0.0, math.min(1.0, 1 - s.depthLast / s.depthFirst)) : 0.0
+    float tests = math.max(0.0, math.min(1.0, (s.touches - minTouchesInput) / 3.0))
+    float steps = math.max(0.0, math.min(1.0, (s.swings - minSwingsInput) / 3.0))
+    int score = math.round(100 * (tight + tests + steps) / 3)
+    string gradeName = score >= GRADE_HIGH ? "High" : score >= GRADE_MODERATE ? "Moderate" : "Low"
+    [score, gradeName, tight]
+
+updateGrade(Structure s) =>
+    if showGradeInput and not na(s.grdLabel)
+        [score, gradeName, tight] = gradeOf(s)
+        bool isBull = s.direction == 1
+        s.grdLabel.set_x(bar_index)
+        s.grdLabel.set_y(math.avg(s.zoneTop, s.zoneBot))
+        s.grdLabel.set_text((isBull ? "Compression ▲" : "Compression ▼") + "\nPressure: " + gradeName + " (" + str.tostring(score) + ")")
+        s.grdLabel.set_tooltip("Level tests: " + str.tostring(s.touches) + " | Shrinking swings: " + str.tostring(s.swings) + " | Contraction: " + str.tostring(math.round(tight * 100)) + "%" + "\nBreak trigger: close " + (isBull ? "above " : "below ") + str.tostring(isBull ? s.zoneTop : s.zoneBot, format.mintick) + "\nFailure trigger: close " + (isBull ? "below " : "above ") + str.tostring(s.stairPrice, format.mintick))
+
+// extend the level and wedge to the current bar, converging the wedge at its apex
+extendStructure(Structure s) =>
+    bool  isBull    = s.direction == 1
+    float innerEdge = isBull ? s.zoneBot : s.zoneTop
+    if showZoneInput and not na(s.zoneBx)
+        s.zoneBx.set_right(bar_index)
+        s.zoneBx.set_top(s.zoneTop)
+        s.zoneBx.set_bottom(s.zoneBot)
+    if showWedgeInput and not na(s.prsLine) and not na(s.edgLine)
+        float slope = (s.stairPrice - s.originPrice) / math.max(1, s.stairBar - s.originBar)
+        int lineEnd = bar_index
+        if slope != 0
+            int apexBar = s.originBar + math.floor((innerEdge - s.originPrice) / slope)
+            lineEnd := math.min(bar_index, math.max(apexBar, s.stairBar))
+        s.prsLine.set_xy2(lineEnd, s.originPrice + slope * (lineEnd - s.originBar))
+        s.edgLine.set_xy1(s.originBar, innerEdge)
+        s.edgLine.set_xy2(lineEnd, innerEdge)
+    if showTriggerInput and not na(s.trgLine)
+        s.trgLine.set_x2(bar_index)
+    updateGrade(s)
+
+freezeStructure(Structure s) =>
+    if not na(s.zoneBx)
+        s.zoneBx.set_right(bar_index)
+    if not na(s.trgLine)
+        s.trgLine.set_x2(bar_index)
+
+// build the on-chart structure: level zone, pressure wedge, failure trigger, consumed bases, grade label
+newStructure(int dirIn, float zTop, float zBot, int zStart, float oP, int oB, float sP, int sB, float d0, int touchesIn, int swingsIn, array<float> basePArr, array<int> baseBArr) =>
+    bool  isBull     = dirIn == 1
+    color pressCol   = isBull ? bullColorInput : bearColorInput
+    color counterCol = isBull ? bearColorInput : bullColorInput
+    float innerEdge  = isBull ? zBot : zTop
+    box      bx  = box(na)
+    line     prs = line(na)
+    line     edg = line(na)
+    linefill wdg = linefill(na)
+    line     trg = line(na)
+    label    grd = label(na)
+    if showZoneInput
+        bx := box.new(zStart, zTop, bar_index, zBot, border_color = color.new(counterCol, 40), border_width = 1, bgcolor = color.new(counterCol, 88))
+    if showWedgeInput
+        prs := line.new(oB, oP, sB, sP, color = pressCol, width = 2)
+        edg := line.new(oB, innerEdge, sB, innerEdge, color = #00000000)
+        wdg := linefill.new(prs, edg, color.new(pressCol, 90))
+    if showTriggerInput
+        trg := line.new(sB, sP, bar_index, sP, color = color.new(counterCol, 25), style = line.style_dashed)
+    if showGradeInput
+        grd := label.new(bar_index, math.avg(zTop, zBot), "", style = label.style_label_left, color = #00000000, textcolor = pressCol, size = size.small)
+    if showBasesInput and array.size(basePArr) > 0
+        for q = 0 to array.size(basePArr) - 1
+            label.new(array.get(baseBArr, q), array.get(basePArr, q), "", style = label.style_circle, color = color.new(neutralColorInput, 30), size = size.tiny, tooltip = BASE_TIP)
+    Structure.new(direction = dirIn, zoneTop = zTop, zoneBot = zBot, zoneStart = zStart, originPrice = oP, originBar = oB, stairPrice = sP, stairBar = sB, depthFirst = d0, depthLast = isBull ? zTop - sP : sP - zBot, touches = touchesIn, swings = swingsIn, zoneBx = bx, prsLine = prs, edgLine = edg, wdgFill = wdg, trgLine = trg, grdLabel = grd)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+atrValue  = ta.atr(ATR_LEN)
+pivotHigh = ta.pivothigh(swingLengthInput, swingLengthInput)
+pivotLow  = ta.pivotlow(swingLengthInput, swingLengthInput)
+
+float tolerance   = toleranceInput * atrValue
+float minApproach = approachInput * atrValue
+
+var Structure st = na
+var int lastEndBar = -1
+
+// event flags, reset every bar
+bool detResEvt   = false
+bool detSupEvt   = false
+bool resBreakEvt = false
+bool resFailEvt  = false
+bool supBreakEvt = false
+bool supFailEvt  = false
+
+// update the zigzag with any swing point confirmed this bar
+int  pivotBar = bar_index - swingLengthInput
+bool newPivot = not na(pivotHigh) or not na(pivotLow)
+if not na(pivotHigh) and not na(pivotLow)
+    bool lastIsHigh = close >= open
+    if array.size(zzT) > 0
+        lastIsHigh := array.get(zzT, array.size(zzT) - 1)
+    if lastIsHigh
+        pushPivot(false, pivotLow, pivotBar)
+        pushPivot(true, pivotHigh, pivotBar)
+    else
+        pushPivot(true, pivotHigh, pivotBar)
+        pushPivot(false, pivotLow, pivotBar)
+else if not na(pivotHigh)
+    pushPivot(true, pivotHigh, pivotBar)
+else if not na(pivotLow)
+    pushPivot(false, pivotLow, pivotBar)
+
+// manage the active structure on new swing points
+if not na(st) and newPivot
+    bool isBull = st.direction == 1
+    // stair side: another step toward the level must keep the series shrinking
+    float stairPvt = isBull ? pivotLow : pivotHigh
+    if not na(stairPvt)
+        bool  stepping = isBull ? stairPvt > st.stairPrice : stairPvt < st.stairPrice
+        float dNew     = isBull ? st.zoneTop - stairPvt : stairPvt - st.zoneBot
+        if stepping and dNew > 0 and dNew < st.depthLast * ratioInput
+            st.stairPrice := stairPvt
+            st.stairBar   := pivotBar
+            st.depthLast  := dNew
+            st.swings     := st.swings + 1
+            if showTriggerInput and not na(st.trgLine)
+                st.trgLine.set_xy1(pivotBar, stairPvt)
+                st.trgLine.set_xy2(bar_index, stairPvt)
+            if showWedgeInput and not na(st.prsLine)
+                st.prsLine.set_xy2(pivotBar, stairPvt)
+            if showBasesInput
+                label.new(pivotBar, stairPvt, "", style = label.style_circle, color = color.new(neutralColorInput, 30), size = size.tiny, tooltip = BASE_TIP)
+        else if stepping and dNew > 0
+            // still stepping, but the pullback series stopped shrinking — the squeeze eased without resolving
+            freezeStructure(st)
+            if showGradeInput and not na(st.grdLabel)
+                st.grdLabel.set_text((isBull ? "Compression ▲" : "Compression ▼") + "\nEased — series no longer shrinking")
+                st.grdLabel.set_textcolor(neutralColorInput)
+            lastEndBar := bar_index
+            st := na
+    // touch side: another test of the level, widening the zone within tolerance
+    if not na(st)
+        float touchPvt = isBull ? pivotHigh : pivotLow
+        if not na(touchPvt)
+            float nTop = math.max(st.zoneTop, touchPvt)
+            float nBot = math.min(st.zoneBot, touchPvt)
+            if nTop - nBot <= tolerance
+                st.zoneTop    := nTop
+                st.zoneBot    := nBot
+                st.touches    := st.touches + 1
+                st.depthFirst := isBull ? st.zoneTop - st.originPrice : st.originPrice - st.zoneBot
+                st.depthLast  := isBull ? st.zoneTop - st.stairPrice : st.stairPrice - st.zoneBot
+
+// detect a fresh compression structure: into resistance first, otherwise into support
+if na(st) and newPivot and not na(atrValue)
+    [okRes, zTopR, zBotR, zStartR, oPr, oBr, sPr, sBr, d0r, tcR, swR, basePr, baseBr] = detect(true, tolerance, minApproach, lastEndBar)
+    if okRes
+        st := newStructure(1, zTopR, zBotR, zStartR, oPr, oBr, sPr, sBr, d0r, tcR, swR, basePr, baseBr)
+        detResEvt := true
+    else
+        [okSup, zTopS, zBotS, zStartS, oPs, oBs, sPs, sBs, d0s, tcS, swS, basePs, baseBs] = detect(false, tolerance, minApproach, lastEndBar)
+        if okSup
+            st := newStructure(-1, zTopS, zBotS, zStartS, oPs, oBs, sPs, sBs, d0s, tcS, swS, basePs, baseBs)
+            detSupEvt := true
+
+// extend visuals and refresh the pressure grade
+if not na(st)
+    extendStructure(st)
+
+// resolution: break through the level, or failure back through the last stair-step swing
+if not na(st)
+    bool isBull   = st.direction == 1
+    bool breakEvt = isBull ? close > st.zoneTop : close < st.zoneBot
+    bool failEvt  = not breakEvt and (isBull ? close < st.stairPrice : close > st.stairPrice)
+    if breakEvt or failEvt
+        color pressCol   = isBull ? bullColorInput : bearColorInput
+        color counterCol = isBull ? bearColorInput : bullColorInput
+        if showMarkersInput
+            if breakEvt
+                label.new(bar_index, isBull ? low : high, "Break", style = isBull ? label.style_label_up : label.style_label_down, color = pressCol, textcolor = chart.bg_color, size = size.small, tooltip = "Compression resolved through the level — the break runs on the stops beyond it")
+            else
+                label.new(bar_index, isBull ? high : low, "Reject", style = isBull ? label.style_label_down : label.style_label_up, color = counterCol, textcolor = chart.bg_color, size = size.small, tooltip = "Compression failed at the level — last stair-step swing lost")
+        if failEvt and showTargetInput
+            int span = math.min(math.max(bar_index - st.originBar, 10), TARGET_MAX_SPAN)
+            line.new(bar_index, st.originPrice, bar_index + span, st.originPrice, color = color.new(neutralColorInput, 20), style = line.style_dotted)
+            label.new(bar_index + span, st.originPrice, "Origin target", style = label.style_label_left, color = #00000000, textcolor = neutralColorInput, size = size.tiny, tooltip = TARGET_TIP)
+        if breakEvt
+            if isBull
+                resBreakEvt := true
+            else
+                supBreakEvt := true
+        else
+            if isBull
+                resFailEvt := true
+            else
+                supFailEvt := true
+        lastEndBar := bar_index
+        st := na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(detResEvt, "Bullish Compression Detected", "Compression into resistance detected — higher lows squeezing under a proven ceiling, resolution near")
+alertcondition(detSupEvt, "Bearish Compression Detected", "Compression into support detected — lower highs squeezing over a proven floor, resolution near")
+alertcondition(resBreakEvt, "Resistance Break (Bullish Resolution)", "Compression into resistance resolved upward — close above the level")
+alertcondition(resFailEvt, "Resistance Rejection (Bearish Resolution)", "Compression into resistance failed — last rising low broken, rejection targets the compression origin")
+alertcondition(supBreakEvt, "Support Break (Bearish Resolution)", "Compression into support resolved downward — close below the level")
+alertcondition(supFailEvt, "Support Rejection (Bullish Resolution)", "Compression into support failed — last falling high broken, rejection targets the compression origin")
+
+//---------------------------------------------------------------------------------------------------------------------}

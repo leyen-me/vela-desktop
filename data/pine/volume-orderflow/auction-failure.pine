@@ -1,0 +1,554 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Auction Failure"
+  , shorttitle       = "Auction Failure"
+  , overlay          = true
+  , format           = format.price
+  , max_lines_count  = 500
+  , max_labels_count = 500
+  , max_boxes_count  = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+//Tracker states: no probe under way, probe beyond the reference being auctioned, probe accepted (failure ruled out)
+int ST_IDLE     = 0
+int ST_PROBING  = 1
+int ST_ACCEPTED = 2
+
+//Per-bar tracker events
+int EV_NONE         = 0
+int EV_FAIL_ABANDON = 1
+int EV_FAIL_REJECT  = 2
+int EV_ACCEPT       = 3
+
+//Tracker slots, one per side of each reference family
+int REF_PRIOR_HIGH = 0
+int REF_PRIOR_LOW  = 1
+int REF_IB_HIGH    = 2
+int REF_IB_LOW     = 3
+int REF_RANGE_HIGH = 4
+int REF_RANGE_LOW  = 5
+int REF_VAH        = 6
+int REF_VAL        = 7
+int REF_COUNT      = 8
+
+string NAME_PRIOR_HIGH = "prior session high"
+string NAME_PRIOR_LOW  = "prior session low"
+string NAME_IB_HIGH    = "initial balance high"
+string NAME_IB_LOW     = "initial balance low"
+string NAME_RANGE_HIGH = "rolling range high"
+string NAME_RANGE_LOW  = "rolling range low"
+string NAME_VAH        = "prior value area high"
+string NAME_VAL        = "prior value area low"
+
+int MS_PER_MINUTE   = 60000
+int ATR_LENGTH      = 14
+int MAX_SESSION_BARS = 20000
+
+color BULL_COLOR   = #089981
+color BEAR_COLOR   = #f23645
+color PRIOR_COLOR  = #ff9800   // reference families are told apart by hue: orange prior session
+color IB_COLOR     = #ffd700   // gold initial balance
+color RANGE_COLOR  = #787b86   // grey rolling range - the generic structural boundary
+color VA_COLOR     = #ab47bc   // purple value area
+color TRANSP_COLOR = #00000000
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_TEXT   = #DBDBDB
+
+int LEVEL_TRANSP       = 45
+int PROBE_TRANSP       = 0
+int ZONE_FILL_TRANSP   = 88
+int ZONE_BORDER_TRANSP = 55
+int TARGET_MID_TRANSP  = 50
+int TARGET_OPP_TRANSP  = 25
+int ACC_TEXT_TRANSP    = 25
+int NOTICE_BG_TRANSP   = 80
+
+string GROUP_DETECT = "Auction Failure"
+string GROUP_REFS   = "References"
+string GROUP_STYLE  = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+acceptBarsInput = input.int(6, "Acceptance: Bars Held Beyond"
+  , minval  = 1
+  , maxval  = 100
+  , group   = GROUP_DETECT
+  , tooltip = "Consecutive closes beyond the reference after which the probe counts as accepted - genuine range expansion that can no longer fail. Profile traders commonly use time-based acceptance of one or more 30-minute periods, e.g. 6 bars on a 5-minute chart; quicker returns are treated as failures.")
+
+confirmBarsInput = input.int(1, "Failure Confirmation: Closes Back Inside"
+  , minval  = 1
+  , maxval  = 10
+  , group   = GROUP_DETECT
+  , tooltip = "Consecutive closes back on the original side of the reference required to confirm the failure. 1 signals on the first close back inside; higher values demand that price holds back inside, the stricter reading of confirmation as the return that holds.")
+
+minPenInput = input.float(0.0, "Minimum Penetration (xATR)"
+  , minval  = 0
+  , step    = 0.05
+  , group   = GROUP_DETECT
+  , tooltip = "Distance beyond the reference, as a multiple of the 14-period ATR, price must probe before a probe is tracked. 0 counts any poke beyond the level; raise it to ignore marginal pokes that never truly advertised beyond the reference.")
+
+rejThresholdInput = input.float(1.0, "Rejection Volume Threshold"
+  , minval  = 0
+  , step    = 0.1
+  , group   = GROUP_DETECT
+  , tooltip = "Volume transacted beyond the reference during the probe, measured in average bars of volume, at or above which the failure is classified as a rejection - responsive traders faded the probe aggressively. Below it the failure is classified as abandonment - the advertisement simply found no interest.")
+
+volLenInput = input.int(20, "Average Volume Length"
+  , minval  = 1
+  , group   = GROUP_DETECT
+  , tooltip = "Bars in the simple moving average of volume used as the participation baseline for the rejection / abandonment classification.")
+
+usePriorInput = input.bool(true, "Prior Session High/Low"
+  , group   = GROUP_REFS
+  , tooltip = "Auctions the prior session's high and low - the reference every breakout trader watches. Sessions follow the chart's daily periods, so this family is active on intraday charts only.")
+
+useIbInput = input.bool(true, "Initial Balance Extremes"
+  , group   = GROUP_REFS
+  , tooltip = "Auctions the initial balance high and low once the opening window completes. A failed auction off the initial balance early in the day often sets the rotation that dominates the remaining hours. Intraday charts only.")
+
+ibMinutesInput = input.int(60, "Initial Balance Length (Minutes)"
+  , minval  = 5
+  , step    = 5
+  , group   = GROUP_REFS
+  , tooltip = "Length of the initial balance window from the session open. The classic market profile definition is the first hour of trade - the first two 30-minute periods. On charts whose timeframe exceeds this window the initial balance references are disabled.")
+
+useRangeInput = input.bool(true, "Rolling Range Extremes"
+  , group   = GROUP_REFS
+  , tooltip = "Auctions the highest high and lowest low of the preceding bars - the generic range-boundary reference, and the only family available on daily and higher timeframes. The boundary is frozen when a probe begins so the probe cannot raise its own reference.")
+
+rangeLenInput = input.int(50, "Range Length (Bars)"
+  , minval  = 2
+  , group   = GROUP_REFS
+  , tooltip = "Lookback, in bars, of the rolling range whose extremes are auctioned. Longer windows track slower, more meaningful range boundaries.")
+
+useVaInput = input.bool(false, "Prior Session Value Area"
+  , group   = GROUP_REFS
+  , tooltip = "Auctions the edges of the prior session's value area, computed from a volume-at-price profile of the completed session. The prior point of control serves as the interim rotation target. Intraday charts only.")
+
+vaRowsInput = input.int(24, "Value Area Profile Rows"
+  , minval  = 10
+  , maxval  = 50
+  , group   = GROUP_REFS
+  , tooltip = "Number of price rows in the prior-session volume profile the value area is derived from. More rows resolve the value area edges more finely.")
+
+vaPctInput = input.float(70, "Value Area Volume %"
+  , minval  = 50
+  , maxval  = 95
+  , step    = 1
+  , group   = GROUP_REFS
+  , tooltip = "Share of the prior session's volume the value area contains. 70% is the market profile convention.")
+
+showLevelsInput = input.bool(true, "Show Reference Levels"
+  , group   = GROUP_STYLE
+  , tooltip = "Plots the active reference levels. A level brightens while an unresolved probe beyond it is under way.")
+
+showZonesInput = input.bool(true, "Failed Probe Zones"
+  , group   = GROUP_STYLE
+  , tooltip = "Shades the failed excursion - from the reference to the probe extreme, over the bars the probe lasted.")
+
+showTargetsInput = input.bool(true, "Rotation Targets"
+  , group   = GROUP_STYLE
+  , tooltip = "Projects dotted lines at the mid of the failed reference's range (interim target) and at its opposite extreme (full rotation target).")
+
+targetExtInput = input.int(30, "Target Extension (Bars)"
+  , minval  = 5
+  , maxval  = 200
+  , group   = GROUP_STYLE
+  , tooltip = "How many bars the rotation target lines extend to the right of the failure bar.")
+
+showAccInput = input.bool(true, "Acceptance Markers"
+  , group   = GROUP_STYLE
+  , tooltip = "Marks probes that built acceptance beyond their reference - the breakout-filter side of the read.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish Events", inline = "events", group = GROUP_STYLE)
+
+bearColorInput = input.color(BEAR_COLOR, "Bearish Events", inline = "events", group = GROUP_STYLE)
+
+priorColorInput = input.color(PRIOR_COLOR, "Prior Session", inline = "famA", group = GROUP_STYLE)
+
+ibColorInput = input.color(IB_COLOR, "Initial Balance", inline = "famA", group = GROUP_STYLE)
+
+rangeColorInput = input.color(RANGE_COLOR, "Range", inline = "famB", group = GROUP_STYLE)
+
+vaColorInput = input.color(VA_COLOR, "Value Area", inline = "famB", group = GROUP_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+//Parallel state storage, one slot per tracked reference side
+var array<int>   refStateArray   = array.new_int(REF_COUNT, ST_IDLE)
+var array<float> refLevelArray   = array.new_float(REF_COUNT, na)
+var array<int>   refStartArray   = array.new_int(REF_COUNT, 0)
+var array<float> refExtremeArray = array.new_float(REF_COUNT, na)
+var array<float> refVolArray     = array.new_float(REF_COUNT, 0.0)
+var array<int>   refHeldArray    = array.new_int(REF_COUNT, 0)
+var array<int>   refInsideArray  = array.new_int(REF_COUNT, 0)
+
+//Discards any unresolved probe, used when the session rolls and the auction context changes
+resetAuctionRef(int idx) =>
+    array.set(refStateArray,   idx, ST_IDLE)
+    array.set(refLevelArray,   idx, na)
+    array.set(refStartArray,   idx, 0)
+    array.set(refExtremeArray, idx, na)
+    array.set(refVolArray,     idx, 0.0)
+    array.set(refHeldArray,    idx, 0)
+    array.set(refInsideArray,  idx, 0)
+
+//True when the tracker event is a confirmed auction failure of either type
+isFailure(int eventCode) =>
+    eventCode == EV_FAIL_ABANDON or eventCode == EV_FAIL_REJECT
+
+//One reference side's auction state machine: ignition beyond the reference, then either time acceptance
+//beyond it or a return back through it - the auction failure. Returns the bar's event code.
+updateAuction(int idx, bool isUpper, float liveLevel, float oppLevel, float midLevel, string refName, float volBaseline, float penOffset) =>
+    int eventCode = EV_NONE
+    int st = array.get(refStateArray, idx)
+
+    //Probe ignition: price advertises beyond the reference. The level is frozen here so a moving
+    //boundary cannot chase its own probe
+    if st == ST_IDLE and not na(liveLevel)
+        bool ignited = isUpper ? high > liveLevel + penOffset : low < liveLevel - penOffset
+        if ignited
+            st := ST_PROBING
+            array.set(refLevelArray,   idx, liveLevel)
+            array.set(refStartArray,   idx, bar_index)
+            array.set(refExtremeArray, idx, isUpper ? high : low)
+            array.set(refVolArray,     idx, 0.0)
+            array.set(refHeldArray,    idx, 0)
+            array.set(refInsideArray,  idx, 0)
+
+    float lvl = array.get(refLevelArray, idx)
+
+    if st == ST_PROBING
+        //Track the probe extreme and estimate the volume transacted beyond the reference,
+        //attributing each bar's volume by the share of its range that traded beyond the level
+        float extreme = isUpper ? math.max(array.get(refExtremeArray, idx), high) : math.min(array.get(refExtremeArray, idx), low)
+        array.set(refExtremeArray, idx, extreme)
+
+        float barSpan = high - low
+        float beyondPortion = 0.0
+        if isUpper
+            beyondPortion := barSpan > 0 ? math.max(0.0, (high - math.max(low, lvl)) / barSpan) : high > lvl ? 1.0 : 0.0
+        else
+            beyondPortion := barSpan > 0 ? math.max(0.0, (math.min(high, lvl) - low) / barSpan) : low < lvl ? 1.0 : 0.0
+
+        float volBeyond = array.get(refVolArray, idx) + nz(volume) * beyondPortion
+        array.set(refVolArray, idx, volBeyond)
+
+        bool closedBeyond = isUpper ? close > lvl : close < lvl
+
+        if closedBeyond
+            int held = array.get(refHeldArray, idx) + 1
+            array.set(refHeldArray, idx, held)
+            array.set(refInsideArray, idx, 0)
+
+            if held >= acceptBarsInput
+                //Acceptance: time built beyond the reference - the auction found business at the new
+                //prices, so the quick-failure read is off the table for this probe
+                st := ST_ACCEPTED
+                eventCode := EV_ACCEPT
+
+                if showAccInput
+                    color accColor = isUpper ? bullColorInput : bearColorInput
+                    string accTip = "Acceptance " + (isUpper ? "above" : "below") + " the " + refName + " (" + str.tostring(lvl, format.mintick) + ")"
+                    accTip := accTip + " - " + str.tostring(held) + " consecutive closes held beyond the reference"
+                    if volBaseline > 0
+                        accTip := accTip + ", with " + str.tostring(volBeyond / volBaseline, "#.##") + "x an average bar's volume transacted beyond it"
+                    accTip := accTip + ". The auction found follow-through instead of failing."
+                    label.new(bar_index, lvl, "ACC", color = TRANSP_COLOR, textcolor = color.new(accColor, ACC_TEXT_TRANSP), style = isUpper ? label.style_label_up : label.style_label_down, size = size.tiny, tooltip = accTip)
+        else
+            int inside = array.get(refInsideArray, idx) + 1
+            array.set(refInsideArray, idx, inside)
+            array.set(refHeldArray, idx, 0)
+
+            if inside >= confirmBarsInput
+                //Auction failure: the probe returned through the reference before building acceptance.
+                //Volume beyond the level separates rejection (faded aggressively) from abandonment (no interest)
+                float volRatio = volBaseline > 0 ? volBeyond / volBaseline : na
+                bool isRejection = not na(volRatio) and volRatio >= rejThresholdInput
+                eventCode := isRejection ? EV_FAIL_REJECT : EV_FAIL_ABANDON
+                st := ST_IDLE
+
+                color evColor = isUpper ? bearColorInput : bullColorInput
+                int startBar = array.get(refStartArray, idx)
+                int probeBars = bar_index - startBar + 1
+
+                if showZonesInput
+                    box.new(startBar, isUpper ? extreme : lvl, bar_index, isUpper ? lvl : extreme, border_color = color.new(evColor, ZONE_BORDER_TRANSP), bgcolor = color.new(evColor, ZONE_FILL_TRANSP))
+
+                string failTip = "Failed auction " + (isUpper ? "above" : "below") + " the " + refName + " (" + str.tostring(lvl, format.mintick) + ")"
+                failTip := failTip + "\nType: " + (na(volRatio) ? "unclassified - no volume data" : isRejection ? "rejection - responsive traders faded the probe" : "abandonment - the probe found no interest")
+                if not na(volRatio)
+                    failTip := failTip + "\nVolume beyond the reference: " + str.tostring(volRatio, "#.##") + "x an average bar"
+                failTip := failTip + "\nProbe: " + str.tostring(probeBars) + (probeBars == 1 ? " bar" : " bars") + ", extreme " + str.tostring(extreme, format.mintick)
+                if not na(midLevel)
+                    failTip := failTip + "\nInterim rotation target (mid): " + str.tostring(midLevel, format.mintick)
+                if not na(oppLevel)
+                    failTip := failTip + "\nFull rotation target (opposite extreme): " + str.tostring(oppLevel, format.mintick)
+
+                label.new(bar_index, extreme, "AF", color = TRANSP_COLOR, textcolor = evColor, style = isUpper ? label.style_label_down : label.style_label_up, size = size.small, tooltip = failTip)
+
+                if showTargetsInput
+                    if not na(midLevel)
+                        line.new(bar_index, midLevel, bar_index + targetExtInput, midLevel, color = color.new(evColor, TARGET_MID_TRANSP), style = line.style_dotted)
+                    if not na(oppLevel)
+                        line.new(bar_index, oppLevel, bar_index + targetExtInput, oppLevel, color = color.new(evColor, TARGET_OPP_TRANSP), style = line.style_dotted)
+    else if st == ST_ACCEPTED
+        //An accepted auction re-arms silently once price eventually trades back through the reference -
+        //a return that comes after acceptance is no longer the prompt return that defines a failure
+        bool backInside = isUpper ? close < lvl : close > lvl
+        if backInside
+            st := ST_IDLE
+
+    array.set(refStateArray, idx, st)
+    eventCode
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Session References
+//---------------------------------------------------------------------------------------------------------------------{
+
+//Session-scoped references follow the chart's daily periods, so they are only defined intraday
+bool sessionOk  = timeframe.isintraday
+bool newSession = sessionOk and timeframe.change("D")
+
+//Prior session high/low
+var float curSesHigh   = na
+var float curSesLow    = na
+var float priorSesHigh = na
+var float priorSesLow  = na
+
+//Initial balance window
+var int   sessionStartTime = na
+var float ibHigh   = na
+var float ibLow    = na
+var bool  ibLocked = false
+
+//Prior session value area, from a volume-at-price profile of the completed session
+var array<float> sesHighArray = array.new_float()
+var array<float> sesLowArray  = array.new_float()
+var array<float> sesVolArray  = array.new_float()
+var float priorVah = na
+var float priorVal = na
+var float priorPoc = na
+
+if newSession
+    //Roll the completed session into the prior-session references
+    priorSesHigh := curSesHigh
+    priorSesLow  := curSesLow
+    curSesHigh   := high
+    curSesLow    := low
+
+    if useVaInput
+        int storedBars = array.size(sesVolArray)
+        priorVah := na
+        priorVal := na
+        priorPoc := na
+
+        if storedBars > 0
+            float sesHi    = array.max(sesHighArray)
+            float sesLo    = array.min(sesLowArray)
+            float totalVol = array.sum(sesVolArray)
+
+            if sesHi > sesLo and totalVol > 0
+                //Distribute each stored bar's volume across the profile rows its range covers
+                int rows = vaRowsInput
+                float rowH = (sesHi - sesLo) / rows
+                array<float> binArray = array.new_float(rows, 0.0)
+
+                for i = 0 to storedBars - 1
+                    float barHi  = array.get(sesHighArray, i)
+                    float barLo  = array.get(sesLowArray, i)
+                    float barVol = array.get(sesVolArray, i)
+                    if barHi - barLo <= 0
+                        int flatIdx = int(math.min(rows - 1, math.max(0, math.floor((barHi - sesLo) / rowH))))
+                        array.set(binArray, flatIdx, array.get(binArray, flatIdx) + barVol)
+                    else
+                        for r = 0 to rows - 1
+                            float rowLo = sesLo + r * rowH
+                            float rowHi = rowLo + rowH
+                            float overlap = math.max(0.0, math.min(barHi, rowHi) - math.max(barLo, rowLo))
+                            if overlap > 0
+                                array.set(binArray, r, array.get(binArray, r) + barVol * overlap / (barHi - barLo))
+
+                //Point of control row, then the value area expands toward the heavier neighboring row
+                //until it holds the configured share of the session's volume
+                int pocIdx = 0
+                float pocVol = -1.0
+                for r = 0 to rows - 1
+                    if array.get(binArray, r) > pocVol
+                        pocVol := array.get(binArray, r)
+                        pocIdx := r
+
+                float targetVol = totalVol * vaPctInput / 100
+                int upIdx = pocIdx
+                int dnIdx = pocIdx
+                float cumVol = array.get(binArray, pocIdx)
+
+                while cumVol < targetVol and (upIdx < rows - 1 or dnIdx > 0)
+                    float upVol = upIdx < rows - 1 ? array.get(binArray, upIdx + 1) : -1.0
+                    float dnVol = dnIdx > 0 ? array.get(binArray, dnIdx - 1) : -1.0
+                    if upVol >= dnVol
+                        upIdx += 1
+                        cumVol += upVol
+                    else
+                        dnIdx -= 1
+                        cumVol += dnVol
+
+                priorVah := sesLo + (upIdx + 1) * rowH
+                priorVal := sesLo + dnIdx * rowH
+                priorPoc := sesLo + (pocIdx + 0.5) * rowH
+
+        array.clear(sesHighArray)
+        array.clear(sesLowArray)
+        array.clear(sesVolArray)
+
+    //Fresh initial balance for the new session
+    sessionStartTime := time
+    ibHigh   := na
+    ibLow    := na
+    ibLocked := false
+else if sessionOk
+    curSesHigh := math.max(nz(curSesHigh, high), high)
+    curSesLow  := math.min(nz(curSesLow, low), low)
+
+//The initial balance builds through the opening window and locks once it elapses - its extremes only
+//become auctionable references from that point on
+if sessionOk and not na(sessionStartTime) and not ibLocked
+    if time - sessionStartTime < ibMinutesInput * MS_PER_MINUTE
+        ibHigh := math.max(nz(ibHigh, high), high)
+        ibLow  := math.min(nz(ibLow, low), low)
+    else
+        ibLocked := true
+
+if useVaInput and sessionOk and array.size(sesVolArray) < MAX_SESSION_BARS
+    array.push(sesHighArray, high)
+    array.push(sesLowArray, low)
+    array.push(sesVolArray, nz(volume))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Auction Failure Detection
+//---------------------------------------------------------------------------------------------------------------------{
+
+//Participation baseline, penetration filter and the rolling range boundary (previous bars only,
+//so the current probe is never part of its own reference)
+float volSma       = ta.sma(nz(volume), volLenInput)
+float atrValue     = ta.atr(ATR_LENGTH)
+float rangeHighRaw = ta.highest(high, rangeLenInput)
+float rangeLowRaw  = ta.lowest(low, rangeLenInput)
+
+float penOffset  = minPenInput > 0 ? minPenInput * nz(atrValue) : 0.0
+float rangeHigh  = rangeHighRaw[1]
+float rangeLow   = rangeLowRaw[1]
+
+//Live reference levels and each family's rotation targets - the mid as the interim reference and the
+//opposite extreme as the full rotation destination (the prior point of control for the value area).
+//The initial balance is only auctionable when the chart timeframe fits inside its window
+bool ibFeasible = timeframe.in_seconds(timeframe.period) <= ibMinutesInput * 60
+
+float priorMid  = (priorSesHigh + priorSesLow) / 2
+float ibRefHigh = ibLocked and ibFeasible ? ibHigh : na
+float ibRefLow  = ibLocked and ibFeasible ? ibLow : na
+float ibMid     = (ibRefHigh + ibRefLow) / 2
+float rangeMid  = (rangeHigh + rangeLow) / 2
+
+float priorHighLevel = usePriorInput ? priorSesHigh : na
+float priorLowLevel  = usePriorInput ? priorSesLow : na
+float ibHighLevel    = useIbInput ? ibRefHigh : na
+float ibLowLevel     = useIbInput ? ibRefLow : na
+float rangeHighLevel = useRangeInput ? rangeHigh : na
+float rangeLowLevel  = useRangeInput ? rangeLow : na
+float vahLevel       = useVaInput ? priorVah : na
+float valLevel       = useVaInput ? priorVal : na
+
+//A new session changes the auction context, so unresolved probes of session-scoped references are discarded
+if newSession
+    resetAuctionRef(REF_PRIOR_HIGH)
+    resetAuctionRef(REF_PRIOR_LOW)
+    resetAuctionRef(REF_IB_HIGH)
+    resetAuctionRef(REF_IB_LOW)
+    resetAuctionRef(REF_VAH)
+    resetAuctionRef(REF_VAL)
+
+int evPriorHigh = updateAuction(REF_PRIOR_HIGH, true,  priorHighLevel, priorLowLevel,  priorMid, NAME_PRIOR_HIGH, volSma, penOffset)
+int evPriorLow  = updateAuction(REF_PRIOR_LOW,  false, priorLowLevel,  priorHighLevel, priorMid, NAME_PRIOR_LOW,  volSma, penOffset)
+int evIbHigh    = updateAuction(REF_IB_HIGH,    true,  ibHighLevel,    ibLowLevel,     ibMid,    NAME_IB_HIGH,    volSma, penOffset)
+int evIbLow     = updateAuction(REF_IB_LOW,     false, ibLowLevel,     ibHighLevel,    ibMid,    NAME_IB_LOW,     volSma, penOffset)
+int evRangeHigh = updateAuction(REF_RANGE_HIGH, true,  rangeHighLevel, rangeLowLevel,  rangeMid, NAME_RANGE_HIGH, volSma, penOffset)
+int evRangeLow  = updateAuction(REF_RANGE_LOW,  false, rangeLowLevel,  rangeHighLevel, rangeMid, NAME_RANGE_LOW,  volSma, penOffset)
+int evVah       = updateAuction(REF_VAH,        true,  vahLevel,       valLevel,       priorPoc, NAME_VAH,        volSma, penOffset)
+int evVal       = updateAuction(REF_VAL,        false, valLevel,       vahLevel,       priorPoc, NAME_VAL,        volSma, penOffset)
+
+//Per-side event flags for the alert runners
+bool failedAbove    = isFailure(evPriorHigh) or isFailure(evIbHigh) or isFailure(evRangeHigh) or isFailure(evVah)
+bool failedBelow    = isFailure(evPriorLow) or isFailure(evIbLow) or isFailure(evRangeLow) or isFailure(evVal)
+bool rejectionAbove = evPriorHigh == EV_FAIL_REJECT or evIbHigh == EV_FAIL_REJECT or evRangeHigh == EV_FAIL_REJECT or evVah == EV_FAIL_REJECT
+bool rejectionBelow = evPriorLow == EV_FAIL_REJECT or evIbLow == EV_FAIL_REJECT or evRangeLow == EV_FAIL_REJECT or evVal == EV_FAIL_REJECT
+bool acceptedAbove  = evPriorHigh == EV_ACCEPT or evIbHigh == EV_ACCEPT or evRangeHigh == EV_ACCEPT or evVah == EV_ACCEPT
+bool acceptedBelow  = evPriorLow == EV_ACCEPT or evIbLow == EV_ACCEPT or evRangeLow == EV_ACCEPT or evVal == EV_ACCEPT
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+
+//Session-scoped levels blank on the bar their value steps, drawing clean horizontal segments; the
+//rolling range draws continuously. A level brightens while a probe beyond it is unresolved
+float priorHighPlot = showLevelsInput and not na(priorHighLevel) and not na(priorHighLevel[1]) and priorHighLevel == priorHighLevel[1] ? priorHighLevel : na
+float priorLowPlot  = showLevelsInput and not na(priorLowLevel) and not na(priorLowLevel[1]) and priorLowLevel == priorLowLevel[1] ? priorLowLevel : na
+float ibHighPlot    = showLevelsInput and not na(ibHighLevel) and not na(ibHighLevel[1]) and ibHighLevel == ibHighLevel[1] ? ibHighLevel : na
+float ibLowPlot     = showLevelsInput and not na(ibLowLevel) and not na(ibLowLevel[1]) and ibLowLevel == ibLowLevel[1] ? ibLowLevel : na
+float rangeHighPlot = showLevelsInput and useRangeInput ? rangeHigh : na
+float rangeLowPlot  = showLevelsInput and useRangeInput ? rangeLow : na
+float vahPlot       = showLevelsInput and not na(vahLevel) and not na(vahLevel[1]) and vahLevel == vahLevel[1] ? vahLevel : na
+float valPlot       = showLevelsInput and not na(valLevel) and not na(valLevel[1]) and valLevel == valLevel[1] ? valLevel : na
+
+color priorHighColor = color.new(priorColorInput, array.get(refStateArray, REF_PRIOR_HIGH) == ST_PROBING ? PROBE_TRANSP : LEVEL_TRANSP)
+color priorLowColor  = color.new(priorColorInput, array.get(refStateArray, REF_PRIOR_LOW) == ST_PROBING ? PROBE_TRANSP : LEVEL_TRANSP)
+color ibHighColor    = color.new(ibColorInput, array.get(refStateArray, REF_IB_HIGH) == ST_PROBING ? PROBE_TRANSP : LEVEL_TRANSP)
+color ibLowColor     = color.new(ibColorInput, array.get(refStateArray, REF_IB_LOW) == ST_PROBING ? PROBE_TRANSP : LEVEL_TRANSP)
+color rangeHighColor = color.new(rangeColorInput, array.get(refStateArray, REF_RANGE_HIGH) == ST_PROBING ? PROBE_TRANSP : LEVEL_TRANSP)
+color rangeLowColor  = color.new(rangeColorInput, array.get(refStateArray, REF_RANGE_LOW) == ST_PROBING ? PROBE_TRANSP : LEVEL_TRANSP)
+color vahColor       = color.new(vaColorInput, array.get(refStateArray, REF_VAH) == ST_PROBING ? PROBE_TRANSP : LEVEL_TRANSP)
+color valColor       = color.new(vaColorInput, array.get(refStateArray, REF_VAL) == ST_PROBING ? PROBE_TRANSP : LEVEL_TRANSP)
+
+plot(priorHighPlot, "Prior Session High", priorHighColor, 1, plot.style_linebr)
+plot(priorLowPlot, "Prior Session Low", priorLowColor, 1, plot.style_linebr)
+plot(ibHighPlot, "Initial Balance High", ibHighColor, 1, plot.style_linebr)
+plot(ibLowPlot, "Initial Balance Low", ibLowColor, 1, plot.style_linebr)
+plot(rangeHighPlot, "Rolling Range High", rangeHighColor, 1, plot.style_linebr)
+plot(rangeLowPlot, "Rolling Range Low", rangeLowColor, 1, plot.style_linebr)
+plot(vahPlot, "Prior Value Area High", vahColor, 1, plot.style_linebr)
+plot(valPlot, "Prior Value Area Low", valColor, 1, plot.style_linebr)
+
+//Chart-compatibility notice: session-scoped families need an intraday chart
+var table noticeTable = table.new(position.top_right, 1, 1, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+if barstate.islast and not sessionOk and (usePriorInput or useIbInput or useVaInput)
+    table.cell(noticeTable, 0, 0, "auction failure: prior session, initial balance and value area references require an intraday chart - only the rolling range is tracked", text_color = DASH_TEXT, text_size = size.small, bgcolor = DASH_BG)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(failedAbove, "Failed Auction Above", "Failed auction above a tracked reference on {{ticker}} ({{interval}}) - the upside probe returned back inside before building acceptance; buyers of the probe are trapped and rotation toward the range mid or opposite extreme is the common follow-through")
+
+alertcondition(failedBelow, "Failed Auction Below", "Failed auction below a tracked reference on {{ticker}} ({{interval}}) - the downside probe returned back inside before building acceptance; sellers of the probe are trapped and rotation toward the range mid or opposite extreme is the common follow-through")
+
+alertcondition(rejectionAbove, "Rejection Failure Above", "Rejection-type auction failure above a tracked reference on {{ticker}} ({{interval}}) - heavy volume was absorbed beyond the level and responsive sellers faded the probe, the stronger form of the signal")
+
+alertcondition(rejectionBelow, "Rejection Failure Below", "Rejection-type auction failure below a tracked reference on {{ticker}} ({{interval}}) - heavy volume was absorbed beyond the level and responsive buyers faded the probe, the stronger form of the signal")
+
+alertcondition(acceptedAbove, "Acceptance Above Reference", "Price built time acceptance above a tracked reference on {{ticker}} ({{interval}}) - the auction higher found follow-through, the condition breakout traders demand before joining range expansion")
+
+alertcondition(acceptedBelow, "Acceptance Below Reference", "Price built time acceptance below a tracked reference on {{ticker}} ({{interval}}) - the auction lower found follow-through, the condition breakout traders demand before joining range expansion")
+
+//---------------------------------------------------------------------------------------------------------------------}

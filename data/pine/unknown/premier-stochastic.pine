@@ -1,0 +1,133 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Premier Stochastic", "Premier Stochastic", overlay = false, precision = 2)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+OSC_MIDPOINT = 50.0 // midpoint removed from the 0-100 stochastic %K to center it on zero
+NORM_FACTOR  = 0.1  // Leibfarth's rescale factor: the centered %K becomes ±5 before smoothing, deep enough into the sigmoid to reach the ±0.9 zones
+
+CENTER_LEVEL = 0.0
+UPPER_RAIL   = 1.0
+LOWER_RAIL   = -1.0
+
+FILL_VALUE_TRANSP  = 50  // gradient transparency at the oscillator end of the fill
+FILL_CENTER_TRANSP = 100 // gradient transparency at the zero-line end of the fill
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+kLengthInput = input.int(8, "%K Length", minval = 1, group = "Settings"
+  , tooltip = "Lookback of the raw stochastic %K — where the close sits inside the high/low range of the last N bars, on a 0-100 scale. Leibfarth's 2008 article uses a short 8-bar window, fast enough that the raw line actually visits its extremes before the transform reshapes it.")
+
+smoothPeriodInput = input.int(25, "Smoothing Period", minval = 1, group = "Settings"
+  , tooltip = "Controls the double EMA smoothing of the centered %K: each of the two EMAs uses the square root of this period as its length (25 → 5), per the original construction. Larger values suppress more one-bar whipsaws at the cost of a bar or two of extra lag — the usual trade.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Thresholds
+//---------------------------------------------------------------------------------------------------------------------{
+upperOuterInput = input.float(0.9, "Upper Outer Threshold", minval = 0, maxval = 1, step = 0.05, group = "Thresholds"
+  , tooltip = "Boundary of the upper stretched-momentum zone, +0.9 by convention. A cross back down through it after a visit above is read as momentum fading from a stretched state — in a strong trend the line can ride beyond it for many bars, so exits from the zone, rather than entries into it, are the more common trigger.")
+
+upperInnerInput = input.float(0.2, "Upper Inner Threshold", minval = 0, maxval = 1, step = 0.05, group = "Thresholds"
+  , tooltip = "Upper edge of the neutral band, +0.2 by convention. A cross up through it flags a fresh bullish directional shift; the sigmoid steepens movement through this region, so crossings tend to be decisive rather than grazing.")
+
+lowerInnerInput = input.float(-0.2, "Lower Inner Threshold", minval = -1, maxval = 0, step = 0.05, group = "Thresholds"
+  , tooltip = "Lower edge of the neutral band, -0.2 by convention. A cross down through it flags a fresh bearish directional shift. Neither band crossing is a standalone entry — they are momentum-shift reads.")
+
+lowerOuterInput = input.float(-0.9, "Lower Outer Threshold", minval = -1, maxval = 0, step = 0.05, group = "Thresholds"
+  , tooltip = "Boundary of the lower stretched-momentum zone, -0.9 by convention. A cross back up through it after a visit below is read as downside momentum fading from a stretched state — the bullish mirror of the upper-zone exit.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Style
+//---------------------------------------------------------------------------------------------------------------------{
+bullColorInput = input.color(#089981, "Bullish", inline = "direction", group = "Style"
+  , tooltip = "Color of the oscillator and gradient fill above the zero line.")
+
+bearColorInput = input.color(#f23645, "Bearish", inline = "direction", group = "Style"
+  , tooltip = "Color of the oscillator and gradient fill below the zero line.")
+
+gradientFillInput = input.bool(true, "Gradient Fill", group = "Style"
+  , tooltip = "Vertical gradient between the oscillator and the zero line, fully transparent at zero and more opaque at the value.")
+
+markersInput = input.bool(false, "Signal Markers", group = "Style"
+  , tooltip = "Circles on the oscillator where it exits a ±0.9 stretched zone and diamonds where it crosses out of the ±0.2 neutral band. Off by default to keep the pane clean — the matching alerts fire regardless.")
+
+levelsColorInput = input.color(#787b86, "Levels Color", group = "Style"
+  , tooltip = "Color of the dashed threshold levels, the dotted zero line and the dotted ±1 rails.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Lee Leibfarth's exponential normalization (TASC, 2008): PSO(s) = (e^s - 1) / (e^s + 1), the same sigmoid
+// family as the inverse Fisher transform (algebraically tanh(s/2)). It steepens movement through the center
+// of the range and flattens it near the ±1 bounds, so the output travels decisively between extremes and
+// then levels off instead of wobbling through the middle the way a raw stochastic does.
+premierNormalize(float smoothed) =>
+    (math.exp(smoothed) - 1) / (math.exp(smoothed) + 1)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+// Each smoothing EMA uses the square root of the smoothing period as its length, per the published recipe
+emaLength = math.max(1, math.round(math.sqrt(smoothPeriodInput)))
+
+// Raw short-lookback %K, then centered on zero and rescaled to ±5 — the information source (where price
+// closed within its recent range) is unchanged, only the footing the sigmoid operates on
+stochK = ta.stoch(close, high, low, kLengthInput)
+normK  = NORM_FACTOR * (stochK - OSC_MIDPOINT)
+
+// Double EMA smoothing cleans one-bar whipsaws out of the centered line before it is compressed; the
+// smoothed value stays within ±5, so the sigmoid output tops out near ±0.99 and the ±0.9 zones are reachable
+smoothK = ta.ema(ta.ema(normK, emaLength), emaLength)
+pso     = premierNormalize(smoothK)
+
+// Threshold events per the standard reading: crossings out of the ±0.2 neutral band are fresh directional
+// shifts, and crossings back out of the ±0.9 stretched zones mark momentum fading from an extreme
+bullShiftEvent = ta.crossover(pso, upperInnerInput)
+bearShiftEvent = ta.crossunder(pso, lowerInnerInput)
+upperFadeEvent = ta.crossunder(pso, upperOuterInput)
+lowerFadeEvent = ta.crossover(pso, lowerOuterInput)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+oscColor = pso > CENTER_LEVEL ? bullColorInput : bearColorInput
+
+fillTopColor    = pso > CENTER_LEVEL ? color.new(bullColorInput, FILL_VALUE_TRANSP) : color.new(bearColorInput, FILL_CENTER_TRANSP)
+fillBottomColor = pso > CENTER_LEVEL ? color.new(bullColorInput, FILL_CENTER_TRANSP) : color.new(bearColorInput, FILL_VALUE_TRANSP)
+
+oscPlotId    = plot(pso, "Premier Stochastic", oscColor, 2)
+centerPlotId = plot(CENTER_LEVEL, "Center", editable = false, display = display.none)
+
+fill(oscPlotId, centerPlotId
+  , math.max(pso, CENTER_LEVEL)
+  , math.min(pso, CENTER_LEVEL)
+  , gradientFillInput ? fillTopColor : na
+  , gradientFillInput ? fillBottomColor : na)
+
+hline(upperOuterInput, "Upper Outer Threshold", levelsColorInput, hline.style_dashed)
+hline(upperInnerInput, "Upper Inner Threshold", levelsColorInput, hline.style_dashed)
+hline(CENTER_LEVEL, "Zero Line", color.new(levelsColorInput, 50), hline.style_dotted)
+hline(lowerInnerInput, "Lower Inner Threshold", levelsColorInput, hline.style_dashed)
+hline(lowerOuterInput, "Lower Outer Threshold", levelsColorInput, hline.style_dashed)
+hline(UPPER_RAIL, "Upper Rail", color.new(levelsColorInput, 50), hline.style_dotted)
+hline(LOWER_RAIL, "Lower Rail", color.new(levelsColorInput, 50), hline.style_dotted)
+
+plotshape(markersInput and upperFadeEvent ? pso : na, "Upper Extreme Fade Marker", shape.circle, location.absolute, color = bearColorInput, size = size.tiny)
+plotshape(markersInput and lowerFadeEvent ? pso : na, "Lower Extreme Fade Marker", shape.circle, location.absolute, color = bullColorInput, size = size.tiny)
+plotshape(markersInput and bullShiftEvent ? pso : na, "Bullish Shift Marker", shape.diamond, location.absolute, color = bullColorInput, size = size.tiny)
+plotshape(markersInput and bearShiftEvent ? pso : na, "Bearish Shift Marker", shape.diamond, location.absolute, color = bearColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(bullShiftEvent, "Bullish Shift", "Premier Stochastic crossed up through the upper inner threshold on {{ticker}} ({{interval}}), fresh bullish momentum shift")
+alertcondition(bearShiftEvent, "Bearish Shift", "Premier Stochastic crossed down through the lower inner threshold on {{ticker}} ({{interval}}), fresh bearish momentum shift")
+alertcondition(upperFadeEvent, "Upper Extreme Fade", "Premier Stochastic crossed back below the upper outer threshold on {{ticker}} ({{interval}}), momentum fading from a stretched bullish state")
+alertcondition(lowerFadeEvent, "Lower Extreme Fade", "Premier Stochastic crossed back above the lower outer threshold on {{ticker}} ({{interval}}), momentum fading from a stretched bearish state")
+
+//---------------------------------------------------------------------------------------------------------------------}

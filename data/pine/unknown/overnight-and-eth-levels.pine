@@ -1,0 +1,475 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Overnight & ETH Levels", shorttitle = "Overnight & ETH Levels", overlay = true, format = format.price, max_lines_count = 500, max_labels_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+string GROUP_SESSIONS = "Sessions"
+string GROUP_DISPLAY  = "Display"
+string GROUP_DASH     = "Dashboard"
+string GROUP_STYLE    = "Style"
+
+string TZ_EXCHANGE = "Exchange"
+
+string POS_TR = "Top Right"
+string POS_TL = "Top Left"
+string POS_BR = "Bottom Right"
+string POS_BL = "Bottom Left"
+
+string SIZE_TINY   = "Tiny"
+string SIZE_SMALL  = "Small"
+string SIZE_NORMAL = "Normal"
+
+color COLOR_BULL    = #089981
+color COLOR_BEAR    = #f23645
+color COLOR_NEUTRAL = #5b9cf6
+color COLOR_GRAY    = #787b86
+color COLOR_NONE    = #00000000
+
+//level interaction states, advanced once per regular-session bar
+int ST_UNTESTED = 0
+int ST_TESTED   = 1
+int ST_BROKEN   = 2
+int ST_FADED    = 3
+
+//RTH open location relative to the overnight range
+int LOC_NONE   = 0
+int LOC_INSIDE = 1
+int LOC_ABOVE  = 2
+int LOC_BELOW  = 3
+
+tzInput = input.string("America/New_York", "Timezone"
+  , options = [TZ_EXCHANGE, "America/New_York", "America/Chicago", "America/Los_Angeles", "UTC", "Europe/London", "Europe/Berlin", "Asia/Tokyo", "Asia/Shanghai", "Asia/Kolkata", "Australia/Sydney"]
+  , group   = GROUP_SESSIONS
+  , tooltip = "Timezone the session windows are defined in. New York time matches the standard US conventions - the futures overnight session and the equity pre-market both run on the New York clock - and follows its daylight-saving changes whatever the chart's time zone. 'Exchange' uses the chart symbol's exchange timezone instead.")
+
+onSessionInput = input.session("1800-0930", "Overnight (ETH) Session"
+  , group   = GROUP_SESSIONS
+  , tooltip = "Extended-hours window whose extremes become the overnight levels: its high is the ONH, its low the ONL and their average the overnight midpoint. The 18:00-09:30 default is the US index futures convention, Globex reopen to the next regular open. For stocks, the span between the regular close and the next regular open is 1600-0930. Extended-hours data must be enabled on the chart or the window holds no bars.")
+
+rthSessionInput = input.session("0930-1600", "Regular Session (RTH)"
+  , group   = GROUP_SESSIONS
+  , tooltip = "Regular trading hours. The overnight and pre-market levels are frozen at this window's open and extended across it, the open is classified against the overnight range, and the dashboard and alerts track every test, break and fade. Use 0930-1615 for US index futures, 0930-1600 for US stocks.")
+
+pmEnabledInput = input.bool(true, "Pre-Market Session"
+  , inline  = "pm"
+  , group   = GROUP_SESSIONS
+  , tooltip = "Also track the pre-market high and low (PMH / PML), the equity extended-hours subset of the overnight map. On futures this is simply the late portion of the overnight session.")
+
+pmSessionInput = input.session("0400-0930", ""
+  , inline  = "pm"
+  , group   = GROUP_SESSIONS
+  , tooltip = "Pre-market window, 04:00-09:30 New York time by US equity convention.")
+
+showOnInput = input.bool(true, "Overnight High / Low"
+  , group   = GROUP_DISPLAY
+  , tooltip = "Plot the overnight session high (ONH) and low (ONL) and extend them across the regular session as the day's first reference map.")
+
+showMidInput = input.bool(true, "Overnight Midpoint"
+  , group   = GROUP_DISPLAY
+  , tooltip = "Plot the midpoint of the overnight range, the target of the inventory-correction read when the early session unwinds a one-sided overnight.")
+
+showDevelopingInput = input.bool(true, "Developing Levels"
+  , group   = GROUP_DISPLAY
+  , tooltip = "While an extended-hours window is forming, draw its running extremes as dotted lines that update live. The finished level then keeps the formation window inside its span.")
+
+fillRangeInput = input.bool(true, "Fill Overnight Range"
+  , group   = GROUP_DISPLAY
+  , tooltip = "Shade the area between the overnight high and low, so opens and trades inside versus outside the overnight range read at a glance.")
+
+showLabelsInput = input.bool(true, "Level Labels"
+  , group   = GROUP_DISPLAY
+  , tooltip = "Show a name and price label at the right end of each level.")
+
+showDashInput = input.bool(true, "Show Dashboard"
+  , group   = GROUP_DASH
+  , tooltip = "Status panel showing where the regular session opened relative to the overnight range and the live state of each level: untested, tested (touched intrabar), broken (closed beyond) or faded (closed back inside after a break).")
+
+dashPositionInput = input.string(POS_TR, "Position"
+  , options = [POS_TR, POS_TL, POS_BR, POS_BL]
+  , group   = GROUP_DASH
+  , tooltip = "Corner of the chart the dashboard is anchored to.")
+
+dashSizeInput = input.string(SIZE_SMALL, "Text Size"
+  , options = [SIZE_TINY, SIZE_SMALL, SIZE_NORMAL]
+  , group   = GROUP_DASH
+  , tooltip = "Text size of the dashboard.")
+
+onhColorInput = input.color(#f23645, "Overnight High"
+  , inline  = "onColors"
+  , group   = GROUP_STYLE
+  , tooltip = "Color of the overnight high line, its label and its dashboard entry.")
+
+onlColorInput = input.color(#089981, "Overnight Low"
+  , inline  = "onColors"
+  , group   = GROUP_STYLE
+  , tooltip = "Color of the overnight low line, its label and its dashboard entry.")
+
+midColorInput = input.color(#5b9cf6, "Overnight Midpoint"
+  , group   = GROUP_STYLE
+  , tooltip = "Color of the overnight midpoint line, its label and its dashboard entry.")
+
+pmhColorInput = input.color(#ff9800, "Pre-Market High"
+  , inline  = "pmColors"
+  , group   = GROUP_STYLE
+  , tooltip = "Color of the pre-market high line, its label and its dashboard entry.")
+
+pmlColorInput = input.color(#ab47bc, "Pre-Market Low"
+  , inline  = "pmColors"
+  , group   = GROUP_STYLE
+  , tooltip = "Color of the pre-market low line, its label and its dashboard entry.")
+
+fillColorInput = input.color(color.new(#5b9cf6, 94), "Range Fill"
+  , group   = GROUP_STYLE
+  , tooltip = "Color of the overnight range fill; keep it highly transparent so price stays readable.")
+
+lineWidthInput = input.int(1, "Line Width"
+  , minval  = 1
+  , maxval  = 5
+  , group   = GROUP_STYLE
+  , tooltip = "Width of every level line.")
+
+string dashTextSize = switch dashSizeInput
+    SIZE_TINY   => size.tiny
+    SIZE_NORMAL => size.normal
+    =>             size.small
+
+string dashPos = switch dashPositionInput
+    POS_TL => position.top_left
+    POS_BR => position.bottom_right
+    POS_BL => position.bottom_left
+    =>        position.top_right
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+//true when the current bar sits inside the given session window, in the selected timezone
+inWindow(string sessionWindow) =>
+    timeframe.isintraday and not na(time(timeframe.period, sessionWindow, tzInput == TZ_EXCHANGE ? syminfo.timezone : tzInput))
+
+//tracks one extended-hours window: start/end flags plus its running high and low
+trackSession(bool active) =>
+    var float sessHi = na
+    var float sessLo = na
+    bool wasActive = na(active[1]) ? false : active[1]
+    bool sessStart = active and not wasActive
+    bool sessEnd   = not active and wasActive
+    if sessStart
+        sessHi := high
+        sessLo := low
+    else if active
+        sessHi := math.max(nz(sessHi, high), high)
+        sessLo := math.min(nz(sessLo, low), low)
+    [sessStart, sessEnd, sessHi, sessLo]
+
+//advances one level's interaction state on a regular-session bar: the first touch tests it, a close beyond
+//breaks it (acceptance), a close back inside after a break fades it (rejection), and a later close beyond
+//breaks it again
+interactState(int currentState, float levelPrice, bool highSide) =>
+    int newState = currentState
+    if not na(levelPrice)
+        bool touched      = highSide ? high  >= levelPrice : low   <= levelPrice
+        bool closedBeyond = highSide ? close >  levelPrice : close <  levelPrice
+        bool closedBack   = highSide ? close <  levelPrice : close >  levelPrice
+        if currentState == ST_BROKEN
+            if closedBack
+                newState := ST_FADED
+        else if closedBeyond
+            newState := ST_BROKEN
+        else if touched and currentState == ST_UNTESTED
+            newState := ST_TESTED
+    newState
+
+statusText(int levelState) =>
+    levelState == ST_TESTED ? "Tested" : levelState == ST_BROKEN ? "Broken" : levelState == ST_FADED ? "Faded" : "Untested"
+
+//broken reads in the break's direction, faded in the reclaim's direction
+statusColor(int levelState, bool highSide) =>
+    levelState == ST_BROKEN ? (highSide ? COLOR_BULL : COLOR_BEAR) : levelState == ST_FADED ? (highSide ? COLOR_BEAR : COLOR_BULL) : levelState == ST_TESTED ? COLOR_NEUTRAL : COLOR_GRAY
+
+//creates one level line at the RTH open - or restyles the developing line already tracking it - and tags it
+//with a name/price label
+placeLevel(bool show, bool reuseLine, line lineId, label labelId, float levelPrice, string nameText, color css, string finalStyle) =>
+    line  newLine  = lineId
+    label newLabel = labelId
+    if show and not na(levelPrice)
+        if reuseLine and not na(lineId)
+            line.set_y1(lineId, levelPrice)
+            line.set_y2(lineId, levelPrice)
+            line.set_x2(lineId, bar_index)
+            line.set_style(lineId, finalStyle)
+        else
+            newLine := line.new(bar_index, levelPrice, bar_index, levelPrice, color = css, style = finalStyle, width = lineWidthInput)
+        if showLabelsInput
+            newLabel := label.new(bar_index, levelPrice, nameText + "  " + str.tostring(levelPrice, format.mintick), color = COLOR_NONE, textcolor = css, style = label.style_label_left, size = size.small)
+    [newLine, newLabel]
+
+//extends one level line (and its label) to the current regular-session bar
+extendLevel(line lineId, label labelId, float levelPrice) =>
+    if not na(levelPrice) and not na(lineId)
+        line.set_x2(lineId, bar_index)
+        if not na(labelId)
+            label.set_x(labelId, bar_index)
+
+//writes one row of the dashboard: level name, price and interaction state
+dashRow(table t, int rowIdx, string nameText, color nameCss, float levelPrice, string stateText, color stateCss) =>
+    table.cell(t, 0, rowIdx, nameText, text_color = nameCss, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(t, 1, rowIdx, na(levelPrice) ? "—" : str.tostring(levelPrice, format.mintick), text_color = chart.fg_color, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(t, 2, rowIdx, stateText, text_color = stateCss, text_size = dashTextSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Sessions
+//---------------------------------------------------------------------------------------------------------------------{
+bool inOn  = inWindow(onSessionInput)
+bool inRth = inWindow(rthSessionInput)
+bool inPm  = pmEnabledInput and inWindow(pmSessionInput)
+
+[onStart, onEnd, onHiLive, onLoLive] = trackSession(inOn)
+[pmStart, pmEnd, pmHiLive, pmLoLive] = trackSession(inPm)
+
+bool rthWasIn = na(inRth[1]) ? false : inRth[1]
+bool rthStart = inRth and not rthWasIn
+
+//true once any extended-hours bar has printed - RTH-only data feeds never set it
+var bool everEth = false
+if inOn or inPm
+    everEth := true
+
+//a completed window stays available to the next RTH open even when a data gap separates them
+var bool onFresh = false
+var bool pmFresh = false
+if onEnd and not na(onHiLive)
+    onFresh := true
+if pmEnd and not na(pmHiLive)
+    pmFresh := true
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Levels
+//---------------------------------------------------------------------------------------------------------------------{
+var float onhLevel = na
+var float onlLevel = na
+var float midLevel = na
+var float pmhLevel = na
+var float pmlLevel = na
+
+var float rthOpenPrice = na
+var int   openLocation = LOC_NONE
+
+var int  onhState   = ST_UNTESTED
+var int  onlState   = ST_UNTESTED
+var int  pmhState   = ST_UNTESTED
+var int  pmlState   = ST_UNTESTED
+var bool midReached = false
+
+//freeze the overnight and pre-market maps on the first bar of the regular session; a window still in
+//progress at the RTH open (overlapping definitions) freezes at its running extremes
+bool onFreeze = rthStart and (onFresh or inOn) and not na(onHiLive)
+bool pmFreeze = rthStart and (pmFresh or inPm) and not na(pmHiLive)
+
+if onFreeze
+    onhLevel     := onHiLive
+    onlLevel     := onLoLive
+    midLevel     := math.avg(onHiLive, onLoLive)
+    rthOpenPrice := open
+    openLocation := open > onhLevel ? LOC_ABOVE : open < onlLevel ? LOC_BELOW : LOC_INSIDE
+    onhState     := ST_UNTESTED
+    onlState     := ST_UNTESTED
+    midReached   := false
+    onFresh      := false
+
+if pmFreeze
+    pmhLevel := pmHiLive
+    pmlLevel := pmLoLive
+    pmhState := ST_UNTESTED
+    pmlState := ST_UNTESTED
+    pmFresh  := false
+
+//advance the interaction reads on regular-session bars
+int  onhPrevState  = onhState
+int  onlPrevState  = onlState
+int  pmhPrevState  = pmhState
+int  pmlPrevState  = pmlState
+bool midWasReached = midReached
+
+if inRth
+    onhState := interactState(onhState, onhLevel, true)
+    onlState := interactState(onlState, onlLevel, false)
+    pmhState := interactState(pmhState, pmhLevel, true)
+    pmlState := interactState(pmlState, pmlLevel, false)
+    if not na(midLevel) and high >= midLevel and low <= midLevel
+        midReached := true
+
+//event pulses for the alert section
+bool openAboveEvt  = onFreeze and openLocation == LOC_ABOVE
+bool openBelowEvt  = onFreeze and openLocation == LOC_BELOW
+bool onhTestedEvt  = onhState == ST_TESTED and onhPrevState == ST_UNTESTED
+bool onhBrokenEvt  = onhState == ST_BROKEN and onhPrevState != ST_BROKEN
+bool onhFadedEvt   = onhState == ST_FADED  and onhPrevState == ST_BROKEN
+bool onlTestedEvt  = onlState == ST_TESTED and onlPrevState == ST_UNTESTED
+bool onlBrokenEvt  = onlState == ST_BROKEN and onlPrevState != ST_BROKEN
+bool onlFadedEvt   = onlState == ST_FADED  and onlPrevState == ST_BROKEN
+bool midReachedEvt = midReached and not midWasReached
+bool pmhTestedEvt  = pmhState == ST_TESTED and pmhPrevState == ST_UNTESTED
+bool pmhBrokenEvt  = pmhState == ST_BROKEN and pmhPrevState != ST_BROKEN
+bool pmlTestedEvt  = pmlState == ST_TESTED and pmlPrevState == ST_UNTESTED
+bool pmlBrokenEvt  = pmlState == ST_BROKEN and pmlPrevState != ST_BROKEN
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visuals
+//---------------------------------------------------------------------------------------------------------------------{
+var line  onhLine  = na
+var line  onlLine  = na
+var line  midLine  = na
+var line  pmhLine  = na
+var line  pmlLine  = na
+var label onhLabel = na
+var label onlLabel = na
+var label midLabel = na
+var label pmhLabel = na
+var label pmlLabel = na
+
+var linefill onRangeFill = na
+var bool     onDevLive   = false
+var bool     pmDevLive   = false
+
+//developing extremes while the extended-hours windows form
+if showDevelopingInput
+    if onStart
+        if showOnInput
+            onhLine := line.new(bar_index, high, bar_index, high, color = onhColorInput, style = line.style_dotted, width = lineWidthInput)
+            onlLine := line.new(bar_index, low,  bar_index, low,  color = onlColorInput, style = line.style_dotted, width = lineWidthInput)
+            if fillRangeInput
+                onRangeFill := linefill.new(onhLine, onlLine, fillColorInput)
+        if showMidInput
+            midLine := line.new(bar_index, math.avg(high, low), bar_index, math.avg(high, low), color = midColorInput, style = line.style_dotted, width = lineWidthInput)
+        onDevLive := showOnInput or showMidInput
+    else if inOn and onDevLive
+        if not na(onhLine)
+            line.set_y1(onhLine, onHiLive)
+            line.set_y2(onhLine, onHiLive)
+            line.set_x2(onhLine, bar_index)
+        if not na(onlLine)
+            line.set_y1(onlLine, onLoLive)
+            line.set_y2(onlLine, onLoLive)
+            line.set_x2(onlLine, bar_index)
+        if not na(midLine)
+            float devMid = math.avg(onHiLive, onLoLive)
+            line.set_y1(midLine, devMid)
+            line.set_y2(midLine, devMid)
+            line.set_x2(midLine, bar_index)
+    if pmStart
+        pmhLine   := line.new(bar_index, high, bar_index, high, color = pmhColorInput, style = line.style_dotted, width = lineWidthInput)
+        pmlLine   := line.new(bar_index, low,  bar_index, low,  color = pmlColorInput, style = line.style_dotted, width = lineWidthInput)
+        pmDevLive := true
+    else if inPm and pmDevLive
+        if not na(pmhLine)
+            line.set_y1(pmhLine, pmHiLive)
+            line.set_y2(pmhLine, pmHiLive)
+            line.set_x2(pmhLine, bar_index)
+        if not na(pmlLine)
+            line.set_y1(pmlLine, pmLoLive)
+            line.set_y2(pmlLine, pmLoLive)
+            line.set_x2(pmlLine, bar_index)
+
+//place the frozen levels at the RTH open, reusing the developing lines when they exist
+if onFreeze
+    bool reuseOn = onDevLive
+    [newOnhLine, newOnhLabel] = placeLevel(showOnInput, reuseOn, onhLine, onhLabel, onhLevel, "ONH", onhColorInput, line.style_solid)
+    onhLine  := newOnhLine
+    onhLabel := newOnhLabel
+    [newOnlLine, newOnlLabel] = placeLevel(showOnInput, reuseOn, onlLine, onlLabel, onlLevel, "ONL", onlColorInput, line.style_solid)
+    onlLine  := newOnlLine
+    onlLabel := newOnlLabel
+    [newMidLine, newMidLabel] = placeLevel(showMidInput, reuseOn, midLine, midLabel, midLevel, "ON Mid", midColorInput, line.style_dotted)
+    midLine  := newMidLine
+    midLabel := newMidLabel
+    if fillRangeInput and showOnInput and not na(onhLine) and not na(onlLine) and (not reuseOn or na(onRangeFill))
+        onRangeFill := linefill.new(onhLine, onlLine, fillColorInput)
+    onDevLive := false
+
+if pmFreeze
+    bool reusePm = pmDevLive
+    [newPmhLine, newPmhLabel] = placeLevel(pmEnabledInput, reusePm, pmhLine, pmhLabel, pmhLevel, "PMH", pmhColorInput, line.style_dashed)
+    pmhLine  := newPmhLine
+    pmhLabel := newPmhLabel
+    [newPmlLine, newPmlLabel] = placeLevel(pmEnabledInput, reusePm, pmlLine, pmlLabel, pmlLevel, "PML", pmlColorInput, line.style_dashed)
+    pmlLine  := newPmlLine
+    pmlLabel := newPmlLabel
+    pmDevLive := false
+
+//extend the reference levels across the regular session
+if inRth
+    extendLevel(onhLine, onhLabel, onhLevel)
+    extendLevel(onlLine, onlLabel, onlLevel)
+    extendLevel(midLine, midLabel, midLevel)
+    extendLevel(pmhLine, pmhLabel, pmhLevel)
+    extendLevel(pmlLine, pmlLabel, pmlLevel)
+
+//level values in the data window: developing while the window forms, frozen across the regular session
+float onhDisplay = inOn ? onHiLive : onhLevel
+float onlDisplay = inOn ? onLoLive : onlLevel
+float midDisplay = inOn ? math.avg(onHiLive, onLoLive) : midLevel
+float pmhDisplay = inPm ? pmHiLive : pmhLevel
+float pmlDisplay = inPm ? pmLoLive : pmlLevel
+
+plot(showOnInput    ? onhDisplay : na, "Overnight High (ONH)",   onhColorInput, 1, display = display.data_window, editable = false)
+plot(showOnInput    ? onlDisplay : na, "Overnight Low (ONL)",    onlColorInput, 1, display = display.data_window, editable = false)
+plot(showMidInput   ? midDisplay : na, "Overnight Midpoint",     midColorInput, 1, display = display.data_window, editable = false)
+plot(pmEnabledInput ? pmhDisplay : na, "Pre-Market High (PMH)",  pmhColorInput, 1, display = display.data_window, editable = false)
+plot(pmEnabledInput ? pmlDisplay : na, "Pre-Market Low (PML)",   pmlColorInput, 1, display = display.data_window, editable = false)
+
+//the session windows cannot be resolved on daily and higher charts
+if barstate.islast and not timeframe.isintraday
+    var table warnTable = table.new(position.top_right, 1, 1)
+    table.cell(warnTable, 0, 0, "Overnight & ETH Levels requires an intraday chart"
+      , text_color = chart.fg_color
+      , text_size  = size.small
+      , bgcolor    = color.new(COLOR_BEAR, 80))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dash = showDashInput ? table.new(dashPos, 3, 6, bgcolor = color.new(chart.bg_color, 20), frame_color = color.new(chart.fg_color, 80), frame_width = 1, border_color = color.new(chart.fg_color, 90), border_width = 1) : table(na)
+
+if showDashInput and barstate.islast and timeframe.isintraday and not na(dash)
+    table.clear(dash, 0, 0, 2, 5)
+    if not everEth
+        table.cell(dash, 0, 0, "No extended-hours data - enable ETH / pre-market data on the chart or adjust the session windows"
+          , text_color = chart.fg_color
+          , text_size  = dashTextSize
+          , bgcolor    = color.new(COLOR_BEAR, 80))
+    else
+        bool onForming = inOn and not inRth
+        bool pmForming = inPm and not inRth
+
+        string locText = openLocation == LOC_ABOVE ? "Above ONH" : openLocation == LOC_BELOW ? "Below ONL" : openLocation == LOC_INSIDE ? "Inside ON Range" : "—"
+        color  locCss  = openLocation == LOC_ABOVE ? COLOR_BULL : openLocation == LOC_BELOW ? COLOR_BEAR : openLocation == LOC_INSIDE ? COLOR_NEUTRAL : COLOR_GRAY
+
+        dashRow(dash, 0, "RTH Open", color.new(chart.fg_color, 30), onForming ? na : rthOpenPrice, onForming ? "ETH forming…" : locText, onForming ? COLOR_GRAY : locCss)
+        dashRow(dash, 1, "ONH",    onhColorInput, onhDisplay, onForming ? "forming…" : na(onhLevel) ? "—" : statusText(onhState), onForming ? COLOR_GRAY : statusColor(onhState, true))
+        dashRow(dash, 2, "ON Mid", midColorInput, midDisplay, onForming ? "forming…" : na(midLevel) ? "—" : midReached ? "Reached" : "Untested", onForming ? COLOR_GRAY : midReached ? COLOR_NEUTRAL : COLOR_GRAY)
+        dashRow(dash, 3, "ONL",    onlColorInput, onlDisplay, onForming ? "forming…" : na(onlLevel) ? "—" : statusText(onlState), onForming ? COLOR_GRAY : statusColor(onlState, false))
+        if pmEnabledInput
+            dashRow(dash, 4, "PMH", pmhColorInput, pmhDisplay, pmForming ? "forming…" : na(pmhLevel) ? "—" : statusText(pmhState), pmForming ? COLOR_GRAY : statusColor(pmhState, true))
+            dashRow(dash, 5, "PML", pmlColorInput, pmlDisplay, pmForming ? "forming…" : na(pmlLevel) ? "—" : statusText(pmlState), pmForming ? COLOR_GRAY : statusColor(pmlState, false))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(openAboveEvt,  "RTH Open Above Overnight High", "{{ticker}} opened the regular session above the overnight high - watch for acceptance (range extension) or a fade back inside the overnight range")
+alertcondition(openBelowEvt,  "RTH Open Below Overnight Low",  "{{ticker}} opened the regular session below the overnight low - watch for acceptance (range extension) or a fade back inside the overnight range")
+alertcondition(onhTestedEvt,  "Overnight High Tested",         "RTH price tested the overnight high on {{ticker}} - first touch of the ONH this regular session")
+alertcondition(onhBrokenEvt,  "Overnight High Broken",         "RTH price closed above the overnight high on {{ticker}} - acceptance beyond the ONH argues for range extension higher")
+alertcondition(onhFadedEvt,   "Overnight High Break Faded",    "{{ticker}} closed back below the overnight high after breaking it - failed break, the classic fade back toward the other side of the overnight range")
+alertcondition(onlTestedEvt,  "Overnight Low Tested",          "RTH price tested the overnight low on {{ticker}} - first touch of the ONL this regular session")
+alertcondition(onlBrokenEvt,  "Overnight Low Broken",          "RTH price closed below the overnight low on {{ticker}} - acceptance beyond the ONL argues for range extension lower")
+alertcondition(onlFadedEvt,   "Overnight Low Break Faded",     "{{ticker}} closed back above the overnight low after breaking it - failed break, the classic fade back toward the other side of the overnight range")
+alertcondition(midReachedEvt, "Overnight Midpoint Reached",    "RTH price reached the overnight midpoint on {{ticker}} - overnight inventory corrected back to the middle of the range")
+alertcondition(pmhTestedEvt,  "Pre-Market High Tested",        "RTH price tested the pre-market high on {{ticker}} - first touch of the PMH this regular session")
+alertcondition(pmhBrokenEvt,  "Pre-Market High Broken",        "RTH price closed above the pre-market high on {{ticker}} - acceptance beyond the pre-market extreme")
+alertcondition(pmlTestedEvt,  "Pre-Market Low Tested",         "RTH price tested the pre-market low on {{ticker}} - first touch of the PML this regular session")
+alertcondition(pmlBrokenEvt,  "Pre-Market Low Broken",         "RTH price closed below the pre-market low on {{ticker}} - acceptance beyond the pre-market extreme")
+
+//---------------------------------------------------------------------------------------------------------------------}

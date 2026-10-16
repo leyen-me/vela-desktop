@@ -1,0 +1,264 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Kagi", shorttitle = "Kagi", overlay = true, format = format.price, max_lines_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+M_ATR = 'ATR'
+M_PCT = 'Percentage'
+M_FIX = 'Fixed Amount'
+
+COLOR_NEUTRAL = #787b86
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+srcInput = input.source(close, 'Source', group = 'Kagi', tooltip = 'Price series the Kagi line is built from. Classic Kagi charts use closing prices.')
+
+methodInput = input.string(M_ATR, 'Reversal Method', options = [M_ATR, M_PCT, M_FIX], group = 'Kagi', tooltip = 'How the minimum reversal amount is defined. ATR adapts the filter to volatility so sensitivity stays roughly constant across regimes, Percentage scales it with price, Fixed Amount uses constant price units. Every structure on the chart is conditional on this choice.')
+
+atrLenInput = input.int(14, 'ATR Length', minval = 1, group = 'Kagi', tooltip = 'Lookback of the Average True Range used when the reversal method is ATR.')
+
+atrMultInput = input.float(1, 'ATR Multiplier', minval = 0.05, step = 0.05, group = 'Kagi', tooltip = 'Multiple of the ATR that price must retrace from the latest Kagi extreme before the line turns. Larger values filter more noise but turn later.')
+
+pctInput = input.float(1, 'Percentage', minval = 0.01, step = 0.25, group = 'Kagi', tooltip = 'Percent of the latest Kagi extreme that price must retrace before the line turns, when the reversal method is Percentage.')
+
+fixedInput = input.float(1, 'Fixed Amount', minval = 0, step = 0.5, group = 'Kagi', tooltip = 'Reversal amount in instrument price units, when the reversal method is Fixed Amount. There is no canonical value - choose and test it per instrument.')
+
+showDashInput = input.bool(true, 'Show Dashboard', group = 'Dashboard', tooltip = 'Summary of the current Kagi state: line direction, yin/yang thickness, and the effective reversal amount in price units.')
+
+dashLocInput = input.string('Top Right', 'Location', options = ['Top Right', 'Top Left', 'Bottom Right', 'Bottom Left', 'Middle Right'], group = 'Dashboard', tooltip = 'Position of the dashboard on the chart.')
+
+dashSizeInput = input.string('Small', 'Size', options = ['Tiny', 'Small', 'Normal'], group = 'Dashboard', tooltip = 'Text size of the dashboard.')
+
+yangColorInput = input.color(#089981, 'Yang (Thick)', inline = 'yang', group = 'Style')
+
+yangWidthInput = input.int(3, 'Width', minval = 1, maxval = 15, inline = 'yang', group = 'Style')
+
+yinColorInput = input.color(#f23645, 'Yin (Thin)', inline = 'yin', group = 'Style')
+
+yinWidthInput = input.int(1, 'Width', minval = 1, maxval = 15, inline = 'yin', group = 'Style')
+
+showLevelsInput = input.bool(true, 'Prior Kagi High/Low Levels', group = 'Style', tooltip = 'Extend dashed levels from the latest shoulder (prior Kagi high) and waist (prior Kagi low) - the levels whose break flips the line between yang and yin.')
+
+showMarkersInput = input.bool(false, 'Yin/Yang Flip Markers', group = 'Style', tooltip = 'Mark the bars where the Kagi line flips thickness. Off by default - the flip alerts cover these events.')
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+f_kagiColor(bool yang) =>
+    yang ? yangColorInput : yinColorInput
+
+f_kagiWidth(bool yang) =>
+    yang ? yangWidthInput : yinWidthInput
+
+f_tablePosition(string positionName) =>
+    switch positionName
+        'Top Right'    => position.top_right
+        'Top Left'     => position.top_left
+        'Bottom Right' => position.bottom_right
+        'Bottom Left'  => position.bottom_left
+        => position.middle_right
+
+f_textSize(string sizeName) =>
+    switch sizeName
+        'Tiny'  => size.tiny
+        'Small' => size.small
+        => size.normal
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Kagi Construction
+//---------------------------------------------------------------------------------------------------------------------{
+float src      = srcInput
+float atrValue = ta.atr(atrLenInput)
+
+// Construction state. The active line runs from lineStart to its running extreme lineTip; a turn only happens once
+// price retraces a full reversal amount from that extreme. priorHigh / priorLow hold the latest shoulder and waist,
+// the levels whose break flips the line thickness between yang and yin.
+var int   kagiDir      = 0
+var float originPrice  = na
+var int   originBar    = na
+var float lineStart    = na
+var int   lineStartBar = na
+var float lineTip      = na
+var int   lineTipBar   = na
+var float priorHigh    = na
+var float priorLow     = na
+var bool  isYang       = false
+var float flipLevel    = na
+
+// Drawings of the active line: the horizontal connector into it, the pre-flip vertical segment, and the post-flip
+// vertical segment once the prior extreme is taken out mid-line. Completed lines are left frozen on the chart.
+var line connLine      = na
+var line lineMain      = na
+var line lineFlip      = na
+var line priorHighLine = na
+var line priorLowLine  = na
+
+// Per-bar event flags feeding the markers and alert conditions.
+bool turnedUp    = false
+bool turnedDown  = false
+bool flippedYang = false
+bool flippedYin  = false
+
+if na(originPrice) and not na(src)
+    originPrice := src
+    originBar   := bar_index
+
+float refPrice = kagiDir == 0 ? originPrice : lineTip
+float rev      = methodInput == M_ATR ? atrValue * atrMultInput : methodInput == M_PCT ? math.abs(refPrice) * pctInput / 100 : fixedInput
+bool  revValid = not na(rev) and rev > 0
+
+// While the reversal amount is not computable yet (ATR warm-up), trail the origin forward so the chart starts cleanly.
+if kagiDir == 0 and not na(src) and not revValid
+    originPrice := src
+    originBar   := bar_index
+
+if not na(src) and revValid
+    if kagiDir == 0
+        // First line: direction is set by the first full reversal-sized move away from the origin.
+        if math.abs(src - originPrice) >= rev
+            kagiDir      := src > originPrice ? 1 : -1
+            isYang       := kagiDir == 1
+            lineStart    := originPrice
+            lineStartBar := originBar
+            lineTip      := src
+            lineTipBar   := bar_index
+            flipLevel    := na
+            connLine     := line.new(lineStartBar, lineStart, lineTipBar, lineStart, color = f_kagiColor(isYang), width = f_kagiWidth(isYang))
+            lineMain     := line.new(lineTipBar, lineStart, lineTipBar, lineTip, color = f_kagiColor(isYang), width = f_kagiWidth(isYang))
+            lineFlip     := na
+    else if kagiDir == 1
+        if src > lineTip
+            // Rising line extends to a new extreme; it turns yang the moment the prior Kagi high is exceeded.
+            lineTip    := src
+            lineTipBar := bar_index
+            if not isYang and not na(priorHigh) and src > priorHigh
+                isYang      := true
+                flipLevel   := priorHigh
+                flippedYang := true
+                line.set_y2(lineMain, flipLevel)
+                lineFlip := line.new(lineTipBar, flipLevel, lineTipBar, lineTip, color = f_kagiColor(true), width = f_kagiWidth(true))
+            line.set_x2(connLine, lineTipBar)
+            line.set_x1(lineMain, lineTipBar)
+            line.set_x2(lineMain, lineTipBar)
+            if na(flipLevel)
+                line.set_y2(lineMain, lineTip)
+            else
+                line.set_x1(lineFlip, lineTipBar)
+                line.set_x2(lineFlip, lineTipBar)
+                line.set_y2(lineFlip, lineTip)
+        else if lineTip - src >= rev
+            // Full reversal down: the finished top is a shoulder and becomes the new prior Kagi high.
+            priorHigh := lineTip
+            if showLevelsInput
+                if not na(priorHighLine)
+                    line.delete(priorHighLine)
+                priorHighLine := line.new(lineTipBar, lineTip, lineTipBar + 1, lineTip, extend = extend.right, color = color.new(yangColorInput, 50), style = line.style_dashed, width = 1)
+            bool wasYang = isYang
+            turnedDown   := true
+            lineStart    := lineTip
+            lineStartBar := lineTipBar
+            kagiDir      := -1
+            lineTip      := src
+            lineTipBar   := bar_index
+            flipLevel    := na
+            if wasYang and not na(priorLow) and src < priorLow
+                isYang     := false
+                flipLevel  := priorLow
+                flippedYin := true
+            connLine := line.new(lineStartBar, lineStart, lineTipBar, lineStart, color = f_kagiColor(wasYang), width = f_kagiWidth(wasYang))
+            if na(flipLevel)
+                lineMain := line.new(lineTipBar, lineStart, lineTipBar, lineTip, color = f_kagiColor(isYang), width = f_kagiWidth(isYang))
+                lineFlip := na
+            else
+                lineMain := line.new(lineTipBar, lineStart, lineTipBar, flipLevel, color = f_kagiColor(wasYang), width = f_kagiWidth(wasYang))
+                lineFlip := line.new(lineTipBar, flipLevel, lineTipBar, lineTip, color = f_kagiColor(isYang), width = f_kagiWidth(isYang))
+    else
+        if src < lineTip
+            // Falling line extends to a new extreme; it turns yin the moment the prior Kagi low is broken.
+            lineTip    := src
+            lineTipBar := bar_index
+            if isYang and not na(priorLow) and src < priorLow
+                isYang     := false
+                flipLevel  := priorLow
+                flippedYin := true
+                line.set_y2(lineMain, flipLevel)
+                lineFlip := line.new(lineTipBar, flipLevel, lineTipBar, lineTip, color = f_kagiColor(false), width = f_kagiWidth(false))
+            line.set_x2(connLine, lineTipBar)
+            line.set_x1(lineMain, lineTipBar)
+            line.set_x2(lineMain, lineTipBar)
+            if na(flipLevel)
+                line.set_y2(lineMain, lineTip)
+            else
+                line.set_x1(lineFlip, lineTipBar)
+                line.set_x2(lineFlip, lineTipBar)
+                line.set_y2(lineFlip, lineTip)
+        else if src - lineTip >= rev
+            // Full reversal up: the finished bottom is a waist and becomes the new prior Kagi low.
+            priorLow := lineTip
+            if showLevelsInput
+                if not na(priorLowLine)
+                    line.delete(priorLowLine)
+                priorLowLine := line.new(lineTipBar, lineTip, lineTipBar + 1, lineTip, extend = extend.right, color = color.new(yinColorInput, 50), style = line.style_dashed, width = 1)
+            bool wasYang = isYang
+            turnedUp     := true
+            lineStart    := lineTip
+            lineStartBar := lineTipBar
+            kagiDir      := 1
+            lineTip      := src
+            lineTipBar   := bar_index
+            flipLevel    := na
+            if not wasYang and not na(priorHigh) and src > priorHigh
+                isYang      := true
+                flipLevel   := priorHigh
+                flippedYang := true
+            connLine := line.new(lineStartBar, lineStart, lineTipBar, lineStart, color = f_kagiColor(wasYang), width = f_kagiWidth(wasYang))
+            if na(flipLevel)
+                lineMain := line.new(lineTipBar, lineStart, lineTipBar, lineTip, color = f_kagiColor(isYang), width = f_kagiWidth(isYang))
+                lineFlip := na
+            else
+                lineMain := line.new(lineTipBar, lineStart, lineTipBar, flipLevel, color = f_kagiColor(wasYang), width = f_kagiWidth(wasYang))
+                lineFlip := line.new(lineTipBar, flipLevel, lineTipBar, lineTip, color = f_kagiColor(isYang), width = f_kagiWidth(isYang))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dashTable = table.new(f_tablePosition(dashLocInput), 2, 3, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+if showDashInput and barstate.islast
+    string sizeTxt  = f_textSize(dashSizeInput)
+    string dirTxt   = kagiDir == 1 ? 'Up ▲' : kagiDir == -1 ? 'Down ▼' : '—'
+    color  dirCol   = kagiDir == 1 ? yangColorInput : kagiDir == -1 ? yinColorInput : DASH_TEXT
+    string stateTxt = kagiDir == 0 ? '—' : isYang ? 'Yang (thick)' : 'Yin (thin)'
+    color  stateCol = kagiDir == 0 ? DASH_TEXT : isYang ? yangColorInput : yinColorInput
+    string revTxt   = not revValid ? '—' : methodInput == M_ATR ? 'ATR(' + str.tostring(atrLenInput) + ') × ' + str.tostring(atrMultInput, '0.##') + ' = ' + str.tostring(rev, format.mintick) : methodInput == M_PCT ? str.tostring(pctInput, '0.##') + '% = ' + str.tostring(rev, format.mintick) : str.tostring(rev, format.mintick)
+    table.cell(dashTable, 0, 0, 'Direction', text_color = DASH_HEADER, text_size = sizeTxt, text_halign = text.align_left)
+    table.cell(dashTable, 1, 0, dirTxt, text_color = dirCol, text_size = sizeTxt, text_halign = text.align_right)
+    table.cell(dashTable, 0, 1, 'Line', text_color = DASH_HEADER, text_size = sizeTxt, text_halign = text.align_left)
+    table.cell(dashTable, 1, 1, stateTxt, text_color = stateCol, text_size = sizeTxt, text_halign = text.align_right)
+    table.cell(dashTable, 0, 2, 'Reversal', text_color = DASH_HEADER, text_size = sizeTxt, text_halign = text.align_left)
+    table.cell(dashTable, 1, 2, revTxt, text_color = DASH_TEXT, text_size = sizeTxt, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Plots, Markers & Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+plot(lineTip, 'Kagi Tip', color = COLOR_NEUTRAL, display = display.data_window)
+plot(kagiDir == 0 ? na : isYang ? 1 : 0, 'Yang (1) / Yin (0)', color = COLOR_NEUTRAL, display = display.data_window)
+
+plotshape(showMarkersInput and flippedYang, 'Yang Flip (Bullish)', shape.triangleup, location.belowbar, yangColorInput, size = size.tiny)
+plotshape(showMarkersInput and flippedYin, 'Yin Flip (Bearish)', shape.triangledown, location.abovebar, yinColorInput, size = size.tiny)
+
+alertcondition(flippedYang, 'Yang Flip (Bullish)', 'Kagi line turned yang (thick) - price exceeded the prior Kagi high (shoulder). Thin turning thick is the traditional buy indication.')
+alertcondition(flippedYin, 'Yin Flip (Bearish)', 'Kagi line turned yin (thin) - price broke the prior Kagi low (waist). Thick turning thin is the traditional sell indication.')
+alertcondition(turnedUp, 'Kagi Reversal Up', 'Kagi line reversed up - price advanced a full reversal amount from the latest low, starting a new rising line.')
+alertcondition(turnedDown, 'Kagi Reversal Down', 'Kagi line reversed down - price declined a full reversal amount from the latest high, starting a new falling line.')
+
+//---------------------------------------------------------------------------------------------------------------------}

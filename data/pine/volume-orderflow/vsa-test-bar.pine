@@ -1,0 +1,213 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("VSA Test Bar", "VSA Test Bar", overlay = true, max_labels_count = 500, max_lines_count = 250, max_boxes_count = 250)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+NEUTRAL_COLOR = #787b86
+
+TEST_GROUP     = 'Test Bar'
+CONTEXT_GROUP  = 'Supply Context'
+RESPONSE_GROUP = 'Response'
+STYLE_GROUP    = 'Style'
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+avgLenInput     = input.int(20, 'Average Length', minval = 2, group = TEST_GROUP, tooltip = 'Length of the simple moving averages of volume and spread (high - low) used as the recent baselines. Test volume and spread are judged against these baselines rather than eyeballed.')
+lowVolInput     = input.float(0.7, 'Low Volume Threshold', minval = 0.05, maxval = 1, step = 0.05, group = TEST_GROUP, tooltip = 'Maximum test bar volume as a multiple of the volume average. A valid test must print volume clearly below the recent average.')
+supplyFracInput = input.float(0.5, 'Max Fraction Of Supply Volume', minval = 0.05, maxval = 1, step = 0.05, group = TEST_GROUP, tooltip = 'Test bar volume must also stay below this fraction of the volume of the supply area it probes - well below the volume of the original supply bars.')
+spreadMultInput = input.float(1.0, 'Maximum Spread Multiple', minval = 0.25, maxval = 3, step = 0.25, group = TEST_GROUP, tooltip = 'Maximum test bar spread as a multiple of the average spread. 1 caps the test at an average sized bar, keeping the spread narrow to moderate.')
+closePosInput   = input.float(50, 'Minimum Close Position %', minval = 0, maxval = 100, step = 5, group = TEST_GROUP, tooltip = 'Lowest allowed close location within the bar range (0 = low, 100 = high). 50 keeps the close in the middle or upper part of the bar, 67 demands the upper third. The confirmation bar must close with the same firmness.')
+
+supplyMultInput = input.float(1.5, 'Supply Bar Volume Multiple', minval = 1, step = 0.25, group = CONTEXT_GROUP, tooltip = 'A down close bar with volume at or above this multiple of the volume average registers as a supply bar. Overlapping supply bars extend a single area, and that area holding afterward is the prior evidence of absorption a test requires.')
+ctxLenInput     = input.int(50, 'Context Lookback (Bars)', minval = 1, maxval = 500, group = CONTEXT_GROUP, tooltip = 'Maximum age in bars of the most recent supply bar for the context to stay valid. The context also breaks as soon as a bar closes below the area low - the lows did not hold.')
+
+confirmLenInput = input.int(5, 'Confirmation Window (Bars)', minval = 1, maxval = 20, group = RESPONSE_GROUP, tooltip = 'Bars allowed for the market response. A successful test must be confirmed within this window by an up bar closing firm on rising volume; no response, or a close below the test low, negates the read.')
+flagFailedInput = input.bool(true, 'Flag Failed Tests', group = RESPONSE_GROUP, tooltip = 'Flag probes of the supply area that instead draw heavy volume. A failed test warns that supply is still present, often preceding another leg down or more ranging.')
+failVolInput    = input.float(1.5, 'Failed Test Volume Multiple', minval = 1, step = 0.25, group = RESPONSE_GROUP, tooltip = 'Volume multiple of the average at or above which a probe of the supply area is flagged as a failed test - the dip attracted heavy volume.')
+
+bullColorInput = input.color(BULL_COLOR, 'Bullish', group = STYLE_GROUP, inline = 'col')
+bearColorInput = input.color(BEAR_COLOR, 'Bearish', group = STYLE_GROUP, inline = 'col')
+showZoneInput  = input.bool(true, 'Show Supply Area', group = STYLE_GROUP, tooltip = 'Shade the supply area being probed. The area switches to the bullish color once a test of it is confirmed.')
+showLineInput  = input.bool(true, 'Show Invalidation Line', group = STYLE_GROUP, tooltip = 'Draw the invalidation level at the test bar low while the test awaits its response and while a confirmed test plays out.')
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+//Baselines, computed on every bar
+volAvg    = ta.sma(volume, avgLenInput)
+spreadAvg = ta.sma(high - low, avgLenInput)
+
+barSpread   = high - low
+closePosPct = barSpread > 0 ? (close - low) / barSpread : 1.0
+minClosePos = closePosInput / 100
+
+hasBase = not na(volAvg) and volAvg > 0 and not na(spreadAvg) and not na(close[1])
+
+//Guard against symbols without volume data
+var float cumVol = 0.0
+cumVol += nz(volume)
+if barstate.islast and cumVol == 0
+    runtime.error('No volume is provided by the data vendor.')
+
+//VSA bar direction is judged close against prior close
+upBar   = hasBase and close > close[1]
+downBar = hasBase and close < close[1]
+
+//High volume down bar marking where supply appeared
+isSupplyBar = downBar and volume >= supplyMultInput * volAvg
+
+//Supply area state: the most recent cluster of high volume down bars whose lows held
+var bool  areaHeld    = false
+var float areaHigh    = na
+var float areaLow     = na
+var float areaVol     = na
+var int   areaLastBar = na
+var box   areaBox     = na
+
+//Context in place before this bar: recent supply whose low has held
+contextActive = areaHeld and not na(areaLastBar) and bar_index - areaLastBar <= ctxLenInput
+
+//Probe: the bar trades below the prior bar low, or reaches down into the supply area from above
+probeDip  = hasBase and (low < low[1] or contextActive and low <= areaHigh and low[1] > areaHigh)
+narrowOk  = hasBase and barSpread <= spreadMultInput * spreadAvg
+firmClose = closePosPct >= minClosePos
+
+//Test bar: a low volume probe into prior supply, narrow to moderate spread, closing firm and holding the area
+testAnatomy  = contextActive and probeDip and narrowOk and firmClose and close >= areaLow
+isTestBar    = testAnatomy and volume > 0 and volume <= lowVolInput * volAvg and volume <= supplyFracInput * areaVol
+isFailedTest = flagFailedInput and contextActive and probeDip and close >= areaLow and volume >= failVolInput * volAvg and not isTestBar
+
+//Response state
+var int   testState = 0 //0 = none, 1 = awaiting response, 2 = confirmed
+var float testLow   = na
+var float testVol   = na
+var int   testIndex = na
+var line  testLine  = na
+
+//Response bar: an up bar closing firm on rising volume
+confirmOk = upBar and firmClose and volume > nz(volume[1], volume)
+
+bool testEvent    = false
+bool confirmEvent = false
+bool negateEvent  = false
+bool failEvent    = false
+
+if barstate.isconfirmed
+    //Response to the active test, judged before any new signal on this bar
+    slideBelow = testState >= 1 and close < testLow
+
+    if testState == 1
+        if slideBelow
+            negateEvent := true
+        else if confirmOk and volume > testVol
+            confirmEvent := true
+        else if bar_index - testIndex >= confirmLenInput
+            negateEvent := true
+    else if testState == 2
+        if slideBelow
+            negateEvent := true
+        else if bar_index - testIndex > ctxLenInput
+            testState := 0
+
+    if negateEvent
+        testState := 0
+
+        if not na(testLine)
+            line.set_x2(testLine, bar_index)
+            line.set_color(testLine, color.new(bearColorInput, 25))
+
+        label.new(bar_index, testLow, '✕', style = label.style_none, textcolor = bearColorInput, size = size.small, tooltip = 'Test negated - no confirming response within the window, or a slide below the test bar low')
+
+    if confirmEvent
+        testState := 2
+
+        if not na(testLine)
+            line.set_style(testLine, line.style_solid)
+
+        //Supply at the tested area is judged exhausted
+        if areaHeld and not na(areaBox)
+            box.set_border_color(areaBox, color.new(bullColorInput, 60))
+            box.set_bgcolor(areaBox, color.new(bullColorInput, 88))
+
+        label.new(bar_index, na, '', yloc = yloc.belowbar, style = label.style_triangleup, color = bullColorInput, size = size.tiny, tooltip = 'Test confirmed - up bar closing firm on rising volume. Stop goes below the test bar low.')
+
+    //Extend the invalidation level while a test is active
+    if testState > 0 and not na(testLine)
+        line.set_x2(testLine, bar_index)
+
+    //New test bar: it replaces any pending test and defines its own invalidation at the bar low
+    if isTestBar
+        testState := 1
+        testLow   := low
+        testVol   := volume
+        testIndex := bar_index
+        testLine  := showLineInput ? line.new(bar_index, low, bar_index, low, color = bullColorInput, style = line.style_dashed) : line(na)
+
+        label.new(bar_index, na, 'Test', yloc = yloc.belowbar, style = label.style_label_up, color = bullColorInput, textcolor = chart.bg_color, size = size.small, tooltip = 'Volume ' + str.tostring(volume / volAvg, '#.##') + 'x the recent average and ' + str.tostring(100 * volume / areaVol, '#') + '% of the supply volume - awaiting an up bar closing firm on rising volume within ' + str.tostring(confirmLenInput) + ' bars')
+
+        testEvent := true
+
+    //Probe with heavy volume: the test failed, supply is still present
+    if isFailedTest
+        label.new(bar_index, na, 'Failed Test', yloc = yloc.belowbar, style = label.style_label_up, color = bearColorInput, textcolor = chart.bg_color, size = size.small, tooltip = 'The dip attracted heavy volume (' + str.tostring(volume / volAvg, '#.##') + 'x the recent average) - supply is still present')
+
+        if areaHeld and not na(areaBox)
+            box.set_border_color(areaBox, color.new(bearColorInput, 60))
+            box.set_bgcolor(areaBox, color.new(bearColorInput, 88))
+
+        failEvent := true
+
+    //Supply context maintenance, evaluated after signals so they compare against the prior area
+    if areaHeld and close < areaLow
+        areaHeld := false
+
+    if isSupplyBar
+        if areaHeld and low <= areaHigh and high >= areaLow
+            //Overlapping supply extends the current area
+            areaHigh := math.max(areaHigh, high)
+            areaLow  := math.min(areaLow, low)
+            areaVol  := math.max(areaVol, volume)
+
+            if not na(areaBox)
+                box.set_top(areaBox, areaHigh)
+                box.set_bottom(areaBox, areaLow)
+                box.set_border_color(areaBox, color.new(bearColorInput, 60))
+                box.set_bgcolor(areaBox, color.new(bearColorInput, 88))
+        else
+            //Fresh supply starts a new area, any previous box is left frozen on the chart
+            areaHigh := high
+            areaLow  := low
+            areaVol  := volume
+            areaBox  := showZoneInput ? box.new(bar_index, high, bar_index, low, border_color = color.new(bearColorInput, 60), border_width = 1, border_style = line.style_dashed, bgcolor = color.new(bearColorInput, 88)) : box(na)
+
+        areaHeld    := true
+        areaLastBar := bar_index
+
+    if areaHeld and bar_index - areaLastBar > ctxLenInput
+        areaHeld := false
+
+    if areaHeld and not na(areaBox)
+        box.set_right(areaBox, bar_index)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visualization
+//---------------------------------------------------------------------------------------------------------------------{
+plot(hasBase ? volume / volAvg : na, 'Relative Volume', NEUTRAL_COLOR, display = display.data_window)
+plot(barSpread > 0 ? 100 * closePosPct : na, 'Close Position %', NEUTRAL_COLOR, display = display.data_window)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(testEvent, 'Test Bar', 'VSA test bar on {{ticker}}: low volume probe into prior supply closing firm - awaiting confirmation')
+alertcondition(confirmEvent, 'Test Confirmed', 'VSA test confirmed on {{ticker}}: up bar closing firm on rising volume - stop below the test bar low')
+alertcondition(negateEvent, 'Test Negated', 'VSA test negated on {{ticker}}: no confirming response, or price slid below the test bar low')
+alertcondition(failEvent, 'Failed Test', 'Failed VSA test on {{ticker}}: the probe drew heavy volume, supply is still present')
+
+//---------------------------------------------------------------------------------------------------------------------}

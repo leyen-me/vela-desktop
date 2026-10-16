@@ -1,0 +1,193 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Garman-Klass–Yang-Zhang Hybrid", shorttitle = "Garman-Klass–Yang-Zhang Hybrid", overlay = false, format = format.percent, precision = 2)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+VOL_COLOR         = #787b86 // volatility line mid-percentile - blends toward the compressed and expanded colors
+COMPRESSED_COLOR  = #089981 // bottom of the percentile scale - compressed, the quiet stretch that precedes expansion
+EXPANDED_COLOR    = #f23645 // top of the percentile scale - expanded volatility
+ACCENT_COLOR      = #ff9800 // the one accent - the diagnostic pair flagging a divergence in the dashboard
+GK_COLOR          = #787b86 // plain Garman-Klass comparison line
+LEVEL_COLOR       = #787b86 // dotted percentile reference levels
+FILL_VALUE_TRANSP = 50      // gradient transparency at the volatility value
+FILL_ZERO_TRANSP  = 100     // gradient transparency at zero
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+MID_PERCENTILE = 50 // percentile rank at which the line is the neutral color
+
+GK_COEF = 2 * math.log(2) - 1 // Garman-Klass open-to-close coefficient (2 ln 2 - 1)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+lengthInput = input.int(20, "Window Length", minval = 2, group = "Calculation",
+     tooltip = "Number of bars the per-bar GKYZ variance is averaged over. Common choices run 10-30 for tactical work and longer for regime studies. The overnight term adds information per bar, so short windows stabilize faster than close-to-close volatility does; keep the window fixed when comparing instruments, since length changes level and responsiveness together.")
+
+annualizeInput = input.bool(true, "Annualize", group = "Calculation",
+     tooltip = "Scales the reading to annualized volatility - average per-bar variance times bars per year, square-rooted - so it can be compared across instruments and against options-market figures. Disable to read the raw per-bar volatility of the window instead.")
+
+barsPerYearInput = input.int(252, "Bars Per Year", minval = 1, group = "Calculation",
+     tooltip = "Annualization constant. Daily equity data conventionally uses 252; some futures and forex tools use 260 or 365. Intraday charts must count bars per year - bars per session times trading days. Annualization constants are a leading cause of cross-platform disagreements, so match this setting when reconciling readings.")
+
+showGkInput = input.bool(true, "Garman-Klass Comparison", group = "Gap Share",
+     tooltip = "Overlays plain Garman-Klass on the same window and annualization - the identical formula minus the overnight term. The spread between the two lines isolates how much current volatility arrives overnight rather than within sessions: after a large opening gap with a quiet session GKYZ jumps while this line stays flat, and on round-the-clock markets the two overlap almost exactly.")
+
+shareAlertInput = input.float(50, "Overnight Share Alert Level %", minval = 0, maxval = 100, step = 5, group = "Gap Share",
+     tooltip = "Overnight share of window variance - the close-to-open term's contribution to the GKYZ total - above which the 'Overnight Share Rising' alert fires. 50% marks the point where more of the measured variance arrives while the market is closed than during sessions.")
+
+percentileLengthInput = input.int(100, "Percentile Lookback", minval = 10, group = "Percentile Thresholds",
+     tooltip = "Bars used to rank the current reading against its own history. The percentile rank drives the expansion and compression alerts without an absolute cutoff, so screening stays comparable across instruments and annualization settings.")
+
+highPercentileInput = input.float(80, "High Percentile", minval = 50, maxval = 100, step = 1, inline = "percentile", group = "Percentile Thresholds",
+     tooltip = "Percentile rank above which volatility counts as expanded; crossing it fires the 'Volatility Expansion' alert.")
+
+lowPercentileInput = input.float(20, "Low Percentile", minval = 0, maxval = 50, step = 1, inline = "percentile", group = "Percentile Thresholds",
+     tooltip = "Percentile rank below which volatility counts as compressed - the quiet stretches that often precede range expansion, where quiet includes calm overnights, not just small candles. Crossing under it fires the 'Volatility Compression' alert.")
+
+showLevelsInput = input.bool(false, "Show Percentile Levels", group = "Percentile Thresholds",
+     tooltip = "Plots the volatility values sitting at the high and low percentiles of the lookback as dotted reference levels, making threshold crossings visible in the pane. Off by default to keep the pane clean; the alerts fire either way.")
+
+showDashInput = input.bool(true, "Show Dashboard", group = "Dashboard",
+     tooltip = "Displays the current GKYZ reading, plain Garman-Klass on the same settings, the overnight share of window variance - the gap-share meter in numbers - and the percentile rank of the reading.")
+
+dashPosInput = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], inline = "dash", group = "Dashboard",
+     tooltip = "Corner of the pane the dashboard is anchored to.")
+
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], inline = "dash", group = "Dashboard",
+     tooltip = "Dashboard text size.")
+
+volColorInput = input.color(VOL_COLOR, "GKYZ Volatility", group = "Style",
+     tooltip = "Color of the GKYZ volatility line and its gradient fill at a mid percentile rank. The line blends toward the compressed color at low ranks and the expanded color at high ranks. The estimate measures movement size only and carries no directional information.")
+
+compressedColorInput = input.color(COMPRESSED_COLOR, "Compressed", inline = "rank", group = "Style",
+     tooltip = "Line and fill color at the bottom of the percentile scale.")
+
+expandedColorInput = input.color(EXPANDED_COLOR, "Expanded", inline = "rank", group = "Style",
+     tooltip = "Line and fill color at the top of the percentile scale.")
+
+gkColorInput = input.color(GK_COLOR, "Garman-Klass", group = "Style",
+     tooltip = "Color of the plain Garman-Klass comparison line.")
+
+levelColorInput = input.color(LEVEL_COLOR, "Percentile Levels", group = "Style",
+     tooltip = "Color of the dotted high and low percentile reference levels.")
+
+gradientInput = input.bool(true, "Gradient Fill", group = "Style",
+     tooltip = "Fills the area between zero and the volatility line with a vertical gradient - fully transparent at zero, strongest at the current value.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+getTablePosition(positionText) =>
+    switch positionText
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        => position.bottom_left
+
+getTextSize(sizeText) =>
+    switch sizeText
+        "Tiny"  => size.tiny
+        "Small" => size.small
+        => size.normal
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+// Log price relations - the three building blocks of the estimator. Guards keep degenerate bars
+// (missing or non-positive prices) from contaminating the window
+logHighLow   = high > 0 and low > 0 ? math.log(high / low) : na
+logCloseOpen = open > 0 and close > 0 ? math.log(close / open) : na
+logOvernight = open > 0 and not na(close[1]) and close[1] > 0 ? math.log(open / close[1]) : na
+
+// Per-bar variance. GKYZ prepends the squared overnight (close-to-open) jump to the classic
+// Garman-Klass formula: ln(O/C1)^2 + 0.5 ln(H/L)^2 - (2 ln 2 - 1) ln(C/O)^2 - booking the gap
+// risk plain Garman-Klass silently drops
+overnightVariance = logOvernight * logOvernight
+gkVariance        = 0.5 * logHighLow * logHighLow - GK_COEF * logCloseOpen * logCloseOpen
+gkyzVariance      = overnightVariance + gkVariance
+
+// Window means -> volatility: average the per-bar variance across the window, multiply by bars
+// per year, take the square root. Per-bar Garman-Klass terms can dip negative on individual bars,
+// so the window mean is floored at zero before the root
+gkyzMeanVariance      = ta.sma(gkyzVariance, lengthInput)
+gkMeanVariance        = ta.sma(gkVariance, lengthInput)
+overnightMeanVariance = ta.sma(overnightVariance, lengthInput)
+
+annualFactor = annualizeInput ? barsPerYearInput : 1
+gkyzVol = na(gkyzMeanVariance) ? na : math.sqrt(math.max(gkyzMeanVariance, 0) * annualFactor) * 100
+gkVol   = na(gkMeanVariance)   ? na : math.sqrt(math.max(gkMeanVariance, 0) * annualFactor) * 100
+
+// Gap share - the overnight term's contribution to total window variance. The spread between GKYZ
+// and plain Garman-Klass isolates how much volatility arrives overnight rather than within sessions
+overnightShare = not na(gkyzMeanVariance) and gkyzMeanVariance > 0 ? math.min(100, 100 * overnightMeanVariance / gkyzMeanVariance) : na
+
+// Percentile rank of the reading against its own history - compression screening and expansion
+// flagging without an absolute cutoff. The interpolated percentile values double as plottable levels
+volPercentile = ta.percentrank(gkyzVol, percentileLengthInput)
+highLevel     = ta.percentile_linear_interpolation(gkyzVol, percentileLengthInput, highPercentileInput)
+lowLevel      = ta.percentile_linear_interpolation(gkyzVol, percentileLengthInput, lowPercentileInput)
+
+// Threshold events
+expansionEvent   = ta.crossover(volPercentile, highPercentileInput)
+compressionEvent = ta.crossunder(volPercentile, lowPercentileInput)
+gapShareEvent    = ta.crossover(overnightShare, shareAlertInput)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+// State coloring by percentile rank - compressed at the bottom of the scale, neutral midway, expanded at the top
+volColor = na(volPercentile) ? volColorInput : volPercentile <= MID_PERCENTILE ? color.from_gradient(volPercentile, 0, MID_PERCENTILE, compressedColorInput, volColorInput) : color.from_gradient(volPercentile, MID_PERCENTILE, 100, volColorInput, expandedColorInput)
+
+fillTopColor    = gradientInput ? color.new(volColor, FILL_VALUE_TRANSP) : na
+fillBottomColor = gradientInput ? color.new(volColor, FILL_ZERO_TRANSP) : na
+
+gkyzPlotId = plot(gkyzVol, "GKYZ Volatility", color = volColor, linewidth = 2)
+zeroPlotId = plot(0, "Zero Line", color = color.new(LEVEL_COLOR, 70), linewidth = 1)
+
+fill(gkyzPlotId, zeroPlotId, top_value = math.max(nz(gkyzVol), 0), bottom_value = 0, top_color = fillTopColor, bottom_color = fillBottomColor, title = "Volatility Gradient Fill")
+
+plot(showGkInput ? gkVol : na, "Garman-Klass Comparison", color = gkColorInput, linewidth = 1)
+
+plot(showLevelsInput ? highLevel : na, "High Percentile Level", color = color.new(levelColorInput, 30), linewidth = 1, style = plot.style_circles)
+plot(showLevelsInput ? lowLevel : na, "Low Percentile Level", color = color.new(levelColorInput, 30), linewidth = 1, style = plot.style_circles)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dashTable = na
+
+if barstate.isfirst and showDashInput
+    dashTable := table.new(getTablePosition(dashPosInput), 2, 4, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+if barstate.islast and showDashInput and not na(dashTable)
+    gkyzText   = na(gkyzVol) ? "-" : str.tostring(gkyzVol, "#.##") + "%"
+    gkText     = na(gkVol) ? "-" : str.tostring(gkVol, "#.##") + "%"
+    shareText  = na(overnightShare) ? "-" : str.tostring(overnightShare, "#.#") + "%"
+    rankText   = na(volPercentile) ? "-" : str.tostring(volPercentile, "#")
+    shareColor = not na(overnightShare) and overnightShare > shareAlertInput ? ACCENT_COLOR : DASH_TEXT
+    labelColor   = DASH_HEADER
+    dashTextSize = getTextSize(dashSizeInput)
+    table.cell(dashTable, 0, 0, "GKYZ", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 0, gkyzText, text_color = volColor, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 1, "Garman-Klass", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 1, gkText, text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 2, "Overnight Share", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 2, shareText, text_color = shareColor, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 3, "Percentile Rank", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 3, rankText, text_color = volColor, text_size = dashTextSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(expansionEvent, "Volatility Expansion", "GKYZ Hybrid on {{ticker}} - annualized volatility crossed above its high percentile threshold, volatility expansion under way ({{interval}})")
+alertcondition(compressionEvent, "Volatility Compression", "GKYZ Hybrid on {{ticker}} - annualized volatility fell below its low percentile threshold, a quiet stretch that often precedes range expansion ({{interval}})")
+alertcondition(gapShareEvent, "Overnight Share Rising", "GKYZ Hybrid on {{ticker}} - the overnight close-to-open term crossed above the alert-level share of window variance, gap risk is driving volatility ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

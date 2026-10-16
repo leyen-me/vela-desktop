@@ -1,0 +1,304 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Alternative Bar Types"
+  , shorttitle      = "Alternative Bar Types"
+  , overlay         = true
+  , max_boxes_count = 500
+  , max_lines_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+string TICK_T   = "Tick"
+string VOLUME_T = "Volume"
+string DOLLAR_T = "Dollar Value"
+string RANGE_T  = "Range"
+string DELTA_T  = "Delta"
+
+color BULL_COLOR = #089981
+color BEAR_COLOR = #f23645
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+barTypeInput = input.string(VOLUME_T, "Bar Type"
+  , options = [TICK_T, VOLUME_T, DOLLAR_T, RANGE_T, DELTA_T]
+  , group   = "Settings"
+  , tooltip = "Activity unit that closes a bar. Tick: a fixed number of chart bars, a proxy for trade count on standard chart data. Volume: a fixed amount of traded volume. Dollar Value: a fixed traded value (volume x typical price). Range: a fixed high-to-low span. Delta: a fixed net difference between estimated buy-side and sell-side volume (volume x close location value).")
+
+autoThresholdInput = input.bool(true, "Auto Threshold"
+  , inline  = "auto"
+  , group   = "Settings"
+  , tooltip = "Scales the threshold to average activity.")
+
+autoMultiplierInput = input.float(10, ""
+  , minval  = 1
+  , step    = 1
+  , inline  = "auto"
+  , group   = "Settings"
+  , tooltip = "Automatic threshold = multiplier x average activity per chart bar over the 'Average Length' window. Each alternative bar then aggregates roughly that multiple of chart bars worth of activity. Increase for fewer, larger bars, decrease for more, smaller bars.")
+
+avgLengthInput = input.int(500, "Average Length"
+  , minval  = 10
+  , maxval  = 5000
+  , group   = "Settings"
+  , tooltip = "Number of most recent chart bars used to measure average activity for the automatic threshold. Revisit threshold sizing when average participation shifts.")
+
+manualThresholdInput = input.float(100000, "Manual Threshold"
+  , minval  = 0
+  , group   = "Settings"
+  , tooltip = "Fixed threshold used when 'Auto Threshold' is disabled, expressed in the selected unit: chart bars (Tick), traded volume (Volume), traded value (Dollar Value), price span (Range), or net buy/sell volume difference (Delta).")
+
+//Dashboard
+showDashboardInput = input.bool(true, "Show Dashboard"
+  , group   = "Dashboard"
+  , tooltip = "Displays the bar type, effective threshold, forming bar progress, bars printed, and the average number of chart bars each alternative bar spans, helping size the threshold so the chart prints a workable number of bars.")
+
+dashboardPositionInput = input.string("Top Right", "Position"
+  , options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"]
+  , inline  = "dash"
+  , group   = "Dashboard"
+  , tooltip = "Dashboard location on the chart.")
+
+dashboardSizeInput = input.string("Small", ""
+  , options = ["Tiny", "Small", "Normal"]
+  , inline  = "dash"
+  , group   = "Dashboard"
+  , tooltip = "Dashboard location on the chart and text size.")
+
+//Style
+bullColorInput = input.color(BULL_COLOR, "Bullish"
+  , inline  = "colors"
+  , group   = "Style"
+  , tooltip = "Color of bullish alternative bars.")
+
+bearColorInput = input.color(BEAR_COLOR, "Bearish"
+  , inline  = "colors"
+  , group   = "Style"
+  , tooltip = "Colors of bullish (close at or above open) and bearish (close below open) alternative bars.")
+
+bodyTransparencyInput = input.int(60, "Body Transparency"
+  , minval  = 0
+  , maxval  = 95
+  , group   = "Style"
+  , tooltip = "Transparency of the bar bodies. Borders and wicks remain opaque.")
+
+showFormingInput = input.bool(true, "Show Forming Bar"
+  , group   = "Style"
+  , tooltip = "Displays the bar currently accumulating toward the threshold with a dashed outline, updating live until the threshold is reached and the bar prints.")
+
+maxBarsInput = input.int(200, "Maximum Bars"
+  , minval  = 10
+  , maxval  = 240
+  , group   = "Style"
+  , tooltip = "Number of most recent alternative bars kept on the chart, older bars are removed.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+//Per chart bar activity units
+float barSpan    = high - low
+float clvValue   = barSpan > 0 ? ((close - low) - (high - close)) / barSpan : 0.0
+float volumeUnit = nz(volume)
+float dollarUnit = nz(volume) * hlc3
+float deltaUnit  = nz(volume) * clvValue
+
+//Average activity per chart bar, with an expanding window fallback over early history
+float avgVolume  = nz(ta.sma(volumeUnit, avgLengthInput), ta.cum(volumeUnit) / (bar_index + 1))
+float avgDollar  = nz(ta.sma(dollarUnit, avgLengthInput), ta.cum(dollarUnit) / (bar_index + 1))
+float avgBarSpan = nz(ta.sma(barSpan, avgLengthInput), ta.cum(barSpan) / (bar_index + 1))
+float avgDelta   = nz(ta.sma(math.abs(deltaUnit), avgLengthInput), ta.cum(math.abs(deltaUnit)) / (bar_index + 1))
+
+//Selected unit and effective threshold
+float unitValue = switch barTypeInput
+    TICK_T   => 1.0
+    VOLUME_T => volumeUnit
+    DOLLAR_T => dollarUnit
+    RANGE_T  => barSpan
+    =>          deltaUnit
+
+float averageUnit = switch barTypeInput
+    TICK_T   => 1.0
+    VOLUME_T => avgVolume
+    DOLLAR_T => avgDollar
+    RANGE_T  => avgBarSpan
+    =>          avgDelta
+
+float threshold   = autoThresholdInput ? autoMultiplierInput * averageUnit : manualThresholdInput
+bool  thresholdOk = not na(threshold) and threshold > 0
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alternative Bars
+//---------------------------------------------------------------------------------------------------------------------{
+var float synOpen  = na
+var float synHigh  = na
+var float synLow   = na
+var float synClose = na
+var int   synStart = na
+var float synAccum = 0.0
+
+var int barsPrinted  = 0
+var int chartBarsSum = 0
+
+var array<box>  bodyArray      = array.new<box>()
+var array<line> upperWickArray = array.new<line>()
+var array<line> lowerWickArray = array.new<line>()
+
+bool newBarEvent  = false
+bool newBullEvent = false
+bool newBearEvent = false
+
+if barstate.isconfirmed
+    //Aggregate the confirmed chart bar into the forming alternative bar
+    if na(synOpen)
+        synOpen  := open
+        synHigh  := high
+        synLow   := low
+        synStart := bar_index
+        synAccum := 0.0
+    else
+        synHigh := math.max(synHigh, high)
+        synLow  := math.min(synLow, low)
+
+    synClose := close
+    synAccum += unitValue
+
+    //Range bars close on the bar's own high-to-low span, other types on the accumulated unit
+    float closeMeasure = barTypeInput == RANGE_T ? synHigh - synLow : math.abs(synAccum)
+
+    if thresholdOk and closeMeasure >= threshold
+        bool  isBull     = synClose >= synOpen
+        color barColor   = isBull ? bullColorInput : bearColorInput
+        float bodyTop    = math.max(synOpen, synClose)
+        float bodyBottom = math.min(synOpen, synClose)
+        int   wickX      = math.floor((synStart + bar_index) / 2.0)
+
+        bodyArray.push(box.new(synStart, bodyTop, bar_index, bodyBottom
+          , border_color = barColor
+          , border_width = 1
+          , bgcolor      = color.new(barColor, bodyTransparencyInput)))
+        upperWickArray.push(line.new(wickX, bodyTop, wickX, synHigh, color = barColor))
+        lowerWickArray.push(line.new(wickX, synLow, wickX, bodyBottom, color = barColor))
+
+        //Cap the number of rendered bars
+        while bodyArray.size() > maxBarsInput
+            box.delete(bodyArray.shift())
+            line.delete(upperWickArray.shift())
+            line.delete(lowerWickArray.shift())
+
+        barsPrinted  += 1
+        chartBarsSum += bar_index - synStart + 1
+        newBarEvent  := true
+        newBullEvent := isBull
+        newBearEvent := not isBull
+
+        //Reset, the next alternative bar starts on the next chart bar
+        synOpen  := na
+        synHigh  := na
+        synLow   := na
+        synClose := na
+        synStart := na
+        synAccum := 0.0
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Forming Bar
+//---------------------------------------------------------------------------------------------------------------------{
+//Forming values, extended with the developing chart bar while it is not yet confirmed
+bool useLiveBar = not barstate.isconfirmed
+
+float liveOpen  = not na(synOpen)  ? synOpen : useLiveBar ? open : na
+float liveHigh  = not na(synOpen)  ? (useLiveBar ? math.max(synHigh, high) : synHigh) : useLiveBar ? high : na
+float liveLow   = not na(synOpen)  ? (useLiveBar ? math.min(synLow, low) : synLow) : useLiveBar ? low : na
+float liveClose = not na(synOpen)  ? (useLiveBar ? close : synClose) : useLiveBar ? close : na
+int   liveStart = not na(synStart) ? synStart : useLiveBar ? bar_index : na
+
+float liveAccum   = synAccum + (useLiveBar ? unitValue : 0.0)
+float liveMeasure = barTypeInput == RANGE_T ? (na(liveHigh) ? 0.0 : liveHigh - liveLow) : math.abs(liveAccum)
+
+var box  formingBody  = na
+var line formingUpper = na
+var line formingLower = na
+
+if barstate.islast
+    box.delete(formingBody)
+    line.delete(formingUpper)
+    line.delete(formingLower)
+
+    if showFormingInput and not na(liveOpen)
+        bool  liveBull   = liveClose >= liveOpen
+        color liveColor  = liveBull ? bullColorInput : bearColorInput
+        float liveTop    = math.max(liveOpen, liveClose)
+        float liveBottom = math.min(liveOpen, liveClose)
+        int   liveWickX  = math.floor((liveStart + bar_index) / 2.0)
+
+        formingBody  := box.new(liveStart, liveTop, bar_index, liveBottom
+          , border_color = color.new(liveColor, 30)
+          , border_width = 1
+          , border_style = line.style_dashed
+          , bgcolor      = color.new(liveColor, math.min(bodyTransparencyInput + 20, 97)))
+        formingUpper := line.new(liveWickX, liveTop, liveWickX, liveHigh, color = color.new(liveColor, 30), style = line.style_dotted)
+        formingLower := line.new(liveWickX, liveLow, liveWickX, liveBottom, color = color.new(liveColor, 30), style = line.style_dotted)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+dashboardPosition = switch dashboardPositionInput
+    "Top Right"    => position.top_right
+    "Top Left"     => position.top_left
+    "Bottom Right" => position.bottom_right
+    =>                position.bottom_left
+
+dashboardTextSize = switch dashboardSizeInput
+    "Tiny"  => size.tiny
+    "Small" => size.small
+    =>         size.normal
+
+var table dashboard = na
+
+if showDashboardInput and barstate.islast
+    if na(dashboard)
+        dashboard := table.new(dashboardPosition, 2, 5
+          , bgcolor      = DASH_BG
+          , border_width = 0
+          , frame_color  = DASH_FRAME
+          , frame_width  = 1)
+
+    bool volumeMissing = avgVolume == 0 and (barTypeInput == VOLUME_T or barTypeInput == DOLLAR_T or barTypeInput == DELTA_T)
+
+    string thresholdText = volumeMissing ? "No volume data"
+      : not thresholdOk ? "n/a"
+      : barTypeInput == TICK_T ? str.tostring(math.ceil(threshold)) + " bars"
+      : barTypeInput == RANGE_T ? str.tostring(threshold, format.mintick)
+      : str.tostring(threshold, format.volume)
+
+    string progressText = thresholdOk ? str.tostring(math.min(liveMeasure / threshold * 100, 100), "#.#") + "%" : "n/a"
+    string avgSpanText  = barsPrinted > 0 ? str.tostring(chartBarsSum * 1.0 / barsPrinted, "#.#") + " bars" : "n/a"
+
+    color thresholdColor = volumeMissing or not thresholdOk ? BEAR_COLOR : DASH_TEXT
+
+    table.cell(dashboard, 0, 0, "Bar Type",     text_color = DASH_HEADER,    text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboard, 1, 0, barTypeInput,   text_color = DASH_TEXT,      text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboard, 0, 1, "Threshold",    text_color = DASH_HEADER,    text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboard, 1, 1, thresholdText,  text_color = thresholdColor, text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboard, 0, 2, "Progress",     text_color = DASH_HEADER,    text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboard, 1, 2, progressText,   text_color = DASH_TEXT,      text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboard, 0, 3, "Bars Printed", text_color = DASH_HEADER,    text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboard, 1, 3, str.tostring(barsPrinted), text_color = DASH_TEXT, text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboard, 0, 4, "Avg Bar Span", text_color = DASH_HEADER,    text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboard, 1, 4, avgSpanText,    text_color = DASH_TEXT,      text_size = dashboardTextSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(newBarEvent, "New Alternative Bar", "A new alternative bar has printed, the activity threshold was reached")
+alertcondition(newBullEvent, "New Bullish Alternative Bar", "A new bullish alternative bar has printed, close at or above open")
+alertcondition(newBearEvent, "New Bearish Alternative Bar", "A new bearish alternative bar has printed, close below open")
+
+//---------------------------------------------------------------------------------------------------------------------}

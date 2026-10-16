@@ -1,0 +1,351 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Fractal Nesting", "Fractal Nesting", overlay = true, max_lines_count = 500, max_labels_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+//Pivot sides
+SIDE_HIGH = 1
+SIDE_LOW  = -1
+
+//Combined state of the three degrees
+ALIGN_FORMING = 0
+ALIGN_BULL    = 1
+ALIGN_BEAR    = -1
+ALIGN_MIXED   = 2
+
+//Drawing caps per degree, oldest pruned first. Short-term structure churns fastest, so the
+//higher degrees deliberately keep a deeper slice of history on the chart.
+ST_LEG_CAP = 240
+IT_LEG_CAP = 140
+LT_LEG_CAP = 100
+ST_TAG_CAP = 200
+IT_TAG_CAP = 160
+LT_TAG_CAP = 120
+
+//Recent same-side pivots kept per degree - the recursion only ever inspects the last three
+PIVOT_MEMORY = 8
+
+//Drawings cannot be created too far behind the current bar
+MAX_DRAW_LOOKBACK = 9000
+
+//Transparency of the full-alignment background tint
+ALIGN_BG_TRANSPARENCY = 92
+
+//Degree colors - structure is grey, weight and tone rising with seniority, the long-term degree is the one accent
+ST_COLOR = color.new(#787b86, 40)
+IT_COLOR = #787b86
+LT_COLOR = #ff9800
+
+BULL_COLOR = #089981
+BEAR_COLOR = #f23645
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+baseLengthInput = input.int(1, "Base Pivot Length", minval = 1, maxval = 20, group = "Structure",
+  tooltip = "Bars required on each side of a raw swing pivot - the short-term, first-degree pivots every higher degree is built from. 1 reproduces the classic recursive definition (a high with a lower high on either side, a low with a higher low on either side); larger values pre-filter minor noise before the degrees are stacked, at the cost of later confirmation.")
+
+showStInput = input.bool(true, "Short-Term", inline = "st", group = "Degrees",
+  tooltip = "Draw the short-term zigzag - the first-degree swing path built directly from raw pivots. Its legs are the raw material the intermediate degree is assembled from.")
+
+stTagsInput = input.bool(false, "Labels", inline = "st", group = "Degrees",
+  tooltip = "Tag every confirmed short-term pivot with ST. Off by default - first-degree pivots are numerous and the thin zigzag already maps them.")
+
+showItInput = input.bool(true, "Intermediate-Term", inline = "it", group = "Degrees",
+  tooltip = "Draw the intermediate-term zigzag - second-degree structure. A short-term high flanked by lower short-term highs on both sides is an intermediate-term high; invert for lows. Each of its legs should enclose a complete short-term sequence.")
+
+itTagsInput = input.bool(true, "Labels", inline = "it", group = "Degrees",
+  tooltip = "Tag every confirmed intermediate-term pivot with IT.")
+
+showLtInput = input.bool(true, "Long-Term", inline = "lt", group = "Degrees",
+  tooltip = "Draw the long-term zigzag - third-degree structure built from intermediate-term pivots by the same recursive rule. Three degrees is the practical ceiling: each added degree needs far more data to form a pivot.")
+
+ltTagsInput = input.bool(true, "Labels", inline = "lt", group = "Degrees",
+  tooltip = "Tag every confirmed long-term pivot with LT.")
+
+alignBgInput = input.bool(true, "Highlight Full Alignment", group = "Degree Alignment",
+  tooltip = "Tint the background while all three degrees point the same way - every degree in an up leg (bullish) or every degree in a down leg (bearish). Unshaded stretches are where degrees disagree, the zone where pullbacks end or reversals begin.")
+
+showDashInput = input.bool(true, "Show Dashboard", group = "Degree Alignment",
+  tooltip = "Per-degree readout of the current leg direction and the latest confirmed swing high and low, plus the combined alignment state. The latest pivots also stack tiered invalidation: the nearest lower-degree pivot guards the entry idea, the higher-degree pivot guards the whole thesis.")
+
+dashPositionInput = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = "Degree Alignment",
+  tooltip = "Corner of the chart holding the dashboard.")
+
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = "Degree Alignment",
+  tooltip = "Dashboard text size.")
+
+stColorInput = input.color(ST_COLOR, "Short-Term", inline = "stStyle", group = "Style",
+  tooltip = "Color of the short-term zigzag and its ST tags.")
+
+stWidthInput = input.int(1, "", minval = 1, maxval = 5, inline = "stStyle", group = "Style",
+  tooltip = "Short-term line width. Degrees read best with weight increasing by seniority.")
+
+itColorInput = input.color(IT_COLOR, "Intermediate", inline = "itStyle", group = "Style",
+  tooltip = "Color of the intermediate-term zigzag and its IT tags.")
+
+itWidthInput = input.int(2, "", minval = 1, maxval = 5, inline = "itStyle", group = "Style",
+  tooltip = "Intermediate-term line width.")
+
+ltColorInput = input.color(LT_COLOR, "Long-Term", inline = "ltStyle", group = "Style",
+  tooltip = "Color of the long-term zigzag and its LT tags.")
+
+ltWidthInput = input.int(3, "", minval = 1, maxval = 5, inline = "ltStyle", group = "Style",
+  tooltip = "Long-term line width.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "direction", group = "Style",
+  tooltip = "Up-leg color used by the dashboard and the full-alignment background tint.")
+
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "direction", group = "Style",
+  tooltip = "Down-leg color used by the dashboard and the full-alignment background tint.")
+
+tagSizeInput = input.string("Tiny", "Label Size", options = ["Tiny", "Small", "Normal"], group = "Style",
+  tooltip = "Text size of the ST/IT/LT degree tags.")
+
+string tagTextSize = switch tagSizeInput
+    "Tiny"  => size.tiny
+    "Small" => size.small
+    => size.normal
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types
+//---------------------------------------------------------------------------------------------------------------------{
+//One degree of structure. The same object serves short-, intermediate- and long-term: the recursion
+//that builds a degree from the one below is identical at every level.
+type DegreeState
+    array<float> highPriceArray
+    array<int>   highBarArray
+    array<float> lowPriceArray
+    array<int>   lowBarArray
+    array<line>  legArray
+    array<label> tagArray
+    line  lastLegLine = na
+    int   lastSide    = 0
+    float lastPrice   = na
+    int   lastBar     = na
+    float promoPrice  = na
+    int   promoBar    = na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+newDegreeState() =>
+    DegreeState.new(array.new<float>(), array.new<int>(), array.new<float>(), array.new<int>(), array.new<line>(), array.new<label>())
+
+//Delete the oldest drawing once a degree exceeds its cap
+pruneLines(array<line> linesArray, int maxCount) =>
+    if array.size(linesArray) > maxCount
+        line.delete(array.shift(linesArray))
+
+pruneLabels(array<label> labelsArray, int maxCount) =>
+    if array.size(labelsArray) > maxCount
+        label.delete(array.shift(labelsArray))
+
+directionWord(int direction) =>
+    direction == 1 ? "up" : direction == -1 ? "down" : "forming"
+
+//Advance a degree's zigzag with a newly confirmed pivot of that degree. A same-side pivot replaces
+//the last vertex when more extreme; an opposite-side pivot fixes the leg between them and starts the
+//next one. Opposite-side pivots whose bar precedes the last vertex (possible at higher degrees when
+//confirmation lags cross) are recorded and tagged but not re-inserted into the drawn path.
+method updateZigzag(DegreeState degree, int side, float price, int barId, bool showLegs, color legColor, int legWidth, int legCap) =>
+    if degree.lastSide == 0
+        degree.lastSide  := side
+        degree.lastPrice := price
+        degree.lastBar   := barId
+    else if side == degree.lastSide
+        if side == SIDE_HIGH ? price >= degree.lastPrice : price <= degree.lastPrice
+            degree.lastPrice := price
+            degree.lastBar   := barId
+            if not na(degree.lastLegLine)
+                line.set_xy2(degree.lastLegLine, barId, price)
+    else if barId > degree.lastBar
+        if showLegs and bar_index - degree.lastBar < MAX_DRAW_LOOKBACK
+            degree.lastLegLine := line.new(degree.lastBar, degree.lastPrice, barId, price, color = legColor, width = legWidth)
+            array.push(degree.legArray, degree.lastLegLine)
+            pruneLines(degree.legArray, legCap)
+        else
+            degree.lastLegLine := na
+        degree.lastSide  := side
+        degree.lastPrice := price
+        degree.lastBar   := barId
+
+//Register a confirmed pivot of a degree: store it, tag it, extend the degree's zigzag, then run the
+//recursive promotion test - the middle of the last three same-side pivots is promoted to the next
+//degree when both neighbors are lower (highs) or higher (lows). Returns true when a promotion fired;
+//the promoted pivot is left in promoPrice/promoBar for the degree above to consume.
+method addPivot(DegreeState degree, int side, float price, int barId, bool showLegs, bool showTags, string tagText, color degreeColor, int legWidth, int legCap, int tagCap) =>
+    array<float> priceArray = side == SIDE_HIGH ? degree.highPriceArray : degree.lowPriceArray
+    array<int>   barArray   = side == SIDE_HIGH ? degree.highBarArray : degree.lowBarArray
+    array.push(priceArray, price)
+    array.push(barArray, barId)
+    if showTags and bar_index - barId < MAX_DRAW_LOOKBACK
+        label pivotTag = label.new(barId, price, tagText
+          , style     = side == SIDE_HIGH ? label.style_label_down : label.style_label_up
+          , color     = #00000000
+          , textcolor = degreeColor
+          , size      = tagTextSize)
+        array.push(degree.tagArray, pivotTag)
+        pruneLabels(degree.tagArray, tagCap)
+    degree.updateZigzag(side, price, barId, showLegs, degreeColor, legWidth, legCap)
+    bool promoted = false
+    int  count = array.size(priceArray)
+    if count >= 3
+        float middlePrice = array.get(priceArray, count - 2)
+        float leftPrice   = array.get(priceArray, count - 3)
+        float rightPrice  = array.get(priceArray, count - 1)
+        if side == SIDE_HIGH ? (middlePrice > leftPrice and middlePrice > rightPrice) : (middlePrice < leftPrice and middlePrice < rightPrice)
+            promoted := true
+            degree.promoPrice := middlePrice
+            degree.promoBar   := array.get(barArray, count - 2)
+    if count > PIVOT_MEMORY
+        array.shift(priceArray)
+        array.shift(barArray)
+    promoted
+
+//Walk one confirmed short-term pivot up the hierarchy: a new ST pivot may complete an IT pivot,
+//which in turn may complete an LT pivot. Returns which higher degrees confirmed a new pivot.
+processCascade(DegreeState stDegree, DegreeState itDegree, DegreeState ltDegree, int side, float price, int barId) =>
+    bool itConfirmed = false
+    bool ltConfirmed = false
+    if stDegree.addPivot(side, price, barId, showStInput, stTagsInput, "ST", stColorInput, stWidthInput, ST_LEG_CAP, ST_TAG_CAP)
+        itConfirmed := true
+        if itDegree.addPivot(side, stDegree.promoPrice, stDegree.promoBar, showItInput, itTagsInput, "IT", itColorInput, itWidthInput, IT_LEG_CAP, IT_TAG_CAP)
+            ltConfirmed := true
+            //Three degrees is the practical ceiling - promotions above long-term are not stacked further
+            ltDegree.addPivot(side, itDegree.promoPrice, itDegree.promoBar, showLtInput, ltTagsInput, "LT", ltColorInput, ltWidthInput, LT_LEG_CAP, LT_TAG_CAP)
+    [itConfirmed, ltConfirmed]
+
+//One dashboard row: a degree's current leg direction and its latest confirmed pivots
+renderDegreeRow(table dashTable, int rowIndex, string degreeName, DegreeState degree, color degreeColor, string textSize, color bullColor, color bearColor) =>
+    color mutedColor = DASH_HEADER
+    color valueColor = DASH_TEXT
+    int legDirection = -degree.lastSide
+    string legText = legDirection == 1 ? "▲ Up" : legDirection == -1 ? "▼ Down" : "—"
+    color legColor = legDirection == 1 ? bullColor : legDirection == -1 ? bearColor : mutedColor
+    string lastHighText = array.size(degree.highPriceArray) > 0 ? str.tostring(array.last(degree.highPriceArray), format.mintick) : "—"
+    string lastLowText  = array.size(degree.lowPriceArray) > 0 ? str.tostring(array.last(degree.lowPriceArray), format.mintick) : "—"
+    table.cell(dashTable, 0, rowIndex, degreeName, text_color = degreeColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, rowIndex, legText, text_color = legColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashTable, 2, rowIndex, lastHighText, text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+    table.cell(dashTable, 3, rowIndex, lastLowText, text_color = valueColor, text_size = textSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// State
+//---------------------------------------------------------------------------------------------------------------------{
+var DegreeState shortTermState    = newDegreeState()
+var DegreeState intermediateState = newDegreeState()
+var DegreeState longTermState     = newDegreeState()
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Degree Construction
+//---------------------------------------------------------------------------------------------------------------------{
+//Raw first-degree pivots: a high with lower highs on both sides, a low with higher lows on both sides
+float pivotHighPrice = ta.pivothigh(baseLengthInput, baseLengthInput)
+float pivotLowPrice  = ta.pivotlow(baseLengthInput, baseLengthInput)
+int   pivotBar       = bar_index - baseLengthInput
+
+bool itHighConfirmed = false
+bool itLowConfirmed  = false
+bool ltHighConfirmed = false
+bool ltLowConfirmed  = false
+
+//On an outside bar both sides confirm at once - process the side extending the current leg first
+bool highFirst = shortTermState.lastSide == SIDE_HIGH
+
+if barstate.isconfirmed
+    for passIndex = 0 to 1
+        bool  isHighPass = highFirst ? passIndex == 0 : passIndex == 1
+        float passPrice  = isHighPass ? pivotHighPrice : pivotLowPrice
+        if not na(passPrice)
+            [itConfirmed, ltConfirmed] = processCascade(shortTermState, intermediateState, longTermState, isHighPass ? SIDE_HIGH : SIDE_LOW, passPrice, pivotBar)
+            if isHighPass
+                itHighConfirmed := itHighConfirmed or itConfirmed
+                ltHighConfirmed := ltHighConfirmed or ltConfirmed
+            else
+                itLowConfirmed := itLowConfirmed or itConfirmed
+                ltLowConfirmed := ltLowConfirmed or ltConfirmed
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Degree Alignment
+//---------------------------------------------------------------------------------------------------------------------{
+//Current leg direction per degree: a degree whose latest vertex is a low is in an up leg, and inversely
+int shortTermDir    = -shortTermState.lastSide
+int intermediateDir = -intermediateState.lastSide
+int longTermDir     = -longTermState.lastSide
+
+bool degreesFormed = shortTermDir != 0 and intermediateDir != 0 and longTermDir != 0
+bool allRising     = shortTermDir == 1 and intermediateDir == 1 and longTermDir == 1
+bool allFalling    = shortTermDir == -1 and intermediateDir == -1 and longTermDir == -1
+
+int alignState = not degreesFormed ? ALIGN_FORMING : allRising ? ALIGN_BULL : allFalling ? ALIGN_BEAR : ALIGN_MIXED
+int previousAlign = nz(alignState[1], ALIGN_FORMING)
+
+bool bullishAlignmentFlip = alignState == ALIGN_BULL and previousAlign != ALIGN_BULL
+bool bearishAlignmentFlip = alignState == ALIGN_BEAR and previousAlign != ALIGN_BEAR
+bool alignmentBrokenFlip  = alignState == ALIGN_MIXED and (previousAlign == ALIGN_BULL or previousAlign == ALIGN_BEAR)
+
+bgcolor(alignBgInput and alignState == ALIGN_BULL ? color.new(bullColorInput, ALIGN_BG_TRANSPARENCY) : alignBgInput and alignState == ALIGN_BEAR ? color.new(bearColorInput, ALIGN_BG_TRANSPARENCY) : na, title = "Full Alignment")
+
+plot(shortTermDir, "Short-Term Leg Direction", stColorInput, display = display.data_window)
+plot(intermediateDir, "Intermediate-Term Leg Direction", itColorInput, display = display.data_window)
+plot(longTermDir, "Long-Term Leg Direction", ltColorInput, display = display.data_window)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+string tablePosition = switch dashPositionInput
+    "Top Right"    => position.top_right
+    "Top Left"     => position.top_left
+    "Bottom Right" => position.bottom_right
+    => position.bottom_left
+
+string tableTextSize = switch dashSizeInput
+    "Tiny"  => size.tiny
+    "Small" => size.small
+    => size.normal
+
+var table dashboardTable = showDashInput ? table.new(tablePosition, 4, 5, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1) : na
+
+if showDashInput and barstate.islast
+    color labelColor = DASH_HEADER
+    color mutedColor = DASH_HEADER
+    table.cell(dashboardTable, 0, 0, "Degree", text_color = labelColor, text_size = tableTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 0, "Leg", text_color = labelColor, text_size = tableTextSize, text_halign = text.align_right,
+      tooltip = "Direction of the leg currently forming at each degree. Every higher-degree turn must begin as a lower-degree one, so the short-term row is the earliest - and noisiest - to flip.")
+    table.cell(dashboardTable, 2, 0, "Last High", text_color = labelColor, text_size = tableTextSize, text_halign = text.align_right,
+      tooltip = "Latest confirmed swing high of each degree. A break of a long-term pivot carries different weight than a break of a short-term one - demand the degree that matches the idea being traded.")
+    table.cell(dashboardTable, 3, 0, "Last Low", text_color = labelColor, text_size = tableTextSize, text_halign = text.align_right,
+      tooltip = "Latest confirmed swing low of each degree. The nearest lower-degree pivot invalidates the entry idea; the higher-degree pivot invalidates the whole thesis.")
+    renderDegreeRow(dashboardTable, 1, "LT", longTermState, ltColorInput, tableTextSize, bullColorInput, bearColorInput)
+    renderDegreeRow(dashboardTable, 2, "IT", intermediateState, itColorInput, tableTextSize, bullColorInput, bearColorInput)
+    renderDegreeRow(dashboardTable, 3, "ST", shortTermState, stColorInput, tableTextSize, bullColorInput, bearColorInput)
+    string alignText = alignState == ALIGN_BULL ? "Full Bullish" : alignState == ALIGN_BEAR ? "Full Bearish" : alignState == ALIGN_MIXED ? "Mixed" : "Forming"
+    color alignColor = alignState == ALIGN_BULL ? bullColorInput : alignState == ALIGN_BEAR ? bearColorInput : mutedColor
+    table.cell(dashboardTable, 0, 4, "Alignment", text_color = labelColor, text_size = tableTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 4, alignText, text_color = alignColor, text_size = tableTextSize, text_halign = text.align_right,
+      tooltip = "ST " + directionWord(shortTermDir) + " · IT " + directionWord(intermediateDir) + " · LT " + directionWord(longTermDir) + ". Degrees in agreement mark trend; a lower-degree leg against a higher-degree one is where pullbacks end or reversals begin.")
+    table.cell(dashboardTable, 2, 4, "", text_size = tableTextSize)
+    table.cell(dashboardTable, 3, 4, "", text_size = tableTextSize)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(itHighConfirmed, "New Intermediate-Term High", "Fractal Nesting: a short-term high flanked by lower short-term highs confirmed a new intermediate-term swing high")
+alertcondition(itLowConfirmed, "New Intermediate-Term Low", "Fractal Nesting: a short-term low flanked by higher short-term lows confirmed a new intermediate-term swing low")
+alertcondition(ltHighConfirmed, "New Long-Term High", "Fractal Nesting: an intermediate-term high flanked by lower intermediate-term highs confirmed a new long-term swing high")
+alertcondition(ltLowConfirmed, "New Long-Term Low", "Fractal Nesting: an intermediate-term low flanked by higher intermediate-term lows confirmed a new long-term swing low")
+alertcondition(itHighConfirmed or itLowConfirmed or ltHighConfirmed or ltLowConfirmed, "Any Higher-Degree Pivot", "Fractal Nesting: a new intermediate-term or long-term pivot confirmed")
+alertcondition(bullishAlignmentFlip, "Bullish Full Alignment", "Fractal Nesting: short-term, intermediate-term and long-term legs are now all rising")
+alertcondition(bearishAlignmentFlip, "Bearish Full Alignment", "Fractal Nesting: short-term, intermediate-term and long-term legs are now all falling")
+alertcondition(alignmentBrokenFlip, "Alignment Broken", "Fractal Nesting: the degrees no longer agree - lower-degree structure has turned against the higher-degree leg")
+
+//---------------------------------------------------------------------------------------------------------------------}

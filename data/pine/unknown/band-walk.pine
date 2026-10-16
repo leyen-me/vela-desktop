@@ -1,0 +1,324 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Band Walk", "Band Walk", overlay = true, max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR    = #089981 // bullish walk - the upper half, labels and background while price rides the upper band
+BEAR_COLOR    = #f23645 // bearish walk - the lower half, labels and background while price rides the lower band
+NEUTRAL_COLOR = #787b86 // idle channel and midline - structure
+TRANSP_COLOR  = #00000000
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+FILL_CENTER_TRANSP = 100
+FILL_EDGE_TRANSP   = 85
+IDLE_BAND_TRANSP   = 40
+BG_TRANSP          = 94
+MUTED_TRANSP       = 30
+
+BOLLINGER = "Bollinger Bands"
+KELTNER   = "Keltner Channel"
+
+GROUP_CHANNEL = "Channel"
+GROUP_WALK    = "Walk Detection"
+GROUP_DASH    = "Dashboard"
+GROUP_STYLE   = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+channelTypeInput = input.string(BOLLINGER, "Channel Type", options = [BOLLINGER, KELTNER], group = GROUP_CHANNEL,
+  tooltip = "Volatility channel the walk is read on. Bollinger Bands place a standard-deviation envelope around an SMA; Keltner Channels place an ATR envelope around an EMA. The walk logic is identical on both.")
+
+lengthInput = input.int(20, "Length", minval = 2, group = GROUP_CHANNEL,
+  tooltip = "Basis length - the SMA of Bollinger Bands or the EMA of Keltner Channels. 20 is the standard published default for both constructions.")
+
+srcInput = input.source(close, "Source", group = GROUP_CHANNEL,
+  tooltip = "Price series the basis (and the Bollinger standard deviation) is computed from.")
+
+multInput = input.float(2.0, "Multiplier", minval = 0.1, step = 0.25, group = GROUP_CHANNEL,
+  tooltip = "Band distance from the basis: standard deviations for Bollinger Bands, ATR multiples for Keltner Channels.")
+
+atrLengthInput = input.int(10, "ATR Length", minval = 1, group = GROUP_CHANNEL,
+  tooltip = "ATR lookback used by the Keltner Channel envelope. Ignored when Bollinger Bands are selected.")
+
+minClosesInput = input.int(3, "Band Closes to Confirm", minval = 2, maxval = 10, group = GROUP_WALK,
+  tooltip = "Closes at or beyond one outer band required inside the detection window before a walk is confirmed. Practitioners commonly want at least three.")
+
+windowInput = input.int(5, "Detection Window", minval = 2, maxval = 20, group = GROUP_WALK,
+  tooltip = "The handful of bars the qualifying band closes must fall within. Closes from before the last walk ended, or from before the last close across the midline, never count toward a new walk.")
+
+slopeFilterInput = input.bool(true, "Midline Slope Filter", group = GROUP_WALK,
+  tooltip = "Require the channel midline to slope in the walk's direction on the confirmation bar, so only walks with the channel tilted in the direction of travel qualify.")
+
+oppositeFilterInput = input.bool(false, "Opposite Band Filter", group = GROUP_WALK,
+  tooltip = "Additionally require the opposite band to be bending away from price on the confirmation bar - the expanding-volatility geometry of the strongest walks.")
+
+maxMissInput = input.int(5, "Max Closes Off the Band", minval = 1, maxval = 50, group = GROUP_WALK,
+  tooltip = "An active walk ends once this many consecutive bars close without reaching the band, or immediately on the first close across the midline, whichever comes first.")
+
+showDashInput = input.bool(true, "Show Dashboard", group = GROUP_DASH,
+  tooltip = "Live walk diagnostics: state, bars ridden, band closes, midline holds, and whether the opposite band is bending away from price.")
+
+dashLocationInput = input.string("Top Right", "Location", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = GROUP_DASH,
+  tooltip = "Corner of the chart anchoring the dashboard.")
+
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = GROUP_DASH,
+  tooltip = "Text size of the dashboard.")
+
+showLabelsInput = input.bool(true, "Walk Start/End Labels", group = GROUP_STYLE,
+  tooltip = "Mark the bar that confirms a walk and the bar that ends it. The end label's tooltip states whether the midline broke or price simply stopped reaching the band.")
+
+showPullbackInput = input.bool(false, "Midline Pullback Markers", group = GROUP_STYLE,
+  tooltip = "Mark pullbacks that tag the midline and hold it while a walk is active - the classic continuation spot. The matching alerts fire even while the markers are hidden.")
+
+showFillInput = input.bool(true, "Gradient Fill", group = GROUP_STYLE,
+  tooltip = "Fill each half of the channel with a vertical gradient fading toward the midline; the walked half takes the walk color while a walk is active.")
+
+showBgInput = input.bool(true, "Walk Background", group = GROUP_STYLE,
+  tooltip = "Tint the chart background over the bars where a walk is active.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish Walk", group = GROUP_STYLE, inline = "walkColors")
+
+bearColorInput = input.color(BEAR_COLOR, "Bearish Walk", group = GROUP_STYLE, inline = "walkColors")
+
+neutralColorInput = input.color(NEUTRAL_COLOR, "Channel", group = GROUP_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+int effWindow = math.max(windowInput, minClosesInput)
+
+// Both channel constructions run on every bar; the selection only gates which result is used
+float smaBasis   = ta.sma(srcInput, lengthInput)
+float emaBasis   = ta.ema(srcInput, lengthInput)
+float stdevValue = ta.stdev(srcInput, lengthInput)
+float atrValue   = ta.atr(atrLengthInput)
+
+bool useBollinger = channelTypeInput == BOLLINGER
+
+float basisLine = useBollinger ? smaBasis : emaBasis
+float bandSpan  = multInput * (useBollinger ? stdevValue : atrValue)
+float upperBand = basisLine + bandSpan
+float lowerBand = basisLine - bandSpan
+
+max_bars_back(close, 200)
+max_bars_back(upperBand, 200)
+max_bars_back(lowerBand, 200)
+
+// A band close - the close sitting at or beyond one outer band
+bool upTouch = not na(upperBand) and close >= upperBand
+bool dnTouch = not na(lowerBand) and close <= lowerBand
+
+// Walk state
+var int walkDir      = 0     // 1 bullish walk, -1 bearish walk, 0 none
+var int walkStartBar = 0     // bar the current walk was confirmed on
+var int walkCloses   = 0     // band closes inside the current walk
+var int walkPulls    = 0     // midline pullbacks held inside the current walk
+var int missStreak   = 0     // consecutive closes that failed to reach the band
+var int upResetBar   = -1    // last bar disqualifying earlier upper-band closes (walk end or close below midline)
+var int dnResetBar   = -1    // last bar disqualifying earlier lower-band closes (walk end or close above midline)
+
+// A close across the midline invalidates the persistence built before it
+if not na(basisLine) and close < basisLine
+    upResetBar := bar_index
+
+if not na(basisLine) and close > basisLine
+    dnResetBar := bar_index
+
+// Qualifying band closes inside the detection window, counted only after the latest reset
+int upCloses = 0
+int dnCloses = 0
+
+for i = 0 to effWindow - 1
+    if bar_index - i > upResetBar and not na(upperBand[i]) and close[i] >= upperBand[i]
+        upCloses += 1
+    if bar_index - i > dnResetBar and not na(lowerBand[i]) and close[i] <= lowerBand[i]
+        dnCloses += 1
+
+// Channel geometry on the confirmation bar
+bool slopeUpOk = not slopeFilterInput or (not na(basisLine[1]) and basisLine > basisLine[1])
+bool slopeDnOk = not slopeFilterInput or (not na(basisLine[1]) and basisLine < basisLine[1])
+bool oppUpOk   = not oppositeFilterInput or (not na(lowerBand[1]) and lowerBand < lowerBand[1])
+bool oppDnOk   = not oppositeFilterInput or (not na(upperBand[1]) and upperBand > upperBand[1])
+
+bool startUpEvent   = false
+bool startDnEvent   = false
+bool endUpEvent     = false
+bool endDnEvent     = false
+bool endedOnMidline = false
+
+// An active walk ends on the first close across the midline, or once price has stopped
+// reaching the band for too many consecutive closes - deceleration rather than reversal
+if walkDir == 1
+    if upTouch
+        missStreak := 0
+        walkCloses += 1
+    else
+        missStreak += 1
+    bool midBreak = not na(basisLine) and close < basisLine
+    if midBreak or missStreak >= maxMissInput
+        endUpEvent     := true
+        endedOnMidline := midBreak
+        walkDir        := 0
+        upResetBar     := bar_index
+else if walkDir == -1
+    if dnTouch
+        missStreak := 0
+        walkCloses += 1
+    else
+        missStreak += 1
+    bool midBreak = not na(basisLine) and close > basisLine
+    if midBreak or missStreak >= maxMissInput
+        endDnEvent     := true
+        endedOnMidline := midBreak
+        walkDir        := 0
+        dnResetBar     := bar_index
+
+// A walk is confirmed on the band close completing the required count, with the channel geometry agreeing
+if walkDir == 0
+    if upTouch and upCloses >= minClosesInput and slopeUpOk and oppUpOk
+        startUpEvent := true
+        walkDir      := 1
+        walkStartBar := bar_index
+        walkCloses   := upCloses
+        walkPulls    := 0
+        missStreak   := 0
+    else if dnTouch and dnCloses >= minClosesInput and slopeDnOk and oppDnOk
+        startDnEvent := true
+        walkDir      := -1
+        walkStartBar := bar_index
+        walkCloses   := dnCloses
+        walkPulls    := 0
+        missStreak   := 0
+
+// Pullbacks that tag the midline and close back in the walk's direction - the continuation spot
+bool pullUpNow = walkDir == 1 and not startUpEvent and not na(basisLine) and low <= basisLine and close >= basisLine
+bool pullDnNow = walkDir == -1 and not startDnEvent and not na(basisLine) and high >= basisLine and close <= basisLine
+
+bool pullUpEvent = pullUpNow and not pullUpNow[1]
+bool pullDnEvent = pullDnNow and not pullDnNow[1]
+
+if pullUpEvent or pullDnEvent
+    walkPulls += 1
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+color upperBandColor = walkDir == 1 ? bullColorInput : color.new(neutralColorInput, IDLE_BAND_TRANSP)
+color lowerBandColor = walkDir == -1 ? bearColorInput : color.new(neutralColorInput, IDLE_BAND_TRANSP)
+color upperFillColor = walkDir == 1 ? bullColorInput : neutralColorInput
+color lowerFillColor = walkDir == -1 ? bearColorInput : neutralColorInput
+
+basisPlotId = plot(basisLine, "Midline", neutralColorInput, 1)
+upperPlotId = plot(upperBand, "Upper Band", upperBandColor, 1)
+lowerPlotId = plot(lowerBand, "Lower Band", lowerBandColor, 1)
+
+fill(basisPlotId, upperPlotId, upperBand, basisLine
+  , showFillInput ? color.new(upperFillColor, FILL_EDGE_TRANSP) : color(na)
+  , showFillInput ? color.new(upperFillColor, FILL_CENTER_TRANSP) : color(na)
+  , title = "Upper Half Fill")
+
+fill(basisPlotId, lowerPlotId, basisLine, lowerBand
+  , showFillInput ? color.new(lowerFillColor, FILL_CENTER_TRANSP) : color(na)
+  , showFillInput ? color.new(lowerFillColor, FILL_EDGE_TRANSP) : color(na)
+  , title = "Lower Half Fill")
+
+bgcolor(showBgInput and walkDir == 1 ? color.new(bullColorInput, BG_TRANSP)
+  : showBgInput and walkDir == -1 ? color.new(bearColorInput, BG_TRANSP)
+  : color(na), title = "Walk Background")
+
+if showLabelsInput and startUpEvent
+    label.new(bar_index, low, "Walk ▲"
+      , style     = label.style_label_up
+      , color     = TRANSP_COLOR
+      , textcolor = bullColorInput
+      , size      = size.small
+      , tooltip   = "Bullish band walk confirmed: " + str.tostring(walkCloses) + " closes at or beyond the upper band within " + str.tostring(effWindow) + " bars")
+
+if showLabelsInput and startDnEvent
+    label.new(bar_index, high, "Walk ▼"
+      , style     = label.style_label_down
+      , color     = TRANSP_COLOR
+      , textcolor = bearColorInput
+      , size      = size.small
+      , tooltip   = "Bearish band walk confirmed: " + str.tostring(walkCloses) + " closes at or beyond the lower band within " + str.tostring(effWindow) + " bars")
+
+if showLabelsInput and endUpEvent
+    label.new(bar_index, high, "✕"
+      , style     = label.style_label_down
+      , color     = TRANSP_COLOR
+      , textcolor = color.new(bullColorInput, MUTED_TRANSP)
+      , size      = size.small
+      , tooltip   = endedOnMidline ? "Bullish band walk ended: first close below the midline" : "Bullish band walk ended: price stopped reaching the upper band")
+
+if showLabelsInput and endDnEvent
+    label.new(bar_index, low, "✕"
+      , style     = label.style_label_up
+      , color     = TRANSP_COLOR
+      , textcolor = color.new(bearColorInput, MUTED_TRANSP)
+      , size      = size.small
+      , tooltip   = endedOnMidline ? "Bearish band walk ended: first close above the midline" : "Bearish band walk ended: price stopped reaching the lower band")
+
+plotshape(showPullbackInput and pullUpEvent, "Bullish Midline Pullback", shape.triangleup, location.belowbar, bullColorInput, size = size.tiny)
+plotshape(showPullbackInput and pullDnEvent, "Bearish Midline Pullback", shape.triangledown, location.abovebar, bearColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+dashLocation = switch dashLocationInput
+    "Top Right"    => position.top_right
+    "Top Left"     => position.top_left
+    "Bottom Right" => position.bottom_right
+    => position.bottom_left
+
+dashTextSize = switch dashSizeInput
+    "Tiny"  => size.tiny
+    "Small" => size.small
+    => size.normal
+
+int  walkBars     = walkDir != 0 ? bar_index - walkStartBar + 1 : 0
+bool oppBendingUp = not na(lowerBand[1]) and lowerBand < lowerBand[1]
+bool oppBendingDn = not na(upperBand[1]) and upperBand > upperBand[1]
+bool oppBending   = walkDir == 1 ? oppBendingUp : walkDir == -1 ? oppBendingDn : false
+
+if barstate.islast and showDashInput
+    var table dashTable = table.new(dashLocation, 2, 5, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+    string stateText  = walkDir == 1 ? "Bullish ▲" : walkDir == -1 ? "Bearish ▼" : "None"
+    color  stateColor = walkDir == 1 ? bullColorInput : walkDir == -1 ? bearColorInput : neutralColorInput
+    string barsText   = walkDir != 0 ? str.tostring(walkBars) : "-"
+    string closesText = walkDir != 0 ? str.tostring(walkCloses) : "-"
+    string pullsText  = walkDir != 0 ? str.tostring(walkPulls) : "-"
+    string oppText    = walkDir != 0 ? (oppBending ? "Bending Away" : "Converging") : "-"
+    color  oppColor   = walkDir != 0 and oppBending ? stateColor : DASH_HEADER
+
+    table.cell(dashTable, 0, 0, "Band Walk", text_color = DASH_TEXT, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 0, stateText, text_color = stateColor, text_halign = text.align_right, text_size = dashTextSize)
+    table.cell(dashTable, 0, 1, "Bars Ridden", text_color = DASH_HEADER, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 1, barsText, text_color = DASH_TEXT, text_halign = text.align_right, text_size = dashTextSize)
+    table.cell(dashTable, 0, 2, "Band Closes", text_color = DASH_HEADER, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 2, closesText, text_color = DASH_TEXT, text_halign = text.align_right, text_size = dashTextSize)
+    table.cell(dashTable, 0, 3, "Midline Holds", text_color = DASH_HEADER, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 3, pullsText, text_color = DASH_TEXT, text_halign = text.align_right, text_size = dashTextSize)
+    table.cell(dashTable, 0, 4, "Opposite Band", text_color = DASH_HEADER, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 4, oppText, text_color = oppColor, text_halign = text.align_right, text_size = dashTextSize)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(startUpEvent, "Bullish Band Walk Started", "band walk: closes riding the upper band on {{ticker}} ({{interval}}) - trend strength argues for continuation tactics, not fades")
+alertcondition(startDnEvent, "Bearish Band Walk Started", "band walk: closes riding the lower band on {{ticker}} ({{interval}}) - trend strength argues for continuation tactics, not fades")
+alertcondition(endUpEvent, "Bullish Band Walk Ended", "band walk: bullish walk ended on {{ticker}} ({{interval}}) - price stopped reaching the upper band or closed below the midline")
+alertcondition(endDnEvent, "Bearish Band Walk Ended", "band walk: bearish walk ended on {{ticker}} ({{interval}}) - price stopped reaching the lower band or closed above the midline")
+alertcondition(pullUpEvent, "Bullish Midline Pullback", "band walk: pullback held the midline during an active bullish walk on {{ticker}} ({{interval}}) - classic continuation spot")
+alertcondition(pullDnEvent, "Bearish Midline Pullback", "band walk: pullback held the midline during an active bearish walk on {{ticker}} ({{interval}}) - classic continuation spot")
+
+//---------------------------------------------------------------------------------------------------------------------}

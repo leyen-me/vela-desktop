@@ -1,0 +1,292 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Model Stacking", "Model Stacking", overlay = false, format = format.percent, precision = 1)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+EPS = 1e-10
+MIN_TRAIN_SAMPLES = 10
+BASE_DECAY = 0.001
+
+// palette - the stacked reading carries the meaning, the base models are structure in three grey tones
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+NEUTRAL_COLOR = #787b86
+MOM_COLOR     = #ffd700
+MR_COLOR      = #ff9800
+VOL_COLOR     = #ab47bc
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+// resolved sample matrix column layout: 0-2 momentum features, 3-5 mean reversion features, 6-8 volume/volatility features
+COL_P_MOM = 9
+COL_P_MR = 10
+COL_P_VOL = 11
+COL_P_STACK = 12
+COL_LABEL = 13
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+horizonInput = input.int(5, "Prediction Horizon", minval = 1, maxval = 50, group = "Stacking", tooltip = "Bars ahead each model predicts. A sample is labeled bullish when price closes higher after this many bars, so every stored prediction is out-of-fold: it is made before its outcome is known and before any model has trained on it.")
+featLenInput = input.int(14, "Feature Length", minval = 2, maxval = 200, group = "Stacking", tooltip = "Lookback used to build the normalized features of the three base learners (momentum, mean reversion, volume/volatility).")
+trainWindowInput = input.int(200, "Training Window", minval = 20, maxval = 500, group = "Stacking", tooltip = "Number of most recent resolved out-of-fold samples kept to train the base learners and the meta-learner, and to measure the out-of-sample hit rates shown in the dashboard.")
+baseLrInput = input.float(0.5, "Base Learning Rate", minval = 0.01, maxval = 2, step = 0.05, group = "Stacking", tooltip = "Gradient step used by the three base logistic models. One pass over the training window is performed on each bar, walk-forward style.")
+metaLrInput = input.float(0.2, "Meta Learning Rate", minval = 0.01, maxval = 2, step = 0.05, group = "Stacking", tooltip = "Gradient step used by the logistic meta-learner that blends the stored out-of-fold base predictions into the final stacked probability.")
+ridgeInput = input.float(0.02, "Meta Ridge (L2)", minval = 0, maxval = 1, step = 0.01, group = "Stacking", tooltip = "L2 penalty shrinking the meta-learner weights, keeping the combiner deliberately simple so it does not overfit the correlated base predictions.")
+
+upperInput = input.float(60, "Upper Threshold", minval = 50, maxval = 100, group = "Signal Levels", tooltip = "Stacked probability level (in %) above which the ensemble is considered decisively bullish.")
+lowerInput = input.float(40, "Lower Threshold", minval = 0, maxval = 50, group = "Signal Levels", tooltip = "Stacked probability level (in %) below which the ensemble is considered decisively bearish.")
+
+showDashInput = input.bool(true, "Show Dashboard", group = "Dashboard", tooltip = "Displays the learned meta weight and out-of-sample hit rate of each base model, the stack's own hit rate, and the stack's edge over its best base model.")
+dashLocInput = input.string("Top Right", "Location", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = "Dashboard", tooltip = "Dashboard position on the pane.")
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = "Dashboard", tooltip = "Dashboard text size.")
+
+showBasesInput = input.bool(true, "Show Base Model Probabilities", group = "Style", tooltip = "Plots the individual probability of each base learner alongside the stacked output.")
+bullColorInput = input.color(BULL_COLOR, "Bullish", group = "Style")
+bearColorInput = input.color(BEAR_COLOR, "Bearish", group = "Style")
+momColorInput = input.color(MOM_COLOR, "Momentum Model", group = "Style")
+mrColorInput = input.color(MR_COLOR, "Mean Reversion Model", group = "Style")
+volColorInput = input.color(VOL_COLOR, "Volume/Volatility Model", group = "Style")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// bounded soft-sign squash keeping features within (-1, 1)
+softsign(float x) =>
+    x / (1.0 + math.abs(x))
+
+// numerically safe logistic function
+sigmoid(float x) =>
+    clamped = math.max(-30.0, math.min(30.0, x))
+    1.0 / (1.0 + math.exp(-clamped))
+
+// logistic model output for a 3-feature input vector, weights laid out as [bias, w1, w2, w3]
+linPredict(array<float> weightsArray, float x1, float x2, float x3) =>
+    sigmoid(array.get(weightsArray, 0) + array.get(weightsArray, 1) * x1 + array.get(weightsArray, 2) * x2 + array.get(weightsArray, 3) * x3)
+
+// one SGD step of L2-regularized logistic regression (the bias term is not regularized)
+linTrain(array<float> weightsArray, float x1, float x2, float x3, float target, float learnRate, float decay) =>
+    prediction = linPredict(weightsArray, x1, x2, x3)
+    errValue = prediction - target
+    array.set(weightsArray, 0, array.get(weightsArray, 0) - learnRate * errValue)
+    array.set(weightsArray, 1, array.get(weightsArray, 1) - learnRate * (errValue * x1 + decay * array.get(weightsArray, 1)))
+    array.set(weightsArray, 2, array.get(weightsArray, 2) - learnRate * (errValue * x2 + decay * array.get(weightsArray, 2)))
+    array.set(weightsArray, 3, array.get(weightsArray, 3) - learnRate * (errValue * x3 + decay * array.get(weightsArray, 3)))
+
+// out-of-sample hit rate of a stored prediction column against the resolved labels
+hitRate(matrix<float> samples, int predColumn) =>
+    rowsCount = matrix.rows(samples)
+    hits = 0.0
+    if rowsCount > 0
+        for i = 0 to rowsCount - 1
+            predUp = matrix.get(samples, i, predColumn) > 0.5
+            labelUp = matrix.get(samples, i, COL_LABEL) > 0.5
+            hits += predUp == labelUp ? 1.0 : 0.0
+    rowsCount > 0 ? hits / rowsCount : na
+
+// dashboard helpers
+getTablePosition(string loc) =>
+    switch loc
+        "Top Right" => position.top_right
+        "Top Left" => position.top_left
+        "Bottom Right" => position.bottom_right
+        => position.bottom_left
+
+getTextSize(string sizeOption) =>
+    switch sizeOption
+        "Tiny" => size.tiny
+        "Small" => size.small
+        => size.normal
+
+dashCell(table tableId, int colIndex, int rowIndex, string cellText, color cellColor, string textSize) =>
+    table.cell(tableId, colIndex, rowIndex, cellText, text_color = cellColor, text_size = textSize)
+
+formatRate(float rateValue) =>
+    na(rateValue) ? "n/a" : str.tostring(rateValue * 100, "0.0") + "%"
+
+rateColor(float rateValue) =>
+    na(rateValue) ? DASH_TEXT : color.from_gradient(rateValue, 0.45, 0.55, bearColorInput, bullColorInput)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Features
+//---------------------------------------------------------------------------------------------------------------------{
+fastLen = math.max(2, math.round(featLenInput * 0.5))
+slowLen = featLenInput * 2
+
+rsiValue = ta.rsi(close, featLenInput)
+closeStdev = ta.stdev(close, featLenInput)
+emaFast = ta.ema(close, fastLen)
+emaSlow = ta.ema(close, slowLen)
+atrValue = ta.atr(featLenInput)
+smaValue = ta.sma(close, featLenInput)
+stochValue = ta.stoch(close, high, low, featLenInput)
+hhValue = ta.highest(high, featLenInput)
+llValue = ta.lowest(low, featLenInput)
+volSma = ta.sma(volume, featLenInput)
+volStdev = ta.stdev(volume, featLenInput)
+trValue = ta.tr(true)
+trSma = ta.sma(trValue, featLenInput)
+trStdev = ta.stdev(trValue, featLenInput)
+obvValue = ta.obv
+obvStdev = ta.stdev(obvValue, featLenInput)
+
+// momentum feature group
+momF1 = nz((rsiValue - 50) / 50)
+momF2 = nz(softsign((close - close[featLenInput]) / (closeStdev + EPS)))
+momF3 = nz(softsign((emaFast - emaSlow) / (atrValue + EPS)))
+
+// mean reversion feature group
+mrF1 = nz(softsign((close - smaValue) / (2 * closeStdev + EPS)))
+mrF2 = nz((stochValue - 50) / 50)
+mrF3 = nz(math.max(-1.0, math.min(1.0, (close - (hhValue + llValue) / 2) / ((hhValue - llValue) / 2 + EPS))))
+
+// volume & volatility feature group
+volF1 = nz(softsign((volume - volSma) / (volStdev + EPS)))
+volF2 = nz(softsign((trValue - trSma) / (trStdev + EPS)))
+volF3 = nz(softsign((obvValue - obvValue[featLenInput]) / (obvStdev + EPS)))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Base Learners & Meta-Learner
+//---------------------------------------------------------------------------------------------------------------------{
+var momWeightsArray = array.new_float(4, 0.0)
+var mrWeightsArray = array.new_float(4, 0.0)
+var volWeightsArray = array.new_float(4, 0.0)
+var metaWeightsArray = array.new_float(4, 1.0)
+
+// equal prior trust in every base model (a plain average) before any training, with a neutral bias
+if barstate.isfirst
+    array.set(metaWeightsArray, 0, 0.0)
+
+// predictions waiting for their label, and resolved out-of-fold training samples
+var pendingMatrix = matrix.new<float>(0, 14)
+var sampleMatrix = matrix.new<float>(0, 14)
+
+// base predictions are computed BEFORE any training step on this bar, so the values stored
+// for the meta-learner are strictly out-of-fold: no model has seen the label they resolve to
+pMom = linPredict(momWeightsArray, momF1, momF2, momF3)
+pMr = linPredict(mrWeightsArray, mrF1, mrF2, mrF3)
+pVol = linPredict(volWeightsArray, volF1, volF2, volF3)
+
+qMom = 2 * (pMom - 0.5)
+qMr = 2 * (pMr - 0.5)
+qVol = 2 * (pVol - 0.5)
+
+pStack = linPredict(metaWeightsArray, qMom, qMr, qVol)
+
+// queue the current out-of-fold predictions until their horizon elapses
+if bar_index > slowLen + horizonInput
+    pendingRowArray = array.new_float(14, 0.0)
+    array.set(pendingRowArray, 0, momF1)
+    array.set(pendingRowArray, 1, momF2)
+    array.set(pendingRowArray, 2, momF3)
+    array.set(pendingRowArray, 3, mrF1)
+    array.set(pendingRowArray, 4, mrF2)
+    array.set(pendingRowArray, 5, mrF3)
+    array.set(pendingRowArray, 6, volF1)
+    array.set(pendingRowArray, 7, volF2)
+    array.set(pendingRowArray, 8, volF3)
+    array.set(pendingRowArray, COL_P_MOM, pMom)
+    array.set(pendingRowArray, COL_P_MR, pMr)
+    array.set(pendingRowArray, COL_P_VOL, pVol)
+    array.set(pendingRowArray, COL_P_STACK, pStack)
+    array.set(pendingRowArray, COL_LABEL, close)
+    matrix.add_row(pendingMatrix, matrix.rows(pendingMatrix), pendingRowArray)
+
+// resolve the oldest pending prediction once its outcome is known
+if matrix.rows(pendingMatrix) > horizonInput
+    sampleRowArray = array.new_float(14, 0.0)
+    for c = 0 to 12
+        array.set(sampleRowArray, c, matrix.get(pendingMatrix, 0, c))
+    labelValue = close > matrix.get(pendingMatrix, 0, COL_LABEL) ? 1.0 : 0.0
+    array.set(sampleRowArray, COL_LABEL, labelValue)
+    matrix.remove_row(pendingMatrix, 0)
+    matrix.add_row(sampleMatrix, matrix.rows(sampleMatrix), sampleRowArray)
+    if matrix.rows(sampleMatrix) > trainWindowInput
+        matrix.remove_row(sampleMatrix, 0)
+
+// one training pass per bar over the rolling window: base learners fit their own feature
+// group, the meta-learner fits the stored out-of-fold base predictions
+sampleCount = matrix.rows(sampleMatrix)
+if sampleCount >= MIN_TRAIN_SAMPLES
+    baseStep = baseLrInput / sampleCount
+    metaStep = metaLrInput / sampleCount
+    for i = 0 to sampleCount - 1
+        targetValue = matrix.get(sampleMatrix, i, COL_LABEL)
+        linTrain(momWeightsArray, matrix.get(sampleMatrix, i, 0), matrix.get(sampleMatrix, i, 1), matrix.get(sampleMatrix, i, 2), targetValue, baseStep, BASE_DECAY)
+        linTrain(mrWeightsArray, matrix.get(sampleMatrix, i, 3), matrix.get(sampleMatrix, i, 4), matrix.get(sampleMatrix, i, 5), targetValue, baseStep, BASE_DECAY)
+        linTrain(volWeightsArray, matrix.get(sampleMatrix, i, 6), matrix.get(sampleMatrix, i, 7), matrix.get(sampleMatrix, i, 8), targetValue, baseStep, BASE_DECAY)
+        linTrain(metaWeightsArray, 2 * (matrix.get(sampleMatrix, i, COL_P_MOM) - 0.5), 2 * (matrix.get(sampleMatrix, i, COL_P_MR) - 0.5), 2 * (matrix.get(sampleMatrix, i, COL_P_VOL) - 0.5), targetValue, metaStep, ridgeInput)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+stackPct = pStack * 100
+momPct = pMom * 100
+mrPct = pMr * 100
+volPct = pVol * 100
+
+stackColor = color.from_gradient(stackPct, lowerInput, upperInput, bearColorInput, bullColorInput)
+baseDisplay = showBasesInput ? display.all : display.none
+
+plot(momPct, "Momentum Model", color = color.new(momColorInput, 30), display = baseDisplay)
+plot(mrPct, "Mean Reversion Model", color = color.new(mrColorInput, 30), display = baseDisplay)
+plot(volPct, "Volume/Volatility Model", color = color.new(volColorInput, 30), display = baseDisplay)
+
+midPlotId = plot(50, "Midline", color = NEUTRAL_COLOR)
+stackPlotId = plot(stackPct, "Stacked Probability", color = stackColor, linewidth = 2)
+
+fill(stackPlotId, midPlotId, top_value = math.max(stackPct, 50), bottom_value = math.min(stackPct, 50), top_color = stackPct >= 50 ? color.new(bullColorInput, 50) : color.new(bearColorInput, 100), bottom_color = stackPct >= 50 ? color.new(bullColorInput, 100) : color.new(bearColorInput, 50), title = "Stack Gradient")
+
+hline(upperInput, "Upper Threshold", color = color.new(NEUTRAL_COLOR, 30), linestyle = hline.style_dashed)
+hline(lowerInput, "Lower Threshold", color = color.new(NEUTRAL_COLOR, 30), linestyle = hline.style_dashed)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dashTable = table.new(getTablePosition(dashLocInput), 3, 6, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+if barstate.islast and showDashInput
+    textSize = getTextSize(dashSizeInput)
+    rateMom = hitRate(sampleMatrix, COL_P_MOM)
+    rateMr = hitRate(sampleMatrix, COL_P_MR)
+    rateVol = hitRate(sampleMatrix, COL_P_VOL)
+    rateStack = hitRate(sampleMatrix, COL_P_STACK)
+    bestBase = math.max(rateMom, math.max(rateMr, rateVol))
+    edgeValue = rateStack - bestBase
+    edgeText = na(edgeValue) ? "n/a" : (edgeValue >= 0 ? "+" : "") + str.tostring(edgeValue * 100, "0.0") + "%"
+    edgeColor = na(edgeValue) ? DASH_TEXT : edgeValue >= 0 ? bullColorInput : bearColorInput
+    dashCell(dashTable, 0, 0, "Model", DASH_HEADER, textSize)
+    dashCell(dashTable, 1, 0, "Weight", DASH_HEADER, textSize)
+    dashCell(dashTable, 2, 0, "OOS Hit Rate", DASH_HEADER, textSize)
+    dashCell(dashTable, 0, 1, "Momentum", momColorInput, textSize)
+    dashCell(dashTable, 1, 1, str.tostring(array.get(metaWeightsArray, 1), "0.00"), DASH_TEXT, textSize)
+    dashCell(dashTable, 2, 1, formatRate(rateMom), rateColor(rateMom), textSize)
+    dashCell(dashTable, 0, 2, "Mean Reversion", mrColorInput, textSize)
+    dashCell(dashTable, 1, 2, str.tostring(array.get(metaWeightsArray, 2), "0.00"), DASH_TEXT, textSize)
+    dashCell(dashTable, 2, 2, formatRate(rateMr), rateColor(rateMr), textSize)
+    dashCell(dashTable, 0, 3, "Volume/Volatility", volColorInput, textSize)
+    dashCell(dashTable, 1, 3, str.tostring(array.get(metaWeightsArray, 3), "0.00"), DASH_TEXT, textSize)
+    dashCell(dashTable, 2, 3, formatRate(rateVol), rateColor(rateVol), textSize)
+    dashCell(dashTable, 0, 4, "Stacked (Meta)", DASH_TEXT, textSize)
+    dashCell(dashTable, 1, 4, "bias " + str.tostring(array.get(metaWeightsArray, 0), "0.00"), DASH_TEXT, textSize)
+    dashCell(dashTable, 2, 4, formatRate(rateStack), rateColor(rateStack), textSize)
+    dashCell(dashTable, 0, 5, "Edge vs Best Base", DASH_TEXT, textSize)
+    dashCell(dashTable, 1, 5, "", DASH_TEXT, textSize)
+    dashCell(dashTable, 2, 5, edgeText, edgeColor, textSize)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(ta.crossover(stackPct, upperInput), "Bullish Stack Signal", "Model Stacking: stacked probability crossed above the upper threshold")
+alertcondition(ta.crossunder(stackPct, lowerInput), "Bearish Stack Signal", "Model Stacking: stacked probability crossed below the lower threshold")
+alertcondition(ta.crossover(stackPct, 50), "Stack Turned Bullish", "Model Stacking: stacked probability crossed above 50%")
+alertcondition(ta.crossunder(stackPct, 50), "Stack Turned Bearish", "Model Stacking: stacked probability crossed below 50%")
+
+//---------------------------------------------------------------------------------------------------------------------}

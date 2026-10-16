@@ -1,0 +1,230 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Projection Bands", "Projection Bands", overlay = false, format = format.price, precision = 2, max_lines_count = 500, max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+NEUTRAL_COLOR = #787b86 // levels and the signal line - structure
+ACCENT_COLOR  = #ff9800 // the one accent - the optional bandwidth gauge
+SIGNAL_COLOR  = NEUTRAL_COLOR
+
+ZONE_TRANSP = 92 // transparency of the soft overbought / oversold zone shading
+LABEL_BG      = #00000000
+
+int   MAX_LOOKBACK = 500
+float MID_LEVEL    = 50
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+lengthInput = input.int(14, "Length", minval = 2, maxval = MAX_LOOKBACK, group = "Settings",
+  tooltip = "Lookback window 'n'. Separate regression slopes are fitted to the window's highs and lows, and every high/low of the window is projected forward to the current bar along its own slope. 14 and 20 are the common defaults; shorter windows tilt faster but whip more.")
+
+showBandsInput = input.bool(true, "Show Bands on Price Chart", group = "Projection Bands",
+  tooltip = "Draws the upper and lower projection bands over price on the main chart. The window's bars cannot lie outside the bands by construction, so signals come from band touches rather than band breaks.")
+
+signalLengthInput = input.int(3, "Signal Length", minval = 1, maxval = 50, group = "Projection Oscillator",
+  tooltip = "Period of the short simple moving average of the projection oscillator used as a signal line. 3 to 5 periods are typical.")
+
+showSignalInput = input.bool(true, "Show Signal Line", group = "Projection Oscillator",
+  tooltip = "Plots the smoothed projection oscillator as a signal line; crossings between the oscillator and this line are covered by the signal cross alerts.")
+
+obInput = input.float(80, "Overbought", minval = 50, maxval = 100, step = 1, group = "Projection Oscillator",
+  tooltip = "Projection oscillator level above which the close presses the top of the tilted channel - an extreme relative to the trend, readable where a raw stochastic would sit pegged.")
+
+osInput = input.float(20, "Oversold", minval = 0, maxval = 50, step = 1, group = "Projection Oscillator",
+  tooltip = "Projection oscillator level below which the close presses the bottom of the tilted channel - oversold relative to the trend.")
+
+showDivergencesInput = input.bool(false, "Show Divergences", group = "Divergences",
+  tooltip = "Draws regular divergences between price extremes and projection oscillator extremes - dashed lines on the oscillator and on the price chart with a label at the confirming pivot. The matching alerts are available regardless of this setting.")
+
+divergenceLengthInput = input.int(5, "Pivot Length", minval = 1, maxval = 50, group = "Divergences",
+  tooltip = "Bars required on each side of a projection oscillator pivot before it is confirmed; divergences are flagged this many bars after the pivot forms.")
+
+showBandwidthInput = input.bool(false, "Show Bandwidth", group = "Projection Bandwidth",
+  tooltip = "Plots projection bandwidth, 200 * (upper - lower) / (upper + lower), in the pane as a volatility gauge. Narrowing readings mark compression phases that often precede directional expansion.")
+
+upperColorInput     = input.color(BEAR_COLOR, "Upper Band", inline = "bands", group = "Style")
+lowerColorInput     = input.color(BULL_COLOR, "Lower Band", inline = "bands", group = "Style")
+bullColorInput      = input.color(BULL_COLOR, "Bullish", inline = "direction", group = "Style")
+bearColorInput      = input.color(BEAR_COLOR, "Bearish", inline = "direction", group = "Style")
+signalColorInput    = input.color(SIGNAL_COLOR, "Signal Line", group = "Style")
+bandwidthColorInput = input.color(ACCENT_COLOR, "Bandwidth", group = "Style")
+
+showFillInput = input.bool(true, "Gradient Fill", group = "Style",
+  tooltip = "Vertical gradient between the 50 midline and the projection oscillator - bullish above the midline, bearish below it - and from zero to the bandwidth when it is shown.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Per-bar least-squares slope of the linear regression of `src` over `len` bars, from the closed
+// form of the regression normal equations: slope = 6 * (WMA(src, len) - SMA(src, len)) / (len - 1).
+linregSlope(series float src, simple int len) =>
+    6 * (ta.wma(src, len) - ta.sma(src, len)) / (len - 1)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+max_bars_back(high, MAX_LOOKBACK)
+max_bars_back(low, MAX_LOOKBACK)
+
+// Regression slopes of the window's highs and of its lows
+float highSlope = linregSlope(high, lengthInput)
+float lowSlope  = linregSlope(low, lengthInput)
+
+// Slide every high/low of the window forward to the current bar along its own slope and keep the
+// extremes: Upper = max(high[i] + i * highSlope), Lower = min(low[i] + i * lowSlope), i = 0..n-1.
+// Because each bar of the window is projected to the current bar, none of them can lie outside.
+float upperBand = na
+float lowerBand = na
+
+if bar_index >= lengthInput - 1 and not na(highSlope) and not na(lowSlope)
+    float projectedHigh = high
+    float projectedLow  = low
+
+    for i = 1 to lengthInput - 1
+        projectedHigh := math.max(projectedHigh, high[i] + i * highSlope)
+        projectedLow  := math.min(projectedLow,  low[i] + i * lowSlope)
+
+    upperBand := projectedHigh
+    lowerBand := projectedLow
+
+// Projection oscillator: position of the close inside the bands on a 0-100 scale, held at the
+// midline when the bands have no width
+float bandRange     = upperBand - lowerBand
+float projectionOsc = na(bandRange) ? na : bandRange > 0 ? 100 * (close - lowerBand) / bandRange : MID_LEVEL
+float signalLine    = ta.sma(projectionOsc, signalLengthInput)
+
+// Projection bandwidth: spread between the bands as a volatility gauge
+float bandSum      = upperBand + lowerBand
+float bandwidth    = na(bandSum) or bandSum == 0 ? na : 200 * bandRange / bandSum
+float bandwidthAvg = ta.sma(bandwidth, lengthInput)
+
+// Band touches - within the window price can only reach a band, never exceed it
+bool upperTouch = not na(upperBand) and high >= upperBand
+bool lowerTouch = not na(lowerBand) and low <= lowerBand
+
+// Oscillator level entries and signal-line crossings
+bool enteredOverbought = ta.crossover(projectionOsc, obInput)
+bool enteredOversold   = ta.crossunder(projectionOsc, osInput)
+bool bullSignalCross   = ta.crossover(projectionOsc, signalLine)
+bool bearSignalCross   = ta.crossunder(projectionOsc, signalLine)
+
+// Bandwidth contraction/expansion relative to its own n-period average
+bool bandwidthContract = ta.crossunder(bandwidth, bandwidthAvg)
+bool bandwidthExpand   = ta.crossover(bandwidth, bandwidthAvg)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Divergences
+//---------------------------------------------------------------------------------------------------------------------{
+float oscPivotHigh = ta.pivothigh(projectionOsc, divergenceLengthInput, divergenceLengthInput)
+float oscPivotLow  = ta.pivotlow(projectionOsc, divergenceLengthInput, divergenceLengthInput)
+
+var float prevHighOsc   = na
+var float prevHighPrice = na
+var int   prevHighIndex = na
+var float prevLowOsc    = na
+var float prevLowPrice  = na
+var int   prevLowIndex  = na
+
+bool bearishDivergence = false
+bool bullishDivergence = false
+
+// Regular bearish divergence: a new price high with a lower projection oscillator high - the
+// advance is losing position within its own channel
+if not na(oscPivotHigh)
+    float highPrice = high[divergenceLengthInput]
+    int   highIndex = bar_index - divergenceLengthInput
+
+    if not na(prevHighOsc) and highPrice > prevHighPrice and oscPivotHigh < prevHighOsc
+        bearishDivergence := true
+
+        if showDivergencesInput
+            line.new(prevHighIndex, prevHighOsc, highIndex, oscPivotHigh, color = bearColorInput, style = line.style_dashed, width = 2)
+            line.new(prevHighIndex, prevHighPrice, highIndex, highPrice, color = bearColorInput, style = line.style_dashed, width = 2, force_overlay = true)
+            label.new(highIndex, oscPivotHigh, "Bear", color = LABEL_BG, textcolor = bearColorInput, style = label.style_label_down, size = size.small,
+              tooltip = "Bearish divergence: price made a higher high while the projection oscillator made a lower high")
+
+    prevHighOsc   := oscPivotHigh
+    prevHighPrice := highPrice
+    prevHighIndex := highIndex
+
+// Regular bullish divergence: a new price low with a higher projection oscillator low
+if not na(oscPivotLow)
+    float lowPrice = low[divergenceLengthInput]
+    int   lowIndex = bar_index - divergenceLengthInput
+
+    if not na(prevLowOsc) and lowPrice < prevLowPrice and oscPivotLow > prevLowOsc
+        bullishDivergence := true
+
+        if showDivergencesInput
+            line.new(prevLowIndex, prevLowOsc, lowIndex, oscPivotLow, color = bullColorInput, style = line.style_dashed, width = 2)
+            line.new(prevLowIndex, prevLowPrice, lowIndex, lowPrice, color = bullColorInput, style = line.style_dashed, width = 2, force_overlay = true)
+            label.new(lowIndex, oscPivotLow, "Bull", color = LABEL_BG, textcolor = bullColorInput, style = label.style_label_up, size = size.small,
+              tooltip = "Bullish divergence: price made a lower low while the projection oscillator made a higher low")
+
+    prevLowOsc   := oscPivotLow
+    prevLowPrice := lowPrice
+    prevLowIndex := lowIndex
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+hline(obInput, "Overbought Level", NEUTRAL_COLOR, hline.style_dashed)
+hline(osInput, "Oversold Level", NEUTRAL_COLOR, hline.style_dashed)
+hline(MID_LEVEL, "Midline", color.new(NEUTRAL_COLOR, 50), hline.style_dotted)
+
+// Soft zone shading anchored on hidden plots - overbought leans bearish, oversold leans bullish
+obZoneId       = plot(obInput, "Overbought Zone Anchor", color = na, editable = false, display = display.none)
+osZoneId       = plot(osInput, "Oversold Zone Anchor", color = na, editable = false, display = display.none)
+topAnchorId    = plot(100, "Top Anchor", color = na, editable = false, display = display.none)
+bottomAnchorId = plot(0, "Bottom Anchor", color = na, editable = false, display = display.none)
+
+fill(obZoneId, topAnchorId, color.new(bearColorInput, ZONE_TRANSP), title = "Overbought Zone")
+fill(osZoneId, bottomAnchorId, color.new(bullColorInput, ZONE_TRANSP), title = "Oversold Zone")
+
+color oscColor = projectionOsc > MID_LEVEL ? bullColorInput : bearColorInput
+
+oscPlotId = plot(projectionOsc, "Projection Oscillator", oscColor, 2)
+plot(showSignalInput ? signalLine : na, "Signal Line", signalColorInput, 1)
+midPlotId = plot(MID_LEVEL, "Midline Anchor", color = na, editable = false, display = display.none)
+
+// Vertical gradient from the midline to the oscillator, fully transparent at the midline
+color fillTopColor    = projectionOsc > MID_LEVEL ? color.new(bullColorInput, 50)  : color.new(bearColorInput, 100)
+color fillBottomColor = projectionOsc > MID_LEVEL ? color.new(bullColorInput, 100) : color.new(bearColorInput, 50)
+
+fill(oscPlotId, midPlotId, top_value = math.max(nz(projectionOsc, MID_LEVEL), MID_LEVEL), bottom_value = math.min(nz(projectionOsc, MID_LEVEL), MID_LEVEL), top_color = showFillInput ? fillTopColor : na, bottom_color = showFillInput ? fillBottomColor : na, title = "Oscillator Gradient")
+
+// Projection bandwidth in the pane, its gradient fading toward zero
+float bandwidthValue = showBandwidthInput ? bandwidth : na
+
+bandwidthPlotId = plot(bandwidthValue, "Projection Bandwidth", bandwidthColorInput, 1, plot.style_linebr)
+zeroPlotId      = plot(0, "Bandwidth Anchor", color = na, editable = false, display = display.none)
+
+fill(bandwidthPlotId, zeroPlotId, top_value = math.max(nz(bandwidthValue, 0), 0), bottom_value = math.min(nz(bandwidthValue, 0), 0), top_color = showFillInput and showBandwidthInput ? color.new(bandwidthColorInput, 50) : na, bottom_color = showFillInput and showBandwidthInput ? color.new(bandwidthColorInput, 100) : na, title = "Bandwidth Gradient")
+
+// Projection bands over price on the main chart (fills cannot be forced onto the price chart from
+// a pane script, so the bands render as clean lines)
+plot(showBandsInput ? upperBand : na, "Upper Band", upperColorInput, 1, plot.style_linebr, force_overlay = true)
+plot(showBandsInput ? lowerBand : na, "Lower Band", lowerColorInput, 1, plot.style_linebr, force_overlay = true)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(upperTouch, "Upper Band Touch", "projection bands: high touched the upper projection band on {{ticker}} ({{interval}})")
+alertcondition(lowerTouch, "Lower Band Touch", "projection bands: low touched the lower projection band on {{ticker}} ({{interval}})")
+alertcondition(enteredOverbought, "Oscillator Overbought", "projection bands: projection oscillator crossed above the overbought level on {{ticker}} ({{interval}})")
+alertcondition(enteredOversold, "Oscillator Oversold", "projection bands: projection oscillator crossed below the oversold level on {{ticker}} ({{interval}})")
+alertcondition(bullSignalCross, "Bullish Signal Cross", "projection bands: projection oscillator crossed above its signal line on {{ticker}} ({{interval}})")
+alertcondition(bearSignalCross, "Bearish Signal Cross", "projection bands: projection oscillator crossed below its signal line on {{ticker}} ({{interval}})")
+alertcondition(bearishDivergence, "Bearish Divergence", "projection bands: price made a higher high while the projection oscillator made a lower high on {{ticker}} ({{interval}})")
+alertcondition(bullishDivergence, "Bullish Divergence", "projection bands: price made a lower low while the projection oscillator made a higher low on {{ticker}} ({{interval}})")
+alertcondition(bandwidthContract, "Bandwidth Contraction", "projection bands: projection bandwidth crossed below its average on {{ticker}} ({{interval}}) - compression phase")
+alertcondition(bandwidthExpand, "Bandwidth Expansion", "projection bands: projection bandwidth crossed above its average on {{ticker}} ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

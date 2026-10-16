@@ -1,0 +1,618 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Divergence Variants & Confirmation", shorttitle = "Divergence Variants & Confirmation", overlay = false, format = format.price, precision = 2, max_lines_count = 500, max_labels_count = 500, max_bars_back = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+OSC_RSI   = "RSI"
+OSC_STOCH = "Stochastic %K"
+OSC_MACD  = "MACD"
+OSC_ROC   = "Rate of Change"
+
+RULE_STRUCTURE = "Structure Break"
+RULE_OSC       = "Oscillator Cross"
+RULE_CLOSE     = "Strong Close"
+RULE_ANY       = "Any of the Three"
+
+TOP_RIGHT    = "Top Right"
+TOP_LEFT     = "Top Left"
+BOTTOM_RIGHT = "Bottom Right"
+BOTTOM_LEFT  = "Bottom Left"
+
+TINY_SIZE   = "Tiny"
+SMALL_SIZE  = "Small"
+NORMAL_SIZE = "Normal"
+
+VARIANT_REGULAR     = 0
+VARIANT_HIDDEN      = 1
+VARIANT_EXAGGERATED = 2
+
+FAMILY_NONE      = 0    // last swing pair did not diverge
+FAMILY_WEAKENING = 1    // regular/exaggerated family — oscillator weakening while price presses on
+FAMILY_HIDDEN    = 2    // hidden family — oscillator overshooting while price holds a shallower extreme
+
+MULTIPLE_MIN_SWINGS = 3 // three or more chained swings read as multiple (triple) divergence
+
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+NEUTRAL_COLOR = #ff9800 // the one accent - pending patterns and the MACD signal line
+FAIL_COLOR    = #787b86
+LEVEL_COLOR   = #787b86 // centerline and zone levels are structure - grey
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+ZONE_TRANSP = 91 // transparency of the soft overbought / oversold zone shading
+
+ATR_LENGTH        = 14  // Wilder ATR used to scale the equal-extreme tolerance
+DIV_LINE_WIDTH    = 2
+PENDING_TRANSP    = 40
+FAIL_TRANSP       = 45
+FILL_VALUE_TRANSP = 50
+FILL_MID_TRANSP   = 100
+MAX_ACTIVE        = 40  // safety cap on simultaneously tracked pending patterns
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+oscTypeInput = input.string(OSC_RSI, "Oscillator", options = [OSC_RSI, OSC_STOCH, OSC_MACD, OSC_ROC]
+  , group   = "Oscillator"
+  , tooltip = "Momentum gauge the price swings are read against. The variant taxonomy is identical for every oscillator — RSI and MACD dominate practice through familiarity, stochastics behave well in ranges, and rate-of-change makes momentum decay explicit. Switching oscillators until a divergence appears is a red flag; pick one and keep it.")
+
+srcInput = input.source(close, "Source"
+  , group   = "Oscillator"
+  , tooltip = "Price series feeding RSI, MACD and Rate of Change. Stochastic %K always uses close/high/low per its standard definition.")
+
+oscLengthInput = input.int(14, "Length", minval = 2
+  , group   = "Oscillator"
+  , tooltip = "Lookback applied to RSI, Stochastic %K and Rate of Change.")
+
+stochSmoothInput = input.int(3, "Stochastic Smoothing", minval = 1
+  , group   = "Oscillator"
+  , tooltip = "Simple moving average applied to raw %K. 3 gives the classic slow %K.")
+
+macdFastInput = input.int(12, "MACD Fast", minval = 1, inline = "macd"
+  , group   = "Oscillator"
+  , tooltip = "Fast EMA length of the MACD line, used when the oscillator is MACD.")
+
+macdSlowInput = input.int(26, "Slow", minval = 2, inline = "macd"
+  , group   = "Oscillator"
+  , tooltip = "Slow EMA length of the MACD line.")
+
+macdSignalInput = input.int(9, "Signal", minval = 1, inline = "macd"
+  , group   = "Oscillator"
+  , tooltip = "Signal-line smoothing. For MACD the Oscillator Cross confirmation reads against this signal line instead of the centerline.")
+
+overboughtInput = input.float(70, "Overbought", minval = 50, maxval = 100, inline = "zones"
+  , group   = "Oscillator"
+  , tooltip = "Zone levels used to grade location, drawn as dashed levels in the pane. Patterns printing from overbought (bearish) or oversold (bullish) territory carry the classic reading and are tagged with a zone dot; mid-range wiggles are graded down. Applies to the bounded oscillators only (RSI, Stochastic %K — 80/20 is the stochastic convention); MACD and Rate of Change have no fixed scale, so their patterns always grade as mid-range.")
+
+oversoldInput = input.float(30, "Oversold", minval = 0, maxval = 50, inline = "zones"
+  , group   = "Oscillator"
+  , tooltip = "Oversold zone level for the bounded oscillators — see the Overbought tooltip.")
+
+swingLeftInput = input.int(5, "Left Bars", minval = 1, maxval = 50, inline = "swing"
+  , group   = "Divergence Detection"
+  , tooltip = "Bars that must print to the left of a swing point without exceeding it.")
+
+swingRightInput = input.int(5, "Right Bars", minval = 1, maxval = 50, inline = "swing"
+  , group   = "Divergence Detection"
+  , tooltip = "Bars that must print to the right of a swing point before it counts as confirmed. Nothing is classified until both swings of the comparison are final by this rule — detections arrive bars after the extreme by design and do not repaint. Signals that appear exactly at the extreme are built on unconfirmed pivots.")
+
+maxSwingGapInput = input.int(60, "Max Bars Between Swings", minval = 5, maxval = 250
+  , group   = "Divergence Detection"
+  , tooltip = "Maximum distance in bars between the two compared swings. Consecutive swings further apart than this are not treated as part of the same structure and are not compared; the multiple-divergence chain also resets.")
+
+equalTolInput = input.float(0.25, "Equal-Extreme Tolerance", minval = 0, maxval = 5, step = 0.05
+  , group   = "Divergence Detection"
+  , tooltip = "Tolerance in ATR(14) multiples that separates the three price conditions: extremes within the tolerance are 'roughly equal' (the exaggerated variant's double top/bottom), beyond it they count as a genuinely new or a genuinely weaker extreme.")
+
+detectRegularInput = input.bool(true, "Regular", inline = "variants"
+  , group   = "Divergence Detection"
+  , tooltip = "Variant classes to detect and track.")
+
+detectHiddenInput = input.bool(true, "Hidden", inline = "variants"
+  , group   = "Divergence Detection"
+  , tooltip = "Variant classes to detect and track.")
+
+detectExaggeratedInput = input.bool(true, "Exaggerated", inline = "variants"
+  , group   = "Divergence Detection"
+  , tooltip = "Variant classes to detect and track. Regular: new price extreme against a weaker oscillator extreme. Hidden: weaker price extreme against a stronger oscillator extreme. Exaggerated: roughly equal price extremes (double top/bottom) against a clearly weaker oscillator. Chains of three or more weakening swings are additionally tagged as multiple divergence.")
+
+confirmRuleInput = input.string(RULE_STRUCTURE, "Confirmation Rule", options = [RULE_STRUCTURE, RULE_OSC, RULE_CLOSE, RULE_ANY]
+  , group   = "Confirmation"
+  , tooltip = "A divergence is a condition, not a signal — it is only acted on when price does something concrete. Structure Break: a close beyond the swing that built the pattern (the interior swing between the two compared pivots). Oscillator Cross: the oscillator on the signal side of its centerline (signal line for MACD) — a cross completed during the pivot-confirmation lag still counts. Strong Close: a close beyond the previous bar's opposite extreme, a decisive close against the prior move. Any of the Three: the first event to fire confirms.")
+
+confirmWindowInput = input.int(30, "Confirmation Window", minval = 1, maxval = 500
+  , group   = "Confirmation"
+  , tooltip = "Bars a pending pattern is given to confirm. If no confirmation event fires within this window the pattern is marked failed (expired). Invalidation can fail it earlier: a fresh price extreme matched by a fresh oscillator extreme re-synchronizes the pair and cancels the pattern. Patterns can confirm on the detection bar itself when the event already occurred during the pivot lag.")
+
+showDashboardInput = input.bool(true, "Variant Dashboard"
+  , group   = "Dashboard"
+  , tooltip = "Side-by-side grading panel: pending, confirmed and failed counts per variant class, the multiple-divergence subset, and the overall confirmation rate of resolved patterns.")
+
+dashboardPositionInput = input.string(TOP_RIGHT, "Position", options = [TOP_RIGHT, TOP_LEFT, BOTTOM_RIGHT, BOTTOM_LEFT], inline = "dash"
+  , group   = "Dashboard"
+  , tooltip = "Corner of the pane the dashboard is anchored to.")
+
+dashboardSizeInput = input.string(SMALL_SIZE, "Size", options = [TINY_SIZE, SMALL_SIZE, NORMAL_SIZE], inline = "dash"
+  , group   = "Dashboard"
+  , tooltip = "Dashboard text size.")
+
+showOscLinesInput = input.bool(true, "Divergence Lines on Oscillator"
+  , group   = "Style"
+  , tooltip = "Draws the line connecting the two compared oscillator readings in this pane. Solid = regular, dashed = hidden, dotted = exaggerated. Lines brighten when the pattern confirms and fade to the failed color when it is invalidated or expires.")
+
+showPriceLinesInput = input.bool(true, "Divergence Lines on Price"
+  , group   = "Style"
+  , tooltip = "Draws the line connecting the two compared price swings on the main chart, restyled with the pattern's confirmation status like the oscillator line.")
+
+showLabelsInput = input.bool(true, "Variant Labels"
+  , group   = "Style"
+  , tooltip = "Tags the confirming swing with the variant code (R / H / E), the chain length when it reaches multiple divergence (×3, ×4, …) and a zone dot when the pattern printed from overbought/oversold. The tag updates with the state machine: plain while pending, ✓ on a filled label when confirmed, ✗ in the failed color when invalidated or expired. Hover the label for the full grading detail.")
+
+showStructureInput = input.bool(true, "Confirmation Levels"
+  , group   = "Style"
+  , tooltip = "While a pattern is pending and the rule involves a structure break, extends a dashed level on the main chart at the swing that must give way. The level freezes on confirmation and is removed on failure.")
+
+showZonesInput = input.bool(true, "Zone Levels"
+  , group   = "Style"
+  , tooltip = "Dashed overbought/oversold levels in the pane when a bounded oscillator (RSI, Stochastic %K) is selected.")
+
+labelSizeInput = input.string(SMALL_SIZE, "Label Size", options = [TINY_SIZE, SMALL_SIZE, NORMAL_SIZE]
+  , group   = "Style"
+  , tooltip = "Text size of the variant labels.")
+
+gradientFillInput = input.bool(true, "Gradient Fill"
+  , group   = "Style"
+  , tooltip = "Vertical gradient between the oscillator and its centerline — bullish color above, bearish below, fully transparent at the centerline.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "colors"
+  , group   = "Style"
+  , tooltip = "Color of bullish divergence lines, labels and confirmation levels, and of the oscillator above its centerline.")
+
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "colors"
+  , group   = "Style"
+  , tooltip = "Color of bearish divergence lines, labels and confirmation levels, and of the oscillator below its centerline.")
+
+neutralColorInput = input.color(NEUTRAL_COLOR, "Neutral", inline = "colors2"
+  , group   = "Style"
+  , tooltip = "Color of the MACD signal line and of the pending counts in the dashboard.")
+
+failColorInput = input.color(FAIL_COLOR, "Failed", inline = "colors2"
+  , group   = "Style"
+  , tooltip = "Color applied to a pattern's lines and label once it is invalidated or expires unconfirmed.")
+
+// Derived settings — bounded scales carry fixed zone levels; the rule decides whether structure takes part
+boundedOsc = oscTypeInput == OSC_RSI or oscTypeInput == OSC_STOCH
+
+useStructureRule = confirmRuleInput == RULE_STRUCTURE or confirmRuleInput == RULE_ANY
+
+ruleSummary = confirmRuleInput == RULE_STRUCTURE ? "close beyond the interior swing"
+  : confirmRuleInput == RULE_OSC ? "oscillator beyond its centerline/signal"
+  : confirmRuleInput == RULE_CLOSE ? "strong close against the prior move"
+  : "structure break, oscillator cross or strong close"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types
+//---------------------------------------------------------------------------------------------------------------------{
+// Last confirmed swing on one side of price, plus the running divergence chain ending at it
+type SwingRef
+    int   priceBar
+    float price
+    float osc
+    int   family = 0
+    int   chain  = 1
+
+// One detected divergence tracked by the confirmation state machine (pending → confirmed / failed)
+type Pattern
+    int    dir             // 1 bullish (lows), -1 bearish (highs)
+    int    variant         // VARIANT_REGULAR / VARIANT_HIDDEN / VARIANT_EXAGGERATED
+    int    swings          // chained swing count — ≥3 is multiple divergence
+    bool   inZone          // printed from overbought/oversold territory
+    int    detectBar
+    float  structureLevel  // the swing that built the pattern — its break is the structure confirmation
+    float  invPriceLevel   // fresh price extreme beyond this level arms half of the invalidation
+    float  invOscLevel     // fresh oscillator extreme beyond this level arms the other half
+    bool   priceExtremeHit = false
+    bool   oscExtremeHit   = false
+    string tagText
+    string infoText
+    line   oscLine
+    line   priceLine
+    line   structureLine
+    label  tag
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Dashboard anchor from the position option
+tableLocation(string positionText) =>
+    switch
+        positionText == TOP_RIGHT    => position.top_right
+        positionText == TOP_LEFT     => position.top_left
+        positionText == BOTTOM_RIGHT => position.bottom_right
+        => position.bottom_left
+
+// Text size constant from the size option
+sizeFromText(string sizeText) =>
+    switch
+        sizeText == TINY_SIZE  => size.tiny
+        sizeText == SMALL_SIZE => size.small
+        => size.normal
+
+variantName(int variantId) =>
+    switch
+        variantId == VARIANT_REGULAR => "Regular"
+        variantId == VARIANT_HIDDEN  => "Hidden"
+        => "Exaggerated"
+
+variantCode(int variantId) =>
+    switch
+        variantId == VARIANT_REGULAR => "R"
+        variantId == VARIANT_HIDDEN  => "H"
+        => "E"
+
+// Solid = the reference case, dashed = the continuation mirror, dotted = the equal-extreme relaxation
+variantLineStyle(int variantId) =>
+    switch
+        variantId == VARIANT_HIDDEN      => line.style_dashed
+        variantId == VARIANT_EXAGGERATED => line.style_dotted
+        => line.style_solid
+
+// Oscillator values formatted for tooltips and the dashboard — MACD lives in price units
+formatOsc(float value) =>
+    na(value) ? "n/a" : oscTypeInput == OSC_MACD ? str.tostring(value, format.mintick) : str.tostring(value, "#.##")
+
+// Classifies the swing pair ending at the newly confirmed swing, draws the pattern and rolls the reference forward.
+// Returns [created variant id or -1, chained swing count, new Pattern or na].
+processSwing(int dir, SwingRef ref, int swingBar, float swingPrice, float swingOsc, float tolerance) =>
+    int variantId      = -1
+    int swings         = 0
+    Pattern newPattern = na
+    bool comparable    = not na(ref.price) and not na(ref.osc) and not na(swingOsc) and swingBar - ref.priceBar <= maxSwingGapInput
+    if comparable
+        float priceDelta   = swingPrice - ref.price
+        // trichotomy of the price condition, scaled by the equal-extreme tolerance
+        bool newExtreme    = priceDelta * dir < -tolerance
+        bool equalExtreme  = math.abs(priceDelta) <= tolerance
+        bool weakerExtreme = priceDelta * dir > tolerance
+        bool oscWeaker     = (swingOsc - ref.osc) * dir > 0
+        bool oscStronger   = (swingOsc - ref.osc) * dir < 0
+        variantId := newExtreme and oscWeaker ? VARIANT_REGULAR
+          : equalExtreme and oscWeaker ? VARIANT_EXAGGERATED
+          : weakerExtreme and oscStronger ? VARIANT_HIDDEN
+          : -1
+    // multiple divergence — successive swings extending the same family chain three or more deep
+    int family = variantId == VARIANT_REGULAR or variantId == VARIANT_EXAGGERATED ? FAMILY_WEAKENING : variantId == VARIANT_HIDDEN ? FAMILY_HIDDEN : FAMILY_NONE
+    if family != FAMILY_NONE
+        swings := (ref.family == family ? ref.chain : 1) + 1
+    bool enabled = variantId == VARIANT_REGULAR ? detectRegularInput
+      : variantId == VARIANT_HIDDEN ? detectHiddenInput
+      : variantId == VARIANT_EXAGGERATED ? detectExaggeratedInput
+      : false
+    if enabled
+        // location grading — did the pattern print from overbought/oversold territory (bounded oscillators only)
+        bool inZone = boundedOsc and (dir == -1 ? math.max(ref.osc, swingOsc) >= overboughtInput : math.min(ref.osc, swingOsc) <= oversoldInput)
+        // the swing that built the pattern: the interior extreme between the two compared price pivots
+        float structureLevel = na
+        if swingBar - ref.priceBar >= 2
+            for b = ref.priceBar + 1 to swingBar - 1
+                float interiorValue = dir == -1 ? low[bar_index - b] : high[bar_index - b]
+                structureLevel := na(structureLevel) ? interiorValue : dir == -1 ? math.min(structureLevel, interiorValue) : math.max(structureLevel, interiorValue)
+        else
+            structureLevel := dir == -1 ? math.min(low[bar_index - ref.priceBar], low[bar_index - swingBar]) : math.max(high[bar_index - ref.priceBar], high[bar_index - swingBar])
+        float invPriceLevel = dir == -1 ? math.max(ref.price, swingPrice) : math.min(ref.price, swingPrice)
+        float invOscLevel   = dir == -1 ? math.max(ref.osc, swingOsc) : math.min(ref.osc, swingOsc)
+        color sideColor     = dir == 1 ? bullColorInput : bearColorInput
+        color pendingColor  = color.new(sideColor, PENDING_TRANSP)
+        string sideName     = dir == 1 ? "Bullish" : "Bearish"
+        string tagText      = variantCode(variantId) + (swings >= MULTIPLE_MIN_SWINGS ? " ×" + str.tostring(swings) : "") + (inZone ? " •" : "")
+        string infoText     = variantName(variantId) + " " + sideName + (swings >= MULTIPLE_MIN_SWINGS ? " — multiple divergence (" + str.tostring(swings) + " swings)" : "")
+          + "\nOscillator: " + formatOsc(ref.osc) + " → " + formatOsc(swingOsc)
+          + "\nPrice: " + str.tostring(ref.price, format.mintick) + " → " + str.tostring(swingPrice, format.mintick)
+          + "\nZone: " + (inZone ? dir == -1 ? "printed from overbought" : "printed from oversold" : "mid-range")
+          + "\nConfirm: " + ruleSummary + (useStructureRule ? " (" + str.tostring(structureLevel, format.mintick) + ")" : "")
+          + "\nInvalidation: fresh extremes beyond " + str.tostring(invPriceLevel, format.mintick) + " (price) and " + formatOsc(invOscLevel) + " (osc)"
+        line oscLn = showOscLinesInput ? line.new(ref.priceBar, ref.osc, swingBar, swingOsc, color = pendingColor, style = variantLineStyle(variantId), width = 1) : na
+        line priceLn = showPriceLinesInput ? line.new(ref.priceBar, ref.price, swingBar, swingPrice, color = pendingColor, style = variantLineStyle(variantId), width = 1, force_overlay = true) : na
+        line structureLn = useStructureRule and showStructureInput ? line.new(swingBar, structureLevel, bar_index, structureLevel, color = pendingColor, style = line.style_dashed, force_overlay = true) : na
+        label tagLabel = showLabelsInput ? label.new(swingBar, swingOsc, tagText, style = dir == -1 ? label.style_label_down : label.style_label_up, color = #00000000, textcolor = sideColor, size = sizeFromText(labelSizeInput), tooltip = infoText + "\nStatus: pending") : na
+        newPattern := Pattern.new(dir = dir, variant = variantId, swings = swings, inZone = inZone, detectBar = bar_index, structureLevel = structureLevel, invPriceLevel = invPriceLevel, invOscLevel = invOscLevel, tagText = tagText, infoText = infoText, oscLine = oscLn, priceLine = priceLn, structureLine = structureLn, tag = tagLabel)
+    // roll the swing reference and the chain forward — every confirmed swing becomes the next comparison's anchor
+    ref.family   := family
+    ref.chain    := family == FAMILY_NONE ? 1 : swings
+    ref.priceBar := swingBar
+    ref.price    := swingPrice
+    ref.osc      := swingOsc
+    [enabled ? variantId : -1, swings, newPattern]
+
+// Confirmed — the pattern graduates from condition to signal
+resolveConfirm(Pattern activePattern) =>
+    color sideColor = activePattern.dir == 1 ? bullColorInput : bearColorInput
+    if not na(activePattern.oscLine)
+        line.set_color(activePattern.oscLine, sideColor)
+        line.set_width(activePattern.oscLine, DIV_LINE_WIDTH)
+    if not na(activePattern.priceLine)
+        line.set_color(activePattern.priceLine, sideColor)
+        line.set_width(activePattern.priceLine, DIV_LINE_WIDTH)
+    if not na(activePattern.structureLine)
+        line.set_x2(activePattern.structureLine, bar_index)
+        line.set_color(activePattern.structureLine, sideColor)
+    if not na(activePattern.tag)
+        label.set_color(activePattern.tag, sideColor)
+        label.set_textcolor(activePattern.tag, chart.bg_color)
+        label.set_text(activePattern.tag, activePattern.tagText + " ✓")
+        label.set_tooltip(activePattern.tag, activePattern.infoText + "\nStatus: CONFIRMED after " + str.tostring(bar_index - activePattern.detectBar) + " bars")
+
+// Failed — invalidated by fresh synchronized extremes, or expired unconfirmed
+resolveFail(Pattern activePattern, string reason) =>
+    color fadedColor = color.new(failColorInput, FAIL_TRANSP)
+    if not na(activePattern.oscLine)
+        line.set_color(activePattern.oscLine, fadedColor)
+    if not na(activePattern.priceLine)
+        line.set_color(activePattern.priceLine, fadedColor)
+    if not na(activePattern.structureLine)
+        line.delete(activePattern.structureLine)
+    if not na(activePattern.tag)
+        label.set_textcolor(activePattern.tag, failColorInput)
+        label.set_text(activePattern.tag, activePattern.tagText + " ✗")
+        label.set_tooltip(activePattern.tag, activePattern.infoText + "\nStatus: FAILED — " + reason)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Oscillator
+//---------------------------------------------------------------------------------------------------------------------{
+// Every candidate is computed on every bar so series histories stay consistent regardless of the selection
+rsiValue   = ta.rsi(srcInput, oscLengthInput)
+stochValue = ta.sma(ta.stoch(close, high, low, oscLengthInput), stochSmoothInput)
+[macdValue, macdSignalValue, macdHistValue] = ta.macd(srcInput, macdFastInput, macdSlowInput, macdSignalInput)
+rocValue   = ta.roc(srcInput, oscLengthInput)
+
+osc = switch oscTypeInput
+    OSC_RSI   => rsiValue
+    OSC_STOCH => stochValue
+    OSC_MACD  => macdValue
+    => rocValue
+
+// 50 is the balance point of the 0-100 scales, zero for the zero-centered designs
+centerValue = boundedOsc ? 50.0 : 0.0
+
+// Trigger for the Oscillator Cross confirmation — centerline, or the signal line when the oscillator is MACD
+triggerValue = oscTypeInput == OSC_MACD ? macdSignalValue : centerValue
+
+atrValue       = ta.atr(ATR_LENGTH)
+equalTolerance = nz(atrValue) * equalTolInput
+
+// Decisive close against the prior move — a close beyond the previous bar's opposite extreme
+strongCloseUp   = close > nz(high[1], high)
+strongCloseDown = close < nz(low[1], low)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Divergence Detection & Variant Classification
+//---------------------------------------------------------------------------------------------------------------------{
+pivotHighPrice = ta.pivothigh(high, swingLeftInput, swingRightInput)
+pivotLowPrice  = ta.pivotlow(low, swingLeftInput, swingRightInput)
+
+var SwingRef highRef = SwingRef.new()
+var SwingRef lowRef  = SwingRef.new()
+
+var array<Pattern> activeArray = array.new<Pattern>()
+
+int bearVariantEvent = -1
+int bearSwingsEvent  = 0
+int bullVariantEvent = -1
+int bullSwingsEvent  = 0
+
+// Bearish side — confirmed swing high compared against the previous confirmed swing high
+if not na(pivotHighPrice)
+    [eventVariant, eventSwings, newPattern] = processSwing(-1, highRef, bar_index - swingRightInput, pivotHighPrice, osc[swingRightInput], equalTolerance)
+    bearVariantEvent := eventVariant
+    bearSwingsEvent  := eventSwings
+    if not na(newPattern)
+        array.push(activeArray, newPattern)
+
+// Bullish side — confirmed swing low compared against the previous confirmed swing low
+if not na(pivotLowPrice)
+    [eventVariant, eventSwings, newPattern] = processSwing(1, lowRef, bar_index - swingRightInput, pivotLowPrice, osc[swingRightInput], equalTolerance)
+    bullVariantEvent := eventVariant
+    bullSwingsEvent  := eventSwings
+    if not na(newPattern)
+        array.push(activeArray, newPattern)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Confirmation Engine
+//---------------------------------------------------------------------------------------------------------------------{
+var array<int> confirmedCounts = array.new<int>(3, 0)
+var array<int> failedCounts    = array.new<int>(3, 0)
+var int confirmedMultiple      = 0
+var int failedMultiple         = 0
+
+bool bullConfirmedEvent = false
+bool bearConfirmedEvent = false
+bool bullFailedEvent    = false
+bool bearFailedEvent    = false
+
+// Safety cap — the oldest still-pending pattern is retired first
+while array.size(activeArray) > MAX_ACTIVE
+    Pattern oldestPattern = array.get(activeArray, 0)
+    resolveFail(oldestPattern, "superseded — active pattern cap reached")
+    array.set(failedCounts, oldestPattern.variant, array.get(failedCounts, oldestPattern.variant) + 1)
+    if oldestPattern.swings >= MULTIPLE_MIN_SWINGS
+        failedMultiple += 1
+    if oldestPattern.dir == 1
+        bullFailedEvent := true
+    else
+        bearFailedEvent := true
+    array.remove(activeArray, 0)
+
+// Each pending pattern walks the state machine: invalidation first, then confirmation, then expiry
+if array.size(activeArray) > 0
+    for i = array.size(activeArray) - 1 to 0
+        Pattern activePattern = array.get(activeArray, i)
+        int patternDir = activePattern.dir
+        // invalidation arms in two halves — a fresh price extreme matched by a fresh oscillator extreme cancels the pattern
+        if patternDir == -1 ? high > activePattern.invPriceLevel : low < activePattern.invPriceLevel
+            activePattern.priceExtremeHit := true
+        if not na(osc) and (patternDir == -1 ? osc > activePattern.invOscLevel : osc < activePattern.invOscLevel)
+            activePattern.oscExtremeHit := true
+        bool invalidatedNow = activePattern.priceExtremeHit and activePattern.oscExtremeHit
+        bool structureHit   = patternDir == -1 ? close < activePattern.structureLevel : close > activePattern.structureLevel
+        bool oscHit         = not na(osc) and not na(triggerValue) and (patternDir == -1 ? osc < triggerValue : osc > triggerValue)
+        bool strongHit      = patternDir == -1 ? strongCloseDown : strongCloseUp
+        bool confirmedNow   = confirmRuleInput == RULE_STRUCTURE ? structureHit
+          : confirmRuleInput == RULE_OSC ? oscHit
+          : confirmRuleInput == RULE_CLOSE ? strongHit
+          : structureHit or oscHit or strongHit
+        bool expiredNow = bar_index - activePattern.detectBar >= confirmWindowInput
+        if invalidatedNow
+            resolveFail(activePattern, "fresh price and oscillator extremes re-synchronized the pair")
+            array.set(failedCounts, activePattern.variant, array.get(failedCounts, activePattern.variant) + 1)
+            if activePattern.swings >= MULTIPLE_MIN_SWINGS
+                failedMultiple += 1
+            if patternDir == 1
+                bullFailedEvent := true
+            else
+                bearFailedEvent := true
+            array.remove(activeArray, i)
+        else if confirmedNow
+            resolveConfirm(activePattern)
+            array.set(confirmedCounts, activePattern.variant, array.get(confirmedCounts, activePattern.variant) + 1)
+            if activePattern.swings >= MULTIPLE_MIN_SWINGS
+                confirmedMultiple += 1
+            if patternDir == 1
+                bullConfirmedEvent := true
+            else
+                bearConfirmedEvent := true
+            array.remove(activeArray, i)
+        else if expiredNow
+            resolveFail(activePattern, "expired — no confirmation within the window")
+            array.set(failedCounts, activePattern.variant, array.get(failedCounts, activePattern.variant) + 1)
+            if activePattern.swings >= MULTIPLE_MIN_SWINGS
+                failedMultiple += 1
+            if patternDir == 1
+                bullFailedEvent := true
+            else
+                bearFailedEvent := true
+            array.remove(activeArray, i)
+        else if not na(activePattern.structureLine)
+            line.set_x2(activePattern.structureLine, bar_index)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+oscColor = na(osc) ? na : osc >= centerValue ? bullColorInput : bearColorInput
+
+oscPlotId = plot(osc, "Oscillator", oscColor, 1)
+midPlotId = plot(centerValue, "Centerline", color.new(LEVEL_COLOR, 50), 1)
+plot(oscTypeInput == OSC_MACD ? macdSignalValue : na, "MACD Signal", color.new(neutralColorInput, 20), 1)
+
+// Vertical gradient between centerline and oscillator — transparent at the centerline, colored at the value
+fillTopColor    = osc >= centerValue ? color.new(bullColorInput, FILL_VALUE_TRANSP) : color.new(bearColorInput, FILL_MID_TRANSP)
+fillBottomColor = osc >= centerValue ? color.new(bullColorInput, FILL_MID_TRANSP) : color.new(bearColorInput, FILL_VALUE_TRANSP)
+fill(oscPlotId, midPlotId, math.max(osc, centerValue), math.min(osc, centerValue), gradientFillInput ? fillTopColor : na, gradientFillInput ? fillBottomColor : na, title = "Momentum Gradient")
+
+// Soft zone shading for the bounded oscillators — overbought band above, oversold band below
+zoneShown     = boundedOsc and showZonesInput
+overboughtId  = plot(zoneShown ? overboughtInput : na, "Overbought Anchor", color = na, editable = false, display = display.none)
+oversoldId    = plot(zoneShown ? oversoldInput : na, "Oversold Anchor", color = na, editable = false, display = display.none)
+topAnchorId   = plot(zoneShown ? 100 : na, "Top Anchor", color = na, editable = false, display = display.none)
+bottomAnchorId = plot(zoneShown ? 0 : na, "Bottom Anchor", color = na, editable = false, display = display.none)
+
+fill(overboughtId, topAnchorId, color.new(bearColorInput, ZONE_TRANSP), title = "Overbought Zone")
+fill(oversoldId, bottomAnchorId, color.new(bullColorInput, ZONE_TRANSP), title = "Oversold Zone")
+
+// Dashed zone levels for the bounded oscillators — the location grade's territory
+var line overboughtLine = na
+var line oversoldLine   = na
+if barstate.isfirst and boundedOsc and showZonesInput
+    overboughtLine := line.new(bar_index, overboughtInput, bar_index + 1, overboughtInput, extend = extend.both, color = color.new(LEVEL_COLOR, 40), style = line.style_dashed)
+    oversoldLine   := line.new(bar_index, oversoldInput, bar_index + 1, oversoldInput, extend = extend.both, color = color.new(LEVEL_COLOR, 40), style = line.style_dashed)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dashboardTable = na
+
+if barstate.islast and showDashboardInput
+    if na(dashboardTable)
+        dashboardTable := table.new(tableLocation(dashboardPositionInput), 4, 6, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+        table.merge_cells(dashboardTable, 1, 5, 3, 5)
+
+    string textSize  = sizeFromText(dashboardSizeInput)
+    color labelColor = DASH_HEADER
+    color valueColor = DASH_TEXT
+
+    int pendingRegular     = 0
+    int pendingHidden      = 0
+    int pendingExaggerated = 0
+    int pendingMultiple    = 0
+    if array.size(activeArray) > 0
+        for i = 0 to array.size(activeArray) - 1
+            Pattern activePattern = array.get(activeArray, i)
+            pendingRegular     += activePattern.variant == VARIANT_REGULAR ? 1 : 0
+            pendingHidden      += activePattern.variant == VARIANT_HIDDEN ? 1 : 0
+            pendingExaggerated += activePattern.variant == VARIANT_EXAGGERATED ? 1 : 0
+            pendingMultiple    += activePattern.swings >= MULTIPLE_MIN_SWINGS ? 1 : 0
+
+    int confirmedTotal = array.get(confirmedCounts, VARIANT_REGULAR) + array.get(confirmedCounts, VARIANT_HIDDEN) + array.get(confirmedCounts, VARIANT_EXAGGERATED)
+    int failedTotal    = array.get(failedCounts, VARIANT_REGULAR) + array.get(failedCounts, VARIANT_HIDDEN) + array.get(failedCounts, VARIANT_EXAGGERATED)
+    int resolvedTotal  = confirmedTotal + failedTotal
+    string rateText = resolvedTotal > 0 ? str.tostring(100.0 * confirmedTotal / resolvedTotal, "#.#") + "% (" + str.tostring(confirmedTotal) + " of " + str.tostring(resolvedTotal) + ")" : "no resolved patterns yet"
+
+    table.cell(dashboardTable, 0, 0, oscTypeInput, text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 0, "Pending", text_color = labelColor, text_size = textSize)
+    table.cell(dashboardTable, 2, 0, "Confirmed", text_color = labelColor, text_size = textSize)
+    table.cell(dashboardTable, 3, 0, "Failed", text_color = labelColor, text_size = textSize)
+
+    table.cell(dashboardTable, 0, 1, "Regular", text_color = valueColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 1, str.tostring(pendingRegular), text_color = neutralColorInput, text_size = textSize)
+    table.cell(dashboardTable, 2, 1, str.tostring(array.get(confirmedCounts, VARIANT_REGULAR)), text_color = valueColor, text_size = textSize)
+    table.cell(dashboardTable, 3, 1, str.tostring(array.get(failedCounts, VARIANT_REGULAR)), text_color = failColorInput, text_size = textSize)
+
+    table.cell(dashboardTable, 0, 2, "Hidden", text_color = valueColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 2, str.tostring(pendingHidden), text_color = neutralColorInput, text_size = textSize)
+    table.cell(dashboardTable, 2, 2, str.tostring(array.get(confirmedCounts, VARIANT_HIDDEN)), text_color = valueColor, text_size = textSize)
+    table.cell(dashboardTable, 3, 2, str.tostring(array.get(failedCounts, VARIANT_HIDDEN)), text_color = failColorInput, text_size = textSize)
+
+    table.cell(dashboardTable, 0, 3, "Exaggerated", text_color = valueColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 3, str.tostring(pendingExaggerated), text_color = neutralColorInput, text_size = textSize)
+    table.cell(dashboardTable, 2, 3, str.tostring(array.get(confirmedCounts, VARIANT_EXAGGERATED)), text_color = valueColor, text_size = textSize)
+    table.cell(dashboardTable, 3, 3, str.tostring(array.get(failedCounts, VARIANT_EXAGGERATED)), text_color = failColorInput, text_size = textSize)
+
+    table.cell(dashboardTable, 0, 4, "Multiple (3+)", text_color = valueColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 4, str.tostring(pendingMultiple), text_color = neutralColorInput, text_size = textSize)
+    table.cell(dashboardTable, 2, 4, str.tostring(confirmedMultiple), text_color = valueColor, text_size = textSize)
+    table.cell(dashboardTable, 3, 4, str.tostring(failedMultiple), text_color = failColorInput, text_size = textSize)
+
+    table.cell(dashboardTable, 0, 5, "Confirm Rate", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 5, rateText, text_color = valueColor, text_size = textSize)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+bullDetected = bullVariantEvent >= 0
+bearDetected = bearVariantEvent >= 0
+bullMultiple = bullDetected and bullSwingsEvent >= MULTIPLE_MIN_SWINGS
+bearMultiple = bearDetected and bearSwingsEvent >= MULTIPLE_MIN_SWINGS
+
+alertcondition(bullDetected, "Bullish Divergence Detected (Any Variant)", "Bullish divergence detected on {{ticker}} ({{interval}}) — pattern is pending until the confirmation rule fires")
+alertcondition(bearDetected, "Bearish Divergence Detected (Any Variant)", "Bearish divergence detected on {{ticker}} ({{interval}}) — pattern is pending until the confirmation rule fires")
+alertcondition(bullVariantEvent == VARIANT_REGULAR, "Regular Bullish Divergence", "Regular bullish divergence on {{ticker}} ({{interval}}) — new price low against a weaker oscillator low, exhaustion warning pending confirmation")
+alertcondition(bearVariantEvent == VARIANT_REGULAR, "Regular Bearish Divergence", "Regular bearish divergence on {{ticker}} ({{interval}}) — new price high against a weaker oscillator high, exhaustion warning pending confirmation")
+alertcondition(bullVariantEvent == VARIANT_HIDDEN, "Hidden Bullish Divergence", "Hidden bullish divergence on {{ticker}} ({{interval}}) — price holds a higher low while the oscillator prints a lower low, continuation setup pending confirmation")
+alertcondition(bearVariantEvent == VARIANT_HIDDEN, "Hidden Bearish Divergence", "Hidden bearish divergence on {{ticker}} ({{interval}}) — price holds a lower high while the oscillator prints a higher high, continuation setup pending confirmation")
+alertcondition(bullVariantEvent == VARIANT_EXAGGERATED, "Exaggerated Bullish Divergence", "Exaggerated bullish divergence on {{ticker}} ({{interval}}) — double bottom at roughly equal lows against a clearly higher oscillator low, pending confirmation")
+alertcondition(bearVariantEvent == VARIANT_EXAGGERATED, "Exaggerated Bearish Divergence", "Exaggerated bearish divergence on {{ticker}} ({{interval}}) — double top at roughly equal highs against a clearly lower oscillator high, pending confirmation")
+alertcondition(bullMultiple, "Multiple Bullish Divergence (3+ Swings)", "Multiple bullish divergence on {{ticker}} ({{interval}}) — three or more swings with successively stronger oscillator shortfall, mature momentum decay; confirmation rules do not relax")
+alertcondition(bearMultiple, "Multiple Bearish Divergence (3+ Swings)", "Multiple bearish divergence on {{ticker}} ({{interval}}) — three or more swings with successively weaker oscillator readings, mature momentum decay; confirmation rules do not relax")
+alertcondition(bullConfirmedEvent, "Bullish Divergence Confirmed", "Bullish divergence CONFIRMED on {{ticker}} ({{interval}}) — the confirmation event fired, the divergence bias is now actionable")
+alertcondition(bearConfirmedEvent, "Bearish Divergence Confirmed", "Bearish divergence CONFIRMED on {{ticker}} ({{interval}}) — the confirmation event fired, the divergence bias is now actionable")
+alertcondition(bullFailedEvent, "Bullish Divergence Failed", "Bullish divergence FAILED on {{ticker}} ({{interval}}) — fresh synchronized extremes cancelled the pattern or the confirmation window lapsed")
+alertcondition(bearFailedEvent, "Bearish Divergence Failed", "Bearish divergence FAILED on {{ticker}} ({{interval}}) — fresh synchronized extremes cancelled the pattern or the confirmation window lapsed")
+
+//---------------------------------------------------------------------------------------------------------------------}

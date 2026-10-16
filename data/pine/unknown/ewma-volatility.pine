@@ -1,0 +1,195 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("EWMA Volatility", shorttitle = "EWMA Volatility", overlay = false, format = format.percent, precision = 2)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+VOL_COLOR         = #787b86 // neutral tone of the line while the percentile rank sits between the thresholds
+COMPRESSED_COLOR  = #089981 // quiet - rank at or below the low percentile
+EXPANDED_COLOR    = #f23645 // turbulent - rank at or above the high percentile
+COMP_COLOR        = #787b86 // equal-weight comparison line
+LEVEL_COLOR       = #787b86 // dotted percentile reference levels
+FILL_VALUE_TRANSP = 50      // gradient transparency at the volatility value
+FILL_ZERO_TRANSP  = 100     // gradient transparency at zero
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+lambdaInput = input.float(0.94, "Lambda (Decay Factor)", minval = 0.01, maxval = 0.999, step = 0.005, group = "Calculation",
+     tooltip = "Decay factor of the RiskMetrics recursion. Each bar the variance estimate keeps lambda of yesterday's estimate and adds one minus lambda of yesterday's squared return, so the weight on a return k bars old decays as lambda to the k. RiskMetrics fixed 0.94 for daily data - weights halve roughly every 11 bars and data older than a quarter contributes little - and 0.97 for monthly, where the half-life is about 23. Higher values decay slower for a smoother, steadier estimate; lower values track shocks faster at the cost of noise. There is no universally correct value: match it to your holding horizon.")
+
+srcInput = input.source(close, "Source", group = "Calculation",
+     tooltip = "Price series the close-to-close log returns are computed from. The recursion runs on squared returns with the mean set to zero, the RiskMetrics convention: at daily and intraday horizons the average return is tiny relative to its variability, and estimating it adds more noise than ignoring it. Session gaps enter through the return itself rather than through bar range.")
+
+annualizeInput = input.bool(true, "Annualize", group = "Calculation",
+     tooltip = "Scales the reading to annualized volatility - per-bar variance times bars per year, square-rooted - so it can be compared across instruments and against options-market figures. Because the recursion has no long-run anchor to revert toward, the forecast at any horizon is flat at the current value, and the same annualized figure stands in for any horizon. Disable to read the raw per-bar volatility instead.")
+
+barsPerYearInput = input.int(252, "Bars Per Year", minval = 1, group = "Calculation",
+     tooltip = "Annualization constant. Daily data conventionally uses 252 trading days for traditional markets, or 365 for markets that trade every day. Intraday charts must count bars per year - bars per session times trading days. Annualization constants are a leading cause of cross-platform disagreements, so match this setting when reconciling readings.")
+
+showCompInput = input.bool(true, "Equal-Weight Comparison", group = "Comparison",
+     tooltip = "Overlays an equal-weight rolling estimate computed over a fixed window on the same returns and annualization. EWMA volatility above this slower line says turbulence is recent and building; crossing back below marks the decay phase. The contrast also exposes window artifacts: the equal-weight line jumps when a large return enters its window and again when it exits, while EWMA decays a shock continuously.")
+
+compLengthInput = input.int(60, "Comparison Window", minval = 2, group = "Comparison",
+     tooltip = "Bars in the equal-weight window - every return inside weighted equally, every return beyond forgotten abruptly. Longer windows make a steadier, slower baseline for the fast-versus-slow read; at the default lambda of 0.94 the EWMA is dominated by the past month, so a window near a quarter of daily bars gives a clearly slower benchmark.")
+
+percentileLengthInput = input.int(100, "Percentile Lookback", minval = 10, group = "Percentile Thresholds",
+     tooltip = "Bars used to rank the current reading against its own history. Raw volatility values do not compare across instruments, so express the reading as a percentile of its own past before calling it high or low - the expansion and compression alerts run on this rank rather than an absolute cutoff.")
+
+highPercentileInput = input.float(80, "High Percentile", minval = 50, maxval = 100, step = 1, inline = "percentile", group = "Percentile Thresholds",
+     tooltip = "Percentile rank above which volatility counts as expanded; crossing it fires the 'Volatility Expansion' alert.")
+
+lowPercentileInput = input.float(20, "Low Percentile", minval = 0, maxval = 50, step = 1, inline = "percentile", group = "Percentile Thresholds",
+     tooltip = "Percentile rank below which volatility counts as compressed - an EWMA line grinding along multi-month lows marks the quiet that eventually gives way. Crossing under it fires the 'Volatility Compression' alert.")
+
+showLevelsInput = input.bool(false, "Show Percentile Levels", group = "Percentile Thresholds",
+     tooltip = "Plots the volatility values sitting at the high and low percentiles of the lookback as dotted reference levels, making threshold crossings visible in the pane. Off by default to keep the pane clean; the alerts fire either way.")
+
+showDashInput = input.bool(true, "Show Dashboard", group = "Dashboard",
+     tooltip = "Displays the current EWMA reading, the equal-weight comparison on the same settings, the percentile rank of the reading, and the half-life implied by lambda - how many bars it takes for the weight on old data to halve.")
+
+dashPosInput = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], inline = "dash", group = "Dashboard",
+     tooltip = "Corner of the pane the dashboard is anchored to.")
+
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], inline = "dash", group = "Dashboard",
+     tooltip = "Dashboard text size.")
+
+volColorInput = input.color(VOL_COLOR, "EWMA Volatility", group = "Style",
+     tooltip = "Neutral tone of the EWMA volatility line and its gradient fill while the percentile rank sits between the thresholds. Toward either threshold the color blends into the compressed or expanded color. The estimate measures movement size only and carries no directional information.")
+
+compressedColorInput = input.color(COMPRESSED_COLOR, "Compressed", inline = "regime", group = "Style",
+     tooltip = "Color of the line and fill at and below the low percentile - a quiet stretch.")
+
+expandedColorInput = input.color(EXPANDED_COLOR, "Expanded", inline = "regime", group = "Style",
+     tooltip = "Color of the line and fill at and above the high percentile - volatility expansion under way.")
+
+compColorInput = input.color(COMP_COLOR, "Equal-Weight Volatility", group = "Style",
+     tooltip = "Color of the equal-weight rolling comparison line.")
+
+levelColorInput = input.color(LEVEL_COLOR, "Percentile Levels", group = "Style",
+     tooltip = "Color of the dotted high and low percentile reference levels.")
+
+gradientInput = input.bool(true, "Gradient Fill", group = "Style",
+     tooltip = "Fills the area between zero and the volatility line with a vertical gradient - fully transparent at zero, strongest at the current value.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+getTablePosition(positionText) =>
+    switch positionText
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        => position.bottom_left
+
+getTextSize(sizeText) =>
+    switch sizeText
+        "Tiny"  => size.tiny
+        "Small" => size.small
+        => size.normal
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+// Close-to-close log return with the mean set to zero, the RiskMetrics convention. Guards keep
+// missing or non-positive prices from contaminating the recursion; gaps enter through the return
+logReturn = srcInput > 0 and not na(srcInput[1]) and srcInput[1] > 0 ? math.log(srcInput / srcInput[1]) : na
+returnSq  = logReturn * logReturn
+
+// RiskMetrics recursion: sigma2(t) = lambda * sigma2(t-1) + (1 - lambda) * r2(t-1). Today's estimate
+// weighs yesterday's estimate against yesterday's squared return, so a large return lifts the line
+// on the following bar and then decays geometrically - no window drop-off artifact, and no long-run
+// anchor to revert toward. The recursion needs no fitting: it stays na until the first valid squared
+// return arrives and seeds itself from that observation
+prevReturnSq = returnSq[1]
+
+var float ewmaVariance = na
+if not na(prevReturnSq)
+    ewmaVariance := na(ewmaVariance) ? prevReturnSq : lambdaInput * ewmaVariance + (1 - lambdaInput) * prevReturnSq
+
+// Equal-weight rolling benchmark on the same squared returns and timing, so the spread between the
+// two lines isolates the weighting scheme: geometric decay against a hard fixed window
+eqMeanVariance = ta.sma(prevReturnSq, compLengthInput)
+
+// Variance -> volatility: square root of per-bar variance times bars per year, expressed in percent
+annualFactor = annualizeInput ? barsPerYearInput : 1
+ewmaVol = na(ewmaVariance) ? na : math.sqrt(ewmaVariance * annualFactor) * 100
+eqVol   = na(eqMeanVariance) ? na : math.sqrt(eqMeanVariance * annualFactor) * 100
+
+// Percentile rank of the reading against its own history - level checks and compression screening
+// run on rank, not raw values. The interpolated percentile values double as plottable levels
+volPercentile = ta.percentrank(ewmaVol, percentileLengthInput)
+highLevel     = ta.percentile_linear_interpolation(ewmaVol, percentileLengthInput, highPercentileInput)
+lowLevel      = ta.percentile_linear_interpolation(ewmaVol, percentileLengthInput, lowPercentileInput)
+
+// Events: fast-versus-slow crossings mark turbulence building or decaying; percentile threshold
+// crossings mark expansion and compression regimes
+buildingEvent    = ta.crossover(ewmaVol, eqVol)
+decayEvent       = ta.crossunder(ewmaVol, eqVol)
+expansionEvent   = ta.crossover(volPercentile, highPercentileInput)
+compressionEvent = ta.crossunder(volPercentile, lowPercentileInput)
+
+// Half-life implied by lambda: the weight on old data halves every ln(0.5) / ln(lambda) bars
+halfLife = math.log(0.5) / math.log(lambdaInput)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+// State coloring across the percentile thresholds - compressed below the low percentile, neutral midway, expanded above the high percentile
+midPercentile = (highPercentileInput + lowPercentileInput) / 2
+volColor      = na(volPercentile) ? volColorInput : volPercentile <= midPercentile ? color.from_gradient(volPercentile, lowPercentileInput, midPercentile, compressedColorInput, volColorInput) : color.from_gradient(volPercentile, midPercentile, highPercentileInput, volColorInput, expandedColorInput)
+
+fillTopColor    = gradientInput ? color.new(volColor, FILL_VALUE_TRANSP) : na
+fillBottomColor = gradientInput ? color.new(volColor, FILL_ZERO_TRANSP) : na
+
+ewmaPlotId = plot(ewmaVol, "EWMA Volatility", color = volColor, linewidth = 2)
+zeroPlotId = plot(0, "Zero Line", color = color.new(LEVEL_COLOR, 50), linewidth = 1)
+
+fill(ewmaPlotId, zeroPlotId, top_value = math.max(nz(ewmaVol), 0), bottom_value = 0, top_color = fillTopColor, bottom_color = fillBottomColor, title = "Volatility Gradient Fill")
+
+plot(showCompInput ? eqVol : na, "Equal-Weight Volatility", color = compColorInput, linewidth = 1)
+
+plot(showLevelsInput ? highLevel : na, "High Percentile Level", color = color.new(levelColorInput, 30), linewidth = 1, style = plot.style_circles)
+plot(showLevelsInput ? lowLevel : na, "Low Percentile Level", color = color.new(levelColorInput, 30), linewidth = 1, style = plot.style_circles)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dashTable = na
+
+if barstate.isfirst and showDashInput
+    dashTable := table.new(getTablePosition(dashPosInput), 2, 4, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+if barstate.islast and showDashInput and not na(dashTable)
+    ewmaText  = na(ewmaVol) ? "-" : str.tostring(ewmaVol, "#.##") + "%"
+    eqText    = na(eqVol) ? "-" : str.tostring(eqVol, "#.##") + "%"
+    rankText  = na(volPercentile) ? "-" : str.tostring(volPercentile, "#")
+    lifeText  = str.tostring(halfLife, "#.#") + " bars"
+    rankColor = na(volPercentile) ? DASH_TEXT : volPercentile > highPercentileInput ? expandedColorInput : volPercentile < lowPercentileInput ? compressedColorInput : DASH_TEXT
+    labelColor   = DASH_HEADER
+    dashTextSize = getTextSize(dashSizeInput)
+    table.cell(dashTable, 0, 0, "EWMA Volatility", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 0, ewmaText, text_color = na(volPercentile) ? DASH_TEXT : volColor, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 1, "Equal-Weight", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 1, eqText, text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 2, "Percentile Rank", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 2, rankText, text_color = rankColor, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 3, "Half-Life", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 3, lifeText, text_color = DASH_TEXT, text_size = dashTextSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(buildingEvent, "Turbulence Building", "EWMA Volatility on {{ticker}} - EWMA crossed above the slower equal-weight estimate, turbulence is recent and building ({{interval}})")
+alertcondition(decayEvent, "Volatility Decaying", "EWMA Volatility on {{ticker}} - EWMA crossed back below the slower equal-weight estimate, the shock is decaying ({{interval}})")
+alertcondition(expansionEvent, "Volatility Expansion", "EWMA Volatility on {{ticker}} - the reading crossed above its high percentile threshold, volatility expansion under way ({{interval}})")
+alertcondition(compressionEvent, "Volatility Compression", "EWMA Volatility on {{ticker}} - the reading fell below its low percentile threshold, a quiet stretch that often precedes range expansion ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

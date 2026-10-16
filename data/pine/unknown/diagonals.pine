@@ -1,0 +1,283 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Diagonals", shorttitle = "Diagonals", overlay = true, max_lines_count = 500, max_labels_count = 500, max_bars_back = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR = #089981
+BEAR_COLOR = #f23645
+
+MAX_PIVOTS     = 12 // stored alternating swing pivots
+CONTEXT_PIVOTS = 8  // 6 pivots for the five waves + 2 for the prior-trend position check
+
+TYPE_LEADING = 1
+TYPE_ENDING  = 2
+
+ST_NONE      = 0
+ST_WATCHING  = 1
+ST_REVERSING = 2
+ST_DONE      = 3
+
+GRP_SET   = "Settings"
+GRP_STYLE = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Inputs
+//---------------------------------------------------------------------------------------------------------------------{
+pivotLengthInput    = input.int(6, "Pivot Length", minval = 2, maxval = 50, group = GRP_SET, tooltip = "Bars on each side required to confirm a swing pivot. The five diagonal waves are measured between consecutive pivots, so this sets the scale of the wedges being detected.")
+minWaveBarsInput    = input.int(3, "Minimum Bars Per Wave", minval = 1, group = GRP_SET, tooltip = "Minimum bar span for each of the five waves. Filters out degenerate one-bar legs that could not plausibly hold the three-wave subdivisions diagonals are built from.")
+requireOverlapInput = input.bool(true, "Require Wave 4 / Wave 1 Overlap", group = GRP_SET, tooltip = "Require wave 4 to enter wave 1 price territory. The overlap would invalidate an ordinary impulse but is the characteristic diagonal trait; disable to also accept borderline wedges whose wave 4 stops just short of it.")
+allowExpandingInput = input.bool(false, "Detect Expanding Diagonals", group = GRP_SET, tooltip = "Also detect the rare expanding variant where the wave 1-3 and 2-4 boundary lines diverge instead of converging. Expanding diagonals are contested in the literature and best treated as low-confidence counts.")
+convergenceInput    = input.float(0.9, "Convergence Ratio", minval = 0.5, maxval = 0.99, step = 0.01, group = GRP_SET, tooltip = "Maximum ratio between the wedge width measured at wave 4 and at wave 2 for a contracting diagonal. Lower values demand a more sharply converging wedge. Expanding detection mirrors it with the inverse threshold.")
+wave5ReachInput     = input.float(60, "Wave 5 Completion %", minval = 0, maxval = 100, step = 5, group = GRP_SET, tooltip = "Minimum progress of the wave 5 extreme across the wedge, measured from the wave 2-4 line toward the wave 1-3 line. Ensures the fifth wave genuinely approaches or pierces the outer boundary before the pattern is called complete.")
+momentumLengthInput = input.int(14, "Momentum Length", minval = 2, group = GRP_SET, tooltip = "RSI length used to test for momentum divergence between waves 3 and 5 - fading momentum as the pattern grinds toward its apex is a common diagonal trait, reported in the pattern tooltip.")
+patternExpiryInput  = input.int(200, "Pattern Expiry (Bars)", minval = 10, maxval = 5000, group = GRP_SET, tooltip = "Bars after confirmation during which a diagonal keeps being monitored for throw-over, the 2-4 line reversal trigger, invalidation and the origin retrace target.")
+
+showWavesInput  = input.bool(true, "Show Wave Labels", group = GRP_STYLE)
+showLevelsInput = input.bool(true, "Show Invalidation & Target Levels", group = GRP_STYLE)
+showEventsInput = input.bool(true, "Show Throw-over & 2-4 Break Markers", group = GRP_STYLE)
+bullColorInput  = input.color(BULL_COLOR, "Bullish Bias", group = GRP_STYLE, inline = "colors")
+bearColorInput  = input.color(BEAR_COLOR, "Bearish Bias", group = GRP_STYLE, inline = "colors")
+waveColorInput  = input.color(color.gray, "Wave Labels", group = GRP_STYLE, inline = "colors")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Variables
+//---------------------------------------------------------------------------------------------------------------------{
+var pivotTypeArray  = array.new<bool>()  // true = swing high
+var pivotPriceArray = array.new<float>()
+var pivotBarArray   = array.new<int>()
+var pivotOscArray   = array.new<float>()
+
+// Most recent confirmed diagonal, monitored for post-pattern events
+var int   activeDirection    = 0 // +1 rising wedge, -1 falling wedge
+var int   activeType         = 0
+var int   activeState        = ST_NONE
+var int   activeBar5         = 0
+var int   activeDetectionBar = 0
+var float activePrice5       = na
+var float activePrice0       = na
+var float activeLine13       = na // wave 1-3 boundary value at the wave 5 pivot
+var float activeSlope13      = na
+var float activeLine24       = na // wave 2-4 boundary value at the wave 5 pivot
+var float activeSlope24      = na
+var bool  activeThrown       = false
+var color activeColor        = color.gray
+var line  activeInvalidLine  = na
+var label activeInvalidLabel = na
+var line  activeTargetLine   = na
+var label activeTargetLabel  = na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Store a confirmed pivot while keeping strict high/low alternation. A same-side pivot
+// replaces the previous one when more extreme. Returns true when a new pivot was appended.
+storePivot(bool isHigh, float price, int barIdx, float oscValue) =>
+    bool pushed = false
+    int n = array.size(pivotTypeArray)
+    if n > 0 and array.get(pivotTypeArray, n - 1) == isHigh
+        bool moreExtreme = isHigh ? price > array.get(pivotPriceArray, n - 1) : price < array.get(pivotPriceArray, n - 1)
+        if moreExtreme
+            array.set(pivotPriceArray, n - 1, price)
+            array.set(pivotBarArray, n - 1, barIdx)
+            array.set(pivotOscArray, n - 1, oscValue)
+    else
+        array.push(pivotTypeArray, isHigh)
+        array.push(pivotPriceArray, price)
+        array.push(pivotBarArray, barIdx)
+        array.push(pivotOscArray, oscValue)
+        if array.size(pivotTypeArray) > MAX_PIVOTS
+            array.shift(pivotTypeArray)
+            array.shift(pivotPriceArray)
+            array.shift(pivotBarArray)
+            array.shift(pivotOscArray)
+        pushed := true
+    pushed
+
+// Pivot accessors counted from the most recent pivot (1 = latest)
+priceFromEnd(int idx) => array.get(pivotPriceArray, array.size(pivotPriceArray) - idx)
+barFromEnd(int idx)   => array.get(pivotBarArray, array.size(pivotBarArray) - idx)
+oscFromEnd(int idx)   => array.get(pivotOscArray, array.size(pivotOscArray) - idx)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Pivot Engine
+//---------------------------------------------------------------------------------------------------------------------{
+float oscSeries = ta.rsi(close, momentumLengthInput)
+float pivotHigh = ta.pivothigh(pivotLengthInput, pivotLengthInput)
+float pivotLow  = ta.pivotlow(pivotLengthInput, pivotLengthInput)
+
+bool newPivot = false
+
+if not na(pivotHigh)
+    newPivot := storePivot(true, pivotHigh, bar_index - pivotLengthInput, oscSeries[pivotLengthInput]) or newPivot
+if not na(pivotLow)
+    newPivot := storePivot(false, pivotLow, bar_index - pivotLengthInput, oscSeries[pivotLengthInput]) or newPivot
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Diagonal Detection
+//---------------------------------------------------------------------------------------------------------------------{
+bool leadingEvent   = false
+bool endingEvent    = false
+bool throwOverEvent = false
+bool breakEvent     = false
+bool invalidEvent   = false
+bool targetEvent    = false
+
+if newPivot and array.size(pivotTypeArray) >= CONTEXT_PIVOTS
+    // pivots 0..5 bound the five candidate waves; the terminal pivot sets the wedge direction
+    bool  isBull = array.get(pivotTypeArray, array.size(pivotTypeArray) - 1)
+    float sgn    = isBull ? 1.0 : -1.0
+    float p0 = priceFromEnd(6)
+    float p1 = priceFromEnd(5)
+    float p2 = priceFromEnd(4)
+    float p3 = priceFromEnd(3)
+    float p4 = priceFromEnd(2)
+    float p5 = priceFromEnd(1)
+    int   b0 = barFromEnd(6)
+    int   b1 = barFromEnd(5)
+    int   b2 = barFromEnd(4)
+    int   b3 = barFromEnd(3)
+    int   b4 = barFromEnd(2)
+    int   b5 = barFromEnd(1)
+    // each wave must span enough bars to plausibly subdivide
+    bool barsOk = b1 - b0 >= minWaveBarsInput and b2 - b1 >= minWaveBarsInput and b3 - b2 >= minWaveBarsInput and b4 - b3 >= minWaveBarsInput and b5 - b4 >= minWaveBarsInput
+    // motive sequence in the wedge direction: wave 2 holds above the origin, wave 3 exceeds wave 1,
+    // wave 4 holds beyond the end of wave 2, wave 5 makes a new price extreme beyond wave 3
+    bool sequenceOk = sgn * (p1 - p0) > 0 and sgn * (p2 - p1) < 0 and sgn * (p2 - p0) > 0 and sgn * (p3 - p1) > 0 and sgn * (p4 - p3) < 0 and sgn * (p4 - p2) > 0 and sgn * (p5 - p3) > 0
+    // wave 4 enters wave 1 territory - the overlap that separates diagonals from impulses
+    bool overlapOk = not requireOverlapInput or sgn * (p4 - p1) < 0
+    // wave 3 is never the shortest motive wave
+    float wave1Size = sgn * (p1 - p0)
+    float wave3Size = sgn * (p3 - p2)
+    float wave5Size = sgn * (p5 - p4)
+    bool  wave3Ok   = not (wave3Size < wave1Size and wave3Size < wave5Size)
+    // wedge geometry from the 1-3 and 2-4 boundary lines: width at wave 4 vs width at wave 2
+    float slope13  = (p3 - p1) / (b3 - b1)
+    float slope24  = (p4 - p2) / (b4 - b2)
+    float gapStart = sgn * (p1 + slope13 * (b2 - b1) - p2)
+    float gapEnd   = sgn * (p1 + slope13 * (b4 - b1) - p4)
+    bool  gapsOk   = gapStart > 0 and gapEnd > 0
+    float gapRatio = gapsOk ? gapEnd / gapStart : 1.0
+    bool  contracting = gapsOk and gapRatio <= convergenceInput
+    bool  expanding   = gapsOk and gapRatio >= 1.0 / convergenceInput
+    bool  shapeOk     = contracting or (allowExpandingInput and expanding)
+    // wave 5 must travel deep into the wedge or pierce the 1-3 boundary (throw-over)
+    float line13End  = p1 + slope13 * (b5 - b1)
+    float line24End  = p2 + slope24 * (b5 - b2)
+    float endWidth   = sgn * (line13End - line24End)
+    float wave5Reach = endWidth > 0 ? sgn * (p5 - line24End) / endWidth : 1.0
+    bool  reachOk    = wave5Reach >= wave5ReachInput / 100
+    if barsOk and sequenceOk and overlapOk and wave3Ok and shapeOk and reachOk
+        // position check: prior swings falling into the origin mean the wedge starts a new move
+        // (leading, wave 1 or A) - prior swings rising into it mean it ends the move (ending, wave 5 or C)
+        bool  isLeading = sgn * (priceFromEnd(8) - p0) > 0
+        bool  throwOver = sgn * (p5 - line13End) > 0
+        float osc3 = oscFromEnd(3)
+        float osc5 = oscFromEnd(1)
+        bool  divergence   = not na(osc3) and not na(osc5) and (isBull ? osc5 < osc3 : osc5 > osc3)
+        float invalidation = isLeading ? p0 : p5
+        // implied bias: a leading diagonal points with the wedge, an ending diagonal against it
+        color biasColor = isLeading == isBull ? bullColorInput : bearColorInput
+        // boundary lines across waves 1-3 and 2-4, drawn through the confirmation bar
+        float y13 = p1 + slope13 * (bar_index - b1)
+        float y24 = p2 + slope24 * (bar_index - b2)
+        line.new(b1, p1, bar_index, y13, color = biasColor, width = 2)
+        line.new(b2, p2, bar_index, y24, color = biasColor, width = 2)
+        if showWavesInput
+            for i = 0 to 5
+                bool waveHigh = isBull ? i % 2 == 1 : i % 2 == 0
+                label.new(barFromEnd(6 - i), priceFromEnd(6 - i), str.tostring(i), color = #00000000, textcolor = waveColorInput, style = waveHigh ? label.style_label_down : label.style_label_up, size = size.tiny)
+        string tip = (isLeading ? "Leading" : "Ending") + " diagonal, " + (contracting ? "contracting" : "expanding")
+        tip := tip + "\nPosition: " + (isLeading ? "wave 1 or A of a new move" : "wave 5 or C of the prior move")
+        tip := tip + "\nThrow-over at wave 5: " + (throwOver ? "yes" : "no")
+        tip := tip + "\nMomentum divergence, wave 3 vs 5: " + (divergence ? "yes" : "no")
+        tip := tip + "\nInvalidation: " + str.tostring(invalidation, format.mintick)
+        tip := tip + (isLeading ? "\nExpect a deep wave-2 pullback" : "\nOrigin target: " + str.tostring(p0, format.mintick))
+        label.new(b5, p5, (isLeading ? "Leading" : "Ending") + " diagonal", color = #00000000, textcolor = biasColor, style = isBull ? label.style_label_down : label.style_label_up, size = size.small, tooltip = tip)
+        // fresh invalidation / origin-target levels (previous pattern drawings are left frozen)
+        activeInvalidLine  := na
+        activeInvalidLabel := na
+        activeTargetLine   := na
+        activeTargetLabel  := na
+        if showLevelsInput
+            activeInvalidLine  := line.new(b5, invalidation, bar_index, invalidation, color = biasColor, style = line.style_dashed)
+            activeInvalidLabel := label.new(bar_index, invalidation, "Invalidation", color = #00000000, textcolor = biasColor, style = label.style_label_left, size = size.tiny)
+            if not isLeading
+                activeTargetLine  := line.new(b5, p0, bar_index, p0, color = biasColor, style = line.style_dotted)
+                activeTargetLabel := label.new(bar_index, p0, "Origin target", color = #00000000, textcolor = biasColor, style = label.style_label_left, size = size.tiny)
+        activeDirection    := isBull ? 1 : -1
+        activeType         := isLeading ? TYPE_LEADING : TYPE_ENDING
+        activeState        := ST_WATCHING
+        activeBar5         := b5
+        activeDetectionBar := bar_index
+        activePrice5       := p5
+        activePrice0       := p0
+        activeLine13       := line13End
+        activeSlope13      := slope13
+        activeLine24       := line24End
+        activeSlope24      := slope24
+        activeThrown       := throwOver
+        activeColor        := biasColor
+        leadingEvent   := isLeading
+        endingEvent    := not isLeading
+        throwOverEvent := throwOver
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Pattern Monitoring
+//---------------------------------------------------------------------------------------------------------------------{
+if (activeState == ST_WATCHING or activeState == ST_REVERSING) and bar_index > activeDetectionBar
+    float sgnActive  = activeDirection
+    float boundary13 = activeLine13 + activeSlope13 * (bar_index - activeBar5)
+    float boundary24 = activeLine24 + activeSlope24 * (bar_index - activeBar5)
+    float probe      = activeDirection > 0 ? high : low
+    // throw-over: a push through the outer 1-3 boundary near completion
+    if activeState == ST_WATCHING and not activeThrown and sgnActive * (probe - boundary13) > 0
+        activeThrown   := true
+        throwOverEvent := true
+        if showEventsInput
+            label.new(bar_index, probe, "Throw-over", color = #00000000, textcolor = activeColor, style = activeDirection > 0 ? label.style_label_down : label.style_label_up, size = size.tiny)
+    // reversal trigger: close breaks back through the wave 2-4 boundary
+    if activeState == ST_WATCHING and sgnActive * (close - boundary24) < 0
+        breakEvent  := true
+        activeState := ST_REVERSING
+        if showEventsInput
+            label.new(bar_index, close, "2-4 break", color = #00000000, textcolor = activeColor, style = activeDirection > 0 ? label.style_label_up : label.style_label_down, size = size.tiny)
+    // invalidation: an ending diagonal dies beyond its wave 5 extreme,
+    // a leading diagonal dies when the pullback retraces beyond its origin
+    bool invalidated = activeType == TYPE_ENDING ? sgnActive * (close - activePrice5) > 0 : sgnActive * (close - activePrice0) < 0
+    if invalidated
+        invalidEvent := true
+        activeState  := ST_DONE
+    // origin retrace target (ending diagonals only)
+    if activeState != ST_DONE and activeType == TYPE_ENDING
+        bool targetHit = activeDirection > 0 ? low <= activePrice0 : high >= activePrice0
+        if targetHit
+            targetEvent := true
+            activeState := ST_DONE
+    if activeState != ST_DONE and bar_index - activeDetectionBar >= patternExpiryInput
+        activeState := ST_DONE
+    // extend the tracked levels while the pattern stays live
+    if activeState != ST_DONE
+        if not na(activeInvalidLine)
+            line.set_x2(activeInvalidLine, bar_index)
+        if not na(activeInvalidLabel)
+            label.set_x(activeInvalidLabel, bar_index)
+        if not na(activeTargetLine)
+            line.set_x2(activeTargetLine, bar_index)
+        if not na(activeTargetLabel)
+            label.set_x(activeTargetLabel, bar_index)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(leadingEvent, "Leading Diagonal Detected", "New leading diagonal confirmed - wedge in the wave 1 or A position, expect a deep second-wave pullback before continuation")
+alertcondition(endingEvent, "Ending Diagonal Detected", "New ending diagonal confirmed - terminal wedge in the wave 5 or C position, watch for a reversal toward its origin")
+alertcondition(throwOverEvent, "Throw-over Detected", "Price pushed through the wave 1-3 boundary of the active diagonal - terminal throw-over behavior")
+alertcondition(breakEvent, "Wave 2-4 Line Break", "Close crossed back through the wave 2-4 boundary of the active diagonal - reversal trigger")
+alertcondition(invalidEvent, "Diagonal Invalidated", "Close moved beyond the invalidation level of the active diagonal - pattern voided")
+alertcondition(targetEvent, "Origin Target Reached", "Price retraced to the origin of the ending diagonal - full retrace tendency fulfilled")
+
+//---------------------------------------------------------------------------------------------------------------------}

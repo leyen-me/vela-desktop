@@ -1,0 +1,304 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Stopping Volume", "Stopping Volume", overlay = true, max_labels_count = 500, max_boxes_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+STATE_WATCH  = 0
+STATE_ACTIVE = 1
+STATE_TESTED = 2
+
+ZONE_FILL_TRANSP     = 85
+TESTED_FILL_TRANSP   = 75
+ZONE_BORDER_TRANSP   = 50
+BROKEN_FILL_TRANSP   = 92
+BROKEN_BORDER_TRANSP = 70
+
+LABEL_BG = #00000000
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+trendLengthInput = input.int(20, "Downtrend Lookback", minval = 2, group = "Detection",
+  tooltip = "Bars used to qualify an established trend into the event. A stopping-volume candidate must print the lowest low of this window, so the signal arrives after a sustained markdown rather than a shallow dip inside a range. Topping-out candidates must print the highest high instead.")
+
+volumeLengthInput = input.int(20, "Volume Baseline Length", minval = 1, group = "Detection",
+  tooltip = "Length of the simple moving average of volume used as the relative-volume baseline. Abnormality is judged against the bar's own recent baseline, the standard yardstick, rather than an absolute threshold.")
+
+rvolMinInput = input.float(2, "Abnormal Volume Multiple", minval = 1, step = 0.1, group = "Detection",
+  tooltip = "Minimum relative volume for a candidate bar. The default 2 demands at least twice the baseline average volume, making the volume anomaly objective.")
+
+closePosInput = input.float(0.5, "Minimum Close Position", minval = 0, maxval = 1, step = 0.05, group = "Detection",
+  tooltip = "Lowest acceptable close location within the bar's range, where 0 is the low and 1 is the high. The default 0.5 requires the bar to finish mid-range or higher, evidence that panic selling was absorbed within the bar. Mirrored for topping-out events.")
+
+wideSpreadInput = input.bool(false, "Require Wide Spread", group = "Detection",
+  tooltip = "Additionally require the candidate bar's range to exceed its average range over the volume baseline length. The classic picture features a wide spread, although the spread may also be ordinary.")
+
+stallLengthInput = input.int(5, "Stall Window", minval = 1, group = "Detection",
+  tooltip = "Bars following the event during which price may not close beyond the event extreme (below the event low, or above the event high for tops). Enormous effort with no further result is the core of the signal; a close beyond the extreme within this window invalidates the setup.")
+
+detectTopsInput = input.bool(false, "Detect Topping-Out Volume", group = "Detection",
+  tooltip = "Also detect the mirrored event at tops: abnormal volume halting an advance with the close falling well off the highs, confirmed by an upside test on low volume.")
+
+testRvolInput = input.float(1, "Test Volume Maximum", minval = 0.1, step = 0.1, group = "Test & Zones",
+  tooltip = "Maximum relative volume allowed on a test bar. The classic confirmation is a revisit of the zone on clearly reduced volume that holds; the default 1 requires below-average volume on the test.")
+
+showZonesInput = input.bool(true, "Show Event Zones", group = "Test & Zones",
+  tooltip = "Draw the absorption zone spanning the event bar's low to its mid-range (mirrored for tops). A later dip into this area on low volume that holds is the classic confirmation, while heavy volume returning warns the prior move may resume.")
+
+maxAgeInput = input.int(200, "Zone Duration", minval = 10, group = "Test & Zones",
+  tooltip = "Maximum number of bars a zone keeps being monitored and extended after its event before it is frozen in place.")
+
+maxZonesInput = input.int(5, "Maximum Tracked Zones", minval = 1, maxval = 25, group = "Test & Zones",
+  tooltip = "Number of zones monitored at the same time; the oldest zone is frozen when the limit is exceeded.")
+
+showAvwapInput = input.bool(true, "VWAP From Latest Event", group = "Anchored VWAP",
+  tooltip = "Anchor a volume-weighted average price at the most recent stopping-volume bar to track the absorption. Price holding above it keeps the accumulation case alive; losing it argues the buyers are underwater.")
+
+bullColorInput = input.color(#089981, "Bullish", group = "Style",
+  tooltip = "Color of stopping-volume markers, absorption zones and holding tests.")
+
+bearColorInput = input.color(#f23645, "Bearish", group = "Style",
+  tooltip = "Color of topping-out markers, distribution zones and supply warnings.")
+
+brokenColorInput = input.color(#787b86, "Broken Zones", group = "Style",
+  tooltip = "Color applied to zones invalidated by a close beyond their event extreme.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types & Variables
+//---------------------------------------------------------------------------------------------------------------------{
+type SvZone
+    box   zoneBox
+    float zoneTop
+    float zoneBottom
+    int   eventBar
+    int   dir
+    int   state
+
+var array<SvZone> zonesArray = array.new<SvZone>()
+
+var float avwapPriceVolume = 0.0
+var float avwapVolume      = 0.0
+var bool  avwapActive      = false
+var float cumulativeVolume = 0.0
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+//Registers an abnormal-volume halt: extends the event zone still forming inside its stall window ("one or a few bars"),
+//otherwise opens a new zone. Returns true when a new zone was created
+zoneEvent(int dirValue, float relVolumeValue) =>
+    bool  createdNew  = false
+    bool  isBullEvent = dirValue == 1
+    color dirColor    = isBullEvent ? bullColorInput : bearColorInput
+    float topValue    = isBullEvent ? math.avg(high, low) : high
+    float bottomValue = isBullEvent ? low : math.avg(high, low)
+
+    //Successive abnormal bars inside the stall window belong to the same event
+    int mergeIndex = -1
+    int scanIndex  = array.size(zonesArray) - 1
+    while scanIndex >= 0 and mergeIndex == -1
+        SvZone scanZone = array.get(zonesArray, scanIndex)
+        if scanZone.state == STATE_WATCH and scanZone.dir == dirValue
+            mergeIndex := scanIndex
+        scanIndex -= 1
+
+    if mergeIndex >= 0
+        SvZone mergeTarget = array.get(zonesArray, mergeIndex)
+        mergeTarget.zoneTop    := math.max(mergeTarget.zoneTop, topValue)
+        mergeTarget.zoneBottom := math.min(mergeTarget.zoneBottom, bottomValue)
+        mergeTarget.eventBar   := bar_index
+        if not na(mergeTarget.zoneBox)
+            box.set_top(mergeTarget.zoneBox, mergeTarget.zoneTop)
+            box.set_bottom(mergeTarget.zoneBox, mergeTarget.zoneBottom)
+    else
+        createdNew := true
+        box eventBox = na
+        if showZonesInput
+            eventBox := box.new(bar_index, topValue, bar_index, bottomValue
+              , border_color = color.new(dirColor, ZONE_BORDER_TRANSP)
+              , border_width = 1
+              , border_style = line.style_dotted
+              , bgcolor      = color.new(dirColor, ZONE_FILL_TRANSP))
+        array.push(zonesArray, SvZone.new(zoneBox = eventBox, zoneTop = topValue, zoneBottom = bottomValue, eventBar = bar_index, dir = dirValue, state = STATE_WATCH))
+        label.new(bar_index, na, isBullEvent ? "SV" : "TV"
+          , yloc      = isBullEvent ? yloc.belowbar : yloc.abovebar
+          , style     = isBullEvent ? label.style_label_up : label.style_label_down
+          , color     = dirColor
+          , textcolor = chart.bg_color
+          , size      = size.small
+          , tooltip   = (isBullEvent ? "Stopping volume, " : "Topping-out volume, ") + str.tostring(relVolumeValue, "#.##") + "x baseline volume")
+    createdNew
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+cumulativeVolume += nz(volume)
+
+//Relative volume against the bar's own recent baseline - the standard yardstick for judging abnormality
+baseVolume = ta.sma(nz(volume), volumeLengthInput)
+relVolume  = baseVolume > 0 ? nz(volume) / baseVolume : na
+
+//Bar geometry - where within its range the bar finished
+barSpan  = high - low
+avgSpan  = ta.sma(barSpan, volumeLengthInput)
+closePos = barSpan > 0 ? (close - low) / barSpan : 0.5
+
+//Trend context - the event must arrive at the extreme of a sustained move, not inside a range
+lowestLow   = ta.lowest(low, trendLengthInput)
+highestHigh = ta.highest(high, trendLengthInput)
+
+prevLow  = low[1]
+prevHigh = high[1]
+
+rvolOk      = not na(relVolume) and relVolume >= rvolMinInput
+spreadOk    = not wideSpreadInput or (not na(avgSpan) and barSpan > avgSpan)
+downtrendOk = not na(lowestLow) and low <= lowestLow
+uptrendOk   = not na(highestHigh) and high >= highestHigh
+
+//Candidate events - sustained move into the bar, clearly abnormal volume, close finishing well off the extreme
+bullEvent = downtrendOk and rvolOk and closePos >= closePosInput and spreadOk
+bearEvent = detectTopsInput and uptrendOk and rvolOk and closePos <= 1 - closePosInput and spreadOk
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Event Zones
+//---------------------------------------------------------------------------------------------------------------------{
+bool newBullZone = false
+bool newBearZone = false
+
+if bullEvent
+    newBullZone := zoneEvent(1, relVolume)
+
+if bearEvent
+    newBearZone := zoneEvent(-1, relVolume)
+
+//Freeze the oldest zones when the tracking limit is exceeded
+while array.size(zonesArray) > maxZonesInput
+    array.remove(zonesArray, 0)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Zone Monitoring
+//---------------------------------------------------------------------------------------------------------------------{
+bool stallConfirmed = false
+bool bullTestOk     = false
+bool bearTestOk     = false
+bool heavyRetest    = false
+bool zoneBroken     = false
+
+int zoneIndex = array.size(zonesArray) - 1
+
+while zoneIndex >= 0
+    SvZone activeZone = array.get(zonesArray, zoneIndex)
+    bool isBullZone = activeZone.dir == 1
+    bool removeZone = false
+
+    //A close beyond the event extreme means the halted move resumed - the read is invalidated
+    bool brokenNow = isBullZone ? close < activeZone.zoneBottom : close > activeZone.zoneTop
+
+    if brokenNow
+        zoneBroken := true
+        removeZone := true
+        if not na(activeZone.zoneBox)
+            box.set_right(activeZone.zoneBox, bar_index)
+            box.set_bgcolor(activeZone.zoneBox, color.new(brokenColorInput, BROKEN_FILL_TRANSP))
+            box.set_border_color(activeZone.zoneBox, color.new(brokenColorInput, BROKEN_BORDER_TRANSP))
+    else
+        //Effort with no further result - the stall window completes without follow-through beyond the extreme
+        if activeZone.state == STATE_WATCH and bar_index - activeZone.eventBar >= stallLengthInput
+            activeZone.state := STATE_ACTIVE
+            stallConfirmed   := true
+            if not na(activeZone.zoneBox)
+                box.set_border_style(activeZone.zoneBox, line.style_dashed)
+
+        //Test phase - price left the zone and now dips back into it
+        if activeZone.state != STATE_WATCH
+            bool entryNow = isBullZone ? prevLow > activeZone.zoneTop and low <= activeZone.zoneTop
+              : prevHigh < activeZone.zoneBottom and high >= activeZone.zoneBottom
+
+            if entryNow and not na(relVolume)
+                if relVolume <= testRvolInput and activeZone.state == STATE_ACTIVE
+                    //Supply dried up on the revisit and the zone held - the classic confirmation
+                    activeZone.state := STATE_TESTED
+                    if isBullZone
+                        bullTestOk := true
+                    else
+                        bearTestOk := true
+                    if not na(activeZone.zoneBox)
+                        box.set_border_style(activeZone.zoneBox, line.style_solid)
+                        box.set_bgcolor(activeZone.zoneBox, color.new(isBullZone ? bullColorInput : bearColorInput, TESTED_FILL_TRANSP))
+                    label.new(bar_index, na, "Test"
+                      , yloc      = isBullZone ? yloc.belowbar : yloc.abovebar
+                      , style     = isBullZone ? label.style_label_up : label.style_label_down
+                      , color     = LABEL_BG
+                      , textcolor = isBullZone ? bullColorInput : bearColorInput
+                      , size      = size.tiny
+                      , tooltip   = "Low-volume test held the zone, " + str.tostring(relVolume, "#.##") + "x baseline volume")
+                else if relVolume >= rvolMinInput
+                    //Heavy volume returned on the retest - supply (or demand, at tops) remains
+                    heavyRetest := true
+                    label.new(bar_index, na, isBullZone ? "Supply" : "Demand"
+                      , yloc      = isBullZone ? yloc.belowbar : yloc.abovebar
+                      , style     = isBullZone ? label.style_label_up : label.style_label_down
+                      , color     = LABEL_BG
+                      , textcolor = isBullZone ? bearColorInput : bullColorInput
+                      , size      = size.tiny
+                      , tooltip   = "Heavy volume returned on the retest, " + str.tostring(relVolume, "#.##") + "x baseline volume")
+
+        //Extend the monitored zone, or freeze it once it exceeds its maximum duration
+        if bar_index - activeZone.eventBar >= maxAgeInput
+            removeZone := true
+        else if not na(activeZone.zoneBox)
+            box.set_right(activeZone.zoneBox, bar_index)
+
+    if removeZone
+        array.remove(zonesArray, zoneIndex)
+
+    zoneIndex -= 1
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Event-Anchored VWAP
+//---------------------------------------------------------------------------------------------------------------------{
+if newBullZone
+    avwapPriceVolume := 0.0
+    avwapVolume      := 0.0
+    avwapActive      := true
+
+if avwapActive
+    avwapPriceVolume += hlc3 * nz(volume)
+    avwapVolume      += nz(volume)
+
+avwapValue = avwapActive and avwapVolume > 0 ? avwapPriceVolume / avwapVolume : na
+avwapLost  = showAvwapInput and not na(avwapValue) and not na(avwapValue[1]) and close < avwapValue and close[1] >= avwapValue[1]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visuals
+//---------------------------------------------------------------------------------------------------------------------{
+avwapColor = not na(avwapValue) and close >= avwapValue ? bullColorInput : bearColorInput
+
+//VWAP anchored at the latest stopping-volume bar - holding above it keeps the accumulation case alive
+plot(showAvwapInput ? avwapValue : na, "Event-Anchored VWAP", avwapColor, 1, plot.style_linebr)
+
+//Graceful notice when the symbol reports no volume at all
+var table noticeTable = table.new(position.top_right, 1, 1)
+
+if barstate.islast and cumulativeVolume == 0
+    table.cell(noticeTable, 0, 0, "No volume data is provided for this symbol - stopping volume requires volume"
+      , text_color = chart.fg_color
+      , text_size  = size.small
+      , bgcolor    = color.new(chart.fg_color, 90))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(bullEvent, "Stopping Volume", "Stopping volume - abnormal volume into new lows with the close finishing off the low; watch for stalled downside and a low-volume test")
+alertcondition(bearEvent, "Topping-Out Volume", "Topping-out volume - abnormal volume into new highs with the close falling well off the high; watch for stalled upside and a low-volume test")
+alertcondition(stallConfirmed, "Stall Confirmed", "Stall confirmed - no close beyond the event extreme within the stall window; enormous effort with no further result")
+alertcondition(bullTestOk, "Low-Volume Test Holds", "Bullish confirmation - the absorption zone was revisited on clearly reduced volume and held")
+alertcondition(bearTestOk, "Upside Low-Volume Test Holds", "Bearish confirmation - the distribution zone was revisited on clearly reduced volume and held")
+alertcondition(heavyRetest, "Heavy Volume on Retest", "Warning - heavy volume returned on the retest of a tracked zone; the halted move may resume")
+alertcondition(zoneBroken, "Zone Invalidated", "A tracked zone was invalidated by a close beyond its event extreme")
+alertcondition(avwapLost, "Event VWAP Lost", "Price closed below the VWAP anchored at the latest stopping-volume bar - buyers may be underwater")
+
+//---------------------------------------------------------------------------------------------------------------------}

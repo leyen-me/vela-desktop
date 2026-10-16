@@ -1,0 +1,235 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Monte Carlo Mean Reversion Heatmap", "MC Mean Reversion Heatmap", overlay = true, max_boxes_count = 500, max_lines_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants & Inputs
+//---------------------------------------------------------------------------------------------------------------------{
+// --- Colors ---
+color BULL_COLOR            = #089981
+color BEAR_COLOR            = #f23645
+color NEUTRAL_COLOR         = #787b86
+color DATA                  = #DBDBDB
+color HEADERS               = #808080
+color BACKGROUND            = #161616
+color BORDERS               = #2E2E2E
+
+// --- Positions/Sizes ---
+string TOP_RIGHT            = 'Top Right'
+string BOTTOM_RIGHT         = 'Bottom Right'
+string BOTTOM_LEFT          = 'Bottom Left'
+
+string TINY                 = 'Tiny'
+string SMALL                = 'Small'
+string NORMAL               = 'Normal'
+string LARGE                = 'Large'
+string HUGE                 = 'Huge'
+
+// --- Mean Settings ---
+string MEAN_GROUP           = "Mean Calculation"
+int maLengthInput           = input.int(200, "Mean Length", minval = 1, group = MEAN_GROUP, tooltip = "The length of the EMA used as the 'Mean' target for reversion analysis.")
+color maColorInput          = input.color(color.new(NEUTRAL_COLOR, 0), "Mean Color", group = MEAN_GROUP)
+
+// --- Monte Carlo Settings ---
+string MC_GROUP             = "Monte Carlo Simulation"
+int simCountInput           = input.int(100, "Simulations", minval = 10, maxval = 200, group = MC_GROUP, tooltip = "Number of simulated paths to generate.")
+int projLenInput            = input.int(30, "Projection Length", minval = 5, maxval = 50, group = MC_GROUP, tooltip = "How many bars into the future to project the simulation.")
+int volLookbackInput        = input.int(50, "Volatility Lookback", minval = 5, group = MC_GROUP, tooltip = "Lookback period for calculating historical log-volatility.")
+bool driftInput             = input.bool(true, "Include Drift", group = MC_GROUP, tooltip = "If enabled, the simulation incorporates the trend (log-drift) of the Mean EMA.")
+
+// --- Visualization ---
+string VIS_GROUP            = "Visuals"
+int priceBinsInput          = input.int(10, "Price Bins", minval = 5, maxval = 20, group = VIS_GROUP, tooltip = "Number of vertical price bins per future bar for the heatmap density.")
+color heatmapColorInput     = input.color(color.new(#00897b, 0), "Heatmap Color", group = VIS_GROUP)
+bool showPercentilesInput    = input.bool(true, "Show Percentile Lines", group = VIS_GROUP, tooltip = "Toggle probability fan lines (5%, 50%, 95%).")
+
+// --- Dashboard ---
+string DASHBOARD_GROUP      = "Dashboard"
+bool dashboardInput         = input.bool(true, "Dashboard", group = DASHBOARD_GROUP, tooltip = "Enable or disable the dashboard.")
+string dashPositionInput    = input.string(TOP_RIGHT, "Position", group = DASHBOARD_GROUP, tooltip = "Select the dashboard location.", options = [TOP_RIGHT, BOTTOM_RIGHT, BOTTOM_LEFT])
+string dashSizeInput        = input.string(SMALL, "Size", group = DASHBOARD_GROUP, tooltip = "Select the dashboard size.", options = [TINY, SMALL, NORMAL, LARGE, HUGE])
+
+//---------------------------------------------------------------------------------------------------------------------}
+// User Defined Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Helper to get Gaussian random numbers using Central Limit Theorem (CLT)
+getGaussian() =>
+    float rand = 0.0
+    for j = 0 to 11
+        rand += math.random(0, 1)
+    rand - 6.0
+
+// Table helper functions
+var parsedDashboardSize = switch dashSizeInput
+    TINY   => size.tiny
+    SMALL  => size.small
+    NORMAL => size.normal
+    LARGE  => size.large
+    HUGE   => size.huge
+
+cell(table t_able, int column, int row, string data, color = #FFFFFF, align = text.align_right, color background = na, float height = 0) => 
+    t_able.cell(column, row, data, text_color = color, text_size = parsedDashboardSize, text_halign = align, bgcolor = background, height = height)
+
+divider(table t_able, int row, int lastColumn) =>    
+    string rowDivider = '━━━━━━━━━━━━━━'
+    t_able.merge_cells(0, row, lastColumn, row)
+    cell(t_able, 0, row, rowDivider, align = text.align_center, height = 0.5, color = BORDERS)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+// 1. Calculate the Target Mean (EMA)
+float meanValue = ta.ema(close, maLengthInput)
+
+// 2. Log returns and Historical Volatility
+float logReturns = math.log(close / nz(close[1], close))
+float vol        = ta.stdev(logReturns, volLookbackInput)
+
+// 3. Log-Drift (Trend of the mean)
+// Geometric Brownian Motion uses log-drift for continuous returns
+float logDrift = driftInput ? math.log(meanValue / nz(meanValue[volLookbackInput], meanValue)) / volLookbackInput : 0.0
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Simulation Logic
+//---------------------------------------------------------------------------------------------------------------------{
+if barstate.islast
+    // --- Clear Previous Drawings ---
+    var boxArray   = array.new_box()
+    var lineArray  = array.new_line()
+    var labelArray = array.new_label()
+    
+    for b in boxArray
+        b.delete()
+    for l in lineArray
+        l.delete()
+    for lb in labelArray
+        lb.delete()
+    
+    boxArray.clear()
+    lineArray.clear()
+    labelArray.clear()
+
+    // Matrix storage for density counts: rows = future step, cols = price bin
+    int[] binCounts = array.new_int(projLenInput * priceBinsInput, 0)
+    
+    // Array to store final prices of each path for percentile fan
+    float[] finalPrices = array.new_float(0)
+    
+    int pathsReverted = 0
+    int pathsAbove    = 0
+    
+    // Core Simulation Loop
+    for i = 0 to simCountInput - 1
+        float currentSimPrice = close
+        bool hasTouchedMean   = false
+        
+        for step = 0 to projLenInput - 1
+            // Random Walk step
+            float randStep = getGaussian()
+            
+            // Apply GBM: S(t+1) = S(t) * exp(drift + vol * epsilon)
+            currentSimPrice *= math.exp(logDrift + (vol * randStep))
+            
+            // Track if this specific path ever crosses the Mean within the projection window
+            if not hasTouchedMean and ((close < meanValue and currentSimPrice >= meanValue) or (close > meanValue and currentSimPrice <= meanValue))
+                hasTouchedMean := true
+                pathsReverted  += 1
+                
+            // Heatmap Bin Logic: Range expands with sqrt(t)
+            float stepExpectedMove = close * vol * math.sqrt(step + 1) * 3.5 
+            float stepCenter       = close * math.exp(logDrift * (step + 1))
+            float stepTop          = stepCenter + stepExpectedMove
+            float stepBot          = stepCenter - stepExpectedMove
+            float stepBinSize      = (stepTop - stepBot) / priceBinsInput
+            
+            int binIndex = math.floor((currentSimPrice - stepBot) / stepBinSize)
+            if binIndex >= 0 and binIndex < priceBinsInput
+                int matrixIdx = (step * priceBinsInput) + binIndex
+                array.set(binCounts, matrixIdx, array.get(binCounts, matrixIdx) + 1)
+        
+        // Final Path metrics
+        array.push(finalPrices, currentSimPrice)
+        if currentSimPrice > close
+            pathsAbove += 1
+
+    //---------------------------------------------------------------------------------------------------------------------}
+    // Visualization: Heatmap
+    //---------------------------------------------------------------------------------------------------------------------{
+    for step = 0 to projLenInput - 1
+        float stepExpectedMove = close * vol * math.sqrt(step + 1) * 3.5
+        float stepCenter       = close * math.exp(logDrift * (step + 1))
+        float stepTop          = stepCenter + stepExpectedMove
+        float stepBot          = stepCenter - stepExpectedMove
+        float stepBinSize      = (stepTop - stepBot) / priceBinsInput
+        
+        for bin = 0 to priceBinsInput - 1
+            int count = array.get(binCounts, (step * priceBinsInput) + bin)
+            if count > 0
+                float density      = float(count) / simCountInput
+                float transparency = 100 - (density * 220) 
+                transparency      := math.max(65, math.min(98, transparency))
+                
+                boxArray.push(box.new(
+                  left          = bar_index + step + 1,
+                  top           = stepBot + (bin + 1) * stepBinSize,
+                  right         = bar_index + step + 2,
+                  bottom        = stepBot + (bin * stepBinSize),
+                  border_color  = na,
+                  bgcolor       = color.new(heatmapColorInput, transparency)
+                  ))
+
+    // Percentile Fan Calculation
+    array.sort(finalPrices)
+    float p05 = array.get(finalPrices, math.floor(simCountInput * 0.05))
+    float p50 = array.get(finalPrices, math.floor(simCountInput * 0.50))
+    float p95 = array.get(finalPrices, math.floor(simCountInput * 0.95))
+
+    if showPercentilesInput
+        lineArray.push(line.new(bar_index, close, bar_index + projLenInput, p05, color = BEAR_COLOR, style = line.style_dotted))
+        lineArray.push(line.new(bar_index, close, bar_index + projLenInput, p50, color = NEUTRAL_COLOR, style = line.style_dashed))
+        lineArray.push(line.new(bar_index, close, bar_index + projLenInput, p95, color = BULL_COLOR, style = line.style_dotted))
+        
+        labelArray.push(label.new(bar_index + projLenInput, p05, "5%",  style = label.style_label_left, color = #00000000, textcolor = BEAR_COLOR, size = size.tiny))
+        labelArray.push(label.new(bar_index + projLenInput, p50, "50%", style = label.style_label_left, color = #00000000, textcolor = NEUTRAL_COLOR, size = size.tiny))
+        labelArray.push(label.new(bar_index + projLenInput, p95, "95%", style = label.style_label_left, color = #00000000, textcolor = BULL_COLOR, size = size.tiny))
+
+    //---------------------------------------------------------------------------------------------------------------------}
+    // Visualization: Dashboard
+    //---------------------------------------------------------------------------------------------------------------------{
+    if dashboardInput
+        var parsedPos  = switch dashPositionInput
+            TOP_RIGHT    => position.top_right
+            BOTTOM_RIGHT => position.bottom_right
+            BOTTOM_LEFT  => position.bottom_left
+
+        var table t_able = table.new(parsedPos, 2, 7, bgcolor = BACKGROUND, border_width = 0, frame_color = BORDERS, frame_width = 1, force_overlay = false)
+        
+        float probRev = (float(pathsReverted) / simCountInput) * 100
+        float probUp  = (float(pathsAbove) / simCountInput) * 100
+
+        t_able.merge_cells(0, 0, 1, 0)
+        cell(t_able, 0, 0, "MC Statistics", color = BULL_COLOR, align = text.align_center)
+
+        divider(t_able, 1, 1)
+
+        cell(t_able, 0, 2, "Mean Reversion", color = HEADERS, align = text.align_left)
+        cell(t_able, 1, 2, str.tostring(probRev, "#.##") + "%", color = DATA)
+
+        divider(t_able, 3, 1)
+
+        cell(t_able, 0, 4, "Bullish Prob.", color = HEADERS, align = text.align_left)
+        cell(t_able, 1, 4, str.tostring(probUp, "#.##") + "%", color = BULL_COLOR)
+
+        divider(t_able, 5, 1)
+
+        cell(t_able, 0, 6, "Bearish Prob.", color = HEADERS, align = text.align_left)
+        cell(t_able, 1, 6, str.tostring(100 - probUp, "#.##") + "%", color = BEAR_COLOR)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Plots
+//---------------------------------------------------------------------------------------------------------------------{
+plot(meanValue, "Mean target", color = maColorInput, linewidth = 2)
+
+//---------------------------------------------------------------------------------------------------------------------}

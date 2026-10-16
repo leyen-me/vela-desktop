@@ -1,0 +1,323 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Dynamic Time Warping Similarity"
+  , shorttitle       = "Dynamic Time Warping Similarity"
+  , overlay          = true
+  , format           = format.price
+  , precision        = 3
+  , max_boxes_count  = 100
+  , max_labels_count = 100)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BEST_COLOR    = #089981 // closest analog - the strongest match
+GRAY_COLOR    = #787b86 // farthest analog - structure
+WINDOW_COLOR  = #ff9800 // the one accent - the current pattern window
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+// Unreachable-cell sentinel of the cumulative cost matrix
+BIG_COST = 1.0e10
+
+// Cell-update budget of one full scan; the stride grows automatically to stay under it
+CELL_BUDGET = 1500000.0
+
+GRP_WINDOW = "Pattern Window"
+GRP_SEARCH = "Analog Search"
+GRP_DASH   = "Dashboard"
+GRP_STYLE  = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+srcInput    = input.source(close, "Source", group = GRP_WINDOW, tooltip = "Series the pattern windows are taken from. Every window is z-normalized before comparison, so DTW measures shape similarity rather than price level.")
+windowInput = input.int(30, "Window Length", minval = 5, maxval = 60, group = GRP_WINDOW, tooltip = "Number of bars in a pattern window. The most recent bars form the reference pattern that is searched for across history.")
+
+lookbackInput  = input.int(1000, "Search Lookback", minval = 200, maxval = 5000, group = GRP_SEARCH, tooltip = "Number of historical bars scanned for analog windows. Larger values retrieve analogs from deeper history at a higher computational cost.")
+strideInput    = input.int(2, "Scan Stride", minval = 1, maxval = 10, group = GRP_SEARCH, tooltip = "Step, in bars, between candidate window positions. Higher values scan fewer windows and compute faster. The stride is increased automatically whenever the scan would exceed its computation budget.")
+bandInput      = input.int(5, "Warping Band Width", minval = 0, maxval = 15, group = GRP_SEARCH, tooltip = "Sakoe-Chiba band width w: the warping path is constrained to |i - j| <= w. Small widths keep alignments near the diagonal and prevent degenerate warping; 0 disables warping entirely (point-by-point comparison).")
+topKInput      = input.int(3, "Analogs To Retrieve", minval = 1, maxval = 8, group = GRP_SEARCH, tooltip = "Number of closest, non-overlapping analog windows retrieved, highlighted on the chart, and ranked in the dashboard.")
+thresholdInput = input.float(3.0, "Strong Match Threshold", minval = 0.0, step = 0.1, group = GRP_SEARCH, tooltip = "DTW distance at or below which the closest analog counts as a strong match. Used by the alerts; distances near 0 mean nearly identical z-normalized shapes.")
+
+aftermathShowInput = input.bool(true, "Aftermath Zone", inline = "aft", group = GRP_SEARCH, tooltip = "Highlight the bars that followed each analog window, so what happened next after each similar shape can be inspected. The zone is a study aid, not a forecast.")
+aftermathLenInput  = input.int(15, "Length", minval = 1, maxval = 60, inline = "aft", group = GRP_SEARCH, tooltip = "Number of bars highlighted after each analog window.")
+
+dashShowInput = input.bool(true, "Show Dashboard", group = GRP_DASH, tooltip = "Display a panel ranking the retrieved analogs with their age in bars and their DTW distance to the current window.")
+dashLocInput  = input.string("Top Right", "Location", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = GRP_DASH, tooltip = "Dashboard position on the chart.")
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = GRP_DASH, tooltip = "Dashboard text size.")
+
+showLabelsInput  = input.bool(true, "Show Labels", group = GRP_STYLE)
+windowColorInput = input.color(WINDOW_COLOR, "Current Window", group = GRP_STYLE)
+bestColorInput   = input.color(BEST_COLOR, "Closest Analog", group = GRP_STYLE, inline = "grad")
+worstColorInput  = input.color(GRAY_COLOR, "Farthest", group = GRP_STYLE, inline = "grad")
+
+dashPosition = switch dashLocInput
+    "Top Right"    => position.top_right
+    "Top Left"     => position.top_left
+    "Bottom Right" => position.bottom_right
+    "Bottom Left"  => position.bottom_left
+    => position.top_right
+
+dashTextSize = switch dashSizeInput
+    "Tiny"   => size.tiny
+    "Small"  => size.small
+    "Normal" => size.normal
+    => size.small
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Mean and population standard deviation of a window inside a values array
+windowStats(array<float> valuesArray, int startIdx, int windowLen) =>
+    float sumVal = 0.0
+    float sumSq  = 0.0
+    for k = 0 to windowLen - 1
+        v = array.get(valuesArray, startIdx + k)
+        sumVal += v
+        sumSq  += v * v
+    meanVal = sumVal / windowLen
+    varVal  = math.max(sumSq / windowLen - meanVal * meanVal, 0.0)
+    [meanVal, math.sqrt(varVal)]
+
+// DTW distance between the z-normalized reference window and one z-normalized candidate window,
+// filling the cumulative cost matrix D(i, j) = d(i, j) + min(D(i-1, j), D(i, j-1), D(i-1, j-1))
+// two rows at a time under a Sakoe-Chiba band |i - j| <= bandWidth, with d(i, j) = (a_i - b_j)^2.
+// Rows carry a leading sentinel cell so column j is stored at index j + 1; prevRow[0] seeds the
+// virtual D(0, 0) predecessor on the first row. Returns sqrt(D(n, m)).
+dtwDistance(array<float> refNormArray, array<float> valuesArray, int candStart, float candMean, float candStd, array<float> rowAArray, array<float> rowBArray, int windowLen, int bandWidth) =>
+    prevRow = rowAArray
+    currRow = rowBArray
+    array.fill(prevRow, BIG_COST)
+    for i = 0 to windowLen - 1
+        array.fill(currRow, BIG_COST)
+        array.set(prevRow, 0, i == 0 ? 0.0 : BIG_COST)
+        aVal = array.get(refNormArray, i)
+        jLo  = math.max(0, i - bandWidth)
+        jHi  = math.min(windowLen - 1, i + bandWidth)
+        for j = jLo to jHi
+            bVal      = (array.get(valuesArray, candStart + j) - candMean) / candStd
+            diffVal   = aVal - bVal
+            localCost = diffVal * diffVal
+            baseCost  = math.min(array.get(prevRow, j + 1), math.min(array.get(currRow, j), array.get(prevRow, j)))
+            array.set(currRow, j + 1, localCost + baseCost)
+        swapRow = prevRow
+        prevRow := currRow
+        currRow := swapRow
+    math.sqrt(array.get(prevRow, windowLen))
+
+// Highest high and lowest low over an index range of the collected bar arrays
+rangeExtremes(array<float> highArray, array<float> lowArray, int startIdx, int endIdx) =>
+    float hiVal = na
+    float loVal = na
+    for k = startIdx to endIdx
+        hVal = array.get(highArray, k)
+        lVal = array.get(lowArray, k)
+        if na(hiVal) or hVal > hiVal
+            hiVal := hVal
+        if na(loVal) or lVal < loVal
+            loVal := lVal
+    [hiVal, loVal]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Data Collection
+//---------------------------------------------------------------------------------------------------------------------{
+// Element k of each array corresponds to bar_index k; only confirmed bars are stored
+var srcValuesArray  = array.new<float>()
+var highValuesArray = array.new<float>()
+var lowValuesArray  = array.new<float>()
+
+if barstate.isconfirmed
+    array.push(srcValuesArray,  srcInput)
+    array.push(highValuesArray, high)
+    array.push(lowValuesArray,  low)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Analog Search & Visualization
+//---------------------------------------------------------------------------------------------------------------------{
+var matchBoxArray   = array.new<box>()
+var matchLabelArray = array.new<label>()
+var box   windowBoxId    = na
+var label windowLabelId  = na
+var table dashboardTable = na
+var float bestDistance   = na
+var int   lastScanSize   = -1
+
+sizeNow = array.size(srcValuesArray)
+minBars = windowInput * 2 + 1
+
+if barstate.islast and sizeNow != lastScanSize
+    lastScanSize := sizeNow
+
+    for eachBox in matchBoxArray
+        box.delete(eachBox)
+    array.clear(matchBoxArray)
+    for eachLabel in matchLabelArray
+        label.delete(eachLabel)
+    array.clear(matchLabelArray)
+    box.delete(windowBoxId)
+    label.delete(windowLabelId)
+    table.delete(dashboardTable)
+    bestDistance := na
+
+    selEndArray  = array.new<int>()
+    selDistArray = array.new<float>()
+    string statusText = na
+
+    if sizeNow < minBars
+        statusText := "Insufficient history"
+    else
+        refStart = sizeNow - windowInput
+        [refMean, refStd] = windowStats(srcValuesArray, refStart, windowInput)
+
+        if na(refStd) or refStd <= 0
+            statusText := "Flat reference window"
+        else
+            // z-normalized reference pattern: the most recent closed bars
+            refNormArray = array.new<float>(windowInput)
+            for k = 0 to windowInput - 1
+                array.set(refNormArray, k, (array.get(srcValuesArray, refStart + k) - refMean) / refStd)
+
+            // scratch rows of the cumulative cost matrix, reused across candidates
+            rowAArray = array.new<float>(windowInput + 1, BIG_COST)
+            rowBArray = array.new<float>(windowInput + 1, BIG_COST)
+
+            bandWidth = math.min(bandInput, windowInput - 1)
+            scanStart = math.max(windowInput - 1, sizeNow - 1 - lookbackInput)
+            scanEnd   = sizeNow - windowInput - 1
+            spanCount = scanEnd - scanStart + 1
+            cellCost  = windowInput * (2 * bandWidth + 1)
+            strideEff = math.max(strideInput, math.ceil(spanCount * cellCost / CELL_BUDGET))
+
+            // DTW distance of every candidate window against the reference
+            candEndArray  = array.new<int>()
+            candDistArray = array.new<float>()
+            for candEnd = scanStart to scanEnd by strideEff
+                candStart = candEnd - windowInput + 1
+                [candMean, candStd] = windowStats(srcValuesArray, candStart, windowInput)
+                if not na(candStd) and candStd > 0
+                    dtwVal = dtwDistance(refNormArray, srcValuesArray, candStart, candMean, candStd, rowAArray, rowBArray, windowInput, bandWidth)
+                    if not na(dtwVal)
+                        array.push(candEndArray, candEnd)
+                        array.push(candDistArray, dtwVal)
+
+            candCount = array.size(candDistArray)
+            if candCount == 0
+                statusText := "No valid analog window"
+            else
+                // greedy top-k selection of the closest mutually non-overlapping windows
+                selecting = true
+                while selecting and array.size(selEndArray) < topKInput
+                    bestIdx = -1
+                    float bestVal = na
+                    for c = 0 to candCount - 1
+                        dVal = array.get(candDistArray, c)
+                        if not na(dVal) and (na(bestVal) or dVal < bestVal)
+                            eVal    = array.get(candEndArray, c)
+                            overlap = false
+                            pickedN = array.size(selEndArray)
+                            if pickedN > 0
+                                for s = 0 to pickedN - 1
+                                    if math.abs(eVal - array.get(selEndArray, s)) < windowInput
+                                        overlap := true
+                                        break
+                            if not overlap
+                                bestVal := dVal
+                                bestIdx := c
+                    if bestIdx >= 0
+                        array.push(selEndArray, array.get(candEndArray, bestIdx))
+                        array.push(selDistArray, bestVal)
+                        array.set(candDistArray, bestIdx, na)
+                    else
+                        selecting := false
+
+    // current pattern window
+    if sizeNow >= windowInput
+        refBoxStart = sizeNow - windowInput
+        [refHi, refLo] = rangeExtremes(highValuesArray, lowValuesArray, refBoxStart, sizeNow - 1)
+        windowBoxId := box.new(refBoxStart, refHi, sizeNow - 1, refLo
+          , border_color = color.new(windowColorInput, 20)
+          , border_width = 1
+          , bgcolor      = color.new(windowColorInput, 88))
+        if showLabelsInput
+            windowLabelId := label.new((refBoxStart + sizeNow - 1) / 2, refHi, "Current Window"
+              , style     = label.style_label_down
+              , color     = #00000000
+              , textcolor = windowColorInput
+              , size      = size.small)
+
+    // retrieved analogs, colored from closest to farthest
+    selCount = array.size(selDistArray)
+    if selCount > 0
+        bestDistance := array.get(selDistArray, 0)
+        worstSel = array.get(selDistArray, selCount - 1)
+        distSpan = math.max(worstSel - bestDistance, 1.0e-9)
+        for r = 0 to selCount - 1
+            endIdx   = array.get(selEndArray, r)
+            startIdx = endIdx - windowInput + 1
+            distVal  = array.get(selDistArray, r)
+            rankColor = color.from_gradient(distVal, bestDistance, bestDistance + distSpan, bestColorInput, worstColorInput)
+            [hiVal, loVal] = rangeExtremes(highValuesArray, lowValuesArray, startIdx, endIdx)
+            array.push(matchBoxArray, box.new(startIdx, hiVal, endIdx, loVal
+              , border_color = color.new(rankColor, 20)
+              , border_width = 1
+              , bgcolor      = color.new(rankColor, 85)))
+            if aftermathShowInput and endIdx + 1 <= sizeNow - 1
+                aftEnd = math.min(endIdx + aftermathLenInput, sizeNow - 1)
+                [aftHi, aftLo] = rangeExtremes(highValuesArray, lowValuesArray, endIdx + 1, aftEnd)
+                array.push(matchBoxArray, box.new(endIdx + 1, aftHi, aftEnd, aftLo
+                  , border_color = color.new(rankColor, 60)
+                  , border_width = 1
+                  , border_style = line.style_dashed
+                  , bgcolor      = color.new(rankColor, 94)))
+            if showLabelsInput
+                barsAgo = sizeNow - 1 - endIdx
+                array.push(matchLabelArray, label.new((startIdx + endIdx) / 2, hiVal, "#" + str.tostring(r + 1) + " · " + str.tostring(distVal, "#.###")
+                  , style     = label.style_label_down
+                  , color     = #00000000
+                  , textcolor = rankColor
+                  , size      = size.small
+                  , tooltip   = "DTW distance: " + str.tostring(distVal, "#.###") + "\nEnded " + str.tostring(barsAgo) + " bars ago"))
+
+    // dashboard
+    if dashShowInput
+        dashboardTable := table.new(dashPosition, 3, (selCount == 0 ? 1 : selCount) + 2
+          , bgcolor      = DASH_BG
+          , border_width = 0
+          , frame_color  = DASH_FRAME
+          , frame_width  = 1)
+        table.merge_cells(dashboardTable, 0, 0, 2, 0)
+        table.cell(dashboardTable, 0, 0, "DTW Similarity", text_color = DASH_TEXT, text_size = dashTextSize)
+        table.cell(dashboardTable, 0, 1, "Rank",     text_color = DASH_HEADER, text_size = dashTextSize)
+        table.cell(dashboardTable, 1, 1, "Bars Ago", text_color = DASH_HEADER, text_size = dashTextSize)
+        table.cell(dashboardTable, 2, 1, "DTW",      text_color = DASH_HEADER, text_size = dashTextSize)
+        if selCount == 0
+            table.merge_cells(dashboardTable, 0, 2, 2, 2)
+            table.cell(dashboardTable, 0, 2, na(statusText) ? "No analogs" : statusText, text_color = GRAY_COLOR, text_size = dashTextSize)
+        else
+            firstSel  = array.get(selDistArray, 0)
+            lastSel   = array.get(selDistArray, selCount - 1)
+            dashSpan  = math.max(lastSel - firstSel, 1.0e-9)
+            for r = 0 to selCount - 1
+                distVal   = array.get(selDistArray, r)
+                rankColor = color.from_gradient(distVal, firstSel, firstSel + dashSpan, bestColorInput, worstColorInput)
+                table.cell(dashboardTable, 0, r + 2, "#" + str.tostring(r + 1), text_color = DASH_TEXT, text_size = dashTextSize)
+                table.cell(dashboardTable, 1, r + 2, str.tostring(sizeNow - 1 - array.get(selEndArray, r)), text_color = DASH_TEXT, text_size = dashTextSize)
+                table.cell(dashboardTable, 2, r + 2, str.tostring(distVal, "#.###"), text_color = rankColor, text_size = dashTextSize)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Plots & Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+plot(bestDistance, "Best Analog DTW Distance", color = GRAY_COLOR, display = display.data_window)
+
+strongMatch = not na(bestDistance) and bestDistance <= thresholdInput
+
+alertcondition(strongMatch and not strongMatch[1], "Strong Analog Found", "dynamic time warping similarity: the closest historical analog's DTW distance dropped to or below the strong-match threshold on {{ticker}} ({{interval}}).")
+alertcondition(not strongMatch and strongMatch[1], "Strong Analog Lost", "dynamic time warping similarity: no historical analog remains at or below the strong-match threshold on {{ticker}} ({{interval}}).")
+
+//---------------------------------------------------------------------------------------------------------------------}

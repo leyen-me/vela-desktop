@@ -1,0 +1,127 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Laguerre RSI", "Laguerre RSI", overlay = false, precision = 2)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+MID_LEVEL         = 0.5
+FILL_VALUE_TRANSP = 50  // gradient transparency at the oscillator end of the fill
+FILL_MID_TRANSP   = 100 // gradient transparency at the midline end of the fill
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+sourceInput = input.source(close, "Source", group = "Settings"
+  , tooltip = "Series fed into the Laguerre filter cascade. Any reasonably scaled series works, but feeding raw price and letting the Laguerre structure do the smoothing avoids compounding lag from an already-smoothed input.")
+
+gammaInput = input.float(0.5, "Gamma", minval = 0, maxval = 0.99, step = 0.01, group = "Settings"
+  , tooltip = "Damping factor of the four-stage Laguerre filter and the oscillator's single knob. Lower values react faster at the cost of noise, higher values smooth harder and hold levels longer. 0.5 is the classic published default, with 0.5 to 0.8 the most common working range.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Thresholds
+//---------------------------------------------------------------------------------------------------------------------{
+obInput = input.float(0.8, "Overbought", minval = 0, maxval = 1, step = 0.01, group = "Thresholds"
+  , tooltip = "Upper decision threshold. A reading pinned above it marks a persistent advance rather than a stretched market, so the actionable event is the drop back through it after a pinned stretch.")
+
+osInput = input.float(0.2, "Oversold", minval = 0, maxval = 1, step = 0.01, group = "Thresholds"
+  , tooltip = "Lower decision threshold. A reading pinned below it marks a persistent decline, so the actionable event is the recovery back up through it.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Style
+//---------------------------------------------------------------------------------------------------------------------{
+bullColorInput = input.color(#089981, "Bullish", inline = "direction", group = "Style"
+  , tooltip = "Color of the oscillator and gradient fill above the 0.5 midline.")
+
+bearColorInput = input.color(#f23645, "Bearish", inline = "direction", group = "Style"
+  , tooltip = "Color of the oscillator and gradient fill below the 0.5 midline.")
+
+gradientFillInput = input.bool(true, "Gradient Fill", group = "Style"
+  , tooltip = "Vertical gradient between the oscillator and the 0.5 midline, fully transparent at the midline and more opaque at the oscillator value.")
+
+markersInput = input.bool(false, "Threshold Exit Markers", group = "Style"
+  , tooltip = "Circles on the oscillator at the threshold exits, the drop back below the overbought level and the recovery back above the oversold level. Off by default to keep the pane clean, the matching alerts fire regardless.")
+
+levelsColorInput = input.color(#787b86, "Levels Color", group = "Style"
+  , tooltip = "Color of the dashed overbought/oversold levels and of the dotted midline.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Four-stage Laguerre filter cascade, John Ehlers' published recipe (Time Warp / Cybernetic Analysis):
+// L0 = (1 - gamma)*price + gamma*L0[1]
+// Ln = -gamma*L(n-1) + L(n-1)[1] + gamma*Ln[1]  for n = 1..3
+// Every stage is seeded with the source itself so the cascade starts on real data instead of ramping from zero
+laguerreCascade(float src, float gamma) =>
+    float l0 = na
+    float l1 = na
+    float l2 = na
+    float l3 = na
+    l0Prev = nz(l0[1], src)
+    l1Prev = nz(l1[1], src)
+    l2Prev = nz(l2[1], src)
+    l3Prev = nz(l3[1], src)
+    l0 := (1 - gamma) * src + gamma * l0Prev
+    l1 := -gamma * l0 + l0Prev + gamma * l1Prev
+    l2 := -gamma * l1 + l1Prev + gamma * l2Prev
+    l3 := -gamma * l2 + l2Prev + gamma * l3Prev
+    [l0, l1, l2, l3]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+[l0, l1, l2, l3] = laguerreCascade(sourceInput, gammaInput)
+
+// Pairwise gaps between successive stages: a faster stage sitting above the slower one below it feeds
+// the up-sum, the reverse feeds the down-sum. In a persistent move all three gaps point the same way,
+// which is what pins the ratio at 0 or 1 for as long as the move lasts.
+upSum    = math.max(l0 - l1, 0) + math.max(l1 - l2, 0) + math.max(l2 - l3, 0)
+downSum  = math.max(l1 - l0, 0) + math.max(l2 - l1, 0) + math.max(l3 - l2, 0)
+totalSum = upSum + downSum
+
+// RSI-style ratio of the up-sum to the total, scaled 0 to 1. When the stages fully compress the ratio
+// holds its prior value (neutral 0.5 before the first reading), matching Ehlers' published handling.
+float laguerreRsi = na
+laguerreRsi := totalSum > 0 ? upSum / totalSum : nz(laguerreRsi[1], MID_LEVEL)
+
+// Threshold events, the crossings implementations act on
+overboughtEntry = ta.crossover(laguerreRsi, obInput)
+overboughtExit  = ta.crossunder(laguerreRsi, obInput)
+oversoldEntry   = ta.crossunder(laguerreRsi, osInput)
+oversoldExit    = ta.crossover(laguerreRsi, osInput)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+oscColor = laguerreRsi > MID_LEVEL ? bullColorInput : bearColorInput
+
+fillTopColor    = laguerreRsi > MID_LEVEL ? color.new(bullColorInput, FILL_VALUE_TRANSP) : color.new(bearColorInput, FILL_MID_TRANSP)
+fillBottomColor = laguerreRsi > MID_LEVEL ? color.new(bullColorInput, FILL_MID_TRANSP) : color.new(bearColorInput, FILL_VALUE_TRANSP)
+
+oscPlotId = plot(laguerreRsi, "Laguerre RSI", oscColor, 2)
+midPlotId = plot(MID_LEVEL, "Midline", editable = false, display = display.none)
+
+fill(oscPlotId, midPlotId
+  , math.max(laguerreRsi, MID_LEVEL)
+  , math.min(laguerreRsi, MID_LEVEL)
+  , gradientFillInput ? fillTopColor : na
+  , gradientFillInput ? fillBottomColor : na)
+
+hline(obInput, "Overbought", levelsColorInput, hline.style_dashed)
+hline(osInput, "Oversold", levelsColorInput, hline.style_dashed)
+hline(MID_LEVEL, "Midline", color.new(levelsColorInput, 50), hline.style_dotted)
+
+plotshape(markersInput and overboughtExit ? laguerreRsi : na, "Overbought Exit Marker", shape.circle, location.absolute, color = bearColorInput, size = size.tiny)
+plotshape(markersInput and oversoldExit ? laguerreRsi : na, "Oversold Recovery Marker", shape.circle, location.absolute, color = bullColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(overboughtEntry, "Overbought Entry", "Laguerre RSI crossed above its overbought level on {{ticker}} ({{interval}}), persistent advance in progress")
+alertcondition(overboughtExit, "Overbought Exit", "Laguerre RSI dropped back below its overbought level on {{ticker}} ({{interval}}), advance exhaustion cue")
+alertcondition(oversoldEntry, "Oversold Entry", "Laguerre RSI crossed below its oversold level on {{ticker}} ({{interval}}), persistent decline in progress")
+alertcondition(oversoldExit, "Oversold Recovery", "Laguerre RSI crossed back above its oversold level on {{ticker}} ({{interval}}), decline exhaustion cue")
+
+//---------------------------------------------------------------------------------------------------------------------}

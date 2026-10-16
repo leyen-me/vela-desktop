@@ -1,0 +1,302 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("High-wave Candle"
+  , shorttitle       = "High-wave Candle"
+  , overlay          = true
+  , format           = format.price
+  , max_lines_count  = 100
+  , max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+//Default palette - the high wave is an indecision candle, neither bullish nor bearish, so the pattern itself
+//is neutral; directional colors only appear once its range resolves
+color NEUTRAL_COLOR = #ff9800
+color BULL_COLOR    = #089981
+color BEAR_COLOR    = #f23645
+color BASIS_COLOR   = #787b86
+color LABEL_BG      = #00000000
+
+//Transparency applied to the unbroken side of a bracket once the other side has resolved
+int DEAD_SIDE_TRANSP = 60
+
+string GROUP_DETECTION = "High-Wave Detection"
+string GROUP_CONTEXT   = "Context & Volume"
+string GROUP_BRACKET   = "Range Bracket"
+string GROUP_STYLE     = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+rangeLengthInput = input.int(20, "Average Range Length"
+  , minval  = 2
+  , maxval  = 200
+  , group   = GROUP_DETECTION
+  , tooltip = "Bars used to average the candle range of the bars preceding the pattern. The defining features are relative, so recent bars set the yardstick that decides whether shadows count as unusually long.")
+
+shadowBodyMultInput = input.float(2, "Min Shadow / Body"
+  , minval  = 0.1
+  , maxval  = 10
+  , step    = 0.1
+  , group   = GROUP_DETECTION
+  , tooltip = "Each shadow must be at least this multiple of the real body, keeping both excursions well over the height of the body.")
+
+shadowRangeMultInput = input.float(0.6, "Min Shadow / Average Range"
+  , minval  = 0
+  , maxval  = 3
+  , step    = 0.05
+  , group   = GROUP_DETECTION
+  , tooltip = "Each shadow must also reach this fraction of the average candle range, so both excursions are large relative to recent bars and not just relative to a tiny body. Modest-shadow spinning tops fail this test.")
+
+maxBodyPctInput = input.float(25, "Max Body % of Range"
+  , minval  = 1
+  , maxval  = 100
+  , step    = 1
+  , group   = GROUP_DETECTION
+  , tooltip = "Largest real body allowed, as a percentage of the total range: the session must close near where it started.")
+
+minBodyPctInput = input.float(5, "Min Body % of Range"
+  , minval  = 0
+  , maxval  = 50
+  , step    = 0.5
+  , group   = GROUP_DETECTION
+  , tooltip = "Bodies below this share of the range are treated as long-legged doji (open and close essentially equal) and left to that pattern. Set to 0 to include them.")
+
+centerTolInput = input.float(20, "Body Center Tolerance %"
+  , minval  = 1
+  , maxval  = 50
+  , step    = 1
+  , group   = GROUP_DETECTION
+  , tooltip = "How far the middle of the body may sit from the middle of the range, as a percentage of the range. Keeps the body near the center and rejects one-sided rejection candles such as hammers and shooting stars, which have one dominant shadow.")
+
+trendLengthInput = input.int(50, "Trend Basis Length"
+  , minval  = 2
+  , maxval  = 500
+  , group   = GROUP_CONTEXT
+  , tooltip = "Bars in the moving average that establishes the backdrop. Price holding one side of this basis defines the directional run preceding the candle.")
+
+trendBarsInput = input.int(10, "Min Trend Bars"
+  , minval  = 1
+  , maxval  = 100
+  , group   = GROUP_CONTEXT
+  , tooltip = "Consecutive closes on one side of the trend basis, immediately before the candle, for the move to count as an extended trend - the location where a high wave is watched as possible exhaustion.")
+
+contextInput = input.string("Any", "Context Filter"
+  , options = ["Any", "After Uptrend", "After Downtrend", "After Either Trend"]
+  , group   = GROUP_CONTEXT
+  , tooltip = "Restrict detections to candles printing after an extended trend. Inside a range the pattern mostly records event noise, news sessions, or thin liquidity, and carries less directional information.")
+
+volFilterInput = input.bool(false, "Require High Volume"
+  , group   = GROUP_CONTEXT
+  , tooltip = "Only mark high waves whose volume clears the multiple below. High volume with no net progress strengthens the reading that large opposing flows met and neutralized each other.")
+
+volMultInput = input.float(1.5, "High Volume Multiplier"
+  , minval  = 0.1
+  , maxval  = 10
+  , step    = 0.1
+  , group   = GROUP_CONTEXT
+  , tooltip = "Volume must reach this multiple of its recent average to count as high volume.")
+
+volLengthInput = input.int(20, "Volume Average Length"
+  , minval  = 1
+  , maxval  = 200
+  , group   = GROUP_CONTEXT
+  , tooltip = "Bars used to average volume on the bars preceding the pattern.")
+
+showBracketInput = input.bool(true, "Show Range Bracket"
+  , group   = GROUP_BRACKET
+  , tooltip = "Extends the high-wave extremes forward as a bracket. Some traders treat these extremes as a bracket and trade the eventual close beyond one side, on the logic that the fight recorded inside the bar has then been decided.")
+
+maxBracketsInput = input.int(8, "Show Last Brackets"
+  , minval  = 1
+  , maxval  = 40
+  , group   = GROUP_BRACKET
+  , tooltip = "Maximum number of brackets kept on the chart; the oldest is dropped as newer high waves print.")
+
+showLabelsInput = input.bool(true, "Show Pattern Labels"
+  , group   = GROUP_STYLE
+  , tooltip = "Labels each high-wave candle where it printed.")
+
+highlightInput = input.bool(false, "Highlight Pattern Candles"
+  , group   = GROUP_STYLE
+  , tooltip = "Colors the high-wave candle itself.")
+
+showBasisInput = input.bool(false, "Show Trend Basis"
+  , group   = GROUP_STYLE
+  , tooltip = "Plots the moving average used as the context backdrop.")
+
+patternColorInput = input.color(NEUTRAL_COLOR, "Pattern", group = GROUP_STYLE)
+
+upColorInput = input.color(BULL_COLOR, "Resolved Up", inline = "resolveColors", group = GROUP_STYLE)
+
+dnColorInput = input.color(BEAR_COLOR, "Resolved Down", inline = "resolveColors", group = GROUP_STYLE)
+
+basisColorInput = input.color(BASIS_COLOR, "Trend Basis", group = GROUP_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types
+//---------------------------------------------------------------------------------------------------------------------{
+
+//A tracked high-wave bracket: the candle's extremes extended forward until a close beyond one side
+//resolves the stalemate recorded inside the bar
+type WaveBracket
+    line  topLine
+    line  botLine
+    float topPrice
+    float botPrice
+    bool  active
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+
+float bodySize    = math.abs(close - open)
+float candleRange = high - low
+float upperShadow = high - math.max(open, close)
+float lowerShadow = math.min(open, close) - low
+
+float rangeAvg   = ta.sma(candleRange, rangeLengthInput)
+float volumeAvg  = ta.sma(nz(volume), volLengthInput)
+float trendBasis = ta.sma(close, trendLengthInput)
+
+//Recent bars set the yardstick, measured on the bars preceding the pattern candle so its own expanded
+//range does not dilute the average
+float priorRangeAvg = rangeAvg[1]
+float priorVolAvg   = volumeAvg[1]
+
+//Directional runs: consecutive closes held on one side of the trend basis
+var int upRunCount = 0
+var int dnRunCount = 0
+upRunCount := not na(trendBasis) and close > trendBasis ? upRunCount + 1 : 0
+dnRunCount := not na(trendBasis) and close < trendBasis ? dnRunCount + 1 : 0
+
+//Context is the run in place before the candle printed: after a sustained trend the high wave is watched
+//as possible exhaustion, elsewhere it mostly records volatility
+bool afterUpTrend = nz(upRunCount[1]) >= trendBarsInput
+bool afterDnTrend = nz(dnRunCount[1]) >= trendBarsInput
+
+bool contextOk = switch contextInput
+    "After Uptrend"      => afterUpTrend
+    "After Downtrend"    => afterDnTrend
+    "After Either Trend" => afterUpTrend or afterDnTrend
+    => true
+
+//High volume with no net progress strengthens the reading that large opposing flows met and neutralized
+//each other
+float volRatio   = not na(priorVolAvg) and priorVolAvg > 0 ? nz(volume) / priorVolAvg : na
+bool  highVolume = not na(volRatio) and volRatio >= volMultInput
+bool  volumeOk   = not volFilterInput or highVolume
+
+//Shape tests. Both shadows must be long: well over the body (separating the high wave from one-sided
+//hammer or shooting-star shapes) and large relative to recent ranges (separating it from the modest
+//spinning top). The body must be small and sit near the middle of the range - the session traveled far
+//in both directions and closed near where it started. Color is essentially irrelevant
+bool shadowsVsBody = upperShadow >= bodySize * shadowBodyMultInput and lowerShadow >= bodySize * shadowBodyMultInput
+bool shadowsVsAvg  = not na(priorRangeAvg) and priorRangeAvg > 0 and upperShadow >= priorRangeAvg * shadowRangeMultInput and lowerShadow >= priorRangeAvg * shadowRangeMultInput
+bool smallBody     = bodySize <= candleRange * maxBodyPctInput / 100 and bodySize >= candleRange * minBodyPctInput / 100
+bool centeredBody  = math.abs((open + close) / 2 - (high + low) / 2) <= candleRange * centerTolInput / 100
+
+bool highWave = candleRange > 0 and shadowsVsBody and shadowsVsAvg and smallBody and centeredBody and contextOk and volumeOk
+
+//Metrics reported on the pattern label
+float bodyPct    = candleRange > 0 ? bodySize / candleRange * 100 : na
+float upperPct   = candleRange > 0 ? upperShadow / candleRange * 100 : na
+float lowerPct   = candleRange > 0 ? lowerShadow / candleRange * 100 : na
+float rangeRatio = not na(priorRangeAvg) and priorRangeAvg > 0 ? candleRange / priorRangeAvg : na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Pattern Marks & Range Brackets
+//---------------------------------------------------------------------------------------------------------------------{
+
+var array<WaveBracket> bracketsArray = array.new<WaveBracket>()
+
+bool resolvedUp = false
+bool resolvedDn = false
+
+//Extend the active brackets and retire any whose range a close has escaped - the fight recorded inside
+//the bar has then been decided. The broken side takes the directional color, the unbroken side dims
+if array.size(bracketsArray) > 0
+    for i = 0 to array.size(bracketsArray) - 1
+        WaveBracket refBracket = array.get(bracketsArray, i)
+        if refBracket.active
+            if not na(refBracket.topLine)
+                line.set_x2(refBracket.topLine, bar_index)
+            if not na(refBracket.botLine)
+                line.set_x2(refBracket.botLine, bar_index)
+            bool brokeUp = close > refBracket.topPrice
+            bool brokeDn = close < refBracket.botPrice
+            if brokeUp or brokeDn
+                refBracket.active := false
+                resolvedUp := resolvedUp or brokeUp
+                resolvedDn := resolvedDn or brokeDn
+                if brokeUp
+                    if not na(refBracket.topLine)
+                        line.set_color(refBracket.topLine, upColorInput)
+                    if not na(refBracket.botLine)
+                        line.set_style(refBracket.botLine, line.style_dotted)
+                        line.set_color(refBracket.botLine, color.new(patternColorInput, DEAD_SIDE_TRANSP))
+                else
+                    if not na(refBracket.botLine)
+                        line.set_color(refBracket.botLine, dnColorInput)
+                    if not na(refBracket.topLine)
+                        line.set_style(refBracket.topLine, line.style_dotted)
+                        line.set_color(refBracket.topLine, color.new(patternColorInput, DEAD_SIDE_TRANSP))
+
+//Mark a new high wave and log its extremes as a fresh bracket. Brackets are tracked even when their
+//lines are hidden so the resolution alerts still fire
+if highWave
+    if showLabelsInput
+        string contextText = afterUpTrend ? "after an extended uptrend - watched as possible exhaustion" : afterDnTrend ? "after an extended downtrend - watched as possible exhaustion" : "no extended trend backdrop - mid-range high waves mostly record volatility or event noise"
+        string volumeText  = na(volRatio) ? "" : " Volume " + str.tostring(volRatio, "#.##") + "x its average" + (highVolume ? " - high volume with no net progress strengthens the two-sided reading." : ".")
+        string tooltipText = "High-wave candle: the session traveled far above and far below its open and closed near where it started. Body " + str.tostring(bodyPct, "#.#") + "% of the range, upper shadow " + str.tostring(upperPct, "#.#") + "%, lower shadow " + str.tostring(lowerPct, "#.#") + "%, range " + str.tostring(rangeRatio, "#.##") + "x the recent average." + volumeText + " Context: " + contextText + ". A close above " + str.tostring(high, format.mintick) + " or below " + str.tostring(low, format.mintick) + " resolves the bracket."
+        label.new(bar_index, high, "High Wave"
+          , style     = label.style_label_down
+          , color     = LABEL_BG
+          , textcolor = patternColorInput
+          , size      = size.small
+          , tooltip   = tooltipText)
+    line topLineId = na
+    line botLineId = na
+    if showBracketInput
+        topLineId := line.new(bar_index, high, bar_index, high, color = patternColorInput, style = line.style_dashed, width = 1)
+        botLineId := line.new(bar_index, low, bar_index, low, color = patternColorInput, style = line.style_dashed, width = 1)
+    array.push(bracketsArray, WaveBracket.new(topLineId, botLineId, high, low, true))
+
+//Oldest brackets beyond the cap are dropped
+while array.size(bracketsArray) > maxBracketsInput
+    WaveBracket oldBracket = array.shift(bracketsArray)
+    if not na(oldBracket.topLine)
+        line.delete(oldBracket.topLine)
+    if not na(oldBracket.botLine)
+        line.delete(oldBracket.botLine)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+
+plot(trendBasis, "Trend Basis", showBasisInput ? basisColorInput : color(na), 1)
+
+barcolor(highlightInput and highWave ? patternColorInput : color(na), title = "High-Wave Candles")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(highWave, "High-Wave Candle", "High-wave candle on {{ticker}} ({{interval}}) - unusually long shadows on both sides with a small body near the middle: heavy two-sided trade with no winner. The expanded range itself is information, often preceding further wide-range sessions")
+
+alertcondition(highWave and highVolume, "High-Wave Candle With High Volume", "High-wave candle on high volume on {{ticker}} ({{interval}}) - large opposing flows met and neutralized each other, strengthening the indecision reading")
+
+alertcondition(highWave and afterUpTrend, "High-Wave Candle After Uptrend", "High-wave candle after an extended uptrend on {{ticker}} ({{interval}}) - two-sided trade has arrived; a common cue to tighten stops or reduce size rather than to reverse outright")
+
+alertcondition(highWave and afterDnTrend, "High-Wave Candle After Downtrend", "High-wave candle after an extended downtrend on {{ticker}} ({{interval}}) - two-sided trade has arrived; a common cue to tighten stops or reduce size rather than to reverse outright")
+
+alertcondition(resolvedUp, "High-Wave Bracket Resolved Up", "Close above a high-wave candle high on {{ticker}} ({{interval}}) - the fight recorded inside the bar has been decided to the upside")
+
+alertcondition(resolvedDn, "High-Wave Bracket Resolved Down", "Close below a high-wave candle low on {{ticker}} ({{interval}}) - the fight recorded inside the bar has been decided to the downside")
+
+//---------------------------------------------------------------------------------------------------------------------}

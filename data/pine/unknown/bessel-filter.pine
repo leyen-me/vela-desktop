@@ -1,0 +1,176 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Bessel Filter", "Bessel Filter", overlay = true)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+// Second-order delay-normalized Bessel prototype H(s) = 3 / (s^2 + 3s + 3)
+const float ORDER2_A    = 3.0       // s coefficient of the prototype denominator
+const float ORDER2_B    = 3.0       // constant term of the prototype denominator
+const float ORDER2_W3DB = 1.3616541 // -3 dB frequency of the delay-normalized two-pole prototype
+
+// Fourth-order delay-normalized prototype theta4(s) = s^4 + 10s^3 + 45s^2 + 105s + 105,
+// factored into two second-order sections from its standard pole pairs
+const float ORDER4_A1   = 4.2075788  // section 1, poles -2.1037894 +/- j2.6574180
+const float ORDER4_B1   = 11.4878003
+const float ORDER4_A2   = 5.7924212  // section 2, poles -2.8962106 +/- j0.8672341
+const float ORDER4_B2   = 9.1401308
+const float ORDER4_W3DB = 2.1139176  // -3 dB frequency of the delay-normalized four-pole prototype
+
+const color BULL_COLOR    = #089981
+const color BEAR_COLOR    = #f23645
+const color NEUTRAL_COLOR = #787b86
+const color FAST_COLOR    = #ff9800 // the one accent - the fast line of the optional crossover pair
+
+const color DASH_BG     = #161616
+const color DASH_FRAME  = #2E2E2E
+const color DASH_HEADER = #808080
+const color DASH_TEXT   = #DBDBDB
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+srcInput = input.source(close, "Source", group = "Filter", tooltip = "Series the Bessel filter smooths.")
+
+cutoffInput = input.int(20, "Cutoff Period", minval = 3, group = "Filter", tooltip = "Approximate -3 dB cutoff wavelength, in bars. Price swings slower than this period pass through while faster fluctuations are attenuated. Pick it near the noise wavelength you want removed.")
+
+orderInput = input.int(2, "Order", options = [2, 4], group = "Filter", tooltip = "Number of filter poles. Two poles are the common starting point; four poles sharpen the rolloff but add delay. The fourth-order filter runs as two cascaded second-order sections.")
+
+showFastInput = input.bool(false, "Show Fast Line", group = "Fast Line", tooltip = "Adds a second Bessel filter with a shorter cutoff, for crossover logic in which the main filter acts as the slow line.")
+
+fastCutoffInput = input.int(10, "Fast Cutoff Period", minval = 3, group = "Fast Line", tooltip = "Cutoff period of the fast line, in bars. Keep it shorter than the main cutoff period. The fast line uses the same filter order as the main line.")
+
+showDashboardInput = input.bool(true, "Show Dashboard", group = "Dashboard", tooltip = "Displays the filter settings and the nominal passband delay in bars. A Bessel design delays every passed frequency component by roughly this same amount, which is what preserves the shape of the smoothed line. On sampled data the constant-delay property is approximate, least so at short cutoff periods.")
+
+dashLocationInput = input.string("Top Right", "Location", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = "Dashboard", tooltip = "Dashboard position on the chart.")
+
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = "Dashboard", tooltip = "Dashboard text size.")
+
+colorModeInput = input.string("Directional", "Line Coloring", options = ["Directional", "Single"], group = "Style", tooltip = "'Directional' colors the filter line by its slope, highlighting turning points. 'Single' uses one fixed color.")
+
+bullColorInput   = input.color(BULL_COLOR, "Bullish", inline = "colors", group = "Style")
+bearColorInput   = input.color(BEAR_COLOR, "Bearish", inline = "colors", group = "Style")
+singleColorInput = input.color(NEUTRAL_COLOR, "Single", inline = "colors", group = "Style")
+fastColorInput   = input.color(FAST_COLOR, "Fast Line", group = "Style")
+
+showMarkersInput = input.bool(false, "Crossing Markers", group = "Style", tooltip = "Shows small triangles when the source crosses the filter, or when the fast line crosses the slow line if the fast line is enabled. Off by default; the matching alerts are always available.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Second-order section of the analog prototype s^2 + sectionA*s + sectionB (unity DC gain), frequency-scaled and
+// mapped to the digital recursion y = b0*x + b1*x[1] + b2*x[2] - a1*y[1] - a2*y[2] via the bilinear transform.
+// warpFactor = tan(pi / cutoff) / w3dB pre-warps the frequency axis so the -3 dB point of the sampled filter
+// lands exactly on the requested cutoff period.
+biquad(float sourceIn, float sectionA, float sectionB, float warpFactor) =>
+    float g  = sectionB * warpFactor * warpFactor
+    float d0 = 1.0 + sectionA * warpFactor + g
+    float b0 = g / d0
+    float b1 = 2.0 * g / d0
+    float b2 = g / d0
+    float a1 = (2.0 * g - 2.0) / d0
+    float a2 = (1.0 - sectionA * warpFactor + g) / d0
+    float x1 = nz(sourceIn[1], sourceIn)
+    float x2 = nz(sourceIn[2], sourceIn)
+    float result = na
+    float y1 = nz(result[1], sourceIn)
+    float y2 = nz(result[2], sourceIn)
+    result := b0 * sourceIn + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2
+    result
+
+// Bessel low-pass of the chosen order at the chosen cutoff period. Both orders are computed on every bar so the
+// recursions stay consistent; the fourth order cascades two second-order sections scaled by a common factor
+besselFilter(float sourceIn, int cutoffPeriod, int filterOrder) =>
+    float warp      = math.tan(math.pi / cutoffPeriod)
+    float order2Out = biquad(sourceIn, ORDER2_A, ORDER2_B, warp / ORDER2_W3DB)
+    float stageOut  = biquad(sourceIn, ORDER4_A1, ORDER4_B1, warp / ORDER4_W3DB)
+    float order4Out = biquad(stageOut, ORDER4_A2, ORDER4_B2, warp / ORDER4_W3DB)
+    filterOrder == 2 ? order2Out : order4Out
+
+// Nominal passband (DC) group delay of the digital filter, in bars
+groupDelay(int cutoffPeriod, int filterOrder) =>
+    float w3dB = filterOrder == 2 ? ORDER2_W3DB : ORDER4_W3DB
+    w3dB / (2.0 * math.tan(math.pi / cutoffPeriod))
+
+// Maps the dashboard location option to a table position constant
+tablePosition(string positionText) =>
+    switch positionText
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        => position.bottom_left
+
+// Maps the dashboard size option to a text size constant
+tableSize(string sizeText) =>
+    switch sizeText
+        "Tiny"  => size.tiny
+        "Small" => size.small
+        => size.normal
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+float besselSlow = besselFilter(srcInput, cutoffInput, orderInput)
+float besselFast = besselFilter(srcInput, fastCutoffInput, orderInput)
+
+float slowPrev1 = nz(besselSlow[1], besselSlow)
+float slowPrev2 = nz(besselSlow[2], besselSlow)
+
+bool filterRising = besselSlow > slowPrev1
+bool turnedUp     = filterRising and slowPrev1 <= slowPrev2
+bool turnedDown   = besselSlow < slowPrev1 and slowPrev1 >= slowPrev2
+
+bool priceCrossUp   = ta.crossover(srcInput, besselSlow)
+bool priceCrossDown = ta.crossunder(srcInput, besselSlow)
+bool fastCrossUp    = ta.crossover(besselFast, besselSlow)
+bool fastCrossDown  = ta.crossunder(besselFast, besselSlow)
+
+bool markerUp   = showFastInput ? fastCrossUp : priceCrossUp
+bool markerDown = showFastInput ? fastCrossDown : priceCrossDown
+
+float slowDelay = groupDelay(cutoffInput, orderInput)
+float fastDelay = groupDelay(fastCutoffInput, orderInput)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+color slowColor = colorModeInput == "Directional" ? filterRising ? bullColorInput : bearColorInput : singleColorInput
+
+plot(besselSlow, "Bessel Filter", slowColor, 2)
+plot(showFastInput ? besselFast : na, "Fast Bessel Filter", fastColorInput, 1)
+
+plotshape(showMarkersInput and markerUp, "Bullish Crossing", shape.triangleup, location.belowbar, bullColorInput, size = size.tiny)
+plotshape(showMarkersInput and markerDown, "Bearish Crossing", shape.triangledown, location.abovebar, bearColorInput, size = size.tiny)
+
+// The table is sized to the rows that render - the fast-delay row only exists while the fast line is shown
+var table infoTable = table.new(tablePosition(dashLocationInput), 2, showFastInput ? 5 : 4, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+if showDashboardInput and barstate.islast
+    string textSize   = tableSize(dashSizeInput)
+    color  labelColor = DASH_HEADER
+    table.cell(infoTable, 0, 0, "Bessel filter", text_color = DASH_TEXT, text_size = textSize, text_halign = text.align_left)
+    table.cell(infoTable, 1, 0, "", text_size = textSize)
+    table.cell(infoTable, 0, 1, "Order", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(infoTable, 1, 1, str.tostring(orderInput), text_color = DASH_TEXT, text_size = textSize, text_halign = text.align_right)
+    table.cell(infoTable, 0, 2, "Cutoff", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(infoTable, 1, 2, str.tostring(cutoffInput) + " bars", text_color = DASH_TEXT, text_size = textSize, text_halign = text.align_right)
+    table.cell(infoTable, 0, 3, "Delay", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+    table.cell(infoTable, 1, 3, "≈ " + str.tostring(slowDelay, "#.#") + " bars", text_color = DASH_TEXT, text_size = textSize, text_halign = text.align_right)
+    if showFastInput
+        table.cell(infoTable, 0, 4, "Fast delay", text_color = labelColor, text_size = textSize, text_halign = text.align_left)
+        table.cell(infoTable, 1, 4, "≈ " + str.tostring(fastDelay, "#.#") + " bars", text_color = fastColorInput, text_size = textSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(turnedUp, "Bessel Filter Turned Up", "Bessel filter turned up on {{ticker}} ({{interval}})")
+alertcondition(turnedDown, "Bessel Filter Turned Down", "Bessel filter turned down on {{ticker}} ({{interval}})")
+alertcondition(priceCrossUp, "Price Crossed Over Filter", "Price crossed over the Bessel filter on {{ticker}} ({{interval}})")
+alertcondition(priceCrossDown, "Price Crossed Under Filter", "Price crossed under the Bessel filter on {{ticker}} ({{interval}})")
+alertcondition(fastCrossUp, "Fast Line Crossed Over Slow Line", "Fast Bessel filter crossed over the slow Bessel filter on {{ticker}} ({{interval}})")
+alertcondition(fastCrossDown, "Fast Line Crossed Under Slow Line", "Fast Bessel filter crossed under the slow Bessel filter on {{ticker}} ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

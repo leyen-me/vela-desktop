@@ -1,0 +1,210 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Monday Range", shorttitle = "Monday Range", overlay = true, max_lines_count = 500, max_labels_count = 100)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+color BULL_COLOR    = #089981
+color BEAR_COLOR    = #f23645
+color NEUTRAL_COLOR = #787b86
+color ACCENT_COLOR  = #ff9800 // the one highlight - the optional Monday session tint
+color DASH_BG       = #161616
+color DASH_TEXT     = #DBDBDB
+
+int DAYS_PER_WEEK  = 7
+int EPOCH_DOW_OFFS = 3
+
+string SESSION_GROUP = "Monday Session"
+string LEVELS_GROUP  = "Levels"
+string STYLE_GROUP   = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+boundaryInput = input.string("Exchange session", "Day Boundary", options = ["Exchange session", "UTC", "America/New_York", "Europe/London"], group = SESSION_GROUP, tooltip = "Defines what counts as Monday. 'Exchange session' groups bars by the symbol's trading day, so overnight sessions map to their trade date - the natural choice for equities and futures. The timezone options use that timezone's calendar day instead, the common convention on 24-hour markets. Consistency matters more than the specific choice.")
+holidayInput  = input.string("Use the first trading day", "When Monday Is Missing", options = ["Use the first trading day", "Skip the week"], group = SESSION_GROUP, tooltip = "Holiday handling. Most practitioners anchor on the first full trading day of the week when Monday does not trade. Choose 'Skip the week' to only ever mark an actual Monday session.")
+
+showMidInput = input.bool(true, "Range Midpoint", group = LEVELS_GROUP, tooltip = "Plot the midpoint of the Monday range. Some traders treat it as the week's equilibrium, in the same spirit as a session half-back.")
+historyInput = input.int(5, "Historical Ranges", minval = 0, maxval = 52, group = LEVELS_GROUP, tooltip = "Completed weekly ranges kept on the chart for review. Archived ranges are frozen at their week's end - a stale Monday range is rarely traded forward. Set to 0 to show the current week only.")
+
+highColorInput       = input.color(BEAR_COLOR, "Monday High", group = STYLE_GROUP, inline = "colors")
+lowColorInput        = input.color(BULL_COLOR, "Low", group = STYLE_GROUP, inline = "colors")
+midColorInput        = input.color(NEUTRAL_COLOR, "Mid", group = STYLE_GROUP, inline = "colors")
+lineWidthInput       = input.int(1, "Line Width", minval = 1, maxval = 4, group = STYLE_GROUP, tooltip = "Width of the Monday high and low lines. The midpoint is always drawn as a thin dotted line.")
+showFillInput        = input.bool(true, "Range Fill", inline = "fill", group = STYLE_GROUP, tooltip = "Shade the area between the Monday high and low.")
+fillColorInput       = input.color(color.new(NEUTRAL_COLOR, 92), "", inline = "fill", group = STYLE_GROUP)
+showLabelsInput      = input.bool(true, "Level Labels", group = STYLE_GROUP, tooltip = "Name and price of each level at the right end of the current week's range.")
+highlightMondayInput = input.bool(false, "Highlight Monday Session", inline = "bg", group = STYLE_GROUP, tooltip = "Shade the chart background over the anchor session whose extremes build the range.")
+mondayBgInput        = input.color(color.new(ACCENT_COLOR, 94), "", inline = "bg", group = STYLE_GROUP)
+showMarkersInput     = input.bool(false, "Break Markers", group = STYLE_GROUP, tooltip = "Plot chart markers on closes through the Monday extremes and on failed breaks back inside the range. Alerts cover these events even when markers are hidden.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Days elapsed since 1970-01-01 for a civil calendar date (standard proleptic Gregorian arithmetic)
+civilToDays(int yr, int mo, int dy) =>
+    int yAdj = mo <= 2 ? yr - 1 : yr
+    int era  = yAdj / 400
+    int yoe  = yAdj - era * 400
+    int doy  = (153 * (mo + (mo > 2 ? -3 : 9)) + 2) / 5 + dy - 1
+    int doe  = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    era * 146097 + doe - 719468
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Monday Session Detection
+//---------------------------------------------------------------------------------------------------------------------{
+bool tfOk = timeframe.in_seconds() <= timeframe.in_seconds("D")
+
+bool   useSession = boundaryInput == "Exchange session"
+string dateTz     = useSession ? "UTC" : boundaryInput
+int    refTime    = useSession ? nz(time_tradingday, time) : time
+
+int dayId   = civilToDays(year(refTime, dateTz), month(refTime, dateTz), dayofmonth(refTime, dateTz))
+int isoDow  = (dayId + EPOCH_DOW_OFFS) % DAYS_PER_WEEK + 1                    // 1 = Monday ... 7 = Sunday
+int weekIdx = (dayId + EPOCH_DOW_OFFS) / DAYS_PER_WEEK                        // increments at each Monday
+
+var int   currentWeek     = na
+var bool  isFirstWeek     = true
+var int   anchorDayId     = na
+var int   anchorStartTime = na
+var bool  rangeActive     = false
+var float mondayHigh      = na
+var float mondayLow       = na
+
+var line     highLineId  = na
+var line     lowLineId   = na
+var line     midLineId   = na
+var linefill rangeFillId = na
+var label    highLabelId = na
+var label    lowLabelId  = na
+var label    midLabelId  = na
+
+var highLineArray = array.new<line>()
+var lowLineArray  = array.new<line>()
+var midLineArray  = array.new<line>()
+var fillArray     = array.new<linefill>()
+
+bool rangeJustSet = false
+
+if tfOk
+    // Week rollover - archive the completed frame, trim history, reset the state
+    if na(currentWeek) or weekIdx != currentWeek
+        if not na(highLineId)
+            int freezeTime = time_close[1]
+            line.set_x2(highLineId, freezeTime)
+            line.set_x2(lowLineId, freezeTime)
+            if not na(midLineId)
+                line.set_x2(midLineId, freezeTime)
+            array.push(highLineArray, highLineId)
+            array.push(lowLineArray, lowLineId)
+            array.push(midLineArray, midLineId)
+            array.push(fillArray, rangeFillId)
+        while array.size(highLineArray) > historyInput
+            line     oldHigh = array.shift(highLineArray)
+            line     oldLow  = array.shift(lowLineArray)
+            line     oldMid  = array.shift(midLineArray)
+            linefill oldFill = array.shift(fillArray)
+            line.delete(oldHigh)
+            line.delete(oldLow)
+            if not na(oldMid)
+                line.delete(oldMid)
+            if not na(oldFill)
+                linefill.delete(oldFill)
+        if not na(highLabelId)
+            label.delete(highLabelId)
+            label.delete(lowLabelId)
+        if not na(midLabelId)
+            label.delete(midLabelId)
+        if not na(currentWeek)
+            isFirstWeek := false
+        currentWeek     := weekIdx
+        anchorDayId     := na
+        anchorStartTime := na
+        rangeActive     := false
+        mondayHigh      := na
+        mondayLow       := na
+        highLineId      := na
+        lowLineId       := na
+        midLineId       := na
+        rangeFillId     := na
+        highLabelId     := na
+        lowLabelId      := na
+        midLabelId      := na
+
+    // Anchor session - Monday, or the week's first trading day when Monday does not trade.
+    // The chart's first, possibly truncated week only ever anchors on an actual Monday.
+    if na(anchorDayId) and (isoDow == 1 or (holidayInput == "Use the first trading day" and not isFirstWeek))
+        anchorDayId     := dayId
+        anchorStartTime := time
+
+    // Track the developing extremes while the anchor session trades
+    if not na(anchorDayId) and dayId == anchorDayId
+        mondayHigh := math.max(nz(mondayHigh, high), high)
+        mondayLow  := math.min(nz(mondayLow, low), low)
+
+    // Anchor session closed - set the weekly frame, extended through the end of the week
+    if not na(anchorDayId) and dayId > anchorDayId and not rangeActive and not na(mondayHigh)
+        rangeActive  := true
+        rangeJustSet := true
+        int   weekEndTime = timestamp(dateTz, year(refTime, dateTz), month(refTime, dateTz), dayofmonth(refTime, dateTz) + 8 - isoDow, 0, 0)
+        float midValue    = math.avg(mondayHigh, mondayLow)
+        highLineId := line.new(anchorStartTime, mondayHigh, weekEndTime, mondayHigh, xloc.bar_time, color = highColorInput, width = lineWidthInput)
+        lowLineId  := line.new(anchorStartTime, mondayLow, weekEndTime, mondayLow, xloc.bar_time, color = lowColorInput, width = lineWidthInput)
+        if showMidInput
+            midLineId := line.new(anchorStartTime, midValue, weekEndTime, midValue, xloc.bar_time, color = midColorInput, style = line.style_dotted, width = 1)
+        if showFillInput
+            rangeFillId := linefill.new(highLineId, lowLineId, fillColorInput)
+        if showLabelsInput
+            highLabelId := label.new(weekEndTime, mondayHigh, "Monday high " + str.tostring(mondayHigh, format.mintick), xloc.bar_time, style = label.style_label_left, color = #00000000, textcolor = highColorInput, size = size.small)
+            lowLabelId  := label.new(weekEndTime, mondayLow, "Monday low " + str.tostring(mondayLow, format.mintick), xloc.bar_time, style = label.style_label_left, color = #00000000, textcolor = lowColorInput, size = size.small)
+            if showMidInput
+                midLabelId := label.new(weekEndTime, midValue, "Monday mid " + str.tostring(midValue, format.mintick), xloc.bar_time, style = label.style_label_left, color = #00000000, textcolor = midColorInput, size = size.small)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Breakout & Failed Break Detection
+//---------------------------------------------------------------------------------------------------------------------{
+float mondayMid = math.avg(mondayHigh, mondayLow)
+
+bool crossUpHigh  = ta.crossover(close, mondayHigh)
+bool crossDownLow = ta.crossunder(close, mondayLow)
+bool crossMid     = ta.cross(close, mondayMid)
+
+bool breakAboveHigh  = rangeActive and crossUpHigh
+bool breakBelowLow   = rangeActive and crossDownLow
+bool failedBreakHigh = rangeActive and close < mondayHigh and (high > mondayHigh or close[1] > mondayHigh)
+bool failedBreakLow  = rangeActive and close > mondayLow and (low < mondayLow or close[1] < mondayLow)
+bool midpointCross   = rangeActive and showMidInput and crossMid
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visuals
+//---------------------------------------------------------------------------------------------------------------------{
+bool inAnchorSession = tfOk and not na(anchorDayId) and dayId == anchorDayId
+
+bgcolor(highlightMondayInput and inAnchorSession ? mondayBgInput : na, title = "Monday session highlight")
+
+plotshape(showMarkersInput and breakAboveHigh, "Break Above Monday High", shape.triangleup, location.belowbar, BULL_COLOR, size = size.tiny)
+plotshape(showMarkersInput and breakBelowLow, "Break Below Monday Low", shape.triangledown, location.abovebar, BEAR_COLOR, size = size.tiny)
+plotshape(showMarkersInput and failedBreakHigh, "Failed Break At Monday High", shape.xcross, location.abovebar, BEAR_COLOR, size = size.tiny)
+plotshape(showMarkersInput and failedBreakLow, "Failed Break At Monday Low", shape.xcross, location.belowbar, BULL_COLOR, size = size.tiny)
+
+var table warnTable = na
+
+if barstate.islast and not tfOk
+    if na(warnTable)
+        warnTable := table.new(position.middle_center, 1, 1, bgcolor = DASH_BG)
+    table.cell(warnTable, 0, 0, "Monday range requires a daily or lower timeframe", text_color = DASH_TEXT, text_size = size.normal)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(rangeJustSet, "New Monday Range Set", "Monday session closed - its high, low and midpoint now frame the week.")
+alertcondition(breakAboveHigh, "Break Above Monday High", "Price closed above the Monday high - watch for acceptance and weekly range extension up.")
+alertcondition(breakBelowLow, "Break Below Monday Low", "Price closed below the Monday low - watch for acceptance and weekly range extension down.")
+alertcondition(failedBreakHigh, "Failed Break At Monday High", "Price swept the Monday high and closed back inside the range - possible failed breakout.")
+alertcondition(failedBreakLow, "Failed Break At Monday Low", "Price swept the Monday low and closed back inside the range - possible failed breakout.")
+alertcondition(midpointCross, "Monday Midpoint Cross", "Price crossed the Monday range midpoint, the week's equilibrium level.")
+
+//---------------------------------------------------------------------------------------------------------------------}

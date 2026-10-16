@@ -1,0 +1,223 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Marubozu", shorttitle = "Marubozu", overlay = true, format = format.price, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR = #089981
+BEAR_COLOR = #f23645
+LABEL_BG   = #00000000
+
+TREND_ANY     = "Any"
+TREND_WITH    = "With Trend"
+TREND_COUNTER = "Counter-Trend"
+
+TAG_FULL    = "M"
+TAG_OPENING = "OM"
+TAG_CLOSING = "CM"
+
+FRAME_BORDER_TRANSP = 60
+FRAME_FILL_TRANSP   = 92
+FRAME_MID_TRANSP    = 30
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+wickTolInput = input.float(3, "Maximum Wick (%)", minval = 0, maxval = 25, step = 0.5, group = "Detection",
+  tooltip = "Largest wick allowed at a shaved end, as a percentage of the candle's high-low range. Purist definitions demand zero shadow, which almost never prints on liquid markets, so practical detectors allow roughly 1-5%, sometimes more on volatile instruments. The tighter the tolerance, the rarer and cleaner the detections.")
+
+openingInput = input.bool(true, "Detect Opening Marubozu", group = "Detection",
+  tooltip = "Also detect the opening variant: shaved at the open end only, so the bar opened at its extreme and drove away without ever trading back through the open, but left a wick at the close end.")
+
+closingInput = input.bool(true, "Detect Closing Marubozu", group = "Detection",
+  tooltip = "Also detect the closing variant: shaved at the close end only, so price finished right at the extreme. Conventionally read as the stronger of the two partial forms, since the drive persisted into the close.")
+
+lookbackInput = input.int(20, "Typical Range Length", minval = 2, maxval = 500, group = "Significance Filters",
+  tooltip = "Number of bars in the trailing averages used as yardsticks: the typical bar range for the body-size test and the average volume for the volume filter. Both are taken one bar back, so the tested candle does not inflate its own baseline.")
+
+bodyMultInput = input.float(1, "Minimum Body Multiple", minval = 0, maxval = 5, step = 0.1, group = "Significance Filters",
+  tooltip = "The candle's real body must exceed this multiple of the typical bar range over the lookback. A shadowless but tiny candle says little, so meaningful size is part of the read. Set to 0 to keep every size.")
+
+volumeFilterInput = input.bool(false, "Volume Filter", inline = "volume", group = "Significance Filters",
+  tooltip = "Require elevated participation: volume must exceed its trailing average times the multiple. Elevated volume supports the conviction read, while a shadowless bar on thin trade means little. Automatically bypassed when the symbol reports no volume data.")
+
+volumeMultInput = input.float(1, "Multiple", minval = 0.1, maxval = 10, step = 0.1, inline = "volume", group = "Significance Filters",
+  tooltip = "Volume must exceed its trailing average times this factor for the volume filter to pass.")
+
+trendFilterInput = input.string(TREND_ANY, "Trend Context", options = [TREND_ANY, TREND_WITH, TREND_COUNTER], group = "Significance Filters",
+  tooltip = "Optional location filter, measured as the prior bar's close against a simple moving average. 'With Trend' keeps drives extending the prevailing direction; 'Counter-Trend' keeps initiative candles printing against it, such as a bullish marubozu turning out of a decline or base. Location decides the meaning: initiative early in a move, potentially climactic after an extended one.")
+
+trendLengthInput = input.int(50, "Trend SMA Length", minval = 2, maxval = 500, group = "Significance Filters",
+  tooltip = "Length of the simple moving average used by the trend context filter.")
+
+levelsInput = input.bool(true, "Candle Levels", group = "Marubozu Levels",
+  tooltip = "Draw each kept marubozu's extremes and dashed midpoint as a short-term reference frame, extended to the latest bar. A conviction candle implies one-sided business across its whole range: price holding beyond the midpoint keeps the drive credible, while a return deep into the range suggests the original pressure is being absorbed.")
+
+levelsCountInput = input.int(1, "Keep Last", minval = 1, maxval = 10, group = "Marubozu Levels",
+  tooltip = "How many of the most recent marubozu candles keep their reference frames on the chart. The oldest frame is dropped as new detections print.")
+
+highlightInput = input.bool(true, "Color Marubozu Candles", group = "Style",
+  tooltip = "Color each detected marubozu directly on the chart in its direction's color.")
+
+labelsInput = input.bool(true, "Show Labels", group = "Style",
+  tooltip = "Tag each detection with a compact label: M for a full marubozu, OM for an opening marubozu, CM for a closing marubozu. Hovering a tag reports the candle's anatomy: body and wick sizes as a share of the range, range versus its average, and volume versus its average where available.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "colors", group = "Style",
+  tooltip = "Color for bullish marubozu highlights, labels and reference frames.")
+
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "colors", group = "Style",
+  tooltip = "Color for bearish marubozu highlights, labels and reference frames.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Detection
+//---------------------------------------------------------------------------------------------------------------------{
+candleRange = high - low
+candleBody  = math.abs(close - open)
+upperWick   = high - math.max(open, close)
+lowerWick   = math.min(open, close) - low
+
+//Trailing context series, computed unconditionally on every bar
+averageRange  = ta.sma(candleRange, lookbackInput)
+volumeAverage = ta.sma(volume, lookbackInput)
+trendSma      = ta.sma(close, trendLengthInput)
+
+//Baselines taken one bar back so the tested candle does not inflate its own yardstick
+averageRangePrev  = averageRange[1]
+volumeAveragePrev = volumeAverage[1]
+trendSmaPrev      = trendSma[1]
+
+//Shaved-end test: open and close must sit within the tolerance of the bar's extremes
+wickTolerance = candleRange * wickTolInput / 100
+shavedTop     = upperWick <= wickTolerance
+shavedBottom  = lowerWick <= wickTolerance
+
+isBull = close > open
+isBear = open > close
+
+//Meaningful size: the real body must exceed the typical range of recent bars
+sizeOk = not na(averageRangePrev) and candleBody > bodyMultInput * averageRangePrev
+
+//Optional volume expansion filter, bypassed when the symbol reports no volume
+hasVolumeData = not na(volume) and not na(volumeAveragePrev) and volumeAveragePrev > 0
+volumeOk      = not volumeFilterInput or not hasVolumeData or volume > volumeMultInput * volumeAveragePrev
+
+//Optional location filter from the prior bar's close against the trend average
+trendUp   = not na(trendSmaPrev) and close[1] > trendSmaPrev
+trendDown = not na(trendSmaPrev) and close[1] < trendSmaPrev
+
+bullContextOk = switch trendFilterInput
+    TREND_WITH    => trendUp
+    TREND_COUNTER => trendDown
+    => true
+
+bearContextOk = switch trendFilterInput
+    TREND_WITH    => trendDown
+    TREND_COUNTER => trendUp
+    => true
+
+//Directional validity, evaluated on confirmed bars only
+bullValid = barstate.isconfirmed and candleRange > 0 and isBull and sizeOk and volumeOk and bullContextOk
+bearValid = barstate.isconfirmed and candleRange > 0 and isBear and sizeOk and volumeOk and bearContextOk
+
+//Form classification: full has no shadow at either end, opening none at the open end, closing none at the close end
+bullFull    = bullValid and shavedTop and shavedBottom
+bullOpening = bullValid and shavedBottom and not shavedTop and openingInput
+bullClosing = bullValid and shavedTop and not shavedBottom and closingInput
+
+bearFull    = bearValid and shavedTop and shavedBottom
+bearOpening = bearValid and shavedTop and not shavedBottom and openingInput
+bearClosing = bearValid and shavedBottom and not shavedTop and closingInput
+
+bullSignal = bullFull or bullOpening or bullClosing
+bearSignal = bearFull or bearOpening or bearClosing
+
+eventColor = bullSignal ? bullColorInput : bearColorInput
+
+//Anatomy ratios reported in label tooltips
+rangeRatio  = not na(averageRangePrev) and averageRangePrev > 0 ? candleRange / averageRangePrev : na
+volumeRatio = hasVolumeData ? volume / volumeAveragePrev : na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Marubozu Levels
+//---------------------------------------------------------------------------------------------------------------------{
+var array<box>  frameBoxArray  = array.new<box>()
+var array<line> frameLineArray = array.new<line>()
+
+//Reference frame of the most recent marubozu, used for the absorption alerts
+var int   frameDir  = 0
+var float frameMid  = na
+var float frameEdge = na
+
+bool midpointLost  = false
+bool fullyRetraced = false
+
+if bullSignal or bearSignal
+    frameDir  := bullSignal ? 1 : -1
+    frameMid  := math.avg(high, low)
+    frameEdge := bullSignal ? low : high
+
+    if levelsInput
+        array.push(frameBoxArray, box.new(bar_index, high, bar_index, low, border_color = color.new(eventColor, FRAME_BORDER_TRANSP), border_width = 1, bgcolor = color.new(eventColor, FRAME_FILL_TRANSP)))
+        array.push(frameLineArray, line.new(bar_index, frameMid, bar_index, frameMid, color = color.new(eventColor, FRAME_MID_TRANSP), style = line.style_dashed))
+
+        while array.size(frameBoxArray) > levelsCountInput
+            box.delete(array.shift(frameBoxArray))
+            line.delete(array.shift(frameLineArray))
+else if frameDir != 0
+    //A close beyond the far extreme swallows the bar; a close beyond the midpoint reads as absorption of the drive
+    if frameDir == 1 ? close < frameEdge : close > frameEdge
+        fullyRetraced := true
+        frameDir      := 0
+        frameMid      := na
+        frameEdge     := na
+    else if not na(frameMid) and (frameDir == 1 ? close < frameMid : close > frameMid)
+        midpointLost := true
+        frameMid     := na
+
+//Extend kept frames to the latest bar
+if array.size(frameBoxArray) > 0
+    for i = 0 to array.size(frameBoxArray) - 1
+        box.set_right(array.get(frameBoxArray, i), bar_index)
+        line.set_x2(array.get(frameLineArray, i), bar_index)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visuals
+//---------------------------------------------------------------------------------------------------------------------{
+//Conviction candle highlighting
+barcolor(highlightInput and (bullSignal or bearSignal) ? eventColor : na, title = "Marubozu Candles")
+
+//Compact form tags, below bullish detections and above bearish ones
+if labelsInput and (bullSignal or bearSignal)
+    variantTag  = bullFull or bearFull ? TAG_FULL : bullOpening or bearOpening ? TAG_OPENING : TAG_CLOSING
+    variantName = bullFull or bearFull ? "Full" : bullOpening or bearOpening ? "Opening" : "Closing"
+
+    tooltipText = (bullSignal ? "Bullish " : "Bearish ") + variantName + " Marubozu"
+      + "\nBody " + str.tostring(candleBody / candleRange * 100, "#.#") + "% of range, upper wick " + str.tostring(upperWick / candleRange * 100, "#.#") + "%, lower wick " + str.tostring(lowerWick / candleRange * 100, "#.#") + "%"
+      + (na(rangeRatio) ? "" : "\nRange " + str.tostring(rangeRatio, "#.##") + "x its " + str.tostring(lookbackInput) + "-bar average")
+      + (na(volumeRatio) ? "" : "\nVolume " + str.tostring(volumeRatio, "#.##") + "x its " + str.tostring(lookbackInput) + "-bar average")
+
+    label.new(bar_index, na, variantTag
+      , yloc      = bullSignal ? yloc.belowbar : yloc.abovebar
+      , style     = bullSignal ? label.style_label_up : label.style_label_down
+      , color     = LABEL_BG
+      , textcolor = eventColor
+      , size      = size.tiny
+      , tooltip   = tooltipText)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(bullSignal, "Bullish Marubozu (Any Form)", "Bullish Marubozu on {{ticker}} ({{interval}}) — buyers held control from the first trade to the last")
+alertcondition(bearSignal, "Bearish Marubozu (Any Form)", "Bearish Marubozu on {{ticker}} ({{interval}}) — sellers held control from the first trade to the last")
+alertcondition(bullFull, "Bullish Full Marubozu", "Bullish Full Marubozu on {{ticker}} ({{interval}}) — opened at the low, closed at the high, no meaningful shadow at either end")
+alertcondition(bullOpening, "Bullish Opening Marubozu", "Bullish Opening Marubozu on {{ticker}} ({{interval}}) — opened at the low and never traded back through it, wick left at the close end")
+alertcondition(bullClosing, "Bullish Closing Marubozu", "Bullish Closing Marubozu on {{ticker}} ({{interval}}) — finished at its high, the stronger partial form since the drive persisted into the close")
+alertcondition(bearFull, "Bearish Full Marubozu", "Bearish Full Marubozu on {{ticker}} ({{interval}}) — opened at the high, closed at the low, no meaningful shadow at either end")
+alertcondition(bearOpening, "Bearish Opening Marubozu", "Bearish Opening Marubozu on {{ticker}} ({{interval}}) — opened at the high and never traded back through it, wick left at the close end")
+alertcondition(bearClosing, "Bearish Closing Marubozu", "Bearish Closing Marubozu on {{ticker}} ({{interval}}) — finished at its low, the stronger partial form since the drive persisted into the close")
+alertcondition(midpointLost, "Marubozu Midpoint Lost", "Close crossed the most recent Marubozu's midpoint against the candle on {{ticker}} ({{interval}}) — the original pressure is being absorbed")
+alertcondition(fullyRetraced, "Marubozu Fully Retraced", "The most recent Marubozu was fully retraced on {{ticker}} ({{interval}}) — the bar has been swallowed, weakening the conviction read")
+
+//---------------------------------------------------------------------------------------------------------------------}

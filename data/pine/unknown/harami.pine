@@ -1,0 +1,241 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Harami", shorttitle = "Harami", overlay = true, format = format.price, max_labels_count = 500, max_lines_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR = #089981
+BEAR_COLOR = #f23645
+VOID_COLOR = #787b86
+MA_COLOR   = #787b86
+LABEL_BG   = #00000000
+
+MA_SMA = "SMA"
+MA_EMA = "EMA"
+
+MODE_BODY  = "First Candle Body"
+MODE_RANGE = "Full Pattern Range"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+wideFilterInput = input.bool(true, "Wide First Body", inline = "wide", group = "Pattern Detection",
+     tooltip = "Require the first candle's real body to exceed a multiple of the trailing average body. The harami starts from a wide-bodied candle in the leg's direction - a small body hiding inside a routine candle records no meaningful contraction.")
+
+wideMultInput = input.float(1.0, "Multiple", minval = 0.1, maxval = 5, step = 0.1, inline = "wide", group = "Pattern Detection",
+     tooltip = "Minimum first-candle body as a multiple of the trailing average body. The average is sampled just before the pattern so its own candles do not distort the yardstick.")
+
+bodyAvgLenInput = input.int(14, "Length", minval = 2, maxval = 100, inline = "wide", group = "Pattern Detection",
+     tooltip = "Number of candles in the trailing average real body used by the wide-body test and reported in each label tooltip.")
+
+maxBodyRatioInput = input.float(50, "Max Inner Body %", minval = 1, maxval = 100, step = 1, group = "Pattern Detection",
+     tooltip = "Largest inside real body allowed, as a percentage of the first candle's body. Grading the pattern is mostly grading the second candle: the smaller its body, the cleaner the contraction reads. 100 only demands that the body be smaller than the first.")
+
+dojiTolInput = input.float(5, "Doji Body % of Range", minval = 0, maxval = 25, step = 0.5, group = "Pattern Detection",
+     tooltip = "Maximum real body, as a percentage of the candle's high-low range, for the inside candle to count as a doji. A doji inside candle upgrades the pattern to a harami cross - the limit case of the contraction, conventionally the stronger hesitation signal.")
+
+crossOnlyInput = input.bool(false, "Harami Cross Only", group = "Pattern Detection",
+     tooltip = "Keep only patterns whose inside candle is a doji. Useful when scanning for the stronger harami cross variant alone.")
+
+useTrendInput = input.bool(true, "Trend Context Filter", group = "Trend Context",
+     tooltip = "A harami needs a directional leg into the pattern - without a preceding move, containment has nothing to reverse. Bullish patterns are reported only when the first candle prints below the trend moving average, bearish ones only above it. Disable to flag the raw body-inside-body geometry anywhere.")
+
+trendTypeInput = input.string(MA_SMA, "Trend Basis", options = [MA_SMA, MA_EMA], inline = "trend", group = "Trend Context",
+     tooltip = "Moving average defining the prior move: price below it is treated as a decline, above it as an advance, sampled at the pattern's first candle.")
+
+trendLenInput = input.int(50, "Length", minval = 2, maxval = 500, inline = "trend", group = "Trend Context",
+     tooltip = "Length of the trend moving average.")
+
+showMaInput = input.bool(false, "Show Trend MA", group = "Trend Context",
+     tooltip = "Plots the moving average used for trend context, so the directional-leg filter can be seen on the chart.")
+
+confirmModeInput = input.string(MODE_BODY, "Resolution Range", options = [MODE_BODY, MODE_RANGE], group = "Confirmation & Levels",
+     tooltip = "Range whose closing break resolves the pattern. 'First Candle Body' is the conventional read: a close above the first candle's body high confirms a bullish harami, a close below its body low voids it. 'Full Pattern Range' is the stricter rule set, demanding the close clear the two-candle high-low extremes instead.")
+
+showLevelsInput = input.bool(true, "Trigger & Void Levels", group = "Confirmation & Levels",
+     tooltip = "Draw each pattern's reference levels as dashed lines: the trigger a following candle must close beyond in the reversal direction, and the void level on the opposite side - a close through it resolves the hesitation as continuation and cancels the pattern.")
+
+extendInput = input.int(10, "Levels Extension", minval = 1, maxval = 250, group = "Confirmation & Levels",
+     tooltip = "Number of bars the trigger and void levels extend to the right of the pattern.")
+
+showResolutionInput = input.bool(true, "Resolution Markers", group = "Confirmation & Levels",
+     tooltip = "Mark the candle that resolves the most recent pattern on each side: a check at the trigger level when a close confirms the reversal, a cross at the void level when a close cancels the pattern as continuation.")
+
+showLabelsInput = input.bool(true, "Pattern Labels", group = "Style",
+     tooltip = "Mark each pattern with a Harami or Harami Cross label - below the candles for bullish patterns, above them for bearish ones. Hovering a label reports the contraction grade, the containment margin, whether the inside candle is also a full inside bar, and the trigger and void prices.")
+
+colorBarsInput = input.bool(true, "Color Pattern Candles", group = "Style",
+     tooltip = "Paint the two pattern candles in the signal direction.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "colors", group = "Style",
+     tooltip = "Color of bullish patterns: labels, candle coloring, trigger levels and confirmation markers.")
+
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "colors", group = "Style",
+     tooltip = "Color of bearish patterns: labels, candle coloring, trigger levels and confirmation markers.")
+
+voidColorInput = input.color(VOID_COLOR, "Void", inline = "colors", group = "Style",
+     tooltip = "Color of the void levels and cancellation markers.")
+
+maColorInput = input.color(MA_COLOR, "Trend MA", group = "Style",
+     tooltip = "Color of the trend moving average plot.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Candle Anatomy & Pattern Detection
+//---------------------------------------------------------------------------------------------------------------------{
+body        = math.abs(close - open)
+bodyHi      = math.max(close, open)
+bodyLo      = math.min(close, open)
+candleRange = high - low
+bullCandle  = close > open
+bearCandle  = close < open
+
+// Trailing context series, computed unconditionally on every bar
+bodyAvg  = ta.sma(body, bodyAvgLenInput)
+smaValue = ta.sma(close, trendLenInput)
+emaValue = ta.ema(close, trendLenInput)
+maValue  = trendTypeInput == MA_EMA ? emaValue : smaValue
+
+// Average real body of the candles immediately preceding the two-candle pattern
+refAvg = bodyAvg[2]
+
+// Trend gate sampled at the pattern's first candle: a decline into bullish patterns, an advance into bearish ones
+maPrev = maValue[1]
+dnCtx  = not useTrendInput or (not na(maPrev) and close[1] < maPrev)
+upCtx  = not useTrendInput or (not na(maPrev) and close[1] > maPrev)
+
+// Containment measured on real bodies - wicks may protrude, which separates the harami from the inside bar
+contained = not na(bodyHi[1]) and bodyHi <= bodyHi[1] and bodyLo >= bodyLo[1]
+innerOk   = body < body[1] and body <= body[1] * maxBodyRatioInput / 100
+wideOk    = not wideFilterInput or (not na(refAvg) and body[1] > refAvg * wideMultInput)
+
+// A doji inside candle upgrades the pattern to a harami cross
+dojiInside = candleRange > 0 and body <= candleRange * dojiTolInput / 100
+
+haramiBase  = contained and innerOk and wideOk
+bullPattern = haramiBase and bearCandle[1] and dnCtx
+bearPattern = haramiBase and bullCandle[1] and upCtx
+
+bullSignal = bullPattern and (not crossOnlyInput or dojiInside)
+bearSignal = bearPattern and (not crossOnlyInput or dojiInside)
+
+// Grading metrics reported in the label tooltips
+innerPct    = nz(body[1]) > 0 ? body / body[1] * 100 : na
+wideRatio   = not na(refAvg) and refAvg > 0 ? body[1] / refAvg : na
+edgeMargin  = nz(body[1]) > 0 ? math.min(bodyHi[1] - bodyHi, bodyLo - bodyLo[1]) / body[1] * 100 : na
+fullInside  = high <= high[1] and low >= low[1]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Trigger & Void Levels
+//---------------------------------------------------------------------------------------------------------------------{
+bodyMode    = confirmModeInput == MODE_BODY
+patternHigh = math.max(high, high[1])
+patternLow  = math.min(low, low[1])
+
+bullTriggerPrice = bodyMode ? bodyHi[1] : patternHigh
+bullVoidPrice    = bodyMode ? bodyLo[1] : patternLow
+bearTriggerPrice = bodyMode ? bodyLo[1] : patternLow
+bearVoidPrice    = bodyMode ? bodyHi[1] : patternHigh
+
+// Levels of the most recent unresolved pattern on each side, cleared once a close resolves them
+var float bullTriggerLevel = na
+var float bullVoidLevel    = na
+var float bearTriggerLevel = na
+var float bearVoidLevel    = na
+
+bool bullConfirmed = false
+bool bullCancelled = false
+bool bearConfirmed = false
+bool bearCancelled = false
+
+if bullSignal
+    bullTriggerLevel := bullTriggerPrice
+    bullVoidLevel    := bullVoidPrice
+else
+    if not na(bullTriggerLevel) and close > bullTriggerLevel
+        bullConfirmed := true
+        if showResolutionInput
+            label.new(bar_index, bullTriggerLevel, "✔", style = label.style_label_center, color = LABEL_BG, textcolor = bullColorInput, size = size.small,
+              tooltip = "Bullish harami confirmed - close beyond the trigger level in the reversal direction")
+        bullTriggerLevel := na
+        bullVoidLevel    := na
+    else if not na(bullVoidLevel) and close < bullVoidLevel
+        bullCancelled := true
+        if showResolutionInput
+            label.new(bar_index, bullVoidLevel, "✘", style = label.style_label_center, color = LABEL_BG, textcolor = voidColorInput, size = size.small,
+              tooltip = "Bullish harami voided - close through the opposite side resolved the hesitation as continuation")
+        bullTriggerLevel := na
+        bullVoidLevel    := na
+
+if bearSignal
+    bearTriggerLevel := bearTriggerPrice
+    bearVoidLevel    := bearVoidPrice
+else
+    if not na(bearTriggerLevel) and close < bearTriggerLevel
+        bearConfirmed := true
+        if showResolutionInput
+            label.new(bar_index, bearTriggerLevel, "✔", style = label.style_label_center, color = LABEL_BG, textcolor = bearColorInput, size = size.small,
+              tooltip = "Bearish harami confirmed - close beyond the trigger level in the reversal direction")
+        bearTriggerLevel := na
+        bearVoidLevel    := na
+    else if not na(bearVoidLevel) and close > bearVoidLevel
+        bearCancelled := true
+        if showResolutionInput
+            label.new(bar_index, bearVoidLevel, "✘", style = label.style_label_center, color = LABEL_BG, textcolor = voidColorInput, size = size.small,
+              tooltip = "Bearish harami voided - close through the opposite side resolved the hesitation as continuation")
+        bearTriggerLevel := na
+        bearVoidLevel    := na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+signalColor = bullSignal ? bullColorInput : bearColorInput
+
+// Both pattern candles painted in the signal direction
+barcolor(colorBarsInput and (bullSignal or bearSignal) ? signalColor : na, title = "Harami Inside Candle")
+barcolor(colorBarsInput and (bullSignal or bearSignal) ? signalColor : na, offset = -1, title = "Harami First Candle")
+
+plot(showMaInput ? maValue : na, "Trend MA", maColorInput, 1)
+
+if bullSignal or bearSignal
+    trigPrice = bullSignal ? bullTriggerPrice : bearTriggerPrice
+    voidPrice = bullSignal ? bullVoidPrice : bearVoidPrice
+
+    if showLabelsInput
+        ratioText = na(wideRatio) ? "" : "\nFirst body: " + str.tostring(wideRatio, "#.##") + "x its " + str.tostring(bodyAvgLenInput) + "-bar average"
+        labelTip  = (bullSignal ? "Bullish harami" : "Bearish harami") + (dojiInside ? " cross - the inside candle is a doji" : "")
+          + "\nInner body: " + str.tostring(innerPct, "#.#") + "% of the first body"
+          + "\nContainment margin: " + str.tostring(edgeMargin, "#.#") + "% to the nearest body edge"
+          + ratioText
+          + "\nFull inside bar (wicks contained): " + (fullInside ? "yes" : "no")
+          + "\nTrigger: " + str.tostring(trigPrice, format.mintick)
+          + "\nVoid: " + str.tostring(voidPrice, format.mintick)
+
+        label.new(bar_index, na, dojiInside ? "Harami Cross" : "Harami"
+          , yloc      = bullSignal ? yloc.belowbar : yloc.abovebar
+          , style     = bullSignal ? label.style_label_up : label.style_label_down
+          , color     = signalColor
+          , textcolor = chart.bg_color
+          , size      = size.small
+          , tooltip   = labelTip)
+
+    if showLevelsInput
+        line.new(bar_index, trigPrice, bar_index + extendInput, trigPrice, color = signalColor, style = line.style_dashed)
+        line.new(bar_index, voidPrice, bar_index + extendInput, voidPrice, color = voidColorInput, style = line.style_dashed)
+        label.new(bar_index + extendInput, trigPrice, "Trigger", style = label.style_label_left, color = LABEL_BG, textcolor = signalColor, size = size.tiny)
+        label.new(bar_index + extendInput, voidPrice, "Void", style = label.style_label_left, color = LABEL_BG, textcolor = voidColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(bullSignal, "Bullish Harami", "Bullish harami on {{ticker}} ({{interval}}) - a small real body held inside the prior wide bearish body after a decline, with all active filters passed")
+alertcondition(bearSignal, "Bearish Harami", "Bearish harami on {{ticker}} ({{interval}}) - a small real body held inside the prior wide bullish body after an advance, with all active filters passed")
+alertcondition(bullSignal and dojiInside, "Bullish Harami Cross", "Bullish harami cross on {{ticker}} ({{interval}}) - the inside candle is a doji, the limit case of the contraction")
+alertcondition(bearSignal and dojiInside, "Bearish Harami Cross", "Bearish harami cross on {{ticker}} ({{interval}}) - the inside candle is a doji, the limit case of the contraction")
+alertcondition(bullConfirmed, "Bullish Harami Confirmed", "A candle closed above the trigger level of a bullish harami on {{ticker}} ({{interval}}) - hesitation resolved in the reversal direction")
+alertcondition(bearConfirmed, "Bearish Harami Confirmed", "A candle closed below the trigger level of a bearish harami on {{ticker}} ({{interval}}) - hesitation resolved in the reversal direction")
+alertcondition(bullCancelled, "Bullish Harami Voided", "A candle closed below the void level of a bullish harami on {{ticker}} ({{interval}}) - the hesitation resolved as continuation and the pattern is cancelled")
+alertcondition(bearCancelled, "Bearish Harami Voided", "A candle closed above the void level of a bearish harami on {{ticker}} ({{interval}}) - the hesitation resolved as continuation and the pattern is cancelled")
+
+//---------------------------------------------------------------------------------------------------------------------}

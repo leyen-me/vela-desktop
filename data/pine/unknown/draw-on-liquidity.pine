@@ -1,0 +1,688 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Draw on Liquidity", shorttitle = "Draw on Liquidity", overlay = true, format = format.price, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 250)
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+int TIER_SWING   = 0
+int TIER_GAP     = 1
+int TIER_SESSION = 2
+int TIER_EQUAL   = 3
+int TIER_DAILY   = 4
+int TIER_WEEKLY  = 5
+
+//Draw-selection weights: higher-timeframe pools weigh more heavily, per the concept
+float WEIGHT_SWING   = 1.0
+float WEIGHT_GAP     = 1.5
+float WEIGHT_SESSION = 2.0
+float WEIGHT_EQUAL   = 2.0
+float WEIGHT_DAILY   = 3.0
+float WEIGHT_WEEKLY  = 4.0
+
+int   ATR_LENGTH   = 200
+float MIN_DIST_ATR = 0.25
+int   MAX_POOLS    = 250
+int   LABEL_OFFSET = 3
+color LABEL_BG     = #00000000
+
+color NEUTRAL_COLOR = #787b86
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+string SIZE_TINY   = "Tiny"
+string SIZE_SMALL  = "Small"
+string SIZE_NORMAL = "Normal"
+
+string POS_TR = "Top Right"
+string POS_TL = "Top Left"
+string POS_BR = "Bottom Right"
+string POS_BL = "Bottom Left"
+
+string GROUP_POOLS = "Liquidity Pools"
+string GROUP_SESS  = "Sessions"
+string GROUP_DRAW  = "Draw Logic"
+string GROUP_DASH  = "Dashboard"
+string GROUP_STYLE = "Style"
+
+showWeeklyInput = input.bool(true, "Prior Week High/Low"
+  , group   = GROUP_POOLS
+  , tooltip = "Track the prior completed week's high and low as resting liquidity pools (PWH/PWL). The heaviest tier in the draw selection (weight 4).")
+
+showDailyInput = input.bool(true, "Prior Day High/Low"
+  , group   = GROUP_POOLS
+  , tooltip = "Track the prior completed day's high and low as resting liquidity pools (PDH/PDL). Weight 3 in the draw selection.")
+
+showSessionsInput = input.bool(true, "Session Highs/Lows"
+  , group   = GROUP_POOLS
+  , tooltip = "Track the completed extremes of the session windows configured in the Sessions group as liquidity pools (intraday charts only). Weight 2 in the draw selection.")
+
+showEqualInput = input.bool(true, "Equal Highs/Lows"
+  , group   = GROUP_POOLS
+  , tooltip = "Merge successive swing points printing within tolerance of each other into equal high/low pools (EQH/EQL) - engineered liquidity resting above or below clustered stops. Weight 2 in the draw selection.")
+
+showSwingInput = input.bool(true, "Swing Highs/Lows"
+  , group   = GROUP_POOLS
+  , tooltip = "Track untapped swing points as old highs and lows holding stop-loss liquidity. Weight 1 in the draw selection.")
+
+showGapsInput = input.bool(true, "Unfilled Gaps"
+  , group   = GROUP_POOLS
+  , tooltip = "Track unfilled three-candle imbalances (fair value gaps) as rebalance magnets. The pool level is the gap midpoint; a gap below price draws delivery lower, a gap above draws it higher. Weight 1.5 in the draw selection.")
+
+swingLengthInput = input.int(10, "Swing Detection Length"
+  , minval  = 2
+  , group   = GROUP_POOLS
+  , tooltip = "Bars a swing point must dominate on each side to register as a pool. Larger values keep only the more significant old highs and lows.")
+
+equalTolInput = input.float(0.1, "Equal Level Tolerance"
+  , minval  = 0
+  , step    = 0.05
+  , group   = GROUP_POOLS
+  , tooltip = "Maximum distance between swing points merged into one equal highs/lows pool, as a multiple of the ATR(200). The pool sits at the outermost of the merged extremes.")
+
+minGapInput = input.float(0.5, "Minimum Gap Height"
+  , minval  = 0
+  , step    = 0.25
+  , group   = GROUP_POOLS
+  , tooltip = "Ignore imbalances shorter than this multiple of the ATR(200); filters insignificant gaps from the inventory. 0 keeps every gap.")
+
+maxAgeInput = input.int(500, "Maximum Pool Age"
+  , minval  = 50
+  , group   = GROUP_POOLS
+  , tooltip = "Swing, equal and gap pools still untapped after this many bars are dropped from the inventory. Prior day/week and session levels roll on their own schedule instead.")
+
+asiaOnInput = input.bool(true, "Asia"
+  , inline  = "asia"
+  , group   = GROUP_SESS
+  , tooltip = "Include this session's completed high/low in the pool inventory.")
+
+asiaSessionInput = input.session("1800-0300", ""
+  , inline  = "asia"
+  , group   = GROUP_SESS
+  , tooltip = "Asia window on the sessions timezone clock, 6:00 pm to 3:00 am New York time by default.")
+
+londonOnInput = input.bool(true, "London"
+  , inline  = "london"
+  , group   = GROUP_SESS
+  , tooltip = "Include this session's completed high/low in the pool inventory.")
+
+londonSessionInput = input.session("0300-0930", ""
+  , inline  = "london"
+  , group   = GROUP_SESS
+  , tooltip = "London window on the sessions timezone clock, 3:00 am to 9:30 am New York time by default.")
+
+nyOnInput = input.bool(true, "New York"
+  , inline  = "ny"
+  , group   = GROUP_SESS
+  , tooltip = "Include this session's completed high/low in the pool inventory.")
+
+nySessionInput = input.session("0930-1600", ""
+  , inline  = "ny"
+  , group   = GROUP_SESS
+  , tooltip = "New York window on the sessions timezone clock, 9:30 am to 4:00 pm New York time by default.")
+
+sessTzInput = input.string("America/New_York", "Sessions Timezone"
+  , group   = GROUP_SESS
+  , tooltip = "IANA timezone the session windows are clocked in. New York time keeps the defaults daylight-saving aware whatever the chart's time zone.")
+
+structureLengthInput = input.int(50, "Structure Length"
+  , minval  = 5
+  , group   = GROUP_DRAW
+  , tooltip = "Swing length of the structure read that sets the bias side. A close through the last structure swing high turns the bias up, through the last swing low turns it down. The working draw is the highest-scoring untapped pool on the bias side, scored as tier weight / distance in ATR(200) - nearest compelling pool first, higher-timeframe pools weighed more heavily. If the bias side holds no pools, the best pool on the other side is used.")
+
+showDashInput = input.bool(true, "Show Dashboard"
+  , group   = GROUP_DASH
+  , tooltip = "Summary panel with the working draw, its side, the structure bias and whether the draw is aligned with it, the distance to the draw, and the count of untapped pools on each side of price.")
+
+dashPosInput = input.string(POS_TR, "Position"
+  , options = [POS_TR, POS_TL, POS_BR, POS_BL]
+  , group   = GROUP_DASH
+  , tooltip = "Chart corner the dashboard is anchored to.")
+
+dashSizeInput = input.string(SIZE_SMALL, "Size"
+  , options = [SIZE_TINY, SIZE_SMALL, SIZE_NORMAL]
+  , group   = GROUP_DASH
+  , tooltip = "Dashboard text size.")
+
+bullColorInput = input.color(#089981, "Buy-side"
+  , inline  = "colors"
+  , group   = GROUP_STYLE
+  , tooltip = "Color of buy-side pools above price and of an upward draw.")
+
+bearColorInput = input.color(#f23645, "Sell-side"
+  , inline  = "colors"
+  , group   = GROUP_STYLE
+  , tooltip = "Color of sell-side pools below price and of a downward draw.")
+
+showMagnetInput = input.bool(true, "Draw Gradient"
+  , group   = GROUP_STYLE
+  , tooltip = "Gradient between price and the working draw, fading in toward the pool - the magnet pull toward the level being reached for.")
+
+showDrawTagInput = input.bool(true, "Draw Tag"
+  , group   = GROUP_STYLE
+  , tooltip = "'DOL' label naming the working draw at its level; the targeted pool is also emphasized with a wider solid line.")
+
+showLabelsInput = input.bool(true, "Pool Labels"
+  , inline  = "labels"
+  , group   = GROUP_STYLE
+  , tooltip = "Tag every pool line with its name. Hover a tag for the pool's side, level, age, touches, weight and current distance.")
+
+labelSizeInput = input.string(SIZE_TINY, ""
+  , options = [SIZE_TINY, SIZE_SMALL, SIZE_NORMAL]
+  , inline  = "labels"
+  , group   = GROUP_STYLE
+  , tooltip = "Pool label text size.")
+
+showSweptInput = input.bool(false, "Keep Swept Pools"
+  , group   = GROUP_STYLE
+  , tooltip = "Keep pools on the chart after price trades into them, faded and frozen at the sweep bar, instead of removing them - useful to review which side of the range has already been purged.")
+
+showPathInput = input.bool(false, "Draw History Path"
+  , group   = GROUP_STYLE
+  , tooltip = "Plot the draw level over time to review how the magnet migrated as pools were purged and the bias flipped.")
+
+string labelTextSize = labelSizeInput == SIZE_TINY ? size.tiny : labelSizeInput == SIZE_SMALL ? size.small : size.normal
+string dashTextSize  = dashSizeInput == SIZE_TINY ? size.tiny : dashSizeInput == SIZE_SMALL ? size.small : size.normal
+dashPosition = dashPosInput == POS_TL ? position.top_left : dashPosInput == POS_BR ? position.bottom_right : dashPosInput == POS_BL ? position.bottom_left : position.top_right
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types
+//---------------------------------------------------------------------------------------------------------------------{
+//One untapped liquidity pool: a level (or gap midpoint) holding resting orders, with its tier, selection weight
+//and chart objects
+type LiquidityPool
+    int    uid
+    float  price
+    int    tier
+    float  weight
+    string tag
+    string longName
+    bool   isUpper
+    int    startBar
+    int    touches  = 1
+    bool   swept    = false
+    int    sweptBar = na
+    line   levelLine
+    label  levelLabel
+    box    gapBox
+
+//Active pool inventory (untapped pools only - swept pools leave the inventory, their drawings stay if kept)
+var poolArray = array.new<LiquidityPool>()
+var uidArray  = array.new_int(1, 0)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+//Next unique pool id
+nextUid() =>
+    int uid = array.get(uidArray, 0) + 1
+    array.set(uidArray, 0, uid)
+    uid
+
+//Side color of a pool
+poolColor(LiquidityPool pool) =>
+    pool.isUpper ? bullColorInput : bearColorInput
+
+//Line style per tier: solid = prior day/week levels, dashed = session extremes, dotted = swing/equal levels
+tierLineStyle(int tier) =>
+    tier == TIER_DAILY or tier == TIER_WEEKLY ? line.style_solid : tier == TIER_SESSION ? line.style_dashed : line.style_dotted
+
+//Base transparency per tier - higher-timeframe pools render more prominently
+tierTransp(int tier) =>
+    tier == TIER_SWING ? 40 : tier == TIER_DAILY or tier == TIER_WEEKLY ? 0 : 20
+
+//Draw-selection weight per tier
+tierWeight(int tier) =>
+    switch tier
+        TIER_WEEKLY  => WEIGHT_WEEKLY
+        TIER_DAILY   => WEIGHT_DAILY
+        TIER_SESSION => WEIGHT_SESSION
+        TIER_EQUAL   => WEIGHT_EQUAL
+        TIER_GAP     => WEIGHT_GAP
+        =>              WEIGHT_SWING
+
+//Removes every drawing object owned by a pool
+deletePoolDrawings(LiquidityPool pool) =>
+    if not na(pool.levelLine)
+        line.delete(pool.levelLine)
+        pool.levelLine := na
+    if not na(pool.levelLabel)
+        label.delete(pool.levelLabel)
+        pool.levelLabel := na
+    if not na(pool.gapBox)
+        box.delete(pool.gapBox)
+        pool.gapBox := na
+
+//Removes a pool from the active inventory
+removePool(LiquidityPool pool) =>
+    int found = -1
+    for [i, p] in poolArray
+        if p.uid == pool.uid
+            found := i
+            break
+    if found >= 0
+        array.remove(poolArray, found)
+
+//Retires a superseded named level (prior day/week or session roll): removed entirely while still untapped,
+//left alone if already swept and frozen
+rollPool(LiquidityPool pool) =>
+    if not na(pool) and not pool.swept
+        removePool(pool)
+        deletePoolDrawings(pool)
+
+//Applies or clears the working-draw emphasis on a pool's drawings
+setPoolEmphasis(LiquidityPool pool, bool emphasized) =>
+    color css = poolColor(pool)
+    if not na(pool.levelLine)
+        line.set_width(pool.levelLine, emphasized ? 2 : 1)
+        line.set_style(pool.levelLine, emphasized ? line.style_solid : tierLineStyle(pool.tier))
+        line.set_color(pool.levelLine, color.new(css, emphasized ? 0 : tierTransp(pool.tier)))
+    if not na(pool.levelLabel)
+        label.set_textcolor(pool.levelLabel, color.new(css, emphasized ? 0 : 25))
+    if not na(pool.gapBox)
+        box.set_border_width(pool.gapBox, emphasized ? 2 : 1)
+        box.set_bgcolor(pool.gapBox, color.new(css, emphasized ? 92 : 96))
+
+//Freezes a pool's drawings at the sweep bar (or removes them when swept pools are not kept)
+freezePool(LiquidityPool pool) =>
+    if showSweptInput
+        color css = poolColor(pool)
+        if not na(pool.levelLine)
+            line.set_extend(pool.levelLine, extend.none)
+            line.set_x2(pool.levelLine, bar_index)
+            line.set_width(pool.levelLine, 1)
+            line.set_color(pool.levelLine, color.new(css, 80))
+        if not na(pool.levelLabel)
+            label.set_x(pool.levelLabel, bar_index)
+            label.set_textcolor(pool.levelLabel, color.new(css, 75))
+        if not na(pool.gapBox)
+            box.set_extend(pool.gapBox, extend.none)
+            box.set_right(pool.gapBox, bar_index)
+            box.set_bgcolor(pool.gapBox, color.new(css, 98))
+            box.set_border_color(pool.gapBox, color.new(css, 88))
+            box.set_text_color(pool.gapBox, color.new(css, 80))
+    else
+        deletePoolDrawings(pool)
+
+//Creates a level pool and adds it to the inventory
+createPool(float price, int tier, string tag, string longName, bool isUpper, int startBar) =>
+    color css        = isUpper ? bullColorInput : bearColorInput
+    line  levelLine  = line.new(startBar, price, bar_index, price, color = color.new(css, tierTransp(tier)), style = tierLineStyle(tier), width = 1, extend = extend.right)
+    label levelLabel = na
+    if showLabelsInput
+        levelLabel := label.new(bar_index + LABEL_OFFSET, price, tag, color = LABEL_BG, textcolor = color.new(css, 25), style = label.style_label_left, size = labelTextSize)
+    LiquidityPool pool = LiquidityPool.new(nextUid(), price, tier, tierWeight(tier), tag, longName, isUpper, startBar, levelLine = levelLine, levelLabel = levelLabel)
+    array.push(poolArray, pool)
+    pool
+
+//Creates an unfilled-gap pool (box, drawn toward its midpoint) and adds it to the inventory
+createGapPool(float topPrice, float bottomPrice, bool isUpper, int startBar) =>
+    color css    = isUpper ? bullColorInput : bearColorInput
+    box   gapBox = box.new(startBar, topPrice, bar_index, bottomPrice, border_color = color.new(css, 70), border_width = 1, border_style = line.style_dotted, extend = extend.right, bgcolor = color.new(css, 96), text = "FVG", text_size = size.tiny, text_color = color.new(css, 40), text_halign = text.align_left)
+    LiquidityPool pool = LiquidityPool.new(nextUid(), math.avg(topPrice, bottomPrice), TIER_GAP, tierWeight(TIER_GAP), "FVG", "Unfilled Gap", isUpper, startBar, gapBox = gapBox)
+    array.push(poolArray, pool)
+    pool
+
+//First untapped swing/equal pool on one side within tolerance of a price - the equal highs/lows merge target
+findMatchingPool(float price, bool isUpper, float tolerance) =>
+    LiquidityPool match = na
+    for p in poolArray
+        if p.isUpper == isUpper and (p.tier == TIER_SWING or p.tier == TIER_EQUAL) and math.abs(p.price - price) <= tolerance
+            match := p
+            break
+    match
+
+//Tracks one session window and posts its completed extremes as liquidity pools; a newer instance of the same
+//session replaces the previous one while that one is still untapped
+trackSession(string sessionWindow, bool enabled, bool dayChanged, string hiTag, string loTag, string longPrefix) =>
+    bool active = not na(time(timeframe.period, sessionWindow, sessTzInput))
+    var bool  wasActive    = false
+    var float sessionHigh  = na
+    var float sessionLow   = na
+    var int   sessionStart = na
+    var LiquidityPool hiPool = na
+    var LiquidityPool loPool = na
+    bool endBlock   = wasActive and (not active or dayChanged)
+    bool startBlock = active and (not wasActive or dayChanged)
+    if endBlock and enabled and not na(sessionHigh)
+        rollPool(hiPool)
+        rollPool(loPool)
+        hiPool := createPool(sessionHigh, TIER_SESSION, hiTag, longPrefix + " Session High", true, sessionStart)
+        loPool := createPool(sessionLow, TIER_SESSION, loTag, longPrefix + " Session Low", false, sessionStart)
+    if startBlock
+        sessionHigh  := high
+        sessionLow   := low
+        sessionStart := bar_index
+    else if active
+        sessionHigh := math.max(sessionHigh, high)
+        sessionLow  := math.min(sessionLow, low)
+    wasActive := active
+    active
+
+//Hover text for a pool label: side, level, age, touches, weight and current distance
+poolTooltip(LiquidityPool pool, float atrUnit) =>
+    string sideText  = pool.isUpper ? "Buy-side pool" : "Sell-side pool"
+    float  distAtr   = math.abs(pool.price - close) / atrUnit
+    string sizeText  = pool.touches > 1 ? "\nTouches: " + str.tostring(pool.touches) : ""
+    sideText + " - " + pool.longName + "\nLevel: " + str.tostring(pool.price, format.mintick) + "\nAge: " + str.tostring(bar_index - pool.startBar) + " bars" + sizeText + "\nWeight " + str.tostring(pool.weight, "#.#") + " - " + str.tostring(distAtr, "#.##") + " ATR away"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+var LiquidityPool drawPool = na
+
+//Volatility unit for the equal-level tolerance, the gap filter and distance scoring
+float atrRaw    = ta.atr(ATR_LENGTH)
+float rangeMean = ta.sma(high - low, 14)
+float atrValue  = math.max(nz(atrRaw, nz(rangeMean, high - low)), syminfo.mintick)
+
+float equalTolerance = equalTolInput * atrValue
+
+//Swing points feeding the pool inventory, and the wider swings feeding the structure read
+float pivotHigh          = ta.pivothigh(swingLengthInput, swingLengthInput)
+float pivotLow           = ta.pivotlow(swingLengthInput, swingLengthInput)
+float structurePivotHigh = ta.pivothigh(structureLengthInput, structureLengthInput)
+float structurePivotLow  = ta.pivotlow(structureLengthInput, structureLengthInput)
+
+//Prior completed day/week extremes, non-repainting
+[priorDayHigh, priorDayLow]   = request.security(syminfo.tickerid, "1D", [high[1], low[1]], lookahead = barmerge.lookahead_on)
+[priorWeekHigh, priorWeekLow] = request.security(syminfo.tickerid, "1W", [high[1], low[1]], lookahead = barmerge.lookahead_on)
+
+bool newDay        = timeframe.change("1D")
+bool newWeek       = timeframe.change("1W")
+bool dailyApplies  = timeframe.in_seconds() < timeframe.in_seconds("1D")
+bool weeklyApplies = timeframe.in_seconds() < timeframe.in_seconds("1W")
+
+//Sessions are clocked on the configured timezone; a calendar-day change splits blocks that only data gaps
+//made contiguous
+int  sessionDay        = dayofmonth(time, sessTzInput)
+bool sessionDayChanged = nz(sessionDay - sessionDay[1], 0) != 0
+bool sessionsApply     = showSessionsInput and timeframe.isintraday
+
+//Old highs/lows: register each confirmed swing point - absorbed into an equal highs/lows pool when it prints
+//within tolerance of an untapped level, opened as a fresh swing pool otherwise
+var float lastPivotHigh    = na
+var int   lastPivotHighBar = na
+var float lastPivotLow     = na
+var int   lastPivotLowBar  = na
+
+if not na(pivotHigh)
+    int pivotBar = bar_index - swingLengthInput
+    LiquidityPool match = findMatchingPool(pivotHigh, true, equalTolerance)
+    if not na(match)
+        match.price   := math.max(match.price, pivotHigh)
+        match.touches := match.touches + 1
+        if showEqualInput
+            match.tier     := TIER_EQUAL
+            match.weight   := WEIGHT_EQUAL
+            match.tag      := "EQH ×" + str.tostring(match.touches)
+            match.longName := "Equal Highs"
+        if not na(match.levelLine)
+            line.set_y1(match.levelLine, match.price)
+            line.set_y2(match.levelLine, match.price)
+        if not na(match.levelLabel)
+            label.set_y(match.levelLabel, match.price)
+            label.set_text(match.levelLabel, match.tag)
+        setPoolEmphasis(match, not na(drawPool) and drawPool.uid == match.uid)
+    else if showSwingInput
+        createPool(pivotHigh, TIER_SWING, "SwH", "Swing High", true, pivotBar)
+    else if showEqualInput and not na(lastPivotHigh) and math.abs(pivotHigh - lastPivotHigh) <= equalTolerance
+        LiquidityPool equalPool = createPool(math.max(pivotHigh, lastPivotHigh), TIER_EQUAL, "EQH ×2", "Equal Highs", true, lastPivotHighBar)
+        equalPool.touches := 2
+    lastPivotHigh    := pivotHigh
+    lastPivotHighBar := pivotBar
+
+if not na(pivotLow)
+    int pivotBar = bar_index - swingLengthInput
+    LiquidityPool match = findMatchingPool(pivotLow, false, equalTolerance)
+    if not na(match)
+        match.price   := math.min(match.price, pivotLow)
+        match.touches := match.touches + 1
+        if showEqualInput
+            match.tier     := TIER_EQUAL
+            match.weight   := WEIGHT_EQUAL
+            match.tag      := "EQL ×" + str.tostring(match.touches)
+            match.longName := "Equal Lows"
+        if not na(match.levelLine)
+            line.set_y1(match.levelLine, match.price)
+            line.set_y2(match.levelLine, match.price)
+        if not na(match.levelLabel)
+            label.set_y(match.levelLabel, match.price)
+            label.set_text(match.levelLabel, match.tag)
+        setPoolEmphasis(match, not na(drawPool) and drawPool.uid == match.uid)
+    else if showSwingInput
+        createPool(pivotLow, TIER_SWING, "SwL", "Swing Low", false, pivotBar)
+    else if showEqualInput and not na(lastPivotLow) and math.abs(pivotLow - lastPivotLow) <= equalTolerance
+        LiquidityPool equalPool = createPool(math.min(pivotLow, lastPivotLow), TIER_EQUAL, "EQL ×2", "Equal Lows", false, lastPivotLowBar)
+        equalPool.touches := 2
+    lastPivotLow    := pivotLow
+    lastPivotLowBar := pivotBar
+
+//Prior day and prior week levels roll at each period change; the superseded untapped levels are replaced
+var LiquidityPool priorDayHighPool  = na
+var LiquidityPool priorDayLowPool   = na
+var LiquidityPool priorWeekHighPool = na
+var LiquidityPool priorWeekLowPool  = na
+
+if showDailyInput and dailyApplies and newDay and not na(priorDayHigh)
+    rollPool(priorDayHighPool)
+    rollPool(priorDayLowPool)
+    priorDayHighPool := createPool(priorDayHigh, TIER_DAILY, "PDH", "Prior Day High", true, bar_index)
+    priorDayLowPool  := createPool(priorDayLow, TIER_DAILY, "PDL", "Prior Day Low", false, bar_index)
+
+if showWeeklyInput and weeklyApplies and newWeek and not na(priorWeekHigh)
+    rollPool(priorWeekHighPool)
+    rollPool(priorWeekLowPool)
+    priorWeekHighPool := createPool(priorWeekHigh, TIER_WEEKLY, "PWH", "Prior Week High", true, bar_index)
+    priorWeekLowPool  := createPool(priorWeekLow, TIER_WEEKLY, "PWL", "Prior Week Low", false, bar_index)
+
+//Session extremes
+trackSession(asiaSessionInput, sessionsApply and asiaOnInput, sessionDayChanged, "Asia High", "Asia Low", "Asia")
+trackSession(londonSessionInput, sessionsApply and londonOnInput, sessionDayChanged, "London High", "London Low", "London")
+trackSession(nySessionInput, sessionsApply and nyOnInput, sessionDayChanged, "NY High", "NY Low", "New York")
+
+//Unfilled gaps: a gap left below price draws delivery down to rebalance it, a gap above draws it up
+bool gapUpFormed   = showGapsInput and bar_index > 2 and low > high[2] and low - high[2] >= minGapInput * atrValue
+bool gapDownFormed = showGapsInput and bar_index > 2 and high < low[2] and low[2] - high >= minGapInput * atrValue
+
+if gapUpFormed
+    createGapPool(low, high[2], false, bar_index - 1)
+if gapDownFormed
+    createGapPool(low[2], high, true, bar_index - 1)
+
+//Inventory cap
+while array.size(poolArray) > MAX_POOLS
+    deletePoolDrawings(array.shift(poolArray))
+
+//Sweep pass: a pool is purged the moment price trades through it; stale minor pools age out of the inventory
+int checkIndex = array.size(poolArray) - 1
+while checkIndex >= 0
+    LiquidityPool pool = array.get(poolArray, checkIndex)
+    bool tapped        = pool.isUpper ? high > pool.price : low < pool.price
+    bool isWorkingDraw = not na(drawPool) and drawPool.uid == pool.uid
+    bool minorTier     = pool.tier == TIER_SWING or pool.tier == TIER_EQUAL or pool.tier == TIER_GAP
+    bool expired       = not tapped and not isWorkingDraw and minorTier and bar_index - pool.startBar > maxAgeInput
+    if tapped
+        pool.swept    := true
+        pool.sweptBar := bar_index
+        freezePool(pool)
+        array.remove(poolArray, checkIndex)
+    else if expired
+        deletePoolDrawings(pool)
+        array.remove(poolArray, checkIndex)
+    checkIndex -= 1
+
+//Draw reached: the working pool was traded into this bar - the read resets
+bool buySideReached  = false
+bool sellSideReached = false
+if not na(drawPool) and drawPool.swept and drawPool.sweptBar == bar_index
+    if drawPool.isUpper
+        buySideReached := true
+    else
+        sellSideReached := true
+
+//Structure bias: a close through the last structure swing sets the side setups are aimed at; a hard rejection
+//of the draw shows up here as the opposite break, flipping the read
+var float structureHighLevel = na
+var float structureLowLevel  = na
+var int   structureBias      = 0
+
+if not na(structurePivotHigh)
+    structureHighLevel := structurePivotHigh
+if not na(structurePivotLow)
+    structureLowLevel := structurePivotLow
+if not na(structureHighLevel) and close > structureHighLevel
+    structureBias      := 1
+    structureHighLevel := na
+if not na(structureLowLevel) and close < structureLowLevel
+    structureBias      := -1
+    structureLowLevel  := na
+
+//Draw selection: highest-scoring untapped pool on the bias side - score = weight / distance in ATR, so the
+//nearest compelling pool wins and higher-timeframe pools weigh more heavily. Falls back to the other side
+//when the bias side is empty; rebuilt every bar, so a purged pool re-anchors the read to the next objective
+LiquidityPool alignedBest = na
+LiquidityPool counterBest = na
+float alignedScore = -1.0
+float counterScore = -1.0
+
+for pool in poolArray
+    float distance = math.abs(pool.price - close) / atrValue
+    float score    = pool.weight / math.max(distance, MIN_DIST_ATR)
+    bool  aligned  = structureBias > 0 ? pool.isUpper : structureBias < 0 ? not pool.isUpper : true
+    if aligned
+        if score > alignedScore
+            alignedScore := score
+            alignedBest  := pool
+    else if score > counterScore
+        counterScore := score
+        counterBest  := pool
+
+LiquidityPool newDraw = na(alignedBest) ? counterBest : alignedBest
+
+int previousUid  = -1
+int previousSide = 0
+if not na(drawPool)
+    previousUid  := drawPool.uid
+    previousSide := drawPool.isUpper ? 1 : -1
+
+int newDrawUid  = -1
+int newDrawSide = 0
+if not na(newDraw)
+    newDrawUid  := newDraw.uid
+    newDrawSide := newDraw.isUpper ? 1 : -1
+
+bool drawFlippedUp   = newDrawUid != previousUid and newDrawSide == 1 and previousSide == -1
+bool drawFlippedDown = newDrawUid != previousUid and newDrawSide == -1 and previousSide == 1
+bool drawRetargeted  = newDrawUid != previousUid and newDrawUid != -1 and previousUid != -1 and newDrawSide == previousSide
+
+if newDrawUid != previousUid
+    if not na(drawPool) and not drawPool.swept
+        setPoolEmphasis(drawPool, false)
+    if not na(newDraw)
+        setPoolEmphasis(newDraw, true)
+
+drawPool := newDraw
+
+float drawLevel   = na
+bool  drawIsUpper = false
+if not na(drawPool)
+    drawLevel   := drawPool.price
+    drawIsUpper := drawPool.isUpper
+
+color drawColor       = drawIsUpper ? bullColorInput : bearColorInput
+float drawDistanceAtr = na(drawLevel) ? na : (drawLevel - close) / atrValue
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visuals
+//---------------------------------------------------------------------------------------------------------------------{
+//Magnet gradient between price and the working draw - transparent at price, glowing toward the pool
+pricePlotId = plot(close, "Price Anchor", color = na, editable = false, display = display.none)
+drawPlotId  = plot(drawLevel, "Draw on Liquidity", color = showPathInput ? color.new(drawColor, 35) : na, style = plot.style_linebr, linewidth = 1, editable = false)
+
+color magnetNearColor = showMagnetInput ? color.new(drawColor, 60) : na
+color magnetFarColor  = showMagnetInput ? color.new(drawColor, 100) : na
+fill(pricePlotId, drawPlotId, top_value = math.max(close, drawLevel), bottom_value = math.min(close, drawLevel), top_color = drawIsUpper ? magnetNearColor : magnetFarColor, bottom_color = drawIsUpper ? magnetFarColor : magnetNearColor, title = "Draw Gradient")
+
+plot(drawDistanceAtr, "Draw Distance (ATR)", color = drawColor, display = display.data_window, editable = false)
+
+//Pin pool labels to the right of the latest bar, refresh their hover context, and tag the working draw
+var label drawTag = na
+if barstate.islast
+    for pool in poolArray
+        if not na(pool.levelLabel)
+            bool isWorkingDraw = not na(drawPool) and drawPool.uid == pool.uid
+            label.set_x(pool.levelLabel, bar_index + LABEL_OFFSET)
+            label.set_text(pool.levelLabel, isWorkingDraw and showDrawTagInput ? "" : pool.tag)
+            label.set_tooltip(pool.levelLabel, poolTooltip(pool, atrValue))
+    if showDrawTagInput and not na(drawPool)
+        if na(drawTag)
+            drawTag := label.new(bar_index + LABEL_OFFSET, close, "", color = LABEL_BG, style = label.style_label_left, size = size.small)
+        label.set_xy(drawTag, bar_index + LABEL_OFFSET, drawLevel)
+        label.set_text(drawTag, "DOL ▸ " + drawPool.tag)
+        label.set_textcolor(drawTag, drawColor)
+        label.set_tooltip(drawTag, "Working draw on liquidity\n" + poolTooltip(drawPool, atrValue))
+    else if not na(drawTag)
+        label.delete(drawTag)
+        drawTag := na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dashTable = table.new(dashPosition, 2, 5
+  , bgcolor      = DASH_BG
+  , border_width = 0
+  , frame_color  = DASH_FRAME
+  , frame_width  = 1)
+
+if barstate.islast and showDashInput
+    int upperCount = 0
+    int lowerCount = 0
+    for pool in poolArray
+        if pool.isUpper
+            upperCount += 1
+        else
+            lowerCount += 1
+
+    string drawText     = "-"
+    string sideText     = "-"
+    string distanceText = "-"
+    color  valueCss     = DASH_TEXT
+    color  drawValueCss = NEUTRAL_COLOR
+    if not na(drawPool)
+        drawText     := drawPool.tag + " @ " + str.tostring(drawLevel, format.mintick)
+        sideText     := drawIsUpper ? "Buy-side ▲" : "Sell-side ▼"
+        distanceText := str.tostring(100 * math.abs(drawLevel - close) / close, "#.##") + "% (" + str.tostring(math.abs(drawLevel - close) / atrValue, "#.#") + " ATR)"
+        drawValueCss := drawColor
+
+    bool drawAligned = na(drawPool) or structureBias == 0 or (structureBias > 0) == drawIsUpper
+    string structureText = structureBias > 0 ? "Bullish" : structureBias < 0 ? "Bearish" : "Neutral"
+    if not na(drawPool) and structureBias != 0
+        structureText := structureText + (drawAligned ? " - aligned" : " - counter")
+    color structureCss = structureBias > 0 ? bullColorInput : structureBias < 0 ? bearColorInput : NEUTRAL_COLOR
+
+    table.cell(dashTable, 0, 0, "Draw on Liquidity", text_color = DASH_TEXT, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 0, sideText, text_color = drawValueCss, text_halign = text.align_right, text_size = dashTextSize)
+    table.cell(dashTable, 0, 1, "Target", text_color = DASH_HEADER, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 1, drawText, text_color = drawValueCss, text_halign = text.align_right, text_size = dashTextSize)
+    table.cell(dashTable, 0, 2, "Structure", text_color = DASH_HEADER, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 2, structureText, text_color = structureCss, text_halign = text.align_right, text_size = dashTextSize)
+    table.cell(dashTable, 0, 3, "Distance", text_color = DASH_HEADER, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 3, distanceText, text_color = valueCss, text_halign = text.align_right, text_size = dashTextSize)
+    table.cell(dashTable, 0, 4, "Untapped Pools", text_color = DASH_HEADER, text_halign = text.align_left, text_size = dashTextSize)
+    table.cell(dashTable, 1, 4, "▲ " + str.tostring(upperCount) + "  ▼ " + str.tostring(lowerCount), text_color = valueCss, text_halign = text.align_right, text_size = dashTextSize)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(buySideReached,  "Buy-side Draw Reached",      "Price traded into the buy-side draw on liquidity on {{ticker}} - pool purged, the read re-anchors")
+alertcondition(sellSideReached, "Sell-side Draw Reached",     "Price traded into the sell-side draw on liquidity on {{ticker}} - pool purged, the read re-anchors")
+alertcondition(drawFlippedUp,   "Draw Flipped to Buy-side",   "The working draw on liquidity on {{ticker}} flipped to a buy-side pool above price")
+alertcondition(drawFlippedDown, "Draw Flipped to Sell-side",  "The working draw on liquidity on {{ticker}} flipped to a sell-side pool below price")
+alertcondition(drawRetargeted,  "Draw Re-anchored Same Side", "The working draw on liquidity on {{ticker}} re-anchored to the next pool on the same side")
+
+//---------------------------------------------------------------------------------------------------------------------}

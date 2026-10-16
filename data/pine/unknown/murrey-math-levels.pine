@@ -1,0 +1,279 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Murrey Math Levels", "Murrey Math Levels", overlay = true, format = format.price, max_lines_count = 500, max_labels_count = 50)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+color TRANSPARENT = #00000000
+
+int FILL_TRANSPARENCY = 94
+
+string FRAME_GROUP = "Frame"
+string STYLE_GROUP = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+lengthInput = input.int(64, "Frame Length", minval = 8, group = FRAME_GROUP, tooltip = "Bars whose highest high and lowest low define the Murrey Math frame, and the cadence at which a completed frame re-anchors the grid. Powers of two (32, 64, 128, 256) are the published convention.")
+
+escapeInput = input.bool(true, "Recalculate On Escape", group = FRAME_GROUP, tooltip = "Rebuild the frame as soon as a bar closes beyond the +2/8 or -2/8 overshoot lines instead of waiting for the current frame to complete, mirroring the system's rule that acceptance in the overshoot octaves calls for a new frame.")
+
+extensionsInput = input.bool(true, "Overshoot Octaves (+/-1/8, +/-2/8)", group = FRAME_GROUP, tooltip = "Extend the ladder one and two eighths beyond 0/8 and 8/8. The system reads price above 8/8 as extremely overbought and price below 0/8 as extremely oversold.")
+
+historyInput = input.bool(true, "Keep Prior Frames", group = FRAME_GROUP, tooltip = "Keep the ladders of completed frames on the chart so reactions at 2/8, 4/8, 6/8 and the extremes can be validated historically before any line is trusted.")
+
+labelsInput = input.bool(true, "Level Labels", group = STYLE_GROUP, tooltip = "Label each line of the current ladder with its octave fraction and its conventional role in the Murrey vocabulary.")
+
+labelSizeInput = input.string("Small", "Label Size", options = ["Tiny", "Small", "Normal"], group = STYLE_GROUP, tooltip = "Text size of the level labels.")
+
+pricesInput = input.bool(false, "Show Prices In Labels", group = STYLE_GROUP, tooltip = "Append each level's price to its role label.")
+
+widthInput = input.int(2, "Major Line Width", minval = 1, maxval = 5, group = STYLE_GROUP, tooltip = "Line width of the structural 0/8, 4/8 and 8/8 levels. All other rungs are drawn one pixel wide.")
+
+majorColorInput = input.color(#787b86, "4/8 Major Pivot", group = STYLE_GROUP, tooltip = "Color of the 4/8 midline, the major pivot separating bullish from bearish territory, also used for the 3/8-5/8 congestion band fill.")
+
+supportColorInput = input.color(#089981, "0/8 Support & Oversold Overshoots", group = STYLE_GROUP, tooltip = "Color of the 0/8 line, the frame's strongest support, and of the -1/8 and -2/8 oversold overshoot lines and fill.")
+
+resistanceColorInput = input.color(#f23645, "8/8 Resistance & Overbought Overshoots", group = STYLE_GROUP, tooltip = "Color of the 8/8 line, the frame's strongest resistance, and of the +1/8 and +2/8 overbought overshoot lines and fill.")
+
+reversalColorInput = input.color(#ff9800, "2/8 & 6/8 Reversal", group = STYLE_GROUP, tooltip = "Color of the 2/8 and 6/8 lines, the system's strong reversal candidates.")
+
+minorColorInput = input.color(#787b86, "Minor Lines", group = STYLE_GROUP, tooltip = "Color of the 1/8 and 7/8 weak stall lines and of the 3/8 and 5/8 congestion band boundaries.")
+
+congestionFillInput = input.bool(true, "Congestion Band Fill (3/8 - 5/8)", group = STYLE_GROUP, tooltip = "Shade the 3/8-5/8 band where the system expects rotational trade to spend much of its time.")
+
+overshootFillInput = input.bool(true, "Overshoot Zone Fills", group = STYLE_GROUP, tooltip = "Shade the overshoot octaves beyond 0/8 and 8/8. Requires the overshoot octaves to be enabled.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Murrey Math Frame Calculation
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Octave scale base for the frame high: powers of ten subdivided into halves, quarters and eighths,
+// per the published Murrey Math scale, extended upward by powers of ten for very large prices
+fractalBase(float value) =>
+    float base = na
+    if value <= 0.390625
+        base := 0.1953125
+    else if value <= 1.5625
+        base := 1.5625
+    else if value <= 3.125
+        base := 3.125
+    else if value <= 6.25
+        base := 6.25
+    else if value <= 25
+        base := 12.5
+    else if value <= 250
+        base := 100
+    else if value <= 2500
+        base := 1000
+    else if value <= 25000
+        base := 10000
+    else
+        base := 100000
+        float cap = 250000
+        while value > cap and cap < 1e17
+            base := base * 10
+            cap  := cap * 10
+    base
+
+// Snap the lookback range onto the octave scale and derive the frame (the "square") per the published
+// rounding rules: the smallest power-of-two subdivision of the scale base that holds the range, anchored
+// to a clean multiple, then reduced to the half or quarter square that best fits the observed high-low
+murreyFrame(float lo, float hi) =>
+    float base   = fractalBase(hi)
+    float rng    = hi - lo
+    float steps  = math.floor(math.log(base / rng) / math.log(2))
+    float octave = base * math.pow(0.5, steps)
+    float mn     = math.floor(lo / octave) * octave
+    float mx     = mn + octave > hi ? mn + octave : mn + 2 * octave
+    float sp     = mx - mn
+    float x1 = 0.0
+    float x2 = 0.0
+    float x3 = 0.0
+    float x4 = 0.0
+    float x5 = 0.0
+    float x6 = 0.0
+    if lo >= mn + sp * 3 / 16 and hi <= mn + sp * 9 / 16
+        x2 := mn + sp / 2
+    if lo >= mn - sp / 8 and hi <= mn + sp * 5 / 8 and x2 == 0
+        x1 := mn + sp / 2
+    if lo >= mn + sp * 7 / 16 and hi <= mn + sp * 13 / 16
+        x4 := mn + sp * 3 / 4
+    if lo >= mn + sp * 3 / 8 and hi <= mn + sp * 9 / 8 and x4 == 0
+        x5 := mx
+    if lo >= mn + sp / 8 and hi <= mn + sp * 7 / 8 and x1 == 0 and x2 == 0 and x4 == 0 and x5 == 0
+        x3 := mn + sp * 3 / 4
+    if x1 + x2 + x3 + x4 + x5 == 0
+        x6 := mx
+    float frameTop = x1 + x2 + x3 + x4 + x5 + x6
+    float y1 = x1 > 0 ? mn : 0
+    float y2 = x2 > 0 ? mn + sp / 4 : 0
+    float y3 = x3 > 0 ? mn + sp / 4 : 0
+    float y4 = x4 > 0 ? mn + sp / 2 : 0
+    float y5 = x5 > 0 ? mn + sp / 2 : 0
+    float y6 = frameTop > 0 and y1 + y2 + y3 + y4 + y5 == 0 ? mn : 0
+    float frameBottom = y1 + y2 + y3 + y4 + y5 + y6
+    [frameBottom, frameTop]
+
+// Price of a rung by index, 0 = -2/8 ... 2 = 0/8 ... 6 = 4/8 ... 10 = 8/8 ... 12 = +2/8
+rungPrice(float frameLo, float stepSize, int idx) =>
+    frameLo + (idx - 2) * stepSize
+
+// Conventional role of each rung in Murrey's vocabulary
+levelRole(int idx) =>
+    switch idx
+        0  => "-2/8 - Extreme Oversold"
+        1  => "-1/8 - Oversold"
+        2  => "0/8 - Strongest Support"
+        3  => "1/8 - Weak Stall"
+        4  => "2/8 - Strong Reversal"
+        5  => "3/8 - Congestion Bottom"
+        6  => "4/8 - Major Pivot"
+        7  => "5/8 - Congestion Top"
+        8  => "6/8 - Strong Reversal"
+        9  => "7/8 - Weak Stall"
+        10 => "8/8 - Strongest Resistance"
+        11 => "+1/8 - Overbought"
+        12 => "+2/8 - Extreme Overbought"
+        => ""
+
+levelColor(int idx) =>
+    switch idx
+        0  => supportColorInput
+        1  => supportColorInput
+        2  => supportColorInput
+        3  => minorColorInput
+        4  => reversalColorInput
+        5  => minorColorInput
+        6  => majorColorInput
+        7  => minorColorInput
+        8  => reversalColorInput
+        9  => minorColorInput
+        10 => resistanceColorInput
+        11 => resistanceColorInput
+        12 => resistanceColorInput
+        => minorColorInput
+
+levelStyle(int idx) =>
+    idx == 0 or idx == 1 or idx == 11 or idx == 12 ? line.style_dashed : idx % 2 == 1 ? line.style_dotted : line.style_solid
+
+levelWidth(int idx) =>
+    idx == 2 or idx == 6 or idx == 10 ? widthInput : 1
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Frame State
+//---------------------------------------------------------------------------------------------------------------------{
+
+var float frameLow  = na
+var float frameHigh = na
+var float frameStep = na
+var int   anchorBar = na
+
+float hh = ta.highest(high, lengthInput)
+float ll = ta.lowest(low, lengthInput)
+
+bool frameDue = na(anchorBar) ? true : bar_index - anchorBar >= lengthInput
+
+bool escaped = false
+if escapeInput and not na(frameStep)
+    escaped := close > frameHigh + 2 * frameStep or close < frameLow - 2 * frameStep
+
+float prevLow  = frameLow
+float prevHigh = frameHigh
+
+bool reAnchored = false
+if (frameDue or escaped) and not na(hh) and not na(ll) and hh > ll and barstate.isconfirmed
+    [fLo, fHi] = murreyFrame(ll, hh)
+    frameLow   := fLo
+    frameHigh  := fHi
+    frameStep  := (fHi - fLo) / 8
+    anchorBar  := bar_index
+    reAnchored := true
+
+bool firstFrame  = reAnchored and na(prevLow)
+bool levelsMoved = reAnchored and (firstFrame or prevLow != frameLow or prevHigh != frameHigh)
+
+float lvl08 = frameLow
+float lvl28 = frameLow + 2 * frameStep
+float lvl48 = frameLow + 4 * frameStep
+float lvl68 = frameLow + 6 * frameStep
+float lvl88 = frameHigh
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Level Ladder
+//---------------------------------------------------------------------------------------------------------------------{
+
+var array<line>     frameLines  = array.new<line>()
+var array<linefill> frameFills  = array.new<linefill>()
+var array<label>    frameLabels = array.new<label>()
+
+int rungFirst = extensionsInput ? 0 : 2
+int rungLast  = extensionsInput ? 12 : 10
+
+if levelsMoved
+    if not historyInput
+        for eachFill in frameFills
+            linefill.delete(eachFill)
+        for eachLine in frameLines
+            line.delete(eachLine)
+    array.clear(frameFills)
+    array.clear(frameLines)
+    for idx = rungFirst to rungLast
+        float rungY = rungPrice(frameLow, frameStep, idx)
+        array.push(frameLines, line.new(bar_index, rungY, bar_index, rungY, color = levelColor(idx), style = levelStyle(idx), width = levelWidth(idx)))
+    if congestionFillInput
+        array.push(frameFills, linefill.new(array.get(frameLines, 5 - rungFirst), array.get(frameLines, 7 - rungFirst), color.new(majorColorInput, FILL_TRANSPARENCY)))
+    if extensionsInput and overshootFillInput
+        array.push(frameFills, linefill.new(array.get(frameLines, 10 - rungFirst), array.get(frameLines, 12 - rungFirst), color.new(resistanceColorInput, FILL_TRANSPARENCY)))
+        array.push(frameFills, linefill.new(array.get(frameLines, 0), array.get(frameLines, 2 - rungFirst), color.new(supportColorInput, FILL_TRANSPARENCY)))
+
+// extend the active ladder to the latest bar, prior ladders stay frozen where they ended
+if array.size(frameLines) > 0
+    for eachLine in frameLines
+        line.set_x2(eachLine, bar_index)
+
+string labelSize = labelSizeInput == "Tiny" ? size.tiny : labelSizeInput == "Normal" ? size.normal : size.small
+
+if barstate.islast and labelsInput and not na(frameLow)
+    if array.size(frameLabels) == 0
+        for idx = rungFirst to rungLast
+            array.push(frameLabels, label.new(bar_index, 0.0, "", style = label.style_label_left, color = TRANSPARENT, size = labelSize))
+    for idx = rungFirst to rungLast
+        label rungLabel = array.get(frameLabels, idx - rungFirst)
+        float rungY = rungPrice(frameLow, frameStep, idx)
+        label.set_xy(rungLabel, bar_index, rungY)
+        label.set_text(rungLabel, levelRole(idx) + (pricesInput ? " (" + str.tostring(rungY, format.mintick) + ")" : ""))
+        label.set_textcolor(rungLabel, levelColor(idx))
+
+plot(lvl08, "0/8", supportColorInput, display = display.data_window)
+plot(lvl48, "4/8", majorColorInput, display = display.data_window)
+plot(lvl88, "8/8", resistanceColorInput, display = display.data_window)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+bool gridStable = not na(lvl48) and not levelsMoved
+
+bool crossAbove48 = gridStable and close[1] <= lvl48 and close > lvl48
+bool crossBelow48 = gridStable and close[1] >= lvl48 and close < lvl48
+bool breakAbove88 = gridStable and close[1] <= lvl88 and close > lvl88
+bool breakBelow08 = gridStable and close[1] >= lvl08 and close < lvl08
+bool test68       = gridStable and high[1] < lvl68 and high >= lvl68
+bool test28       = gridStable and low[1] > lvl28 and low <= lvl28
+bool frameJumped  = levelsMoved and not firstFrame
+
+alertcondition(crossAbove48, "Cross Above 4/8", "Price crossed above the 4/8 major pivot - bullish territory on the Murrey Math grid")
+alertcondition(crossBelow48, "Cross Below 4/8", "Price crossed below the 4/8 major pivot - bearish territory on the Murrey Math grid")
+alertcondition(breakAbove88, "Close Above 8/8", "Price closed above the 8/8 extreme resistance into the overbought overshoot octaves")
+alertcondition(breakBelow08, "Close Below 0/8", "Price closed below the 0/8 extreme support into the oversold overshoot octaves")
+alertcondition(test68, "6/8 Reversal Test", "Price tested the 6/8 strong reversal line from below")
+alertcondition(test28, "2/8 Reversal Test", "Price tested the 2/8 strong reversal line from above")
+alertcondition(frameJumped, "New Frame", "Murrey Math frame recomputed - the level ladder jumped to new prices")
+
+//---------------------------------------------------------------------------------------------------------------------}

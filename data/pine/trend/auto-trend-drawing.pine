@@ -1,0 +1,137 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Auto Trend Drawing", "Auto Trend Drawing", overlay = true, max_polylines_count = 100)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+lengthInput     = input.int(300, "Window Size", minval = 10, maxval = 1000, tooltip = "Number of recent bars to simplify.")
+multInput       = input.float(2.0, "Simplification Multiplier", minval = 0.1, step = 0.1, tooltip = "Higher values create smoother, more 'macro' curves.")
+atrLengthInput  = input.int(14, "ATR Length", minval = 1)
+tensionInput    = input.float(0.5, "Curve Tension", minval = 0.0, maxval = 1.0, step = 0.1, tooltip = "Adjusts how tightly the curve follows the anchor points.")
+resolutionInput = input.int(10, "Curve Resolution", minval = 2, maxval = 20, tooltip = "Number of sub-points between each anchor point.")
+
+STYLE_GROUP     = "Style"
+lineColorInput  = input.color(#ff5d00, "Line Color", group = STYLE_GROUP)
+lineWidthInput  = input.int(1, "Line Width", minval = 1, group = STYLE_GROUP)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types
+//---------------------------------------------------------------------------------------------------------------------{
+type Point
+    float x
+    float y
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// @function Calculates the perpendicular distance from a point to a line segment
+get_distance(Point p1, Point p2, Point p0) =>
+    float x1 = p1.x, y1 = p1.y
+    float x2 = p2.x, y2 = p2.y
+    float x0 = p0.x, y0 = p0.y
+    float dx = x2 - x1
+    float dy = y2 - y1
+    float numerator = math.abs(dy * x0 - dx * y0 + x2 * y1 - y2 * x1)
+    float denominator = math.sqrt(dy * dy + dx * dx)
+    denominator == 0 ? 0 : numerator / denominator
+
+// @function Catmull-Rom Spline interpolation
+// @param p0, p1, p2, p3 Control points
+// @param t Interpolation factor (0 to 1)
+// @param alpha Tension (0.5 is centripetal)
+interpolate(Point p0, Point p1, Point p2, Point p3, float t, float tension) =>
+    float t2 = t * t
+    float t3 = t2 * t
+    
+    // Catmull-Rom basis functions
+    float f1 = -tension * t3 + 2.0 * tension * t2 - tension * t
+    float f2 = (2.0 - tension) * t3 + (tension - 3.0) * t2 + 1.0
+    float f3 = (tension - 2.0) * t3 + (3.0 - 2.0 * tension) * t2 + tension * t
+    float f4 = tension * t3 - tension * t2
+    
+    float resX = p0.x * f1 + p1.x * f2 + p2.x * f3 + p3.x * f4
+    float resY = p0.y * f1 + p1.y * f2 + p2.y * f3 + p3.y * f4
+    Point.new(resX, resY)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+float atr = ta.atr(atrLengthInput)
+
+var polyline flowLine = na
+
+if barstate.islast and not na(atr) and atr > 0
+    Point[] normPoints = array.new<Point>()
+    chart.point[] origPoints = array.new<chart.point>()
+    
+    // 1. Gather points
+    for i = lengthInput - 1 to 0
+        float price = close[i]
+        normPoints.push(Point.new(bar_index[i], price / atr))
+    
+    int n = normPoints.size()
+    bool[] keep = array.new_bool(n, false)
+    keep.set(0, true)
+    keep.set(n - 1, true)
+    
+    // 2. RDP Anchor Identification
+    int[] stack = array.new_int()
+    stack.push(0)
+    stack.push(n - 1)
+    
+    while stack.size() > 0
+        int lastIdx = stack.pop()
+        int firstIdx = stack.pop()
+        float max_dist = 0.0
+        int index = firstIdx
+        for i = firstIdx + 1 to lastIdx - 1
+            float d = get_distance(normPoints.get(firstIdx), normPoints.get(lastIdx), normPoints.get(i))
+            if d > max_dist
+                max_dist := d
+                index := i
+        if max_dist > multInput
+            keep.set(index, true)
+            stack.push(index)
+            stack.push(lastIdx)
+            stack.push(firstIdx)
+            stack.push(index)
+
+    // 3. Extract kept anchor points
+    Point[] anchors = array.new<Point>()
+    for i = 0 to n - 1
+        if keep.get(i)
+            anchors.push(normPoints.get(i))
+
+    // 4. Spline Interpolation
+    if anchors.size() >= 2
+        chart.point[] splinePoints = array.new<chart.point>()
+        
+        // Add "phantom" points at ends for Catmull-Rom
+        Point pStart = Point.new(anchors.get(0).x - 1, anchors.get(0).y)
+        Point pEnd   = Point.new(anchors.get(anchors.size()-1).x + 1, anchors.get(anchors.size()-1).y)
+        
+        for i = 0 to anchors.size() - 2
+            Point p0 = i == 0 ? pStart : anchors.get(i - 1)
+            Point p1 = anchors.get(i)
+            Point p2 = anchors.get(i + 1)
+            Point p3 = i == anchors.size() - 2 ? pEnd : anchors.get(i + 2)
+            
+            for j = 0 to resolutionInput - 1
+                float t = j / float(resolutionInput)
+                Point inter = interpolate(p0, p1, p2, p3, t, tensionInput)
+                splinePoints.push(chart.point.from_index(int(inter.x), inter.y * atr))
+        
+        // Add final point
+        Point last = anchors.get(anchors.size() - 1)
+        splinePoints.push(chart.point.from_index(int(last.x), last.y * atr))
+
+        // 5. Visualize
+        if not na(flowLine)
+            flowLine.delete()
+        
+        flowLine := polyline.new(splinePoints, line_color = lineColorInput, line_width = lineWidthInput)
+
+//---------------------------------------------------------------------------------------------------------------------}

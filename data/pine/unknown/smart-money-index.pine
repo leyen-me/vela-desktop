@@ -1,0 +1,191 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Smart Money Index", "Smart Money Index", overlay = false, format = format.price, precision = 2, max_lines_count = 500, max_labels_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+MS_PER_MINUTE = 60000
+
+BULL_COLOR    = #089981 // SMI above its average, bullish divergences
+BEAR_COLOR    = #f23645 // SMI below its average, bearish divergences
+NEUTRAL_COLOR = #787b86 // the moving average, and the SMI while the average is hidden
+
+DASH_BG    = #161616
+DASH_FRAME = #2E2E2E
+DASH_TEXT  = #DBDBDB
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+firstMinutesInput = input.int(30, "Opening Window", minval = 1, inline = "open", group = "Calculation", tooltip = "Length of the opening window in minutes, classically the first 30 minutes of the cash session. Its net change is treated as emotional, news-driven flow and is subtracted from the running total, scaled by the weight. Published variants use different window lengths and weightings.")
+firstWeightInput  = input.float(1.0, "Weight", minval = 0, step = 0.1, inline = "open", group = "Calculation", tooltip = "Weight applied to the opening window net change. A value of 1 reproduces the classic formula.")
+lastMinutesInput  = input.int(60, "Closing Window", minval = 1, inline = "close", group = "Calculation", tooltip = "Length of the closing window in minutes, classically the final hour of the cash session. Its net change is treated as deliberate, well-capitalized flow and is added to the running total, scaled by the weight. Use a chart timeframe that divides the windows evenly (e.g. 30m or lower for the defaults).")
+lastWeightInput   = input.float(1.0, "Weight", minval = 0, step = 0.1, inline = "close", group = "Calculation", tooltip = "Weight applied to the closing window net change. A value of 1 reproduces the classic formula.")
+
+showMaInput   = input.bool(true, "Show Moving Average", group = "Moving Average", tooltip = "Overlay a moving average of the SMI. The SMI line and gradient fill are colored by the side of the average the SMI is on, and average crossings are available as alerts.")
+maTypeInput   = input.string("SMA", "Type", options = ["SMA", "EMA", "RMA (SMMA)", "WMA"], inline = "ma", group = "Moving Average", tooltip = "Moving average type applied to the SMI.")
+maLengthInput = input.int(20, "Length", minval = 1, inline = "ma", group = "Moving Average", tooltip = "Moving average period in bars.")
+
+showDivInput   = input.bool(true, "Show Divergences", group = "Divergences", tooltip = "Detect and draw regular divergences between price and the SMI: new price highs the SMI refuses to confirm (distribution into strength) and new price lows where the SMI holds firmer (accumulation under a weak tape). Divergences are context, not triggers, and can persist for a long time before mattering.")
+divLengthInput = input.int(5, "Pivot Length", minval = 1, group = "Divergences", tooltip = "Number of bars to the left and right required to confirm an SMI swing point. Divergences are evaluated between consecutive confirmed swings, so they are detected with this many bars of delay.")
+divRangeInput  = input.int(60, "Max Bars Between Pivots", minval = 2, maxval = 500, group = "Divergences", tooltip = "Maximum number of bars allowed between two swing points for a divergence to be considered. SMI divergences often build over multiple weeks, so keep this generous.")
+
+smiColorInput  = input.color(NEUTRAL_COLOR, "SMI Line", group = "Style", tooltip = "Color of the SMI line when the moving average is hidden.")
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "bb", group = "Style", tooltip = "Color used when the SMI is above its moving average and for bullish divergences.")
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "bb", group = "Style", tooltip = "Color used when the SMI is below its moving average and for bearish divergences.")
+maColorInput   = input.color(NEUTRAL_COLOR, "Moving Average", group = "Style", tooltip = "Color of the SMI moving average.")
+fillInput      = input.bool(true, "Gradient Fill", group = "Style", tooltip = "Draw a vertical gradient fill between the SMI and its moving average, fully transparent at the average and stronger toward the SMI value.")
+showModeInput  = input.bool(true, "Show Calculation Mode", group = "Style", tooltip = "Display which calculation is active: intraday session windows, or the daily fallback that subtracts the overnight gap and adds the open-to-close change when the intraday windows cannot be observed on the chart timeframe.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Smart Money Index
+//---------------------------------------------------------------------------------------------------------------------{
+firstWindowMs = firstMinutesInput * MS_PER_MINUTE
+lastWindowMs  = lastMinutesInput  * MS_PER_MINUTE
+
+//Daily anchor & session close time, requested with a timeframe that is always valid on the current chart
+dayTime        = time(timeframe.isintraday ? "D" : timeframe.period)
+sessionEndTime = time_close(timeframe.isintraday ? "D" : timeframe.period)
+newDay         = nz(ta.change(dayTime), 0) != 0
+
+var float smi              = 0.0
+var float smiBase          = 0.0
+var float dumbSum          = 0.0
+var float smartSum         = 0.0
+var int   sessionStartTime = na
+
+if timeframe.isintraday
+    //Anchor the running total to the prior session value and reset the accumulated windows on each new session
+    if session.isfirstbar_regular or newDay
+        smiBase  := smi
+        dumbSum  := 0.0
+        smartSum := 0.0
+    if session.isfirstbar_regular
+        sessionStartTime := time
+
+    //Net change contributed by the current bar, measured from the session open on the first session bar
+    barChange = session.isfirstbar_regular ? close - open : close - nz(close[1], close)
+
+    //Window membership tested on the bar opening time
+    inOpeningWindow = not na(sessionStartTime) and time >= sessionStartTime and time - sessionStartTime < firstWindowMs
+    inClosingWindow = not na(sessionEndTime) and time >= sessionEndTime - lastWindowMs and time < sessionEndTime
+
+    if inOpeningWindow
+        dumbSum += barChange
+    if inClosingWindow
+        smartSum += barChange
+
+    smi := smiBase - firstWeightInput * dumbSum + lastWeightInput * smartSum
+else
+    //Daily & higher timeframe fallback: the overnight gap proxies the emotional open, open-to-close the positioned session
+    gapChange     = open - nz(close[1], open)
+    sessionChange = close - open
+
+    smi := smi - firstWeightInput * gapChange + lastWeightInput * sessionChange
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Moving Average
+//---------------------------------------------------------------------------------------------------------------------{
+maSma = ta.sma(smi, maLengthInput)
+maEma = ta.ema(smi, maLengthInput)
+maRma = ta.rma(smi, maLengthInput)
+maWma = ta.wma(smi, maLengthInput)
+
+smiMa = switch maTypeInput
+    "SMA"        => maSma
+    "EMA"        => maEma
+    "RMA (SMMA)" => maRma
+    => maWma
+
+crossAbove = ta.crossover(smi, smiMa)
+crossBelow = ta.crossunder(smi, smiMa)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Divergences
+//---------------------------------------------------------------------------------------------------------------------{
+pivotHighValue = ta.pivothigh(smi, divLengthInput, divLengthInput)
+pivotLowValue  = ta.pivotlow(smi, divLengthInput, divLengthInput)
+
+var float prevHighSmi   = na
+var float prevHighPrice = na
+var int   prevHighBar   = na
+var float prevLowSmi    = na
+var float prevLowPrice  = na
+var int   prevLowBar    = na
+
+bearishDivergence = false
+bullishDivergence = false
+
+if not na(pivotHighValue)
+    pivotBar   = bar_index - divLengthInput
+    pivotPrice = high[divLengthInput]
+
+    //Price sets a higher high the SMI refuses to confirm - distribution into strength
+    if not na(prevHighSmi) and pivotBar - prevHighBar <= divRangeInput and pivotPrice > prevHighPrice and pivotHighValue < prevHighSmi
+        bearishDivergence := true
+
+        if showDivInput
+            line.new(prevHighBar, prevHighSmi, pivotBar, pivotHighValue, color = bearColorInput, style = line.style_dashed, width = 2)
+            label.new(pivotBar, pivotHighValue, "Bear", color = #00000000, textcolor = bearColorInput, style = label.style_label_down, size = size.tiny)
+
+    prevHighSmi   := pivotHighValue
+    prevHighPrice := pivotPrice
+    prevHighBar   := pivotBar
+
+if not na(pivotLowValue)
+    pivotBar   = bar_index - divLengthInput
+    pivotPrice = low[divLengthInput]
+
+    //Price sets a lower low while the SMI holds firmer - accumulation under a weak tape
+    if not na(prevLowSmi) and pivotBar - prevLowBar <= divRangeInput and pivotPrice < prevLowPrice and pivotLowValue > prevLowSmi
+        bullishDivergence := true
+
+        if showDivInput
+            line.new(prevLowBar, prevLowSmi, pivotBar, pivotLowValue, color = bullColorInput, style = line.style_dashed, width = 2)
+            label.new(pivotBar, pivotLowValue, "Bull", color = #00000000, textcolor = bullColorInput, style = label.style_label_up, size = size.tiny)
+
+    prevLowSmi   := pivotLowValue
+    prevLowPrice := pivotPrice
+    prevLowBar   := pivotBar
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Plots
+//---------------------------------------------------------------------------------------------------------------------{
+maReady  = showMaInput and not na(smiMa)
+smiColor = maReady ? (smi >= smiMa ? bullColorInput : bearColorInput) : smiColorInput
+
+smiPlotId = plot(smi, "Smart Money Index", smiColor, 2)
+maPlotId  = plot(smiMa, "Moving Average", showMaInput ? maColorInput : color(na), 1)
+
+//Vertical gradient fill, transparent at the moving average and stronger toward the SMI value
+maSafe     = nz(smiMa, smi)
+fillTop    = math.max(smi, maSafe)
+fillBottom = math.min(smi, maSafe)
+smiAbove   = smi >= maSafe
+fillOn     = fillInput and maReady
+
+fillTopColor    = fillOn ? (smiAbove ? color.new(bullColorInput, 50) : color.new(bearColorInput, 100)) : color(na)
+fillBottomColor = fillOn ? (smiAbove ? color.new(bullColorInput, 100) : color.new(bearColorInput, 50)) : color(na)
+
+fill(smiPlotId, maPlotId, top_value = fillTop, bottom_value = fillBottom, top_color = fillTopColor, bottom_color = fillBottomColor, title = "SMI / MA Gradient Fill")
+
+//Calculation mode readout
+var table modeTable = table.new(position.top_right, 1, 1, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+if showModeInput and barstate.islast
+    modeText = timeframe.isintraday
+         ? str.format("SMI windows: first {0}m / last {1}m of session", firstMinutesInput, lastMinutesInput)
+         : "SMI fallback: overnight gap vs open-to-close"
+    table.cell(modeTable, 0, 0, modeText, text_color = DASH_TEXT, text_size = size.small, bgcolor = DASH_BG)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(bullishDivergence, "Bullish Divergence", "Smart Money Index bullish divergence: price set a lower low while the SMI held a higher low (accumulation under a weak tape).")
+alertcondition(bearishDivergence, "Bearish Divergence", "Smart Money Index bearish divergence: price set a higher high the SMI did not confirm (distribution into strength).")
+alertcondition(crossAbove, "SMI Crossed Above MA", "Smart Money Index crossed above its moving average.")
+alertcondition(crossBelow, "SMI Crossed Below MA", "Smart Money Index crossed below its moving average.")
+
+//---------------------------------------------------------------------------------------------------------------------}

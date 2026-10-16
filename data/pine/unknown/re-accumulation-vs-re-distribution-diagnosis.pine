@@ -1,0 +1,691 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Re-accumulation vs Re-distribution Diagnosis"
+  , shorttitle       = "Re-accumulation vs Re-distribution Diagnosis"
+  , overlay          = true
+  , format           = format.price
+  , max_boxes_count  = 250
+  , max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+//Evidence weights on the signed score: positive score argues an upward resolution, negative a downward one.
+//The score is a running probability proxy, never a verdict - only a held break settles the case
+float ASYM_WEIGHT          = 25.0
+float EDGE_STEP            = 8.0
+float EDGE_STEP_SOFT       = 4.0
+float EDGE_CLAMP           = 24.0
+float EVENT_STEP           = 18.0
+float EVENT_CLAMP          = 36.0
+float CHOCH_WEIGHT         = 20.0
+float ENTRY_CLIMAX_WEIGHT  = 12.0
+float ENTRY_ORDERLY_WEIGHT = 6.0
+float SCORE_CLAMP          = 100.0
+
+color BULL_COLOR    = #089981
+color BEAR_COLOR    = #f23645
+color NEUTRAL_COLOR = #787b86 // the developing range and an ambiguous read - structure until it resolves
+color TRANSP_COLOR  = #00000000
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+int EXPIRED_TRANSP   = 60
+
+string GROUP_TREND = "Trend Context"
+string GROUP_RANGE = "Range Detection"
+string GROUP_EVID  = "Evidence Weighing"
+string GROUP_DASH  = "Dashboard"
+string GROUP_STYLE = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+trendLenInput = input.int(50, "Trend Lookback (Bars)"
+  , minval  = 10
+  , group   = GROUP_TREND
+  , tooltip = "Bars used to measure the leg into the pause. The diagnosis only applies to consolidations inside an existing trend, so a range opens only when price travelled at least the minimum trend leg across this window into the range start.")
+
+trendMultInput = input.float(3.0, "Minimum Trend Leg (xATR)"
+  , minval  = 0.5
+  , step    = 0.25
+  , group   = GROUP_TREND
+  , tooltip = "Net ATR-normalized change over the trend lookback, measured into the range start, required to call the context an advance (re-accumulation vs distribution question) or a decline (re-distribution vs accumulation question).")
+
+atrLengthInput = input.int(14, "ATR Length"
+  , minval  = 1
+  , group   = GROUP_TREND
+  , tooltip = "Average True Range length used to normalize the prior leg and the range height.")
+
+rangeLenInput = input.int(15, "Compression Window (Bars)"
+  , minval  = 5
+  , group   = GROUP_RANGE
+  , tooltip = "Bars price must spend inside the maximum range height before a mid-trend range is recognized. Also the minimum pause duration - shorter stalls are treated as simple pullbacks, not diagnosable ranges.")
+
+rangeAtrMultInput = input.float(3.0, "Maximum Range Height (xATR)"
+  , minval  = 0.5
+  , step    = 0.25
+  , group   = GROUP_RANGE
+  , tooltip = "Height cap of the compression window, in multiples of the ATR prevailing as the range began. Raise it to accept looser consolidations, lower it to demand tighter pauses.")
+
+confirmBarsInput = input.int(3, "Break Hold (Bars)"
+  , minval  = 1
+  , group   = GROUP_RANGE
+  , tooltip = "Consecutive closes beyond a range edge required for the resolution to count as held. A break that falls back inside before holding this long is scored as the opposite evidence instead: a shakeout under support or an upthrust-style failure above resistance.")
+
+maxRangeBarsInput = input.int(400, "Maximum Range Duration (Bars)"
+  , minval  = 50
+  , group   = GROUP_RANGE
+  , tooltip = "Chart-hygiene cap only - Wyckoff ties range width to the size of the next move, not to any calendar norm. A range still unresolved after this many bars is closed as expired so a stale box does not track price forever.")
+
+swingLenInput = input.int(5, "Reaction Window (Bars)"
+  , minval  = 2
+  , group   = GROUP_EVID
+  , tooltip = "Window used to measure the depth and volume of the current reaction or rally - the unit of comparison for the change-of-character check and the entry-climax scan. Also the cooldown between repeated shakeout/upthrust events.")
+
+volLengthInput = input.int(20, "Volume Average Length"
+  , minval  = 1
+  , group   = GROUP_EVID
+  , tooltip = "Simple moving average length of volume used as the participation baseline for the climactic-entry and follow-through checks.")
+
+climaxMultInput = input.float(2.0, "Climactic Volume Multiple"
+  , minval  = 1.0
+  , step    = 0.1
+  , group   = GROUP_EVID
+  , tooltip = "Volume multiple of its average that marks a climactic bar. A climactic thrust into the range start raises the odds the range reverses the prior trend; an orderly, low-urgency drift into it leans continuation.")
+
+edgeZoneInput = input.float(20, "Edge Zone (% of Range Height)"
+  , minval  = 5
+  , maxval  = 40
+  , step    = 5
+  , group   = GROUP_EVID
+  , tooltip = "Depth of the test zones inside the range edges, as a share of range height. Visits into these zones are counted as tests of support or resistance and compared with the previous test on the same edge.")
+
+volStepInput = input.float(1.15, "Test Volume Step (Ratio)"
+  , minval  = 1.0
+  , step    = 0.05
+  , group   = GROUP_EVID
+  , tooltip = "How much lighter or heavier a test must be than the previous test of the same edge before it counts as evidence: support tests drying up lean toward absorption and continuation of an advance, successively heavier and deeper support tests lean toward supply winning.")
+
+chochMultInput = input.float(1.1, "Change of Character Multiple"
+  , minval  = 1.0
+  , step    = 0.05
+  , group   = GROUP_EVID
+  , tooltip = "A counter-trend reaction inside the range must exceed the widest reaction of the prior trend by this multiple, on heavier volume, to fire the change-of-character tell - often the earliest sign the range opposes the trend.")
+
+priorWeightInput = input.int(15, "Continuation Prior (Score Points)"
+  , minval  = 0
+  , maxval  = 40
+  , group   = GROUP_EVID
+  , tooltip = "Base-rate bias toward continuation: in strong trends most pauses resolve with the trend, so the score starts tilted that way and contrary evidence must overcome it. Set to 0 to weigh the evidence with no prior.")
+
+leanThresholdInput = input.int(20, "Diagnosis Lean Threshold"
+  , minval  = 5
+  , maxval  = 60
+  , group   = GROUP_EVID
+  , tooltip = "Absolute score needed before the dashboard calls a lean (re-accumulation likely / distribution risk, or their downtrend mirrors) instead of reporting the range as ambiguous.")
+
+ftVolMultInput = input.float(1.2, "Follow-through Volume Multiple"
+  , minval  = 0.5
+  , step    = 0.1
+  , group   = GROUP_EVID
+  , tooltip = "Volume multiple of its average that qualifies the resolving break as carried by follow-through participation; the resolution label and alert report whether the break had it. On symbols without volume data the check is reported as unavailable.")
+
+showDashboardInput = input.bool(true, "Show Dashboard"
+  , group   = GROUP_DASH
+  , tooltip = "Shows the running diagnosis: the range context, each class of evidence, and the current probability-style read that updates with every test.")
+
+dashboardPositionInput = input.string("Top Right", "Position"
+  , options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"]
+  , group   = GROUP_DASH
+  , tooltip = "Chart corner the dashboard is anchored to.")
+
+dashboardSizeInput = input.string("Small", "Size"
+  , options = ["Tiny", "Small", "Normal"]
+  , group   = GROUP_DASH
+  , tooltip = "Dashboard text size.")
+
+showBoxInput = input.bool(true, "Show Range Box"
+  , group   = GROUP_STYLE
+  , tooltip = "Draws the mid-trend range. While the diagnosis is live the fill shades between the bearish and bullish colors with the running score; on resolution the box takes the verdict color.")
+
+showEventLabelsInput = input.bool(true, "Evidence Event Labels"
+  , group   = GROUP_STYLE
+  , tooltip = "Labels the discrete evidence events on the chart: scored support tests (ST), shakeouts (SO), upthrust-style failures (UT) and the change of character (CHoCH).")
+
+showVerdictInput = input.bool(true, "Resolution Labels"
+  , group   = GROUP_STYLE
+  , tooltip = "Labels the resolved verdict on the chart: re-accumulation or distribution after an advance, re-distribution or accumulation after a decline.")
+
+fillTransparencyInput = input.int(85, "Range Fill Transparency"
+  , minval  = 50
+  , maxval  = 100
+  , group   = GROUP_STYLE
+  , tooltip = "Transparency of the range box fill, both while the diagnosis is live and once the range resolves.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "colors", group = GROUP_STYLE)
+
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "colors", group = GROUP_STYLE)
+
+neutralColorInput = input.color(NEUTRAL_COLOR, "Developing", inline = "colors", group = GROUP_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+//Keeps an evidence accumulator inside its band so no single evidence class can dominate the diagnosis
+clampValue(float valueToClamp, float limitAbs) =>
+    math.max(-limitAbs, math.min(limitAbs, valueToClamp))
+
+//Small transparent-background event label anchored to the evidence bar
+makeEventLabel(int anchorBar, float anchorPrice, string labelText, color labelColor, bool anchorBelow, string tipText) =>
+    label.new(anchorBar, anchorPrice, labelText
+      , style     = anchorBelow ? label.style_label_up : label.style_label_down
+      , color     = TRANSP_COLOR
+      , textcolor = labelColor
+      , size      = size.small
+      , tooltip   = tipText)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Context Series
+//---------------------------------------------------------------------------------------------------------------------{
+
+float atrValue   = ta.atr(atrLengthInput)
+float volumeSma  = ta.sma(nz(volume), volLengthInput)
+float windowHigh = ta.highest(high, rangeLenInput)
+float windowLow  = ta.lowest(low, rangeLenInput)
+
+//Current reaction depth from the recent high and rally height from the recent low, with the volume that
+//moved counter to each - the units compared against the prior trend for the change-of-character tell
+float pullbackDepth = ta.highest(high, swingLenInput) - low
+float rallyHeight   = high - ta.lowest(low, swingLenInput)
+float downVolWindow = math.sum(close < close[1] ? nz(volume) : 0.0, swingLenInput)
+float upVolWindow   = math.sum(close > close[1] ? nz(volume) : 0.0, swingLenInput)
+
+float maxPullbackTrend = ta.highest(pullbackDepth, trendLenInput)
+float maxRallyTrend    = ta.highest(rallyHeight, trendLenInput)
+float maxDownVolTrend  = ta.highest(downVolWindow, trendLenInput)
+float maxUpVolTrend    = ta.highest(upVolWindow, trendLenInput)
+
+//Climactic bars scanned over the entry window - how the range was entered is the first evidence class
+bool  upClimaxBar   = volumeSma > 0 and nz(volume) >= climaxMultInput * volumeSma and close > open
+bool  dnClimaxBar   = volumeSma > 0 and nz(volume) >= climaxMultInput * volumeSma and close < open
+float upClimaxCount = math.sum(upClimaxBar ? 1.0 : 0.0, rangeLenInput + swingLenInput)
+float dnClimaxCount = math.sum(dnClimaxBar ? 1.0 : 0.0, rangeLenInput + swingLenInput)
+
+//Prior leg measured into the range start (the bar just before the compression window)
+float closeAtStart   = close[rangeLenInput]
+float closeBeforeLeg = close[rangeLenInput + trendLenInput]
+float atrAtStart     = atrValue[rangeLenInput]
+float legChangeAtr   = not na(closeBeforeLeg) and not na(atrAtStart) and atrAtStart > 0 ? (closeAtStart - closeBeforeLeg) / atrAtStart : na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Range State & Evidence Tallies
+//---------------------------------------------------------------------------------------------------------------------{
+
+//Range context: 0 = scanning, +1 = pause after an advance (re-accumulation vs distribution),
+//-1 = pause after a decline (re-distribution vs accumulation)
+var int   rangeDir      = 0
+var float rangeTop      = na
+var float rangeBottom   = na
+var int   rangeStartBar = na
+var int   barsInRange   = 0
+var int   lastRangeEnd  = -1
+var box   rangeBox      = na
+
+//Evidence state - reset when a new range opens
+var bool  entryClimax    = false
+var float upVolSum       = 0.0
+var float dnVolSum       = 0.0
+var float edgeScoreVar   = 0.0
+var float eventScoreVar  = 0.0
+var bool  chochFired     = false
+var float chochSpreadRef = na
+var float chochVolRef    = na
+var int   supTestCount   = 0
+var int   resTestCount   = 0
+var int   springCount    = 0
+var int   upthrustCount  = 0
+var float lastSupVol     = na
+var float lastSupLow     = na
+var float lastResVol     = na
+var string lastSupRead   = "-"
+var string lastResRead   = "-"
+var int   lastSpringBar  = na
+var int   lastUpthrustBar = na
+
+//Edge-visit trackers: one visit spans consecutive bars in a test zone and is scored when it ends
+var bool  inSupVisit    = false
+var float supVisitLow   = na
+var float supVisitVol   = na
+var int   supVisitBar   = na
+var bool  supVisitPoked = false
+var bool  inResVisit    = false
+var float resVisitHigh  = na
+var float resVisitVol   = na
+var int   resVisitBar   = na
+var bool  resVisitPoked = false
+
+//Pending break tracker: a close beyond an edge that must hold to resolve, or fail back inside as evidence
+var int   pendDir        = 0
+var int   pendCount      = 0
+var float pendMaxVol     = na
+var float pendExtreme    = na
+var int   pendExtremeBar = na
+
+var int    prevLean    = 0
+var string lastVerdict = "None yet"
+
+//Per-bar event flags feeding labels and alerts
+bool rangeAfterAdvanceEvent = false
+bool rangeAfterDeclineEvent = false
+bool supportDryingEvent     = false
+bool supportHarderEvent     = false
+bool springEvent            = false
+bool upthrustEvent          = false
+bool chochEvent             = false
+bool resolveUp              = false
+bool resolveDn              = false
+bool expiredEvent           = false
+bool openedThisBar          = false
+
+//A compression window after a qualifying leg opens a mid-trend range - the diagnosis goes live
+float windowHeight = windowHigh - windowLow
+bool  trendUpOk    = not na(legChangeAtr) and legChangeAtr >= trendMultInput
+bool  trendDnOk    = not na(legChangeAtr) and legChangeAtr <= -trendMultInput
+bool  compressed   = not na(windowHeight) and windowHeight > 0 and not na(atrAtStart) and atrAtStart > 0 and windowHeight <= rangeAtrMultInput * atrAtStart
+
+if rangeDir == 0 and compressed and (trendUpOk or trendDnOk) and bar_index - rangeLenInput + 1 > lastRangeEnd
+    rangeDir      := trendUpOk ? 1 : -1
+    rangeTop      := windowHigh
+    rangeBottom   := windowLow
+    rangeStartBar := bar_index - rangeLenInput + 1
+    barsInRange   := rangeLenInput
+    openedThisBar := true
+    rangeAfterAdvanceEvent := rangeDir > 0
+    rangeAfterDeclineEvent := rangeDir < 0
+    //Entry character: was the thrust into the range climactic or an orderly drift?
+    entryClimax := (rangeDir > 0 ? upClimaxCount : dnClimaxCount) > 0
+    //Change-of-character references: the widest and heaviest counter-trend reaction of the prior leg
+    chochSpreadRef := rangeDir > 0 ? maxPullbackTrend[rangeLenInput] : maxRallyTrend[rangeLenInput]
+    chochVolRef    := rangeDir > 0 ? maxDownVolTrend[rangeLenInput] : maxUpVolTrend[rangeLenInput]
+    //Reset the tallies and backfill rally/reaction volume over the formation window
+    upVolSum      := 0.0
+    dnVolSum      := 0.0
+    edgeScoreVar  := 0.0
+    eventScoreVar := 0.0
+    chochFired    := false
+    supTestCount  := 0
+    resTestCount  := 0
+    springCount   := 0
+    upthrustCount := 0
+    lastSupVol    := na
+    lastSupLow    := na
+    lastResVol    := na
+    lastSupRead   := "-"
+    lastResRead   := "-"
+    lastSpringBar := na
+    lastUpthrustBar := na
+    inSupVisit    := false
+    inResVisit    := false
+    pendDir       := 0
+    pendCount     := 0
+    pendMaxVol    := na
+    prevLean      := 0
+    for i = 0 to rangeLenInput - 1
+        float barClose  = close[i]
+        float prevClose = close[i + 1]
+        float barVolume = nz(volume[i])
+        if not na(prevClose)
+            if barClose > prevClose
+                upVolSum += barVolume
+            else if barClose < prevClose
+                dnVolSum += barVolume
+    if showBoxInput
+        rangeBox := box.new(rangeStartBar, rangeTop, bar_index, rangeBottom, border_color = neutralColorInput, border_width = 1, border_style = line.style_dashed, bgcolor = color.new(neutralColorInput, fillTransparencyInput))
+
+//Active range: tally volume asymmetry, score the edge tests, watch for the character change and the break
+if rangeDir != 0 and not openedThisBar
+    barsInRange += 1
+    if close > close[1]
+        upVolSum += nz(volume)
+    else if close < close[1]
+        dnVolSum += nz(volume)
+
+if rangeDir != 0
+    float rangeHeight = rangeTop - rangeBottom
+    float tolPrice    = rangeHeight * edgeZoneInput / 100
+
+    //Support-zone visits: successful tests on drying volume read as absorption; successively heavier and
+    //deeper tests read as supply winning even while resistance still holds
+    bool supZoneTouch = low <= rangeBottom + tolPrice
+    if inSupVisit
+        if close < rangeBottom
+            inSupVisit := false
+        else if supZoneTouch
+            if low < supVisitLow
+                supVisitLow := low
+                supVisitBar := bar_index
+            supVisitVol   := math.max(supVisitVol, nz(volume))
+            supVisitPoked := supVisitPoked or low < rangeBottom
+        else
+            supTestCount += 1
+            if supVisitPoked and (na(lastSpringBar) or bar_index - lastSpringBar > swingLenInput)
+                springCount   += 1
+                springEvent   := true
+                lastSpringBar := bar_index
+                eventScoreVar := clampValue(eventScoreVar + EVENT_STEP, EVENT_CLAMP)
+                if showEventLabelsInput
+                    makeEventLabel(supVisitBar, supVisitLow, "SO", bullColorInput, true, "Shakeout: the poke below range support (" + str.tostring(rangeBottom, format.mintick) + ") failed and recovered - final-test behavior arguing an upward resolution")
+            else if supTestCount > 1 and not na(lastSupVol)
+                if supVisitVol < lastSupVol / volStepInput and supVisitLow >= lastSupLow
+                    supportDryingEvent := true
+                    lastSupRead        := "Drying up"
+                    edgeScoreVar       := clampValue(edgeScoreVar + EDGE_STEP, EDGE_CLAMP)
+                    if showEventLabelsInput
+                        makeEventLabel(supVisitBar, supVisitLow, "ST", bullColorInput, true, "Support test on volume lighter than the previous test, holding at a shallower low - absorption evidence favoring an upward resolution")
+                else if supVisitVol > lastSupVol * volStepInput and supVisitLow < lastSupLow
+                    supportHarderEvent := true
+                    lastSupRead        := "Harder"
+                    edgeScoreVar       := clampValue(edgeScoreVar - EDGE_STEP, EDGE_CLAMP)
+                    if showEventLabelsInput
+                        makeEventLabel(supVisitBar, supVisitLow, "ST", bearColorInput, true, "Support tested harder: heavier volume and a deeper low than the previous test - supply-winning evidence favoring a downward resolution")
+                else
+                    lastSupRead := "Neutral"
+            lastSupVol := supVisitVol
+            lastSupLow := supVisitLow
+            inSupVisit := false
+    if not inSupVisit and pendDir == 0 and supZoneTouch and close >= rangeBottom and not (resVisitPoked and inResVisit)
+        inSupVisit    := true
+        supVisitLow   := low
+        supVisitVol   := nz(volume)
+        supVisitBar   := bar_index
+        supVisitPoked := low < rangeBottom
+
+    //Resistance-zone visits: upthrust-style pokes that fail, heavy rallies that attract supply, and
+    //rallies whose volume fades all lean toward a downward resolution
+    bool resZoneTouch = high >= rangeTop - tolPrice
+    if inResVisit
+        if close > rangeTop
+            inResVisit := false
+        else if resZoneTouch
+            if high > resVisitHigh
+                resVisitHigh := high
+                resVisitBar  := bar_index
+            resVisitVol   := math.max(resVisitVol, nz(volume))
+            resVisitPoked := resVisitPoked or high > rangeTop
+        else
+            resTestCount += 1
+            if resVisitPoked and (na(lastUpthrustBar) or bar_index - lastUpthrustBar > swingLenInput)
+                upthrustCount   += 1
+                upthrustEvent   := true
+                lastUpthrustBar := bar_index
+                eventScoreVar   := clampValue(eventScoreVar - EVENT_STEP, EVENT_CLAMP)
+                if showEventLabelsInput
+                    makeEventLabel(resVisitBar, resVisitHigh, "UT", bearColorInput, false, "Upthrust-style failure: the poke above range resistance (" + str.tostring(rangeTop, format.mintick) + ") was rejected back inside - supply evidence favoring a downward resolution")
+            else if resTestCount > 1 and not na(lastResVol)
+                if resVisitVol > lastResVol * volStepInput
+                    lastResRead  := "Supply on rise"
+                    edgeScoreVar := clampValue(edgeScoreVar - EDGE_STEP, EDGE_CLAMP)
+                else if resVisitVol < lastResVol / volStepInput
+                    lastResRead  := "Fading"
+                    edgeScoreVar := clampValue(edgeScoreVar - EDGE_STEP_SOFT, EDGE_CLAMP)
+                else
+                    lastResRead := "Neutral"
+            lastResVol := resVisitVol
+            inResVisit := false
+    if not inResVisit and pendDir == 0 and resZoneTouch and close <= rangeTop
+        inResVisit    := true
+        resVisitHigh  := high
+        resVisitVol   := nz(volume)
+        resVisitBar   := bar_index
+        resVisitPoked := high > rangeTop
+
+    //Change of character: the first reaction inside the range materially wider and heavier than anything
+    //seen during the prior trend - often the earliest tell that the range opposes the trend
+    if not chochFired and not na(chochSpreadRef) and chochSpreadRef > 0 and not na(chochVolRef) and chochVolRef > 0
+        float ctSpread = rangeDir > 0 ? pullbackDepth : rallyHeight
+        float ctVolume = rangeDir > 0 ? downVolWindow : upVolWindow
+        if ctSpread > chochMultInput * chochSpreadRef and ctVolume > chochMultInput * chochVolRef
+            chochFired := true
+            chochEvent := true
+            if showEventLabelsInput
+                makeEventLabel(bar_index, rangeDir > 0 ? low : high, "CHoCH", rangeDir > 0 ? bearColorInput : bullColorInput, rangeDir > 0, "Change of character: this counter-trend reaction is wider and heavier than anything seen during the prior trend - evidence the range opposes the trend")
+
+    //Pending break: a close beyond an edge must hold to resolve the range; failing back inside within the
+    //hold window is itself evidence - a shakeout under support or a terminal upthrust above resistance
+    int newPendDir = close > rangeTop ? 1 : close < rangeBottom ? -1 : 0
+    if pendDir == 0 and newPendDir != 0
+        pendDir        := newPendDir
+        pendCount      := 0
+        pendMaxVol     := 0.0
+        pendExtreme    := newPendDir == 1 ? high : low
+        pendExtremeBar := bar_index
+    if pendDir != 0
+        if (pendDir == 1 and close > rangeTop) or (pendDir == -1 and close < rangeBottom)
+            pendCount  += 1
+            pendMaxVol := math.max(pendMaxVol, nz(volume))
+            if pendDir == 1 and high > pendExtreme
+                pendExtreme    := high
+                pendExtremeBar := bar_index
+            if pendDir == -1 and low < pendExtreme
+                pendExtreme    := low
+                pendExtremeBar := bar_index
+            if pendCount >= confirmBarsInput
+                resolveUp := pendDir == 1
+                resolveDn := pendDir == -1
+        else
+            if pendDir == 1
+                if na(lastUpthrustBar) or bar_index - lastUpthrustBar > swingLenInput
+                    upthrustCount   += 1
+                    upthrustEvent   := true
+                    lastUpthrustBar := bar_index
+                    eventScoreVar   := clampValue(eventScoreVar - EVENT_STEP, EVENT_CLAMP)
+                    if showEventLabelsInput
+                        makeEventLabel(pendExtremeBar, pendExtreme, "UT", bearColorInput, false, "Terminal upside failure: the close above range resistance (" + str.tostring(rangeTop, format.mintick) + ") could not hold and fell back inside - distribution ranges frequently end with exactly this")
+            else
+                if na(lastSpringBar) or bar_index - lastSpringBar > swingLenInput
+                    springCount   += 1
+                    springEvent   := true
+                    lastSpringBar := bar_index
+                    eventScoreVar := clampValue(eventScoreVar + EVENT_STEP, EVENT_CLAMP)
+                    if showEventLabelsInput
+                        makeEventLabel(pendExtremeBar, pendExtreme, "SO", bullColorInput, true, "Shakeout: the close below range support (" + str.tostring(rangeBottom, format.mintick) + ") recovered quickly - reads as the final test before an upward resolution")
+            pendDir    := 0
+            pendCount  := 0
+            pendMaxVol := na
+
+    //Chart-hygiene expiry for ranges that never resolve
+    if not (resolveUp or resolveDn) and barsInRange >= maxRangeBarsInput
+        expiredEvent := true
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Diagnosis Score
+//---------------------------------------------------------------------------------------------------------------------{
+
+//Signed evidence score: positive argues an upward resolution, negative a downward one. The continuation
+//prior tilts it with the trend; every evidence class shifts it as the range develops - a running
+//probability that updates with each test, never a verdict issued early
+float asymRatio     = upVolSum + dnVolSum > 0 ? (upVolSum - dnVolSum) / (upVolSum + dnVolSum) : 0.0
+float priorBias     = rangeDir * priorWeightInput
+float entryScoreVal = rangeDir == 0 ? 0.0 : entryClimax ? -ENTRY_CLIMAX_WEIGHT * rangeDir : ENTRY_ORDERLY_WEIGHT * rangeDir
+float chochScoreVal = chochFired ? -CHOCH_WEIGHT * rangeDir : 0.0
+
+float diagScore     = rangeDir != 0 ? clampValue(priorBias + entryScoreVal + ASYM_WEIGHT * asymRatio + edgeScoreVar + eventScoreVar + chochScoreVal, SCORE_CLAMP) : na
+float upProbability = rangeDir != 0 ? 50 + diagScore / 2 : na
+
+int  leanNow       = rangeDir == 0 ? 0 : diagScore >= leanThresholdInput ? 1 : diagScore <= -leanThresholdInput ? -1 : 0
+bool leanBullEvent = rangeDir != 0 and leanNow == 1 and prevLean != 1
+bool leanBearEvent = rangeDir != 0 and leanNow == -1 and prevLean != -1
+prevLean := leanNow
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Resolution & Range Drawing
+//---------------------------------------------------------------------------------------------------------------------{
+
+bool   resolvedEvent   = resolveUp or resolveDn
+bool   volumeDataOk    = volumeSma > 0
+bool   followThroughOk = resolvedEvent and volumeDataOk and not na(pendMaxVol) and pendMaxVol >= ftVolMultInput * volumeSma
+string followText      = not volumeDataOk ? "volume data unavailable" : followThroughOk ? "on follow-through volume" : "without follow-through volume"
+string verdictText     = resolveUp ? (rangeDir > 0 ? "Re-accumulation" : "Accumulation") : rangeDir > 0 ? "Distribution" : "Re-distribution"
+
+bool reaccResolvedEvent  = resolveUp and rangeDir > 0
+bool accResolvedEvent    = resolveUp and rangeDir < 0
+bool distResolvedEvent   = resolveDn and rangeDir > 0
+bool redistResolvedEvent = resolveDn and rangeDir < 0
+
+//The live box shades between the bearish and bullish colors with the running score, then takes the
+//verdict color once the case is settled
+if rangeDir != 0 and not na(rangeBox)
+    box.set_right(rangeBox, bar_index)
+    if not resolvedEvent and not expiredEvent
+        color liveFill = color.from_gradient(diagScore, -SCORE_CLAMP, SCORE_CLAMP, bearColorInput, bullColorInput)
+        box.set_bgcolor(rangeBox, color.new(liveFill, fillTransparencyInput))
+
+if resolvedEvent
+    color verdictColor = resolveUp ? bullColorInput : bearColorInput
+    if not na(rangeBox)
+        box.set_border_color(rangeBox, verdictColor)
+        box.set_border_style(rangeBox, line.style_solid)
+        box.set_bgcolor(rangeBox, color.new(verdictColor, fillTransparencyInput))
+    if showVerdictInput
+        makeEventLabel(bar_index, resolveUp ? low : high, verdictText, verdictColor, resolveUp, "Mid-trend range resolved as " + verdictText + ": the break held " + str.tostring(pendCount) + " close(s) beyond the range edge " + followText + " - final diagnosis score " + str.tostring(diagScore, "#") + " (" + str.tostring(upProbability, "#") + "% up-resolution read)")
+    lastVerdict := verdictText
+
+if expiredEvent
+    if not na(rangeBox)
+        box.set_border_color(rangeBox, color.new(NEUTRAL_COLOR, EXPIRED_TRANSP))
+        box.set_bgcolor(rangeBox, color.new(NEUTRAL_COLOR, fillTransparencyInput))
+    lastVerdict := "Expired unresolved"
+
+if resolvedEvent or expiredEvent
+    lastRangeEnd   := bar_index
+    rangeDir       := 0
+    rangeTop       := na
+    rangeBottom    := na
+    rangeStartBar  := na
+    barsInRange    := 0
+    rangeBox       := na
+    entryClimax    := false
+    chochFired     := false
+    chochSpreadRef := na
+    chochVolRef    := na
+    inSupVisit     := false
+    inResVisit     := false
+    pendDir        := 0
+    pendCount      := 0
+    pendMaxVol     := na
+    prevLean       := 0
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+
+string tablePosition = switch dashboardPositionInput
+    "Top Right"    => position.top_right
+    "Top Left"     => position.top_left
+    "Bottom Right" => position.bottom_right
+    => position.bottom_left
+
+string tableTextSize = switch dashboardSizeInput
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    => size.small
+
+if showDashboardInput and barstate.islast
+    var table dashboardTable = table.new(tablePosition, 2, 13, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+    color dimColor  = DASH_HEADER
+    color idleColor = DASH_HEADER
+    bool  hasRange  = rangeDir != 0
+    bool  hasVolume = upVolSum + dnVolSum > 0
+
+    string contextText  = hasRange ? (rangeDir > 0 ? "After advance" : "After decline") : "Scanning"
+    string statusText   = not hasRange ? "-" : pendDir == 1 ? "Testing breakout" : pendDir == -1 ? "Testing breakdown" : "Developing"
+    string entryText    = hasRange ? (entryClimax ? "Climactic" : "Orderly") : "-"
+    color  entryColor   = not hasRange ? dimColor : (entryClimax ? -rangeDir : rangeDir) > 0 ? bullColorInput : bearColorInput
+    string asymText     = not hasRange ? "-" : not hasVolume ? "n/a" : (asymRatio >= 0 ? "Demand +" : "Supply ") + str.tostring(asymRatio * 100, "#") + "%"
+    color  asymColor    = not hasRange or not hasVolume ? dimColor : asymRatio >= 0 ? bullColorInput : bearColorInput
+    string supText      = hasRange ? str.tostring(supTestCount) + (lastSupRead != "-" ? " (" + lastSupRead + ")" : "") : "-"
+    color  supColor     = not hasRange ? dimColor : lastSupRead == "Drying up" ? bullColorInput : lastSupRead == "Harder" ? bearColorInput : DASH_TEXT
+    string resText      = hasRange ? str.tostring(resTestCount) + (lastResRead != "-" ? " (" + lastResRead + ")" : "") : "-"
+    color  resColor     = not hasRange ? dimColor : lastResRead == "Supply on rise" or lastResRead == "Fading" ? bearColorInput : DASH_TEXT
+    string chochText    = hasRange ? (chochFired ? "Detected" : "-") : "-"
+    color  chochColor   = hasRange and chochFired ? (rangeDir > 0 ? bearColorInput : bullColorInput) : dimColor
+    string scoreText    = hasRange ? str.tostring(upProbability, "#") + "% (score " + (diagScore >= 0 ? "+" : "") + str.tostring(diagScore, "#") + ")" : "-"
+    color  scoreColor   = hasRange ? color.from_gradient(diagScore, -SCORE_CLAMP, SCORE_CLAMP, bearColorInput, bullColorInput) : dimColor
+    string diagnosisText = not hasRange ? "Last: " + lastVerdict : rangeDir > 0 ? (leanNow == 1 ? "Re-accumulation likely" : leanNow == -1 ? "Distribution risk" : "Ambiguous - evidence building") : leanNow == -1 ? "Re-distribution likely" : leanNow == 1 ? "Accumulation possible" : "Ambiguous - evidence building"
+    color  diagnosisColor = not hasRange ? idleColor : leanNow == 1 ? bullColorInput : leanNow == -1 ? bearColorInput : neutralColorInput
+
+    table.cell(dashboardTable, 0, 0, "Mid-Trend Range Diagnosis", text_color = DASH_TEXT, text_size = tableTextSize, text_halign = text.align_center)
+    table.merge_cells(dashboardTable, 0, 0, 1, 0)
+    table.cell(dashboardTable, 0, 1, "Context", text_color = dimColor, text_size = tableTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 1, contextText, text_color = hasRange ? DASH_TEXT : idleColor, text_size = tableTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 2, "Status", text_color = dimColor, text_size = tableTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 2, statusText, text_color = hasRange ? neutralColorInput : dimColor, text_size = tableTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 3, "Duration", text_color = dimColor, text_size = tableTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 3, hasRange ? str.tostring(barsInRange) + " bars" : "-", text_color = hasRange ? DASH_TEXT : dimColor, text_size = tableTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 4, "Entry character", text_color = dimColor, text_size = tableTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 4, entryText, text_color = entryColor, text_size = tableTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 5, "Volume asymmetry", text_color = dimColor, text_size = tableTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 5, asymText, text_color = asymColor, text_size = tableTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 6, "Support tests", text_color = dimColor, text_size = tableTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 6, supText, text_color = supColor, text_size = tableTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 7, "Resistance tests", text_color = dimColor, text_size = tableTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 7, resText, text_color = resColor, text_size = tableTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 8, "Shakeouts", text_color = dimColor, text_size = tableTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 8, hasRange ? str.tostring(springCount) : "-", text_color = hasRange and springCount > 0 ? bullColorInput : dimColor, text_size = tableTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 9, "Upthrusts", text_color = dimColor, text_size = tableTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 9, hasRange ? str.tostring(upthrustCount) : "-", text_color = hasRange and upthrustCount > 0 ? bearColorInput : dimColor, text_size = tableTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 10, "Change of character", text_color = dimColor, text_size = tableTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 10, chochText, text_color = chochColor, text_size = tableTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 11, "Up-resolution read", text_color = dimColor, text_size = tableTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 11, scoreText, text_color = scoreColor, text_size = tableTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 12, "Diagnosis", text_color = dimColor, text_size = tableTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 12, diagnosisText, text_color = diagnosisColor, text_size = tableTextSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Data-window Readouts
+//---------------------------------------------------------------------------------------------------------------------{
+
+plot(diagScore, "Diagnosis Score", color = diagScore >= 0 ? bullColorInput : bearColorInput, display = display.data_window)
+plot(upProbability, "Up-resolution Probability %", color = neutralColorInput, display = display.data_window)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(rangeAfterAdvanceEvent, "Range Detected After Advance", "Mid-trend range detected after an advance on {{ticker}} ({{interval}}) - the re-accumulation vs distribution question is open; the evidence score will update with each test")
+
+alertcondition(rangeAfterDeclineEvent, "Range Detected After Decline", "Mid-trend range detected after a decline on {{ticker}} ({{interval}}) - the re-distribution vs accumulation question is open; the evidence score will update with each test")
+
+alertcondition(leanBullEvent, "Diagnosis Lean Turned Up", "The running diagnosis on {{ticker}} ({{interval}}) crossed the lean threshold toward an upward resolution - re-accumulation reading after an advance, accumulation reading after a decline")
+
+alertcondition(leanBearEvent, "Diagnosis Lean Turned Down", "The running diagnosis on {{ticker}} ({{interval}}) crossed the lean threshold toward a downward resolution - distribution reading after an advance, re-distribution reading after a decline")
+
+alertcondition(supportDryingEvent, "Support Test Drying Up", "Range support on {{ticker}} ({{interval}}) was tested on lighter volume at a shallower low than the previous test - absorption evidence favoring an upward resolution")
+
+alertcondition(supportHarderEvent, "Support Tested Harder", "Range support on {{ticker}} ({{interval}}) was tested on heavier volume at a deeper low than the previous test - supply is winning even while resistance holds")
+
+alertcondition(springEvent, "Shakeout At Support", "Shakeout on {{ticker}} ({{interval}}) - the break under range support failed and recovered quickly, final-test behavior favoring an upward resolution")
+
+alertcondition(upthrustEvent, "Upthrust-style Failure", "Upthrust-style failure on {{ticker}} ({{interval}}) - the move above range resistance was rejected back inside, supply evidence favoring a downward resolution")
+
+alertcondition(chochEvent, "Change Of Character", "Change of character on {{ticker}} ({{interval}}) - a counter-trend reaction inside the range is wider and heavier than anything seen during the prior trend")
+
+alertcondition(reaccResolvedEvent, "Re-accumulation Confirmed", "Range after an advance on {{ticker}} ({{interval}}) resolved upward and held - diagnosed as re-accumulation; the advance has resumed")
+
+alertcondition(distResolvedEvent, "Distribution Confirmed", "Range after an advance on {{ticker}} ({{interval}}) broke down and held - diagnosed as distribution; the pause reversed the trend")
+
+alertcondition(redistResolvedEvent, "Re-distribution Confirmed", "Range after a decline on {{ticker}} ({{interval}}) resolved downward and held - diagnosed as re-distribution; the decline has resumed")
+
+alertcondition(accResolvedEvent, "Accumulation Confirmed", "Range after a decline on {{ticker}} ({{interval}}) broke upward and held - diagnosed as accumulation; the pause reversed the trend")
+
+//---------------------------------------------------------------------------------------------------------------------}

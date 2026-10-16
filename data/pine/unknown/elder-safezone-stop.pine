@@ -1,0 +1,220 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Elder SafeZone Stop", "Elder SafeZone Stop", overlay = true, format = format.inherit)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+NEUTRAL_COLOR = #787b86
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+PEN_ONLY   = "Penetrating bars only"
+ALL_BARS   = "All bars in window"
+PREV_BAR   = "Previous bar"
+CURR_BAR   = "Current bar"
+AUTO_MODE  = "Auto (stop & flip)"
+LONG_MODE  = "Long only"
+SHORT_MODE = "Short only"
+TRIG_CLOSE = "Close"
+TRIG_WICK  = "Wick"
+
+TOP_RIGHT    = "Top Right"
+TOP_LEFT     = "Top Left"
+BOTTOM_RIGHT = "Bottom Right"
+BOTTOM_LEFT  = "Bottom Left"
+
+SIZE_TINY   = "Tiny"
+SIZE_SMALL  = "Small"
+SIZE_NORMAL = "Normal"
+
+GRP_CALC  = "Calculation"
+GRP_DASH  = "Dashboard"
+GRP_STYLE = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+lengthInput      = input.int(20, "Penetration Lookback", minval = 2, maxval = 250, group = GRP_CALC, tooltip = "Window n over which adverse penetrations are measured. Elder-style settings commonly range from 10 to 30 bars, matched to the trend being traded.")
+coefInput        = input.float(2.5, "Noise Coefficient (k)", minval = 0.1, step = 0.1, group = GRP_CALC, tooltip = "Multiple of the average penetration used as the stop distance. Elder suggests values in the 2 to 3 range: near 2 trails tighter for short swings, near 3 gives trends more room.")
+avgModeInput     = input.string(PEN_ONLY, "Averaging Basis", options = [PEN_ONLY, ALL_BARS], group = GRP_CALC, tooltip = "Divisor of the penetration average. 'Penetrating bars only' divides the summed penetrations by the count of bars that actually undercut the prior extreme (Elder's primary form). 'All bars in window' divides by the full lookback, yielding a smaller average.")
+anchorInput      = input.string(PREV_BAR, "Stop Anchor", options = [PREV_BAR, CURR_BAR], group = GRP_CALC, tooltip = "Extreme the stop hangs from: the previous bar's low/high (Elder's default) or the current bar's low/high.")
+positionInput    = input.string(AUTO_MODE, "Position Mode", options = [AUTO_MODE, LONG_MODE, SHORT_MODE], group = GRP_CALC, tooltip = "'Auto (stop & flip)' trails one side of price and switches to the opposite trail once the stop is hit. 'Long only' / 'Short only' keep trailing a single side, restarting a fresh trail after each stop-out.")
+triggerInput     = input.string(TRIG_CLOSE, "Stop Trigger", options = [TRIG_CLOSE, TRIG_WICK], group = GRP_CALC, tooltip = "Price used to detect a stop hit: the bar close, or the bar's wick (low/high touching the level).")
+minDistInput     = input.int(0, "Minimum Stop Distance (Ticks)", minval = 0, group = GRP_CALC, tooltip = "Optional floor on the stop distance, in ticks (0 = off). When the window holds no penetrations the last valid average is held; the floor additionally guarantees a minimum distance, including before any penetration has been measured.")
+
+showDashInput    = input.bool(true, "Show Dashboard", group = GRP_DASH, tooltip = "Displays the active side, its average penetration, the SafeZone stop distance (useful as an initial stop width for position sizing) and the current stop level.")
+dashLocInput     = input.string(TOP_RIGHT, "Location", options = [TOP_RIGHT, TOP_LEFT, BOTTOM_RIGHT, BOTTOM_LEFT], group = GRP_DASH, tooltip = "Dashboard position on the chart.")
+dashSizeInput    = input.string(SIZE_SMALL, "Size", options = [SIZE_TINY, SIZE_SMALL, SIZE_NORMAL], group = GRP_DASH, tooltip = "Dashboard text size.")
+
+bullColorInput   = input.color(BULL_COLOR, "Bullish", inline = "colors", group = GRP_STYLE)
+bearColorInput   = input.color(BEAR_COLOR, "Bearish", inline = "colors", group = GRP_STYLE)
+showFillInput    = input.bool(true, "Gradient Fill", group = GRP_STYLE, tooltip = "Vertical gradient between price and the trailing stop, fading toward the stop.")
+showMarkersInput = input.bool(false, "Stop-Hit Markers", group = GRP_STYLE, tooltip = "Marks bars where the active stop is hit. Off by default; the stop-hit alerts cover these events.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+//@function Formats a price-like value at the symbol's tick precision, "-" when not available
+formatPrice(float value) =>
+    na(value) ? "-" : str.tostring(value, format.mintick)
+
+//@function Average adverse penetration over the last `length` bars. Returns na when the window holds no
+//          penetrations, so the caller can apply the fallback rule (hold prior value or minimum distance)
+averagePenetration(float penetration, simple int length) =>
+    cumPenetration = ta.cum(penetration)
+    cumCount       = ta.cum(penetration > 0 ? 1.0 : 0.0)
+    windowSum      = cumPenetration - nz(cumPenetration[length])
+    windowCount    = cumCount - nz(cumCount[length])
+    windowBars     = math.min(length, bar_index + 1)
+    windowCount > 0 ? (avgModeInput == PEN_ONLY ? windowSum / windowCount : windowSum / windowBars) : na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+// Adverse penetrations: bars undercutting the prior low (long side) / exceeding the prior high (short side)
+penetrationLong  = nz(math.max(low[1] - low, 0))
+penetrationShort = nz(math.max(high - high[1], 0))
+
+rawAvgLong  = averagePenetration(penetrationLong, lengthInput)
+rawAvgShort = averagePenetration(penetrationShort, lengthInput)
+
+// Fallback: when no penetrations occur in the window, hold the prior average
+var float heldAvgLong  = na
+var float heldAvgShort = na
+
+if not na(rawAvgLong)
+    heldAvgLong := rawAvgLong
+if not na(rawAvgShort)
+    heldAvgShort := rawAvgShort
+
+// Stop distance = k * average penetration, with an optional minimum-distance floor
+floorDistance = minDistInput * syminfo.mintick
+
+float longDistance  = not na(heldAvgLong)  ? coefInput * heldAvgLong  : na
+float shortDistance = not na(heldAvgShort) ? coefInput * heldAvgShort : na
+
+if minDistInput > 0
+    longDistance  := na(longDistance)  ? floorDistance : math.max(longDistance,  floorDistance)
+    shortDistance := na(shortDistance) ? floorDistance : math.max(shortDistance, floorDistance)
+
+// Raw stop levels for the current bar: anchor extreme -/+ k * average penetration
+anchorLow  = anchorInput == PREV_BAR ? nz(low[1],  low)  : low
+anchorHigh = anchorInput == PREV_BAR ? nz(high[1], high) : high
+
+longStopRaw  = anchorLow  - longDistance
+shortStopRaw = anchorHigh + shortDistance
+
+// Trailing state: ratchet the active trail (long stops never lowered, short stops never raised),
+// detect hits against the level in force during the bar, then flip (Auto) or restart (Long/Short only)
+var int   direction = 0
+var float trail     = na
+
+float prevTrail = trail
+
+triggerLow  = triggerInput == TRIG_CLOSE ? close : low
+triggerHigh = triggerInput == TRIG_CLOSE ? close : high
+
+bool longHit  = false
+bool shortHit = false
+
+if direction == 0
+    if positionInput == SHORT_MODE
+        if not na(shortStopRaw)
+            direction := -1
+            trail     := shortStopRaw
+    else if not na(longStopRaw)
+        direction := 1
+        trail     := longStopRaw
+else if direction == 1
+    longHit := not na(prevTrail) and not na(triggerLow) and triggerLow < prevTrail
+    if longHit
+        if positionInput == AUTO_MODE
+            direction := -1
+            trail     := shortStopRaw
+        else
+            trail := longStopRaw
+    else
+        trail := na(prevTrail) ? longStopRaw : na(longStopRaw) ? prevTrail : math.max(longStopRaw, prevTrail)
+else
+    shortHit := not na(prevTrail) and not na(triggerHigh) and triggerHigh > prevTrail
+    if shortHit
+        if positionInput == AUTO_MODE
+            direction := 1
+            trail     := longStopRaw
+        else
+            trail := shortStopRaw
+    else
+        trail := na(prevTrail) ? shortStopRaw : na(shortStopRaw) ? prevTrail : math.min(shortStopRaw, prevTrail)
+
+changeBar = longHit or shortHit or direction != nz(direction[1], 0)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visuals
+//---------------------------------------------------------------------------------------------------------------------{
+color stopColor = changeBar or direction == 0 ? color(na) : direction == 1 ? bullColorInput : bearColorInput
+
+stopPlotId  = plot(trail, "SafeZone Stop", stopColor, 1, plot.style_linebr)
+pricePlotId = plot(close, "Price Anchor", color(na), editable = false)
+
+// Trailing-stop gradient: fully transparent at the stop, 50% transparency at price
+activeColor = direction == 1 ? bullColorInput : bearColorInput
+topIsPrice  = not na(trail) and close >= trail
+showFillBar = showFillInput and direction != 0 and not changeBar and not na(trail)
+
+color fillTopColor    = showFillBar ? color.new(activeColor, topIsPrice ? 50 : 100) : color(na)
+color fillBottomColor = showFillBar ? color.new(activeColor, topIsPrice ? 100 : 50) : color(na)
+
+fill(stopPlotId, pricePlotId, top_value = math.max(trail, close), bottom_value = math.min(trail, close), top_color = fillTopColor, bottom_color = fillBottomColor, title = "Price to Stop Gradient")
+
+plotshape(showMarkersInput and longHit,  "Long Stop Hit Marker",  shape.xcross, location.belowbar, bearColorInput, size = size.tiny)
+plotshape(showMarkersInput and shortHit, "Short Stop Hit Marker", shape.xcross, location.abovebar, bullColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+dashPosition = switch dashLocInput
+    TOP_LEFT     => position.top_left
+    BOTTOM_RIGHT => position.bottom_right
+    BOTTOM_LEFT  => position.bottom_left
+    => position.top_right
+
+dashTextSize = switch dashSizeInput
+    SIZE_TINY   => size.tiny
+    SIZE_NORMAL => size.normal
+    => size.small
+
+var table dashTable = showDashInput ? table.new(dashPosition, 2, 4, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1) : table(na)
+
+if showDashInput and barstate.islast
+    float activeAvg      = direction == 1 ? heldAvgLong : direction == -1 ? heldAvgShort : na
+    float activeDistance = direction == 1 ? longDistance : direction == -1 ? shortDistance : na
+    float distancePct    = not na(activeDistance) and not na(close) and close != 0 ? activeDistance / close * 100 : na
+    string sideText      = direction == 1 ? "Long" : direction == -1 ? "Short" : "-"
+    color  sideColor     = direction == 1 ? bullColorInput : direction == -1 ? bearColorInput : NEUTRAL_COLOR
+    string distanceText  = formatPrice(activeDistance) + (na(distancePct) ? "" : " (" + str.tostring(distancePct, "#.##") + "%)")
+    color  labelColor    = DASH_HEADER
+
+    table.cell(dashTable, 0, 0, "Side",                 text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 0, sideText,               text_color = sideColor,  text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 1, "Avg Penetration",      text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 1, formatPrice(activeAvg), text_color = DASH_TEXT,  text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 2, "Stop Distance",        text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 2, distanceText,           text_color = DASH_TEXT,  text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 3, "Stop Level",           text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 3, formatPrice(trail),     text_color = DASH_TEXT,  text_size = dashTextSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(longHit,  "Long Stop Hit",  "Elder SafeZone stop: price crossed below the long trailing stop")
+alertcondition(shortHit, "Short Stop Hit", "Elder SafeZone stop: price crossed above the short trailing stop")
+
+//---------------------------------------------------------------------------------------------------------------------}

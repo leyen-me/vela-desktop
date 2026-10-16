@@ -1,0 +1,152 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Vertical Horizontal Filter", "Vertical Horizontal Filter", overlay = false, format = format.price, precision = 3)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+NUM_CLOSE = "Close"
+NUM_HILO  = "High/Low"
+
+BASIS_MA  = "Moving Average"
+BASIS_PCT = "Percentile"
+
+MODE_REGIME = "Regime (vs Basis)"
+MODE_SLOPE  = "Slope (Rising/Falling)"
+MODE_FIXED  = "Fixed"
+
+TREND_COLOR = #089981 // trending regime - the favorable state for trend-following, direction-blind
+RANGE_COLOR = #787b86
+BASIS_COLOR = #ff9800
+
+SETTINGS_GROUP = "Settings"
+BASIS_GROUP    = "Regime Basis"
+STYLE_GROUP    = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+lengthInput = input.int(28, "Length", minval = 2, group = SETTINGS_GROUP
+  , tooltip = "Lookback window (n). The VHF divides the spread between the highest and lowest value of the window by the total absolute close-to-close travel within it. Shorter windows flip regimes faster but produce more false transitions; longer windows are steadier but slower.")
+
+numeratorInput = input.string(NUM_CLOSE, "Numerator Extremes", options = [NUM_CLOSE, NUM_HILO], group = SETTINGS_GROUP
+  , tooltip = "Series used for the numerator's extremes. 'Close' uses the highest and lowest close (classic definition); 'High/Low' uses the highest high and lowest low, a slightly noisier variant with unchanged interpretation.")
+
+basisModeInput = input.string(BASIS_MA, "Basis Type", options = [BASIS_MA, BASIS_PCT], group = BASIS_GROUP
+  , tooltip = "The VHF has no fixed universal threshold, so it is read against its own recent history. 'Moving Average' compares it with a moving average of itself; 'Percentile' compares it with a percentile of its recent readings.")
+
+maTypeInput = input.string("SMA", "MA Type", options = ["SMA", "EMA", "WMA", "RMA"], inline = "ma", group = BASIS_GROUP
+  , tooltip = "Moving average type applied to the VHF itself when the basis type is 'Moving Average'.")
+maLengthInput = input.int(28, "Length", minval = 1, inline = "ma", group = BASIS_GROUP
+  , tooltip = "Moving average type and length applied to the VHF itself when the basis type is 'Moving Average'. Readings above this average flag a trending regime.")
+
+percentileRankInput = input.float(75, "Percentile Rank", minval = 0, maxval = 100, step = 1, inline = "pct", group = BASIS_GROUP
+  , tooltip = "Percentile of recent VHF readings used as the regime level when the basis type is 'Percentile'.")
+percentileLookbackInput = input.int(100, "Lookback", minval = 2, inline = "pct", group = BASIS_GROUP
+  , tooltip = "Percentile rank and number of recent VHF readings used when the basis type is 'Percentile'. Readings above the chosen percentile of their own recent range flag a trending regime.")
+
+slopeLookbackInput = input.int(1, "Slope Lookback", minval = 1, maxval = 500, group = BASIS_GROUP
+  , tooltip = "Bars used to judge whether the VHF is rising or falling. Because absolute levels vary by market, a rising VHF is read as trend development regardless of where it starts.")
+
+colorModeInput = input.string(MODE_REGIME, "Color Mode", options = [MODE_REGIME, MODE_SLOPE, MODE_FIXED], group = STYLE_GROUP
+  , tooltip = "Coloring of the VHF line and gradient fill: by regime (above/below the basis), by slope (rising/falling), or a single fixed color. The VHF is direction-blind, so colors describe trendiness, not bullishness.")
+
+trendColorInput = input.color(TREND_COLOR, "Trending", inline = "colors", group = STYLE_GROUP)
+rangeColorInput = input.color(RANGE_COLOR, "Ranging", inline = "colors", group = STYLE_GROUP)
+basisColorInput = input.color(BASIS_COLOR, "Basis", inline = "colors", group = STYLE_GROUP)
+
+showBasisInput = input.bool(true, "Show Basis Line", group = STYLE_GROUP)
+showFillInput  = input.bool(true, "Gradient Fill", group = STYLE_GROUP)
+showLabelInput = input.bool(true, "Regime Label", group = STYLE_GROUP)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Moving average of the requested type — every candidate runs on each bar so series stay consistent
+selectMa(float sourceValue, simple int lengthValue, simple string maTypeValue) =>
+    smaValue = ta.sma(sourceValue, lengthValue)
+    emaValue = ta.ema(sourceValue, lengthValue)
+    wmaValue = ta.wma(sourceValue, lengthValue)
+    rmaValue = ta.rma(sourceValue, lengthValue)
+    switch maTypeValue
+        "EMA" => emaValue
+        "WMA" => wmaValue
+        "RMA" => rmaValue
+        => smaValue
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+// Window extremes — classic close-based numerator, optional high/low variant
+highestClose = ta.highest(close, lengthInput)
+lowestClose  = ta.lowest(close, lengthInput)
+highestHigh  = ta.highest(high, lengthInput)
+lowestLow    = ta.lowest(low, lengthInput)
+
+useClose      = numeratorInput == NUM_CLOSE
+extremeTop    = useClose ? highestClose : highestHigh
+extremeBottom = useClose ? lowestClose : lowestLow
+
+// Net vertical progress vs total horizontal travel
+numerator   = math.abs(extremeTop - extremeBottom)
+denominator = math.sum(math.abs(ta.change(close)), lengthInput)
+
+float vhf = na
+
+if not na(numerator) and not na(denominator)
+    if denominator > 0
+        vhf := numerator / denominator
+    else
+        vhf := 0.0
+
+// Regime basis — the VHF read against its own recent history
+maBasis         = selectMa(vhf, maLengthInput, maTypeInput)
+percentileBasis = ta.percentile_linear_interpolation(vhf, percentileLookbackInput, percentileRankInput)
+basis           = basisModeInput == BASIS_MA ? maBasis : percentileBasis
+
+// Regime & slope states
+vhfBack  = vhf[slopeLookbackInput]
+trending = na(vhf) or na(basis) ? false : vhf > basis
+rising   = na(vhf) or na(vhfBack) ? false : vhf > vhfBack
+falling  = na(vhf) or na(vhfBack) ? false : vhf < vhfBack
+
+trendingStart = trending and not trending[1]
+rangingStart  = not trending and trending[1]
+risingTurn    = rising and not rising[1]
+fallingTurn   = falling and not falling[1]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+color vhfColor = switch colorModeInput
+    MODE_REGIME => trending ? trendColorInput : rangeColorInput
+    MODE_SLOPE  => rising ? trendColorInput : rangeColorInput
+    => trendColorInput
+
+vhfPlotId  = plot(vhf, "VHF", vhfColor, 2)
+zeroPlotId = plot(0, "Zero", color(na), editable = false)
+
+plot(showBasisInput ? basis : na, "Basis", basisColorInput)
+
+fill(vhfPlotId, zeroPlotId, top_value = vhf, bottom_value = 0
+  , top_color    = showFillInput ? color.new(vhfColor, 50) : na
+  , bottom_color = showFillInput ? color.new(vhfColor, 100) : na
+  , title = "Gradient Fill")
+
+var label regimeLabelId = na
+
+if barstate.islast and showLabelInput and not na(vhf)
+    regimeText = (trending ? "Trending" : "Ranging") + "\nVHF " + str.tostring(vhf, "0.000")
+    label.delete(regimeLabelId)
+    regimeLabelId := label.new(bar_index + 2, vhf, regimeText, style = label.style_label_left, color = #00000000, textcolor = vhfColor, size = size.small)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(trendingStart, "Trending Regime Start", "Vertical Horizontal Filter crossed above its basis — directional movement is building, trend-following tools favored")
+alertcondition(rangingStart, "Ranging Regime Start", "Vertical Horizontal Filter crossed below its basis — directional movement is fading, mean-reversion tools favored")
+alertcondition(risingTurn, "VHF Turned Rising", "Vertical Horizontal Filter turned rising — trending conditions developing")
+alertcondition(fallingTurn, "VHF Turned Falling", "Vertical Horizontal Filter turned falling — trending conditions weakening")
+
+//---------------------------------------------------------------------------------------------------------------------}

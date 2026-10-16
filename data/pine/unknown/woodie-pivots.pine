@@ -1,0 +1,246 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Woodie Pivots", shorttitle = "Woodie Pivots", overlay = true, format = format.price, max_labels_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+string GROUP_SETTINGS  = "Settings"
+string GROUP_STYLE     = "Style"
+string GROUP_DASHBOARD = "Dashboard"
+
+string VARIANT_CLOSE = "Close-Weighted"
+string VARIANT_OPEN  = "Open-Based"
+
+PIVOT_COLOR   = #ff9800 // the central pivot is the one accent - the bias line the ladder is built on
+NEUTRAL_COLOR = #787b86
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+anchorInput = input.string("Daily", "Anchor Period"
+  , options = ["Daily", "Weekly", "Monthly"]
+  , group   = GROUP_SETTINGS
+  , tooltip = "Completed prior period supplying the high, low and close (or the new period's open, per the formula). Daily pivots on 1 to 15 minute charts are the classic Woodie setting; weekly and monthly sets give swing references that update once per period. The ladder rolls at each new period and stays fixed until the next roll: nothing that prints today changes today's pivots. On 24-hour markets the day boundary of your data feed shifts every level.")
+
+formulaInput = input.string(VARIANT_CLOSE, "Pivot Formula"
+  , options = [VARIANT_CLOSE, VARIANT_OPEN]
+  , group   = GROUP_SETTINGS
+  , tooltip = "Which price the pivot double-weights. Close-Weighted, the widespread platform version: P = (H + L + 2C) / 4 from the prior period. Open-Based, closer to the original convention: P = (H + L + 2 * Open) / 4 with the current period's open, so the pivot absorbs the overnight gap and the whole ladder shifts to where trading actually resumed. Both variants coexist across platforms, which is why two Woodie overlays can disagree on the same chart — hand-check the central pivot to see which convention another tool uses.")
+
+showPivotInput = input.bool(true, "Pivot (P)"
+  , inline = "pivot"
+  , group  = GROUP_STYLE)
+
+pivotColorInput = input.color(PIVOT_COLOR, ""
+  , inline  = "pivot"
+  , group   = GROUP_STYLE
+  , tooltip = "Central Woodie pivot, P = (H + L + 2C) / 4 or P = (H + L + 2 * Open) / 4 per the selected formula. Either way the most recent information is double-weighted, and the level is commonly read as the session's bias line: trade above it favors longs, below it favors shorts.")
+
+showTier1Input = input.bool(true, "R1 / S1"
+  , group   = GROUP_STYLE
+  , tooltip = "First tier: R1 = 2P - L reflects the prior low through the pivot, S1 = 2P - H reflects the prior high. The familiar structure of the classic ladder, built on the Woodie center.")
+
+showTier2Input = input.bool(true, "R2 / S2"
+  , group   = GROUP_STYLE
+  , tooltip = "Second tier: R2 = P + (H - L) and S2 = P - (H - L), one full prior range above and below the pivot.")
+
+showTier3Input = input.bool(false, "R3 / S3"
+  , group   = GROUP_STYLE
+  , tooltip = "Extended tier: R3 = H + 2 * (P - L) and S3 = L - 2 * (H - P), matching the classic third-tier extensions. Sources disagree on whether these belong to the original Woodie convention, so they are off by default — treat them as a platform choice rather than a canonical part of the formula.")
+
+showFloorInput = input.bool(false, "Floor Pivot Comparison"
+  , inline = "floor"
+  , group  = GROUP_STYLE)
+
+floorColorInput = input.color(color.new(#787b86, 30), ""
+  , inline  = "floor"
+  , group   = GROUP_STYLE
+  , tooltip = "Overlay the classic floor center P = (H + L + C) / 3 as a faded reference line. After quiet mid-range closes the two centers nearly coincide; after a strong directional day or an opening gap they separate, and the distance between them shows how much the extra close or open weighting mattered.")
+
+resistanceColorInput = input.color(#f23645, "Resistance Color"
+  , group   = GROUP_STYLE
+  , tooltip = "Color of the resistance levels R1, R2 and R3.")
+
+supportColorInput = input.color(#089981, "Support Color"
+  , group   = GROUP_STYLE
+  , tooltip = "Color of the support levels S1, S2 and S3.")
+
+lineWidthInput = input.int(1, "Line Width"
+  , minval  = 1
+  , maxval  = 5
+  , group   = GROUP_STYLE
+  , tooltip = "Line width of all pivot levels.")
+
+showLabelsInput = input.bool(true, "Level Labels"
+  , group   = GROUP_STYLE
+  , tooltip = "Show a name and price label for each visible level of the current set, next to the most recent bar.")
+
+showDashInput = input.bool(true, "Info Panel"
+  , group   = GROUP_DASHBOARD
+  , tooltip = "Compact summary of the active anchor and pivot formula, plus where the current period opened relative to the pivot — the open-versus-P relationship many Woodie playbooks key off.")
+
+dashLocInput = input.string("Top Right", "Location"
+  , options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"]
+  , inline  = "dash"
+  , group   = GROUP_DASHBOARD
+  , tooltip = "Panel position on the chart and text size.")
+
+dashSizeInput = input.string("Small", ""
+  , options = ["Tiny", "Small", "Normal"]
+  , inline  = "dash"
+  , group   = GROUP_DASHBOARD)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+string anchorTf = switch anchorInput
+    "Daily"  => "D"
+    "Weekly" => "W"
+    =>          "M"
+
+// prior completed period high, low and close plus the current period's open — the [1] offsets with lookahead return
+// the finished period's values from the first bar of the new period without repainting, and the current period's open
+// is fixed from its first tick, so neither input repaints
+[priorHigh, priorLow, priorClose, periodOpen] = request.security(syminfo.tickerid, anchorTf, [high[1], low[1], close[1], open], lookahead = barmerge.lookahead_on)
+
+// the anchor period must be greater than or equal to the chart timeframe to be meaningful
+bool anchorTooSmall = timeframe.in_seconds(anchorTf) < timeframe.in_seconds(timeframe.period)
+bool anchorIsChart  = timeframe.in_seconds(anchorTf) == timeframe.in_seconds(timeframe.period)
+
+// first chart bar of a new anchor period, where the whole ladder rolls to fresh values
+bool newPeriod = timeframe.change(anchorTf)
+bool rollBar   = newPeriod and not anchorIsChart
+
+// the Woodie center double-weights the most recent information: the prior close in the widespread platform version,
+// or the current period's open in the variant closer to the original convention, pricing the overnight gap into the
+// whole ladder
+bool  openBased  = formulaInput == VARIANT_OPEN
+float pivotBasis = openBased ? periodOpen : priorClose
+float pivotPoint = anchorTooSmall ? na : (priorHigh + priorLow + 2 * pivotBasis) / 4
+float priorRange = priorHigh - priorLow
+
+float r1Level = 2 * pivotPoint - priorLow
+float s1Level = 2 * pivotPoint - priorHigh
+float r2Level = pivotPoint + priorRange
+float s2Level = pivotPoint - priorRange
+
+// extended tier matching the classic third-tier math — a platform extension rather than canonical Woodie
+float r3Level = priorHigh + 2 * (pivotPoint - priorLow)
+float s3Level = priorLow  - 2 * (priorHigh - pivotPoint)
+
+// classic floor center with equal weighting, for the optional comparison overlay
+float floorPivot = anchorTooSmall ? na : (priorHigh + priorLow + priorClose) / 3
+
+// where the period opened relative to the pivot selects the session lean many Woodie playbooks start from
+[openBiasText, openBiasColor] = if anchorTooSmall or na(periodOpen) or na(pivotPoint)
+    ["—", NEUTRAL_COLOR]
+else if periodOpen > pivotPoint
+    ["Above P — long lean", supportColorInput]
+else if periodOpen < pivotPoint
+    ["Below P — short lean", resistanceColorInput]
+else
+    ["At P — neutral", pivotColorInput]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Plots
+//---------------------------------------------------------------------------------------------------------------------{
+// levels hold flat within each period, breaking at every roll so each set displays as its own horizontal segment
+plot(showTier3Input and not rollBar ? r3Level    : na, "R3",        resistanceColorInput, lineWidthInput, plot.style_linebr)
+plot(showTier2Input and not rollBar ? r2Level    : na, "R2",        resistanceColorInput, lineWidthInput, plot.style_linebr)
+plot(showTier1Input and not rollBar ? r1Level    : na, "R1",        resistanceColorInput, lineWidthInput, plot.style_linebr)
+plot(showPivotInput and not rollBar ? pivotPoint : na, "Pivot (P)", pivotColorInput,      lineWidthInput, plot.style_linebr)
+plot(showFloorInput and not rollBar ? floorPivot : na, "Floor P",   floorColorInput,      lineWidthInput, plot.style_linebr)
+plot(showTier1Input and not rollBar ? s1Level    : na, "S1",        supportColorInput,    lineWidthInput, plot.style_linebr)
+plot(showTier2Input and not rollBar ? s2Level    : na, "S2",        supportColorInput,    lineWidthInput, plot.style_linebr)
+plot(showTier3Input and not rollBar ? s3Level    : na, "S3",        supportColorInput,    lineWidthInput, plot.style_linebr)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Labels
+//---------------------------------------------------------------------------------------------------------------------{
+var label[] levelLabels = array.new<label>()
+
+if barstate.islast and showLabelsInput and not anchorTooSmall
+    for eachLabel in levelLabels
+        label.delete(eachLabel)
+    array.clear(levelLabels)
+
+    string[] levelNames  = array.from("R3", "R2", "R1", "P", "Floor P", "S1", "S2", "S3")
+    float[]  levelValues = array.from(r3Level, r2Level, r1Level, pivotPoint, floorPivot, s1Level, s2Level, s3Level)
+    bool[]   levelShows  = array.from(showTier3Input, showTier2Input, showTier1Input, showPivotInput, showFloorInput, showTier1Input, showTier2Input, showTier3Input)
+    color[]  levelColors = array.from(resistanceColorInput, resistanceColorInput, resistanceColorInput, pivotColorInput, floorColorInput, supportColorInput, supportColorInput, supportColorInput)
+
+    for i = 0 to array.size(levelNames) - 1
+        float levelValue = array.get(levelValues, i)
+
+        if array.get(levelShows, i) and not na(levelValue)
+            array.push(levelLabels, label.new(bar_index, levelValue
+              , array.get(levelNames, i) + "  " + str.tostring(levelValue, format.mintick)
+              , color     = #00000000
+              , textcolor = array.get(levelColors, i)
+              , style     = label.style_label_left
+              , size      = size.small))
+
+// warn when the selected anchor period is lower than the chart timeframe
+if barstate.islast and anchorTooSmall
+    var table warnTable = table.new(position.top_right, 1, 1)
+
+    table.cell(warnTable, 0, 0, "Woodie Pivots: anchor period must be greater than or equal to the chart timeframe"
+      , text_color = chart.fg_color
+      , text_size  = size.small
+      , bgcolor    = color.new(#f23645, 80))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+dashPosition = switch dashLocInput
+    "Top Right"    => position.top_right
+    "Top Left"     => position.top_left
+    "Bottom Right" => position.bottom_right
+    =>                position.bottom_left
+
+dashTextSize = switch dashSizeInput
+    "Tiny"  => size.tiny
+    "Small" => size.small
+    =>         size.normal
+
+var table dashTable = showDashInput ? table.new(dashPosition, 2, 3
+  , bgcolor      = DASH_BG
+  , frame_color  = DASH_FRAME
+  , frame_width  = 1
+  , border_width = 0) : na
+
+if showDashInput and barstate.islast and not anchorTooSmall
+    dashTable.cell(0, 0, "Anchor",    text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left)
+    dashTable.cell(1, 0, anchorInput, text_color = DASH_TEXT,   text_size = dashTextSize, text_halign = text.align_right)
+    dashTable.cell(0, 1, "Formula",   text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left)
+    dashTable.cell(1, 1, formulaInput, text_color = DASH_TEXT,  text_size = dashTextSize, text_halign = text.align_right)
+    dashTable.cell(0, 2, "Open vs P", text_color = DASH_HEADER, text_size = dashTextSize, text_halign = text.align_left)
+    dashTable.cell(1, 2, openBiasText, text_color = openBiasColor,                text_size = dashTextSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+// crosses on the roll bar itself are ignored, since they compare price against the previous period's ladder
+bool crossAbovePivot = ta.crossover(close, pivotPoint)  and not rollBar
+bool crossBelowPivot = ta.crossunder(close, pivotPoint) and not rollBar
+bool crossAboveR1    = ta.crossover(close, r1Level)     and not rollBar
+bool crossBelowS1    = ta.crossunder(close, s1Level)    and not rollBar
+bool crossAboveR2    = ta.crossover(close, r2Level)     and not rollBar
+bool crossBelowS2    = ta.crossunder(close, s2Level)    and not rollBar
+bool crossAboveR3    = ta.crossover(close, r3Level)     and not rollBar
+bool crossBelowS3    = ta.crossunder(close, s3Level)    and not rollBar
+
+alertcondition(crossAbovePivot, "Price Crossed Above Pivot (P)", "Price crossed above the Woodie pivot, bias leans long while P holds as support")
+alertcondition(crossBelowPivot, "Price Crossed Below Pivot (P)", "Price crossed below the Woodie pivot, bias leans short while P holds as resistance")
+alertcondition(crossAboveR1,    "Price Crossed Above R1",        "Price crossed above R1, the common first objective for longs taken at the Woodie pivot")
+alertcondition(crossBelowS1,    "Price Crossed Below S1",        "Price crossed below S1, the common first objective for shorts taken at the Woodie pivot")
+alertcondition(crossAboveR2,    "Price Crossed Above R2",        "Price crossed above R2, one full prior range above the Woodie pivot")
+alertcondition(crossBelowS2,    "Price Crossed Below S2",        "Price crossed below S2, one full prior range below the Woodie pivot")
+alertcondition(crossAboveR3,    "Price Crossed Above R3",        "Price crossed above R3, the extended third resistance of the Woodie ladder")
+alertcondition(crossBelowS3,    "Price Crossed Below S3",        "Price crossed below S3, the extended third support of the Woodie ladder")
+
+//---------------------------------------------------------------------------------------------------------------------}

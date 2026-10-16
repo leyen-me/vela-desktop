@@ -1,0 +1,554 @@
+// This work is licensed under Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Spike and Channel"
+  , shorttitle       = "Spike and Channel"
+  , overlay          = true
+  , format           = format.price
+  , max_lines_count  = 500
+  , max_labels_count = 500
+  , max_boxes_count  = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+color BULL_COLOR    = #089981
+color BEAR_COLOR    = #f23645
+color NEUTRAL_COLOR = #787b86
+color LABEL_BG      = #00000000
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+// Pattern lifecycle, one machine per direction
+int ST_IDLE     = 0
+int ST_PULLBACK = 1
+int ST_CHANNEL  = 2
+int ST_BROKEN   = 3
+
+int CHANNEL_FILL_TRANSP = 90
+int POSITION_BG_TRANSP  = 88
+
+string GROUP_SPIKE   = "Spike"
+string GROUP_CHANNEL = "Channel"
+string GROUP_TRADE   = "Channel End Trade"
+string GROUP_DASH    = "Dashboard"
+string GROUP_STYLE   = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+spikeAtrInput = input.float(2, "Minimum Spike (ATR)", minval = 0.5, maxval = 20, step = 0.25, group = GROUP_SPIKE
+  , tooltip = "Travel of the spike, from the first trend bar's open-side extreme to the last one's far extreme, in 14-bar ATRs measured before the spike. The spike is the urgency phase: one side overwhelming the other.")
+
+maxSpikeBarsInput = input.int(5, "Maximum Spike Bars", minval = 1, maxval = 20, group = GROUP_SPIKE
+  , tooltip = "Most consecutive trend bars a spike may contain. A longer run of strong bars is read on its own merits rather than as one breakout.")
+
+bodyInput = input.float(50, "Trend Bar Body (%)", minval = 20, maxval = 100, step = 5, group = GROUP_SPIKE
+  , tooltip = "A spike bar is a trend bar: its body fills at least this share of its range.")
+
+closeInput = input.float(30, "Close Near Extreme (%)", minval = 5, maxval = 50, step = 5, group = GROUP_SPIKE
+  , tooltip = "A spike bar closes within this share of its range from its extreme (the high of a bull bar, the low of a bear bar).")
+
+overlapInput = input.float(50, "Maximum Overlap (%)", minval = 0, maxval = 100, step = 5, group = GROUP_SPIKE
+  , tooltip = "Consecutive spike bars barely overlap: each bar may give back at most this share of the previous bar's range before closing beyond it.")
+
+maxRetraceInput = input.float(75, "Maximum Pullback (% of Spike)", minval = 20, maxval = 100, step = 5, group = GROUP_CHANNEL
+  , tooltip = "The pullback after the spike may retrace at most this share of the spike. Deeper, and the breakout failed rather than paused.")
+
+maxPullbackBarsInput = input.int(20, "Maximum Pullback Bars", minval = 2, maxval = 200, group = GROUP_CHANNEL
+  , tooltip = "Bars the pullback may last before the trend must resume beyond the spike's extreme, which starts the channel.")
+
+minLegsInput = input.int(2, "Minimum Channel Legs", minval = 1, maxval = 6, group = GROUP_CHANNEL
+  , tooltip = "Legs the channel needs before it counts: pushes to a new extreme separated by pullbacks. Brooks' minimum is a breakout, a pullback, then at least two more legs in a channel.")
+
+maxSlopeInput = input.float(70, "Maximum Channel Slope (% of Spike)", minval = 10, maxval = 100, step = 5, group = GROUP_CHANNEL
+  , tooltip = "The channel continues the spike at a shallower angle: its fitted slope per bar may be at most this share of the spike's. A channel as steep as the spike is still part of the spike.")
+
+maxChannelBarsInput = input.int(80, "Maximum Channel Bars", minval = 10, maxval = 500, group = GROUP_CHANNEL
+  , tooltip = "A channel still running after this many bars is closed as history: it has turned into a broad trend or a range, and its start is no longer a practical target.")
+
+breakBufferInput = input.float(0.2, "Trendline Break Buffer (ATR)", minval = 0, maxval = 2, step = 0.05, group = GROUP_CHANNEL
+  , tooltip = "A break needs a close at least this many ATRs beyond the trendline, so the bar-to-bar noise along a two-sided channel does not count as its end.")
+
+maxTestBarsInput = input.int(15, "Failed Test Window (Bars)", minval = 2, maxval = 100, group = GROUP_CHANNEL
+  , tooltip = "After the trendline breaks, bars allowed for the test of the trend extreme to fail. A close beyond the trend extreme first means the channel is still running.")
+
+showTradeInput = input.bool(true, "Trade the Channel End", group = GROUP_TRADE
+  , tooltip = "After a trendline break and a failed test of the trend extreme, plan the countertrend trade toward the start of the channel: entry when price breaks the post-break low (high for bear channels), stop beyond the test.")
+
+stopBufferInput = input.float(0.1, "Stop Buffer (ATR)", minval = 0, maxval = 2, step = 0.05, group = GROUP_TRADE)
+
+maxHoldInput = input.int(60, "Maximum Hold (Bars)", minval = 5, maxval = 500, group = GROUP_TRADE
+  , tooltip = "A trade that reaches neither the channel start nor its stop within this many bars is closed and recorded as Timed Out.")
+
+showDashInput = input.bool(true, "Show Dashboard", group = GROUP_DASH
+  , tooltip = "The active or last pattern: spike size and length, channel slope against the spike, legs, the channel start and the trade.")
+
+dashPosInput  = input.string("Top Right", "Position", options = ["Top Right", "Bottom Right", "Bottom Left", "Top Left"], group = GROUP_DASH)
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = GROUP_DASH)
+
+bullColorInput    = input.color(BULL_COLOR, "Bull", inline = "colors", group = GROUP_STYLE)
+bearColorInput    = input.color(BEAR_COLOR, "Bear", inline = "colors", group = GROUP_STYLE)
+neutralColorInput = input.color(NEUTRAL_COLOR, "Channel Start", inline = "colors", group = GROUP_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types
+//---------------------------------------------------------------------------------------------------------------------{
+type SCState
+    int      dir
+    int      state        = 0
+    // spike in progress
+    int      runCount     = 0
+    int      runStartBar  = na
+    float    runStart     = na
+    float    runExtreme   = na
+    int      runExtBar    = na
+    // spike
+    int      spikeStartBar = na
+    float    spikeStart    = na
+    int      spikeEndBar   = na
+    float    spikeEnd      = na
+    float    spikeAtr      = na
+    // pullback and channel
+    float    extreme      = na
+    int      extremeBar   = na
+    float    pbExtreme    = na
+    int      pbBar        = na
+    float    chStart      = na
+    int      chStartBar   = na
+    int      legs         = 0
+    bool     armed        = false
+    float    fitSlope     = na
+    float    fitWidth     = na
+    // break and test
+    int      breakBar     = na
+    int      breaks       = 0
+    float    breakExt     = na
+    float    testExtreme  = na
+    int      testBar      = na
+    float    testBack     = na
+    float    postBreak    = na
+    // trade
+    bool     inTrade      = false
+    int      tradeBar     = na
+    float    entry        = na
+    float    stop         = na
+    float    target       = na
+    string   status       = "Scanning"
+    // drawings
+    line     spikeLine
+    label    spikeLabel
+    line     trendLine
+    line     channelLine
+    linefill channelFill
+    label    startLabel
+    line     startLine
+    box      rewardBox
+    box      riskBox
+    label    chLabel
+    int      chLabelBar   = na
+    label    brLabel
+    int      brLabelBar   = na
+
+var SCState bullState = SCState.new(dir = 1)
+var SCState bearState = SCState.new(dir = -1)
+var SCState lastState = na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+getTablePosition(string positionText) =>
+    switch positionText
+        "Top Right"   => position.top_right
+        "Top Left"    => position.top_left
+        "Bottom Left" => position.bottom_left
+        =>               position.bottom_right
+
+getTableSize(string sizeText) =>
+    switch sizeText
+        "Tiny"   => size.tiny
+        "Normal" => size.normal
+        =>          size.small
+
+// Trendline anchored at the channel start: the steepest line from the start that no later low (high for a bear
+// channel) crosses, so it touches the start and at least one later pullback. The trend channel line runs parallel
+// through the furthest opposite extreme. x = 0 is the start bar, n bars in all
+anchoredChannel(int n, int d, float anchor) =>
+    float slope = na
+    if n >= 2
+        for offset = 0 to n - 2
+            int   x = n - 1 - offset
+            float p = d == 1 ? low[offset] : high[offset]
+            float m = (p - anchor) / x
+            slope := na(slope) ? m : d == 1 ? math.min(slope, m) : math.max(slope, m)
+    float m0    = nz(slope)
+    float width = 0.
+    for offset = 0 to n - 1
+        int   x  = n - 1 - offset
+        float tl = anchor + m0 * x
+        float p  = d == 1 ? high[offset] : low[offset]
+        width := math.max(width, d * (p - tl))
+    [m0, width]
+
+// Strong trend bar in the given direction: big body, close near the extreme, little overlap with the previous bar
+trendBar(int d) =>
+    float rng      = high - low
+    float body     = math.abs(close - open)
+    bool  dirOk    = d == 1 ? close > open : close < open
+    bool  bodyOk   = rng > 0 and body >= bodyInput / 100 * rng
+    bool  closeOk  = rng > 0 and (d == 1 ? high - close : close - low) <= closeInput / 100 * rng
+    float prevRng  = high[1] - low[1]
+    float giveBack = d == 1 ? high[1] - math.max(low, low[1]) : math.min(high, high[1]) - low[1]
+    bool  overlapOk = prevRng <= 0 or giveBack <= overlapInput / 100 * prevRng or d * (close - close[1]) > 0 and d * (open - close[1]) >= 0
+    dirOk and bodyOk and closeOk and overlapOk
+
+clearPattern(SCState s) =>
+    line.delete(s.spikeLine)
+    label.delete(s.spikeLabel)
+    line.delete(s.trendLine)
+    line.delete(s.channelLine)
+    linefill.delete(s.channelFill)
+    label.delete(s.startLabel)
+    line.delete(s.startLine)
+
+// Advances one direction's machine on a confirmed bar; returns [spike, channel confirmed, trendline break, channel over, target, stop]
+update(SCState s, float atrValue, color dirColor, color oppColor) =>
+    int  d            = s.dir
+    bool spikeEvent   = false
+    bool channelEvent = false
+    bool breakEvent   = false
+    bool overEvent    = false
+    bool targetEvent  = false
+    bool stopEvent    = false
+    float barExt  = d == 1 ? high : low
+    float barBack = d == 1 ? low : high
+
+    // -- open countertrend trade --------------------------------------------------------------------------------
+    if s.inTrade and bar_index > s.tradeBar
+        box.set_right(s.rewardBox, bar_index)
+        box.set_right(s.riskBox, bar_index)
+        line.set_x2(s.startLine, bar_index)
+        bool stopped = d == 1 ? high >= s.stop : low <= s.stop
+        bool reached = d == 1 ? low <= s.target : high >= s.target
+        if stopped
+            stopEvent := true
+            s.inTrade := false
+            s.status  := "Stopped"
+            label.new(bar_index, d == 1 ? high : low, "Stopped", style = d == 1 ? label.style_label_down : label.style_label_up, color = LABEL_BG, textcolor = dirColor, size = size.small
+              , tooltip = "The trend extreme was exceeded: the channel is still running")
+        else if reached
+            targetEvent := true
+            s.inTrade   := false
+            s.status    := "Channel start tested"
+            label.new(bar_index, d == 1 ? low : high, "Start tested", style = d == 1 ? label.style_label_up : label.style_label_down, color = LABEL_BG, textcolor = oppColor, size = size.small
+              , tooltip = "The correction reached the start of the channel " + str.tostring(s.target, format.mintick) + ", " + str.tostring(bar_index - s.tradeBar) + " bars after the entry: where with-trend traders look for a double bottom or top flag")
+        else if bar_index - s.tradeBar >= maxHoldInput
+            s.inTrade := false
+            s.status  := "Timed out"
+
+    // -- keep the two event tags clear of the neighbouring candles for a few bars after they print ----------------
+    if not na(s.chLabelBar) and bar_index - s.chLabelBar <= 3
+        int   k  = bar_index - s.chLabelBar + 2
+        float ex = d == 1 ? high : low
+        for i = 0 to k
+            ex := d == 1 ? math.max(ex, high[i]) : math.min(ex, low[i])
+        label.set_y(s.chLabel, ex + d * 0.15 * atrValue)
+    if not na(s.brLabelBar) and bar_index - s.brLabelBar <= 3
+        int   k  = bar_index - s.brLabelBar + 2
+        float ex = d == 1 ? low : high
+        for i = 0 to k
+            ex := d == 1 ? math.min(ex, low[i]) : math.max(ex, high[i])
+        label.set_y(s.brLabel, ex - d * 0.15 * atrValue)
+
+    // -- channel phase ------------------------------------------------------------------------------------------
+    if s.state == ST_CHANNEL or s.state == ST_BROKEN
+        int   n       = bar_index - s.chStartBar + 1
+        float projTL  = s.chStart + s.fitSlope * (n - 1)
+        if s.state == ST_CHANNEL
+            bool newExt = d * (barExt - s.extreme) > 0
+            if newExt
+                if s.armed
+                    s.legs  += 1
+                    s.armed := false
+                    if s.legs == minLegsInput
+                        channelEvent := true
+                        s.status := "Channel, " + str.tostring(s.legs) + " legs"
+                        s.chLabelBar := bar_index
+                        s.chLabel    := label.new(bar_index, barExt, "Channel", style = d == 1 ? label.style_label_down : label.style_label_up, color = LABEL_BG, textcolor = dirColor, size = size.small
+                          , tooltip = "Channel confirmed: " + str.tostring(s.legs) + " legs since the channel start, contained by a trendline and a parallel trend channel line, shallower than the spike")
+                    else if s.legs > minLegsInput
+                        s.status := "Channel, " + str.tostring(s.legs) + " legs"
+                s.extreme    := barExt
+                s.extremeBar := bar_index
+            else if d * (barExt - (d == 1 ? high[1] : low[1])) < 0
+                s.armed := true
+            // Trendline break: a close beyond the trendline of the channel fitted through the previous bar
+            bool broke = d * (close - projTL) < -breakBufferInput * atrValue
+            if broke and s.legs >= minLegsInput
+                breakEvent    := true
+                s.state       := ST_BROKEN
+                s.breakBar    := bar_index
+                s.breaks      += 1
+                s.breakExt    := barExt
+                s.testExtreme := barExt
+                s.testBar     := bar_index
+                s.testBack    := barBack
+                s.postBreak   := barBack
+                s.status      := "Trendline broken"
+                // Only the first break is labelled; a channel that resumes and breaks again keeps its one marker
+                if s.breaks == 1
+                    s.brLabelBar := bar_index
+                    s.brLabel    := label.new(bar_index, barBack, "TL break", style = d == 1 ? label.style_label_up : label.style_label_down, color = LABEL_BG, textcolor = oppColor, size = size.small
+                      , tooltip = "Close beyond the channel's trendline. A failed test of the trend extreme next would end the channel phase.")
+            else if broke
+                // The trendline gave way before the channel had its legs: a spike without a channel
+                clearPattern(s)
+                s.state  := ST_IDLE
+                s.status := "No channel"
+            else if n > maxChannelBarsInput
+                s.state  := ST_IDLE
+                s.status := "Channel expired"
+            else
+                // Refit the channel through this bar and slope-check it against the spike
+                [slope, width] = anchoredChannel(n, d, s.chStart)
+                float spikeSlope = math.abs(s.spikeEnd - s.spikeStart) / math.max(s.spikeEndBar - s.spikeStartBar + 1, 1)
+                bool  slopeOk    = d * slope > 0 and math.abs(slope) <= maxSlopeInput / 100 * spikeSlope
+                if not slopeOk and s.legs < minLegsInput and n > 6
+                    clearPattern(s)
+                    s.state  := ST_IDLE
+                    s.status := "No channel"
+                else
+                    s.fitSlope := slope
+                    s.fitWidth := width
+                    float tl1 = s.chStart + slope * (n - 1)
+                    line.set_xy1(s.trendLine, s.chStartBar, s.chStart)
+                    line.set_xy2(s.trendLine, bar_index, tl1)
+                    line.set_xy1(s.channelLine, s.chStartBar, s.chStart + d * width)
+                    line.set_xy2(s.channelLine, bar_index, tl1 + d * width)
+                    line.set_x2(s.startLine, bar_index)
+        else
+            // Broken: wait for the test of the trend extreme to fail
+            line.set_x2(s.startLine, bar_index)
+            if d * (close - s.extreme) > 0
+                // The test succeeded: the channel is still running, once. A second break settles it either way
+                if s.breaks >= 2 or bar_index - s.chStartBar > maxChannelBarsInput
+                    s.state  := ST_IDLE
+                    s.status := "Channel extended"
+                else
+                    s.state  := ST_CHANNEL
+                    s.status := "Channel resumed"
+                s.extreme    := barExt
+                s.extremeBar := bar_index
+            else if bar_index - s.breakBar > maxTestBarsInput
+                s.state  := ST_IDLE
+                s.status := "Break not followed through"
+            else
+                // The test: a rally back beyond the break bar toward the trend extreme. It has failed when a later bar
+                // trades through the test bar's other end, the stop entry of the countertrend trade
+                bool  tested  = d * (s.testExtreme - s.breakExt) > 0
+                float trigger = s.testBack - d * syminfo.mintick
+                bool  fired   = tested and bar_index > s.testBar and d * (barBack - trigger) <= 0
+                if fired
+                    overEvent := true
+                    s.state   := ST_IDLE
+                    s.status  := "Channel over"
+                    float entryPrice = d == 1 ? math.min(open, trigger) : math.max(open, trigger)
+                    label.new(bar_index, barExt, "Channel Over", style = d == 1 ? label.style_label_down : label.style_label_up, color = oppColor, textcolor = color.white, size = size.small
+                      , tooltip = "Trendline broken, then the test of the trend extreme " + str.tostring(s.extreme, format.mintick) + " failed at " + str.tostring(s.testExtreme, format.mintick) + ": price traded through the test bar's " + (d == 1 ? "low" : "high") + ". The start of the channel " + str.tostring(s.chStart, format.mintick) + " is the first target.")
+                    if showTradeInput and not s.inTrade
+                        float stopPrice = s.testExtreme + d * stopBufferInput * atrValue
+                        float targetPx  = s.chStart
+                        if d * (entryPrice - targetPx) > 0
+                            s.inTrade   := true
+                            s.tradeBar  := bar_index
+                            s.entry     := entryPrice
+                            s.stop      := stopPrice
+                            s.target    := targetPx
+                            s.status    := d == 1 ? "Short to channel start" : "Long to channel start"
+                            s.rewardBox := box.new(bar_index, math.max(entryPrice, targetPx), bar_index, math.min(entryPrice, targetPx), border_color = color.new(bullColorInput, 70), bgcolor = color.new(bullColorInput, POSITION_BG_TRANSP))
+                            s.riskBox   := box.new(bar_index, math.max(entryPrice, stopPrice), bar_index, math.min(entryPrice, stopPrice), border_color = color.new(bearColorInput, 70), bgcolor = color.new(bearColorInput, POSITION_BG_TRANSP))
+                            // A bar that triggers and closes beyond the target or the stop resolves at once
+                            if d * (close - targetPx) <= 0
+                                targetEvent := true
+                                s.inTrade   := false
+                                s.status    := "Channel start tested"
+                else
+                    if d * (barExt - s.testExtreme) > 0
+                        s.testExtreme := barExt
+                        s.testBar     := bar_index
+                        s.testBack    := barBack
+                    s.postBreak := d == 1 ? math.min(s.postBreak, low) : math.max(s.postBreak, high)
+
+    // -- pullback after the spike ---------------------------------------------------------------------------------
+    else if s.state == ST_PULLBACK
+        if d * (barExt - s.extreme) > 0
+            if na(s.pbExtreme)
+                // Still extending before any pullback: the spike's reach grows
+                s.extreme    := barExt
+                s.extremeBar := bar_index
+                line.set_xy2(s.spikeLine, bar_index, barExt)
+            else
+                // The trend resumed beyond the spike: the channel starts at the pullback extreme
+                s.state      := ST_CHANNEL
+                s.chStart    := s.pbExtreme
+                s.chStartBar := s.pbBar
+                s.legs       := 1
+                s.armed      := false
+                s.extreme    := barExt
+                s.extremeBar := bar_index
+                s.status     := "Channel forming"
+                int n = bar_index - s.chStartBar + 1
+                [slope, width] = anchoredChannel(n, d, s.chStart)
+                s.fitSlope := slope
+                s.fitWidth := width
+                float tl1 = s.chStart + slope * (n - 1)
+                s.trendLine   := line.new(s.chStartBar, s.chStart, bar_index, tl1, color = dirColor, width = 2)
+                s.channelLine := line.new(s.chStartBar, s.chStart + d * width, bar_index, tl1 + d * width, color = color.new(dirColor, 40))
+                s.channelFill := linefill.new(s.trendLine, s.channelLine, color.new(dirColor, CHANNEL_FILL_TRANSP))
+                s.startLine   := line.new(s.chStartBar, s.chStart, bar_index, s.chStart, color = neutralColorInput, style = line.style_dashed)
+                s.startLabel  := label.new(s.chStartBar, s.chStart, "Channel start", style = d == 1 ? label.style_label_up : label.style_label_down, color = LABEL_BG, textcolor = neutralColorInput, size = size.small
+                  , tooltip = "Extreme of the pullback after the spike: the channel starts here, and the correction that ends the channel often comes back to test it")
+        else
+            if na(s.pbExtreme) or d * (barBack - s.pbExtreme) < 0
+                s.pbExtreme := barBack
+                s.pbBar     := bar_index
+            if d * (s.extreme - s.pbExtreme) > maxRetraceInput / 100 * math.abs(s.extreme - s.spikeStart) or bar_index - s.extremeBar > maxPullbackBarsInput
+                clearPattern(s)
+                s.state  := ST_IDLE
+                s.status := "Spike failed"
+
+    // -- spike detection ------------------------------------------------------------------------------------------
+    bool isTrendBar = trendBar(d)
+    if isTrendBar
+        if s.runCount == 0
+            s.runStartBar := bar_index
+            s.runStart    := d == 1 ? math.min(low, open) : math.max(high, open)
+            s.runExtreme  := barExt
+            s.runExtBar   := bar_index
+        s.runCount += 1
+        if d * (barExt - s.runExtreme) >= 0
+            s.runExtreme := barExt
+            s.runExtBar  := bar_index
+    if not isTrendBar and s.runCount > 0
+        float travel = math.abs(s.runExtreme - s.runStart)
+        float atrRef = atrValue[s.runCount + 1]
+        bool  spikeOk = not na(atrRef) and travel >= spikeAtrInput * atrRef and s.runCount <= maxSpikeBarsInput
+        if spikeOk and s.state == ST_IDLE and not s.inTrade
+            spikeEvent      := true
+            // A new pattern owns new drawings: the previous pattern's stay on the chart as history
+            s.trendLine     := line(na)
+            s.channelLine   := line(na)
+            s.channelFill   := linefill(na)
+            s.startLabel    := label(na)
+            s.startLine     := line(na)
+            s.breaks        := 0
+            s.chLabelBar    := na
+            s.brLabelBar    := na
+            s.chStart       := na
+            s.fitSlope      := na
+            s.entry         := na
+            s.state         := ST_PULLBACK
+            s.spikeStartBar := s.runStartBar
+            s.spikeStart    := s.runStart
+            s.spikeEndBar   := s.runExtBar
+            s.spikeEnd      := s.runExtreme
+            s.spikeAtr      := travel / atrRef
+            s.extreme       := s.runExtreme
+            s.extremeBar    := s.runExtBar
+            s.pbExtreme     := na
+            s.pbBar         := na
+            s.legs          := 0
+            s.status        := "Spike, awaiting pullback"
+            s.spikeLine  := line.new(s.spikeStartBar, s.spikeStart, s.spikeEndBar, s.spikeEnd, color = dirColor, width = 3)
+            s.spikeLabel := label.new(s.spikeStartBar, s.spikeStart, "Spike " + str.tostring(s.spikeAtr, "#.#") + " ATR", style = d == 1 ? label.style_label_up : label.style_label_down, color = LABEL_BG, textcolor = dirColor, size = size.small
+              , tooltip = str.tostring(s.runCount) + (s.runCount == 1 ? " trend bar" : " consecutive trend bars") + " travelling " + str.tostring(s.spikeAtr, "#.#") + " ATR with little overlap")
+            // The bar that ended the run is the first bar after the spike: it may already start the pullback
+            if d * (barExt - s.extreme) <= 0
+                s.pbExtreme := barBack
+                s.pbBar     := bar_index
+        s.runCount := 0
+    [spikeEvent, channelEvent, breakEvent, overEvent, targetEvent, stopEvent]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+float atrValue = ta.atr(14)
+
+bool bullSpike   = false
+bool bullChannel = false
+bool bullBreak   = false
+bool bullOver    = false
+bool bullTarget  = false
+bool bullStop    = false
+bool bearSpike   = false
+bool bearChannel = false
+bool bearBreak   = false
+bool bearOver    = false
+bool bearTarget  = false
+bool bearStop    = false
+
+if barstate.isconfirmed and not na(atrValue)
+    [s1, c1, b1, o1, t1, x1] = update(bullState, atrValue, bullColorInput, bearColorInput)
+    bullSpike   := s1
+    bullChannel := c1
+    bullBreak   := b1
+    bullOver    := o1
+    bullTarget  := t1
+    bullStop    := x1
+    [s2, c2, b2, o2, t2, x2] = update(bearState, atrValue, bearColorInput, bullColorInput)
+    bearSpike   := s2
+    bearChannel := c2
+    bearBreak   := b2
+    bearOver    := o2
+    bearTarget  := t2
+    bearStop    := x2
+    if s1 or c1 or b1 or o1 or bullState.inTrade
+        lastState := bullState
+    if s2 or c2 or b2 or o2 or bearState.inTrade
+        lastState := bearState
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dashTable = table.new(getTablePosition(dashPosInput), 2, 6, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+dashRow(int row, string labelText, string valueText, color valueColor, string textSize) =>
+    table.cell(dashTable, 0, row, labelText, text_color = DASH_HEADER, text_halign = text.align_left, text_size = textSize)
+    table.cell(dashTable, 1, row, valueText, text_color = valueColor, text_halign = text.align_right, text_size = textSize)
+
+if showDashInput and barstate.islast
+    string dashSize = getTableSize(dashSizeInput)
+    table.cell(dashTable, 0, 0, "Spike and Channel", text_color = DASH_TEXT, text_halign = text.align_left, text_size = dashSize)
+    if na(lastState)
+        table.cell(dashTable, 1, 0, "Scanning", text_color = DASH_HEADER, text_halign = text.align_right, text_size = dashSize)
+    else
+        color  dirColor   = lastState.dir == 1 ? bullColorInput : bearColorInput
+        float  spikeSlope = math.abs(lastState.spikeEnd - lastState.spikeStart) / math.max(lastState.spikeEndBar - lastState.spikeStartBar + 1, 1)
+        string slopeText  = "-"
+        if not na(lastState.fitSlope) and spikeSlope > 0
+            slopeText := str.tostring(100 * math.abs(lastState.fitSlope) / spikeSlope, "#") + "% of spike"
+        table.cell(dashTable, 1, 0, (lastState.dir == 1 ? "Bull: " : "Bear: ") + lastState.status, text_color = dirColor, text_halign = text.align_right, text_size = dashSize)
+        dashRow(1, "Spike", str.tostring(lastState.spikeAtr, "#.#") + " ATR in " + str.tostring(lastState.spikeEndBar - lastState.spikeStartBar + 1) + " bars", DASH_TEXT, dashSize)
+        dashRow(2, "Channel slope", slopeText, DASH_TEXT, dashSize)
+        dashRow(3, "Channel legs", str.tostring(lastState.legs), DASH_TEXT, dashSize)
+        dashRow(4, "Channel start", na(lastState.chStart) ? "-" : str.tostring(lastState.chStart, format.mintick), neutralColorInput, dashSize)
+        string tradeText = "-"
+        if not na(lastState.entry)
+            float risk = math.abs(lastState.stop - lastState.entry)
+            tradeText := str.tostring(lastState.entry, format.mintick) + (risk > 0 ? ", " + str.tostring(math.abs(lastState.target - lastState.entry) / risk, "#.#") + "R to start" : "")
+        dashRow(5, "Channel end entry", tradeText, DASH_TEXT, dashSize)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(bullSpike or bearSpike, "Spike", "Spike on {{ticker}} ({{interval}}): consecutive strong trend bars with little overlap. Watch the first pullback, its extreme starts the channel.")
+alertcondition(bullChannel or bearChannel, "Channel Confirmed", "Spike and channel on {{ticker}} ({{interval}}): the channel has its minimum legs after the spike.")
+alertcondition(bullBreak or bearBreak, "Trendline Break", "Spike and channel on {{ticker}} ({{interval}}): close beyond the channel trendline. Watch the test of the trend extreme.")
+alertcondition(bullOver or bearOver, "Channel Over", "Spike and channel on {{ticker}} ({{interval}}): the test of the trend extreme failed after the trendline break. The channel start is the first target.")
+alertcondition(bullTarget or bearTarget, "Channel Start Tested", "Spike and channel on {{ticker}} ({{interval}}): the correction reached the start of the channel.")
+
+//---------------------------------------------------------------------------------------------------------------------}

@@ -1,0 +1,451 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Livermore Pivotal Point"
+  , shorttitle       = "Livermore Pivotal Point"
+  , overlay          = true
+  , format           = format.price
+  , max_lines_count  = 500
+  , max_labels_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+int ST_NONE   =  0
+int ST_UP     =  3
+int ST_NRALLY =  2
+int ST_SRALLY =  1
+int ST_SREACT = -1
+int ST_NREACT = -2
+int ST_DOWN   = -3
+
+int HIST_MAX = 480
+
+color NEUTRAL_COLOR = #787b86 // forming record, inactive ledger entries
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+string unitInput    = input.string("Percent", "Threshold Units", options = ["Percent", "Points"], group = "Pivotal Point Record", tooltip = "How the swing and confirmation thresholds are measured. 'Percent' scales Livermore's point rules to any symbol and price level (recommended). 'Points' uses raw price units, exactly as in the 1940 Market Key tables.")
+float  swingInput   = input.float(6.0, "Natural Rally/Reaction Threshold", minval = 0.1, step = 0.5, group = "Pivotal Point Record", tooltip = "Minimum counter-move from the last recorded figure that opens a Natural Rally or Natural Reaction record. Livermore used about 6 points on leading stocks; 6% is the scale-free equivalent.")
+float  confirmInput = input.float(3.0, "Confirmation Threshold", minval = 0.0, step = 0.5, group = "Pivotal Point Record", tooltip = "Penetration beyond a pivotal point required to confirm follow-through and transfer the record to a trend column. Livermore demanded about 3 points of prompt extension beyond the pivotal point; a cross that fails to reach it is treated as a danger signal.")
+string sourceInput  = input.string("High/Low", "Record Source", options = ["High/Low", "Close"], group = "Pivotal Point Record", tooltip = "Prices used to fill the record. 'High/Low' records bar extremes, as Livermore recorded the day's extreme prices. 'Close' builds the record from closing prices only. Danger signals always evaluate the close.")
+
+bool showLevelsInput = input.bool(true, "Pivotal Point Levels", group = "Display", tooltip = "Draw a horizontal level at each pivotal point, anchored at the swing extreme that formed it. Levels stop extending once broken with follow-through; superseded levels turn dotted.")
+bool showLabelsInput = input.bool(true, "Pivotal Point Labels", group = "Display", tooltip = "Label each pivotal point: C-PP for continuation (a break resumes the prevailing trend) or R-PP for reversal (a break starts a new trend after a base or climax).")
+bool showBreaksInput = input.bool(true, "Break Markers", group = "Display", tooltip = "Plot a triangle on the bar where price first penetrates an active pivotal point — Livermore's entry cue; he bought or sold only on the penetration, never inside the base.")
+bool showDangerInput = input.bool(true, "Danger Signal Markers", group = "Display", tooltip = "Plot a cross when price crosses a pivotal point but closes back through it before reaching the confirmation threshold — the stalled break Livermore treated as a danger signal and exit cue.")
+bool showRecordInput = input.bool(true, "Price Record Trail", group = "Display", tooltip = "Plot the running figure of the column currently being recorded, colored by column: solid for trend columns, lighter for natural and secondary rallies/reactions.")
+
+bool   showTableInput     = input.bool(true, "Record Table", group = "Record Table", tooltip = "Show the six-column price record ledger: the last figure in each column, the active pivotal points with their break status (! = crossed awaiting follow-through, ✓ = broken with follow-through), and the column currently being recorded.")
+string tablePositionInput = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = "Record Table", tooltip = "Chart corner where the record table is anchored.")
+string tableSizeInput     = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = "Record Table", tooltip = "Text size of the record table.")
+
+color bullColorInput   = input.color(#089981, "Bullish", group = "Style", tooltip = "Color of upper pivotal points, upward breaks, and up-side record columns.")
+color bearColorInput   = input.color(#f23645, "Bearish", group = "Style", tooltip = "Color of lower pivotal points, downward breaks, and down-side record columns.")
+color dangerColorInput = input.color(#ff9800, "Danger Signal", group = "Style", tooltip = "Color of danger signal markers plotted on failed pivotal point breaks.")
+int   levelWidthInput  = input.int(1, "Level Width", minval = 1, maxval = 4, group = "Style", tooltip = "Line width of pivotal point levels.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types & Variables
+//---------------------------------------------------------------------------------------------------------------------{
+
+// One pivotal point = the underlined figure of a record column
+// status: 0 = active, 1 = crossed (awaiting follow-through), 2 = broken with follow-through
+type PPSlot
+    float price
+    int   dir
+    bool  isCont
+    int   status
+    float target
+    line  levelLine
+    label markLabel
+
+var int recState     = ST_NONE
+var int prevailTrend = 0
+
+var float upRec        = na
+var int   upRecBar     = na
+var float downRec      = na
+var int   downRecBar   = na
+var float nRallyRec    = na
+var int   nRallyRecBar = na
+var float nReactRec    = na
+var int   nReactRecBar = na
+var float sRallyRec    = na
+var float sReactRec    = na
+
+var PPSlot upTrendSlot   = na
+var PPSlot natRallySlot  = na
+var PPSlot downTrendSlot = na
+var PPSlot natReactSlot  = na
+
+var array<line>  histLines  = array.new<line>()
+var array<label> histLabels = array.new<label>()
+
+var float seedHi = na
+var float seedLo = na
+
+var table recTable = na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Natural rally/reaction threshold measured from a reference figure
+swingOffset(float ref) =>
+    na(ref) ? float(na) : unitInput == "Percent" ? math.abs(ref) * swingInput / 100 : swingInput
+
+// Follow-through threshold measured from a pivotal point
+confirmOffset(float ref) =>
+    na(ref) ? float(na) : unitInput == "Percent" ? math.abs(ref) * confirmInput / 100 : confirmInput
+
+// Keep the drawing history bounded
+trimHistory() =>
+    if array.size(histLines) > HIST_MAX
+        line.delete(array.shift(histLines))
+    if array.size(histLabels) > HIST_MAX
+        label.delete(array.shift(histLabels))
+
+// Send a superseded/resolved pivotal point to the drawing history
+retireSlot(PPSlot slot) =>
+    if not na(slot)
+        if not na(slot.levelLine)
+            if slot.status != 2
+                line.set_extend(slot.levelLine, extend.none)
+                line.set_x2(slot.levelLine, bar_index)
+                line.set_style(slot.levelLine, line.style_dotted)
+            array.push(histLines, slot.levelLine)
+        if not na(slot.markLabel)
+            array.push(histLabels, slot.markLabel)
+        trimHistory()
+
+// Underline a record figure as a new pivotal point
+newPivot(float price, int priceBar, int dir, bool isCont) =>
+    color base = dir > 0 ? bullColorInput : bearColorInput
+    line  ln   = na
+    label lb   = na
+    if showLevelsInput
+        ln := line.new(priceBar, price, priceBar + 1, price, extend = extend.right, color = base, style = line.style_solid, width = levelWidthInput)
+    if showLabelsInput
+        string side     = dir > 0 ? "above" : "below"
+        string trendTxt = dir > 0 ? "uptrend" : "downtrend"
+        string clsTxt   = isCont ? "Continuation" : "Reversal"
+        string body     = isCont ? "confirms the prevailing " + trendTxt + " is resuming" : "starts a new " + trendTxt
+        string tip      = clsTxt + " pivotal point at " + str.tostring(price, format.mintick) + "\nPenetration " + side + " it with prompt follow-through " + body + "; a cross that stalls and returns is a danger signal."
+        lb := label.new(priceBar, price, isCont ? "C-PP" : "R-PP", style = dir > 0 ? label.style_label_down : label.style_label_up, color = #00000000, textcolor = base, size = size.small, tooltip = tip)
+    PPSlot.new(price, dir, isCont, 0, float(na), ln, lb)
+
+// Penetration -> follow-through / danger-signal lifecycle of one pivotal point
+breakLifecycle(PPSlot slot, float hiSrc, float loSrc) =>
+    bool crossed   = false
+    bool confirmed = false
+    bool danger    = false
+    if not na(slot)
+        if slot.status < 2
+            if slot.dir > 0
+                if slot.status == 0 and hiSrc > slot.price
+                    crossed     := true
+                    slot.status := 1
+                    slot.target := slot.price + confirmOffset(slot.price)
+                if slot.status == 1
+                    if hiSrc >= slot.target
+                        confirmed   := true
+                        slot.status := 2
+                        if not na(slot.levelLine)
+                            line.set_extend(slot.levelLine, extend.none)
+                            line.set_x2(slot.levelLine, bar_index)
+                    else if close < slot.price
+                        danger      := true
+                        slot.status := 0
+            else
+                if slot.status == 0 and loSrc < slot.price
+                    crossed     := true
+                    slot.status := 1
+                    slot.target := slot.price - confirmOffset(slot.price)
+                if slot.status == 1
+                    if loSrc <= slot.target
+                        confirmed   := true
+                        slot.status := 2
+                        if not na(slot.levelLine)
+                            line.set_extend(slot.levelLine, extend.none)
+                            line.set_x2(slot.levelLine, bar_index)
+                    else if close > slot.price
+                        danger      := true
+                        slot.status := 0
+    [crossed, confirmed, danger]
+
+// Formatting helpers for the record table
+fmt(float value) =>
+    na(value) ? "—" : str.tostring(value, format.mintick)
+
+slotInfo(PPSlot slot) =>
+    string txt = "—"
+    color  col = DASH_HEADER
+    if not na(slot)
+        txt := str.tostring(slot.price, format.mintick) + (slot.status == 1 ? " !" : slot.status == 2 ? " ✓" : "")
+        col := slot.dir > 0 ? bullColorInput : bearColorInput
+    [txt, col]
+
+renderRow(table tb, int rowIndex, string colName, string figTxt, color figCol, string pvTxt, color pvCol, color rowBg, string txtSize) =>
+    // the row label is the one cell that may carry an accent background (the column being recorded)
+    table.cell(tb, 0, rowIndex, colName, text_color = DASH_HEADER, text_size = txtSize, text_halign = text.align_left,  bgcolor = rowBg)
+    table.cell(tb, 1, rowIndex, figTxt,  text_color = figCol,      text_size = txtSize, text_halign = text.align_right, bgcolor = DASH_BG)
+    table.cell(tb, 2, rowIndex, pvTxt,   text_color = pvCol,       text_size = txtSize, text_halign = text.align_right, bgcolor = DASH_BG)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Price Record & Pivotal Points
+//---------------------------------------------------------------------------------------------------------------------{
+
+float srcHi = sourceInput == "Close" ? close : high
+float srcLo = sourceInput == "Close" ? close : low
+
+seedHi := na(seedHi) ? srcHi : math.max(seedHi, srcHi)
+seedLo := na(seedLo) ? srcLo : math.min(seedLo, srcLo)
+
+// Pivotal point break lifecycle: penetration (entry cue), follow-through, or danger signal
+[upTrendCross, upTrendConf, upTrendDanger]       = breakLifecycle(upTrendSlot,   srcHi, srcLo)
+[rallyCross,   rallyConf,   rallyDanger]         = breakLifecycle(natRallySlot,  srcHi, srcLo)
+[downTrendCross, downTrendConf, downTrendDanger] = breakLifecycle(downTrendSlot, srcHi, srcLo)
+[reactCross,   reactConf,   reactDanger]         = breakLifecycle(natReactSlot,  srcHi, srcLo)
+
+bool breakUpEvent  = upTrendCross or rallyCross
+bool breakDnEvent  = downTrendCross or reactCross
+bool followUpEvent = upTrendConf or rallyConf
+bool followDnEvent = downTrendConf or reactConf
+bool dangerUpEvent = upTrendDanger or rallyDanger
+bool dangerDnEvent = downTrendDanger or reactDanger
+
+bool newUpperEvent = false
+bool newLowerEvent = false
+
+// Record transfers into the trend columns: penetration of the trend figure resumes its record,
+// penetration of an underlined rally/reaction extreme by the confirmation threshold starts a new one
+bool toUp = upTrendCross or rallyConf
+bool toDn = downTrendCross or reactConf
+if toUp and toDn
+    if close >= open
+        toDn := false
+    else
+        toUp := false
+
+if toUp
+    if recState == ST_UP
+        if srcHi > upRec
+            upRec    := srcHi
+            upRecBar := bar_index
+    else
+        recState     := ST_UP
+        prevailTrend := 1
+        upRec        := srcHi
+        upRecBar     := bar_index
+else if toDn
+    if recState == ST_DOWN
+        if srcLo < downRec
+            downRec    := srcLo
+            downRecBar := bar_index
+    else
+        recState     := ST_DOWN
+        prevailTrend := -1
+        downRec      := srcLo
+        downRecBar   := bar_index
+else
+    // Six-column swing recording
+    if recState == ST_NONE
+        float upThr    = swingOffset(seedLo)
+        float dnThr    = swingOffset(seedHi)
+        bool seedRally = not na(upThr) and srcHi >= seedLo + upThr
+        bool seedReact = not na(dnThr) and srcLo <= seedHi - dnThr
+        if seedRally and seedReact
+            if close >= open
+                seedReact := false
+            else
+                seedRally := false
+        if seedRally
+            recState     := ST_NRALLY
+            nRallyRec    := srcHi
+            nRallyRecBar := bar_index
+        else if seedReact
+            recState     := ST_NREACT
+            nReactRec    := srcLo
+            nReactRecBar := bar_index
+    else if recState == ST_UP
+        if srcHi > upRec
+            upRec    := srcHi
+            upRecBar := bar_index
+        float thr = swingOffset(upRec)
+        if not na(thr) and srcLo <= upRec - thr
+            retireSlot(upTrendSlot)
+            upTrendSlot   := newPivot(upRec, upRecBar, 1, true)
+            newUpperEvent := true
+            recState      := ST_NREACT
+            nReactRec     := srcLo
+            nReactRecBar  := bar_index
+    else if recState == ST_DOWN
+        if srcLo < downRec
+            downRec    := srcLo
+            downRecBar := bar_index
+        float thr = swingOffset(downRec)
+        if not na(thr) and srcHi >= downRec + thr
+            retireSlot(downTrendSlot)
+            downTrendSlot := newPivot(downRec, downRecBar, -1, true)
+            newLowerEvent := true
+            recState      := ST_NRALLY
+            nRallyRec     := srcHi
+            nRallyRecBar  := bar_index
+    else if recState == ST_NRALLY
+        if srcHi > nRallyRec
+            nRallyRec    := srcHi
+            nRallyRecBar := bar_index
+        float thr = swingOffset(nRallyRec)
+        if not na(thr) and srcLo <= nRallyRec - thr
+            retireSlot(natRallySlot)
+            natRallySlot  := newPivot(nRallyRec, nRallyRecBar, 1, prevailTrend == 1)
+            newUpperEvent := true
+            if na(nReactRec) or srcLo < nReactRec
+                recState     := ST_NREACT
+                nReactRec    := srcLo
+                nReactRecBar := bar_index
+            else
+                recState  := ST_SREACT
+                sReactRec := srcLo
+    else if recState == ST_NREACT
+        if srcLo < nReactRec
+            nReactRec    := srcLo
+            nReactRecBar := bar_index
+        float thr = swingOffset(nReactRec)
+        if not na(thr) and srcHi >= nReactRec + thr
+            retireSlot(natReactSlot)
+            natReactSlot  := newPivot(nReactRec, nReactRecBar, -1, prevailTrend == -1)
+            newLowerEvent := true
+            if na(nRallyRec) or srcHi > nRallyRec
+                recState     := ST_NRALLY
+                nRallyRec    := srcHi
+                nRallyRecBar := bar_index
+            else
+                recState  := ST_SRALLY
+                sRallyRec := srcHi
+    else if recState == ST_SRALLY
+        if not na(nRallyRec) and srcHi > nRallyRec
+            recState     := ST_NRALLY
+            nRallyRec    := srcHi
+            nRallyRecBar := bar_index
+        else
+            if srcHi > sRallyRec
+                sRallyRec := srcHi
+            float thr = swingOffset(sRallyRec)
+            if not na(thr) and srcLo <= sRallyRec - thr
+                if na(nReactRec) or srcLo < nReactRec
+                    recState     := ST_NREACT
+                    nReactRec    := srcLo
+                    nReactRecBar := bar_index
+                else
+                    recState  := ST_SREACT
+                    sReactRec := srcLo
+    else if recState == ST_SREACT
+        if not na(nReactRec) and srcLo < nReactRec
+            recState     := ST_NREACT
+            nReactRec    := srcLo
+            nReactRecBar := bar_index
+        else
+            if srcLo < sReactRec
+                sReactRec := srcLo
+            float thr = swingOffset(sReactRec)
+            if not na(thr) and srcHi >= sReactRec + thr
+                if na(nRallyRec) or srcHi > nRallyRec
+                    recState     := ST_NRALLY
+                    nRallyRec    := srcHi
+                    nRallyRecBar := bar_index
+                else
+                    recState  := ST_SRALLY
+                    sRallyRec := srcHi
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visualization
+//---------------------------------------------------------------------------------------------------------------------{
+
+float recVal = switch recState
+    ST_UP     => upRec
+    ST_NRALLY => nRallyRec
+    ST_SRALLY => sRallyRec
+    ST_SREACT => sReactRec
+    ST_NREACT => nReactRec
+    ST_DOWN   => downRec
+    => float(na)
+
+color stateColor = switch recState
+    ST_UP     => bullColorInput
+    ST_NRALLY => color.new(bullColorInput, 30)
+    ST_SRALLY => color.new(bullColorInput, 55)
+    ST_SREACT => color.new(bearColorInput, 55)
+    ST_NREACT => color.new(bearColorInput, 30)
+    ST_DOWN   => bearColorInput
+    => NEUTRAL_COLOR
+
+string stateName = switch recState
+    ST_UP     => "Upward Trend"
+    ST_NRALLY => "Natural Rally"
+    ST_SRALLY => "Secondary Rally"
+    ST_SREACT => "Secondary Reaction"
+    ST_NREACT => "Natural Reaction"
+    ST_DOWN   => "Downward Trend"
+    => "Forming Record"
+
+plot(recVal, "Price Record", stateColor, 1, plot.style_steplinebr, display = showRecordInput ? display.all : display.none)
+
+plotshape(showBreaksInput and breakUpEvent, "Pivotal Point Break Up", style = shape.triangleup, location = location.belowbar, color = bullColorInput, size = size.tiny)
+plotshape(showBreaksInput and breakDnEvent, "Pivotal Point Break Down", style = shape.triangledown, location = location.abovebar, color = bearColorInput, size = size.tiny)
+plotshape(showDangerInput and dangerUpEvent, "Danger Signal (Failed Up Break)", style = shape.xcross, location = location.abovebar, color = dangerColorInput, size = size.tiny)
+plotshape(showDangerInput and dangerDnEvent, "Danger Signal (Failed Down Break)", style = shape.xcross, location = location.belowbar, color = dangerColorInput, size = size.tiny)
+
+string tablePos = switch tablePositionInput
+    "Top Right"    => position.top_right
+    "Top Left"     => position.top_left
+    "Bottom Right" => position.bottom_right
+    => position.bottom_left
+
+string tableTextSize = switch tableSizeInput
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    => size.small
+
+if showTableInput and barstate.islast
+    if na(recTable)
+        recTable := table.new(tablePos, 3, 8, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+    [upPvTxt,    upPvCol]    = slotInfo(upTrendSlot)
+    [rallyPvTxt, rallyPvCol] = slotInfo(natRallySlot)
+    [dnPvTxt,    dnPvCol]    = slotInfo(downTrendSlot)
+    [reactPvTxt, reactPvCol] = slotInfo(natReactSlot)
+    color headCol  = DASH_HEADER
+    color mutedCol = DASH_HEADER
+    color activeBg = color.new(stateColor, 80)
+    renderRow(recTable, 0, "Column", "Figure", headCol, "Pivotal Point", headCol, DASH_BG, tableTextSize)
+    renderRow(recTable, 1, "Secondary Rally",    fmt(sRallyRec), color.new(bullColorInput, 45), "—",        mutedCol,   recState == ST_SRALLY ? activeBg : DASH_BG, tableTextSize)
+    renderRow(recTable, 2, "Natural Rally",      fmt(nRallyRec), color.new(bullColorInput, 25), rallyPvTxt, rallyPvCol, recState == ST_NRALLY ? activeBg : DASH_BG, tableTextSize)
+    renderRow(recTable, 3, "Upward Trend",       fmt(upRec),     bullColorInput,                upPvTxt,    upPvCol,    recState == ST_UP     ? activeBg : DASH_BG, tableTextSize)
+    renderRow(recTable, 4, "Downward Trend",     fmt(downRec),   bearColorInput,                dnPvTxt,    dnPvCol,    recState == ST_DOWN   ? activeBg : DASH_BG, tableTextSize)
+    renderRow(recTable, 5, "Natural Reaction",   fmt(nReactRec), color.new(bearColorInput, 25), reactPvTxt, reactPvCol, recState == ST_NREACT ? activeBg : DASH_BG, tableTextSize)
+    renderRow(recTable, 6, "Secondary Reaction", fmt(sReactRec), color.new(bearColorInput, 45), "—",        mutedCol,   recState == ST_SREACT ? activeBg : DASH_BG, tableTextSize)
+    renderRow(recTable, 7, "Recording",          stateName,      stateColor,                    prevailTrend > 0 ? "▲" : prevailTrend < 0 ? "▼" : "—", prevailTrend > 0 ? bullColorInput : prevailTrend < 0 ? bearColorInput : mutedCol, DASH_BG, tableTextSize)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(breakUpEvent,  "Upper Pivotal Point Break",         "Livermore Pivotal Point: price penetrated an upper pivotal point upward on {{ticker}} ({{interval}}) at {{close}} — Livermore's entry cue; demand prompt follow-through.")
+alertcondition(breakDnEvent,  "Lower Pivotal Point Break",         "Livermore Pivotal Point: price penetrated a lower pivotal point downward on {{ticker}} ({{interval}}) at {{close}} — Livermore's entry cue; demand prompt follow-through.")
+alertcondition(followUpEvent, "Bullish Follow-Through Confirmed",  "Livermore Pivotal Point: the upward break extended beyond the confirmation threshold on {{ticker}} ({{interval}}) — record transferred to the Upward Trend column.")
+alertcondition(followDnEvent, "Bearish Follow-Through Confirmed",  "Livermore Pivotal Point: the downward break extended beyond the confirmation threshold on {{ticker}} ({{interval}}) — record transferred to the Downward Trend column.")
+alertcondition(dangerUpEvent, "Danger Signal - Failed Up Break",   "Livermore Pivotal Point: price crossed above a pivotal point but closed back below it before following through on {{ticker}} ({{interval}}) — danger signal, Livermore's exit cue.")
+alertcondition(dangerDnEvent, "Danger Signal - Failed Down Break", "Livermore Pivotal Point: price crossed below a pivotal point but closed back above it before following through on {{ticker}} ({{interval}}) — danger signal, Livermore's exit cue.")
+alertcondition(newUpperEvent, "New Upper Pivotal Point",           "Livermore Pivotal Point: a rally extreme was underlined as a new upper pivotal point on {{ticker}} ({{interval}}) — candidate break level mapped in advance.")
+alertcondition(newLowerEvent, "New Lower Pivotal Point",           "Livermore Pivotal Point: a reaction extreme was underlined as a new lower pivotal point on {{ticker}} ({{interval}}) — candidate break level mapped in advance.")
+
+//---------------------------------------------------------------------------------------------------------------------}

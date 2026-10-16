@@ -1,0 +1,411 @@
+// This work is licensed under Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Triple Top/bottom", shorttitle = "Triple Top/bottom", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+color BULL_COLOR    = #089981
+color BEAR_COLOR    = #f23645
+color NEUTRAL_COLOR = #787b86
+color HIDDEN_COLOR  = #00000000
+
+int MAX_SWINGS   = 50
+int BAND_TRANSP  = 88
+int DIM_TRANSP   = 70
+
+string DETECT_GROUP = 'Pattern Detection'
+string TREND_GROUP  = 'Prior Trend & Volume'
+string DONE_GROUP   = 'Completion'
+string STYLE_GROUP  = 'Style'
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+swingLengthInput = input.int(6, 'Swing Length', minval = 2, maxval = 50, group = DETECT_GROUP, tooltip = 'Bars to the left and right a high or low must dominate to count as a confirmed swing. The three tests and the two reactions between them are read from these swings, so the third test is recognized this many bars after it prints.')
+
+toleranceInput = input.float(1.0, 'Level Tolerance (ATR)', minval = 0.1, maxval = 5, step = 0.1, group = DETECT_GROUP, tooltip = 'Maximum spread between the three tests, as a multiple of the ATR. The extremes need not match to the tick, but none may stand out the way a head does; a middle test clearly beyond the others reads as a head and shoulders instead.')
+
+reactionInput = input.float(2.0, 'Minimum Reaction (ATR)', minval = 0.5, maxval = 20, step = 0.25, group = DETECT_GROUP, tooltip = 'Smallest retreat between two tests, as a multiple of the ATR. Meaningful reactions separate genuine tests from rapid taps of the same level.')
+
+minSpacingInput = input.int(8, 'Test Spacing (bars)', minval = 2, maxval = 200, inline = 'spacing', group = DETECT_GROUP, tooltip = 'Fewest bars between consecutive tests. Well-separated touches carry more information than three quick taps.')
+maxSpanInput    = input.int(200, '', minval = 20, maxval = 1000, inline = 'spacing', group = DETECT_GROUP, tooltip = 'Most bars from the first to the third test.')
+
+atrLengthInput = input.int(14, 'ATR Length', minval = 1, maxval = 200, group = DETECT_GROUP, tooltip = 'Length of the Average True Range that scales the tolerance, the reaction size, the prior trend and the break buffer.')
+
+trendFilterInput = input.bool(true, 'Require Prior Trend', group = TREND_GROUP, tooltip = 'Only accept a triple top that an advance ran into, and a triple bottom that a decline ran into. Without a trend to reverse, three touches of a level are a trading range.')
+trendLengthInput = input.int(60, 'Prior Trend Window (bars)', minval = 5, maxval = 500, group = TREND_GROUP, tooltip = 'Bars before the first test inspected for the move into the level.')
+trendSizeInput   = input.float(3.0, 'Minimum Prior Move (ATR)', minval = 0, maxval = 50, step = 0.5, group = TREND_GROUP, tooltip = 'The prior trend must have started at least this many ATRs beyond the confirmation level, measured from the window extreme.')
+
+volumeFadeInput = input.bool(false, 'Require Fading Test Volume', group = TREND_GROUP, tooltip = 'Only accept patterns whose rally (or decline) into each test traded on less average volume than the one before. Volume classically diminishes across tests; it is always reported in the pattern tooltip, and off as a filter by default because it is a tendency, not a rule. Ignored on symbols without volume data.')
+
+breakBufferInput = input.float(0.0, 'Decisive Break Buffer (ATR)', minval = 0, maxval = 3, step = 0.05, group = DONE_GROUP, tooltip = 'Extra ATR multiple the close must clear beyond the confirmation level for the break to count as decisive. At 0 any close beyond it completes the pattern.')
+
+windowInput = input.int(60, 'Completion Window (bars)', minval = 5, maxval = 500, group = DONE_GROUP, tooltip = 'Bars after the third test within which the confirming break must arrive. Until the break, three touches are equally consistent with a range that continues the trend, so an unconfirmed pattern is dropped after this window.')
+
+reclaimInput = input.int(2, 'Closes Back Inside for Failure', minval = 1, maxval = 10, group = DONE_GROUP, tooltip = 'Consecutive closes back across the broken confirmation level that mark the break as failed. A close beyond the third test fails the pattern at once, the stop location.')
+
+watchInput = input.int(60, 'Post-Break Watch (bars)', minval = 5, maxval = 500, group = DONE_GROUP, tooltip = 'Bars the target, stop and broken level are tracked after the break. The watch ends early on a target, a stop or a failure.')
+
+showTargetInput = input.bool(true, 'Measured Target', group = DONE_GROUP, tooltip = 'Project the pattern height, from the extreme test to the confirmation level, from the break as the conventional objective. A planning reference, not a promise.')
+
+bullColorInput    = input.color(BULL_COLOR, 'Triple Bottom', inline = 'colors', group = STYLE_GROUP)
+bearColorInput    = input.color(BEAR_COLOR, 'Triple Top', inline = 'colors', group = STYLE_GROUP)
+neutralColorInput = input.color(NEUTRAL_COLOR, 'Unconfirmed', inline = 'colors', group = STYLE_GROUP, tooltip = 'Color of patterns awaiting their confirming break, and of failed patterns.')
+
+showBandInput   = input.bool(true, 'Show Tested Level', group = STYLE_GROUP, tooltip = 'Shade the band spanned by the three tests.')
+showEventsInput = input.bool(true, 'Show Event Labels', group = STYLE_GROUP, tooltip = 'Mark retests, failures, stops and targets after the break.')
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types
+//---------------------------------------------------------------------------------------------------------------------{
+
+// dir = -1 triple top, 1 triple bottom. state 0 = awaiting the break, 1 = completed
+type Pattern
+    int   dir
+    int   b1
+    float p1
+    int   rb1
+    float r1
+    int   b2
+    float p2
+    int   rb2
+    float r2
+    int   b3
+    float p3
+    float level
+    float extreme
+    float height
+    string volText
+    int   state    = 0
+    int   breakBar = 0
+    float target
+    float stop
+    bool  retested = false
+    int   reclaims = 0
+    line  leg1
+    line  leg2
+    line  leg3
+    line  leg4
+    line  neckLn
+    box   band
+    label lb1
+    label lb2
+    label lb3
+    line  targetLn
+    label targetLb
+    line  stopLn
+    label stopLb
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Variables
+//---------------------------------------------------------------------------------------------------------------------{
+
+var array<float> zzPriceArray = array.new<float>()
+var array<int>   zzBarArray   = array.new<int>()
+var array<int>   zzDirArray   = array.new<int>()
+
+// Per-bar history indexed by bar_index for the prior-trend and volume reads
+var array<float> highArray   = array.new<float>()
+var array<float> lowArray    = array.new<float>()
+var array<float> cumVolArray = array.new<float>()
+
+var Pattern topForming    = na
+var Pattern bottomForming = na
+var Pattern topActive     = na
+var Pattern bottomActive  = na
+
+float atrValue  = ta.atr(atrLengthInput)
+float pivotHigh = ta.pivothigh(high, swingLengthInput, swingLengthInput)
+float pivotLow  = ta.pivotlow(low, swingLengthInput, swingLengthInput)
+
+var float cumVol = 0.0
+cumVol += nz(volume)
+array.push(highArray, high)
+array.push(lowArray, low)
+array.push(cumVolArray, cumVol)
+
+var bool volumeSeen = false
+if nz(volume) > 0
+    volumeSeen := true
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions & Methods
+//---------------------------------------------------------------------------------------------------------------------{
+
+method patternColor(Pattern this) =>
+    this.dir == 1 ? bullColorInput : bearColorInput
+
+method erase(Pattern this) =>
+    line.delete(this.leg1)
+    line.delete(this.leg2)
+    line.delete(this.leg3)
+    line.delete(this.leg4)
+    line.delete(this.neckLn)
+    box.delete(this.band)
+    label.delete(this.lb1)
+    label.delete(this.lb2)
+    label.delete(this.lb3)
+
+method recolor(Pattern this, color col) =>
+    line.set_color(this.leg1, col)
+    line.set_color(this.leg2, col)
+    line.set_color(this.leg3, col)
+    line.set_color(this.leg4, col)
+    line.set_color(this.neckLn, col)
+    if not na(this.band)
+        box.set_border_color(this.band, color.new(col, 60))
+        box.set_bgcolor(this.band, color.new(col, BAND_TRANSP))
+    label.set_textcolor(this.lb1, col)
+    label.set_textcolor(this.lb2, col)
+    label.set_textcolor(this.lb3, col)
+
+eventMark(int x, float y, string txt, color col, bool below, string tip) =>
+    if showEventsInput
+        label.new(x, y, txt, style = below ? label.style_label_up : label.style_label_down, color = HIDDEN_COLOR, textcolor = col, size = size.small, tooltip = tip)
+
+// Average volume of the leg ending at a test (from the previous swing to the test)
+legVolume(int fromBar, int toBar) =>
+    toBar > fromBar ? (array.get(cumVolArray, toBar) - array.get(cumVolArray, fromBar)) / (toBar - fromBar) : na
+
+// Maintain the alternating swing sequence; a same-side swing that extends the last one replaces it
+pushSwing(float price, int swingBar, int swingDir) =>
+    bool changed = false
+    int  n       = array.size(zzPriceArray)
+    if n > 0 and array.get(zzDirArray, n - 1) == swingDir
+        if (swingDir == 1 and price >= array.get(zzPriceArray, n - 1)) or (swingDir == -1 and price <= array.get(zzPriceArray, n - 1))
+            array.set(zzPriceArray, n - 1, price)
+            array.set(zzBarArray, n - 1, swingBar)
+            changed := true
+    else
+        array.push(zzPriceArray, price)
+        array.push(zzBarArray, swingBar)
+        array.push(zzDirArray, swingDir)
+        if array.size(zzPriceArray) > MAX_SWINGS
+            array.shift(zzPriceArray)
+            array.shift(zzBarArray)
+            array.shift(zzDirArray)
+        changed := true
+    changed
+
+// Validate the last five swings as a triple top (dir -1) or triple bottom (dir 1) and draw the pending structure
+tryDetect(int dir) =>
+    Pattern result = na
+    int e = -dir
+    int n = array.size(zzPriceArray)
+    if n >= 5 and array.get(zzDirArray, n - 1) == e and atrValue > 0
+        float p3  = array.get(zzPriceArray, n - 1)
+        int   b3  = array.get(zzBarArray, n - 1)
+        float r2  = array.get(zzPriceArray, n - 2)
+        int   rb2 = array.get(zzBarArray, n - 2)
+        float p2  = array.get(zzPriceArray, n - 3)
+        int   b2  = array.get(zzBarArray, n - 3)
+        float r1  = array.get(zzPriceArray, n - 4)
+        int   rb1 = array.get(zzBarArray, n - 4)
+        float p1  = array.get(zzPriceArray, n - 5)
+        int   b1  = array.get(zzBarArray, n - 5)
+
+        float hiTest  = math.max(p1, math.max(p2, p3))
+        float loTest  = math.min(p1, math.min(p2, p3))
+        float level   = e == 1 ? math.min(r1, r2) : math.max(r1, r2)
+        float extreme = e == 1 ? hiTest : loTest
+
+        // Three tests of one level: the spread stays inside the tolerance, so no test stands out like a head
+        bool levelOk = hiTest - loTest <= toleranceInput * atrValue
+        // Two meaningful reactions, each measured from the nearer of its two neighbouring tests
+        float react1 = e == 1 ? math.min(p1, p2) - r1 : r1 - math.max(p1, p2)
+        float react2 = e == 1 ? math.min(p2, p3) - r2 : r2 - math.max(p2, p3)
+        bool  reactOk = react1 >= reactionInput * atrValue and react2 >= reactionInput * atrValue
+        bool  spaceOk = b2 - b1 >= minSpacingInput and b3 - b2 >= minSpacingInput and b3 - b1 <= maxSpanInput
+
+        // Prior trend: the move into the first test started well beyond the confirmation level
+        bool trendOk = not trendFilterInput
+        if trendFilterInput and b1 - trendLengthInput >= 0
+            float origin = e == 1 ? array.get(lowArray, b1) : array.get(highArray, b1)
+            for b = b1 - trendLengthInput to b1
+                origin := e == 1 ? math.min(origin, array.get(lowArray, b)) : math.max(origin, array.get(highArray, b))
+            trendOk := e * (level - origin) >= trendSizeInput * atrValue
+
+        // Volume into each test, leg by leg
+        float v1 = legVolume(math.max(0, b1 - (rb1 - b1)), b1)
+        float v2 = legVolume(rb1, b2)
+        float v3 = legVolume(rb2, b3)
+        bool  volKnown = volumeSeen and not na(v1) and not na(v2) and not na(v3) and v1 > 0
+        bool  fading   = volKnown and v2 < v1 and v3 < v2
+        bool  volOk    = not volumeFadeInput or not volKnown or fading
+        string volText = volKnown ? 'Volume into the tests: ' + str.tostring(v2 / v1, '#.##') + 'x then ' + str.tostring(v3 / v1, '#.##') + 'x the first' + (fading ? ' (fading)' : '') : 'Volume into the tests: n/a'
+
+        // Do not rebuild around a third test already completed and tracked
+        Pattern active = dir == 1 ? bottomActive : topActive
+        bool    fresh  = na(active) or active.b3 != b3
+
+        if levelOk and reactOk and spaceOk and trendOk and volOk and fresh
+            result := Pattern.new(dir = dir, b1 = b1, p1 = p1, rb1 = rb1, r1 = r1, b2 = b2, p2 = p2, rb2 = rb2, r2 = r2, b3 = b3, p3 = p3, level = level, extreme = extreme, height = e * (extreme - level), volText = volText)
+            color col  = neutralColorInput
+            bool  isTop = dir == -1
+            result.leg1 := line.new(b1, p1, rb1, r1, color = col, width = 2)
+            result.leg2 := line.new(rb1, r1, b2, p2, color = col, width = 2)
+            result.leg3 := line.new(b2, p2, rb2, r2, color = col, width = 2)
+            result.leg4 := line.new(rb2, r2, b3, p3, color = col, width = 2)
+            int levelBar = e == 1 ? (r1 <= r2 ? rb1 : rb2) : (r1 >= r2 ? rb1 : rb2)
+            result.neckLn := line.new(levelBar, level, bar_index, level, color = col, style = line.style_dashed, width = 2)
+            if showBandInput
+                result.band := box.new(b1, hiTest, b3, loTest, border_color = color.new(col, 60), bgcolor = color.new(col, BAND_TRANSP))
+            string tip = (isTop ? 'Triple top' : 'Triple bottom') + ' test '
+            result.lb1 := label.new(b1, p1, '1', style = isTop ? label.style_label_down : label.style_label_up, color = HIDDEN_COLOR, textcolor = col, size = size.small, tooltip = tip + '1: ' + str.tostring(p1, format.mintick))
+            result.lb2 := label.new(b2, p2, '2', style = isTop ? label.style_label_down : label.style_label_up, color = HIDDEN_COLOR, textcolor = col, size = size.small, tooltip = tip + '2: ' + str.tostring(p2, format.mintick))
+            result.lb3 := label.new(b3, p3, '3', style = isTop ? label.style_label_down : label.style_label_up, color = HIDDEN_COLOR, textcolor = col, size = size.small, tooltip = tip + '3: ' + str.tostring(p3, format.mintick) + '\nConfirmation level: ' + str.tostring(level, format.mintick) + '\n' + volText)
+    result
+
+// Advance a pattern awaiting its break: 0 = waiting, 1 = completed, 2 = invalidated or expired
+trackForming(Pattern p) =>
+    int evt = 0
+    int e   = -p.dir
+    line.set_x2(p.neckLn, bar_index)
+    float buffer = breakBufferInput * atrValue
+    // A decisive move through the tested level in the original trend direction: the structure was consolidation
+    bool levelBroken = e == 1 ? close > p.extreme + toleranceInput * atrValue : close < p.extreme - toleranceInput * atrValue
+    bool broke       = e == 1 ? close < p.level - buffer : close > p.level + buffer
+    if levelBroken or bar_index - p.b3 > windowInput
+        p.erase()
+        evt := 2
+    else if broke
+        color col = p.patternColor()
+        p.state    := 1
+        p.breakBar := bar_index
+        p.target   := p.level - e * p.height
+        p.stop     := p.p3
+        p.recolor(col)
+        line.set_style(p.neckLn, line.style_solid)
+        string name = p.dir == -1 ? 'Triple Top' : 'Triple Bottom'
+        string tip  = name + ' completed: close beyond the confirmation level ' + str.tostring(p.level, format.mintick) + '\nPattern height ' + str.tostring(p.height, format.mintick) + ', third test ' + str.tostring(p.p3, format.mintick) + '\n' + p.volText
+        // The pattern name sits on the far side of the confirmation level under the middle test, empty until the break
+        label.new(p.b2, p.level, name, style = p.dir == -1 ? label.style_label_up : label.style_label_down, color = HIDDEN_COLOR, textcolor = col, size = size.normal, tooltip = tip)
+        label.new(bar_index, p.dir == -1 ? math.max(high, high[1], high[2]) : math.min(low, low[1], low[2]), 'Break', style = p.dir == -1 ? label.style_label_down : label.style_label_up, color = col, textcolor = chart.bg_color, size = size.small, tooltip = tip)
+        if showTargetInput
+            p.targetLn := line.new(bar_index, p.target, bar_index, p.target, color = col, style = line.style_dashed)
+            p.targetLb := label.new(bar_index, p.target, 'Target ' + str.tostring(p.target, format.mintick), style = label.style_label_right, color = HIDDEN_COLOR, textcolor = col, size = size.small, tooltip = 'Pattern height projected from the confirmation level (measure rule)')
+        p.stopLn := line.new(bar_index, p.stop, bar_index, p.stop, color = neutralColorInput, style = line.style_dotted)
+        p.stopLb := label.new(bar_index, p.stop, 'Stop ' + str.tostring(p.stop, format.mintick), style = label.style_label_left, color = HIDDEN_COLOR, textcolor = neutralColorInput, size = size.small, tooltip = 'Beyond the third test')
+        evt := 1
+    evt
+
+// Advance a completed pattern: 0 = tracking, 1 = target reached, 2 = failed, 3 = retest of the broken level,
+// 4 = watch over
+trackActive(Pattern p) =>
+    int evt = 0
+    int e   = -p.dir
+    if not na(p.targetLn)
+        line.set_x2(p.targetLn, bar_index)
+    line.set_x2(p.stopLn, bar_index)
+    label.set_x(p.stopLb, bar_index)
+    line.set_x2(p.neckLn, bar_index)
+    bool targetHit = e == 1 ? low <= p.target : high >= p.target
+    bool stopHit   = e == 1 ? close > p.stop : close < p.stop
+    p.reclaims := e * (close - p.level) > 0 ? p.reclaims + 1 : 0
+    if showTargetInput and targetHit
+        eventMark(bar_index, e == 1 ? low : high, 'Target', p.patternColor(), e == 1, 'Measured target ' + str.tostring(p.target, format.mintick) + ' reached')
+        evt := 1
+    else if stopHit or p.reclaims >= reclaimInput
+        if not na(p.targetLn)
+            line.delete(p.targetLn)
+            label.delete(p.targetLb)
+        eventMark(bar_index, e == 1 ? high : low, stopHit ? 'Stop' : 'Failed', neutralColorInput, e == -1, stopHit ? 'Close beyond the third test' : 'Confirmation level reclaimed: the break failed')
+        evt := 2
+    else if not p.retested and bar_index > p.breakBar and (e == 1 ? high >= p.level and close < p.level : low <= p.level and close > p.level)
+        p.retested := true
+        eventMark(bar_index, e == 1 ? high : low, 'Retest', p.patternColor(), e == -1, 'First return to the broken confirmation level')
+        evt := 3
+    else if bar_index - p.breakBar >= watchInput
+        evt := 4
+    evt
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Detection
+//---------------------------------------------------------------------------------------------------------------------{
+
+bool topFormingAlert    = false
+bool bottomFormingAlert = false
+bool topBreakAlert      = false
+bool bottomBreakAlert   = false
+bool topTargetAlert     = false
+bool bottomTargetAlert  = false
+bool topFailAlert       = false
+bool bottomFailAlert    = false
+bool topRetestAlert     = false
+bool bottomRetestAlert  = false
+
+if barstate.isconfirmed
+    if not na(pivotHigh)
+        if pushSwing(pivotHigh, bar_index - swingLengthInput, 1)
+            Pattern candidate = tryDetect(-1)
+            if not na(candidate)
+                if not na(topForming)
+                    topForming.erase()
+                topForming      := candidate
+                topFormingAlert := true
+    if not na(pivotLow)
+        if pushSwing(pivotLow, bar_index - swingLengthInput, -1)
+            Pattern candidate = tryDetect(1)
+            if not na(candidate)
+                if not na(bottomForming)
+                    bottomForming.erase()
+                bottomForming      := candidate
+                bottomFormingAlert := true
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Tracking
+//---------------------------------------------------------------------------------------------------------------------{
+
+if barstate.isconfirmed
+    if not na(topActive)
+        int evt = trackActive(topActive)
+        topTargetAlert := evt == 1
+        topFailAlert   := evt == 2
+        topRetestAlert := evt == 3
+        if evt == 1 or evt == 2 or evt == 4
+            topActive := na
+    if not na(bottomActive)
+        int evt = trackActive(bottomActive)
+        bottomTargetAlert := evt == 1
+        bottomFailAlert   := evt == 2
+        bottomRetestAlert := evt == 3
+        if evt == 1 or evt == 2 or evt == 4
+            bottomActive := na
+    if not na(topForming) and not topFormingAlert
+        int evt = trackForming(topForming)
+        if evt == 1
+            topBreakAlert := true
+            topActive     := topForming
+            topForming    := na
+        else if evt == 2
+            topForming := na
+    if not na(bottomForming) and not bottomFormingAlert
+        int evt = trackForming(bottomForming)
+        if evt == 1
+            bottomBreakAlert := true
+            bottomActive     := bottomForming
+            bottomForming    := na
+        else if evt == 2
+            bottomForming := na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(topFormingAlert, 'Triple Top Forming', 'Triple top forming: third test of the level confirmed after an advance, awaiting a close below the confirmation level')
+alertcondition(bottomFormingAlert, 'Triple Bottom Forming', 'Triple bottom forming: third test of the level confirmed after a decline, awaiting a close above the confirmation level')
+alertcondition(topBreakAlert, 'Triple Top Completed', 'Triple top completed: decisive close below the lowest reaction low between the peaks')
+alertcondition(bottomBreakAlert, 'Triple Bottom Completed', 'Triple bottom completed: decisive close above the highest reaction high between the troughs')
+alertcondition(topRetestAlert, 'Triple Top Retest', 'Triple top: broken confirmation level retested from below')
+alertcondition(bottomRetestAlert, 'Triple Bottom Retest', 'Triple bottom: broken confirmation level retested from above')
+alertcondition(topTargetAlert, 'Triple Top Target Reached', 'Triple top: measured target reached')
+alertcondition(bottomTargetAlert, 'Triple Bottom Target Reached', 'Triple bottom: measured target reached')
+alertcondition(topFailAlert, 'Triple Top Failed', 'Triple top failed: confirmation level reclaimed or close above the third peak')
+alertcondition(bottomFailAlert, 'Triple Bottom Failed', 'Triple bottom failed: confirmation level lost or close below the third trough')
+
+//---------------------------------------------------------------------------------------------------------------------}

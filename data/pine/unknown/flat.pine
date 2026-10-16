@@ -1,0 +1,348 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Flat", "Flat", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 100)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+int MAX_MAJOR_PIVOTS  = 60
+int MAX_MINOR_PIVOTS  = 500
+int PROJ_RIGHT_OFFSET = 3
+
+string DETECTION_GROUP = 'Swing Detection'
+string RULES_GROUP     = 'Flat Rules'
+string STYLE_GROUP     = 'Style'
+
+string SUB_OFF    = 'Off'
+string SUB_LOOSE  = 'Loose'
+string SUB_STRICT = 'Strict'
+
+string REGULAR_TXT  = 'Regular Flat'
+string EXPANDED_TXT = 'Expanded Flat'
+string RUNNING_TXT  = 'Running Flat'
+
+color TRANSPARENT_COLOR = #00000000
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Inputs
+//---------------------------------------------------------------------------------------------------------------------{
+
+majorLengthInput = input.int(10, 'Swing Length', minval = 2, group = DETECTION_GROUP, tooltip = 'Pivot length used to detect the swing points forming waves A, B and C. Larger values look for flats at a higher degree.')
+
+minorLengthInput = input.int(3, 'Sub-Wave Length', minval = 1, group = DETECTION_GROUP, tooltip = 'Smaller pivot length used to count the sub-swings inside each wave when checking the 3-3-5 blueprint. Keep it a few times smaller than the swing length; values equal to or above the swing length are clamped below it.')
+
+subwaveModeInput = input.string(SUB_LOOSE, 'Sub-Wave Validation', options = [SUB_OFF, SUB_LOOSE, SUB_STRICT], group = DETECTION_GROUP, tooltip = 'Checks each wave sub-swing count against the 3-3-5 blueprint using the sub-wave pivots (a three shows about 2 interior sub-swings, a five about 4). Loose rejects waves A or B that subdivide like a clean five, since a five-wave A argues for a zigzag instead. Strict additionally requires visible three-wave structure in wave A and a five-like count in wave C. Off relies on the price rules alone.')
+
+waveBMinInput = input.float(0.9, 'Wave B Min Retracement', minval = 0.5, maxval = 1, step = 0.05, group = RULES_GROUP, tooltip = 'Minimum retracement of wave A required from wave B, as a fraction of wave A. Common convention asks for roughly 90% of wave A or more.')
+
+expandedBeyondInput = input.float(1, 'Expanded Threshold', minval = 1, maxval = 1.5, step = 0.01, group = RULES_GROUP, tooltip = 'Wave B retracements beyond this multiple of wave A indicate the expanded or running variants, in which wave B exceeds the start of wave A.')
+
+waveBMaxInput = input.float(1.382, 'Wave B Max Retracement', minval = 1, step = 0.01, group = RULES_GROUP, tooltip = 'Upper bound for wave B as a multiple of wave A. Deeper retracements are treated as a new move rather than the B wave of a flat; 1.382 is a common guideline for expanded flat B waves.')
+
+extension1Input = input.float(1, 'Wave C Targets', inline = 'targets', minval = 0.1, step = 0.1, group = RULES_GROUP, tooltip = 'First Fibonacci extension of wave A projected from the end of wave B, marking the near wave C target.')
+extension2Input = input.float(1.618, '', inline = 'targets', minval = 0.1, step = 0.1, group = RULES_GROUP, tooltip = 'Fibonacci extensions of wave A projected from the end of wave B, commonly around 1.0 to 1.618, used as wave C targets once a deep three-wave B completes.')
+
+showProjectionInput = input.bool(true, 'Project Wave C Targets', group = RULES_GROUP, tooltip = 'Once a deep three-wave B is confirmed, draws the projected wave C target zone together with the wave A start and extreme levels separating regular and expanded flats from running flats.')
+
+bullColorInput = input.color(#089981, 'Bullish Flats', group = STYLE_GROUP, inline = 'colors')
+bearColorInput = input.color(#f23645, 'Bearish Flats', group = STYLE_GROUP, inline = 'colors')
+
+showWaveLabelsInput = input.bool(true, 'Wave Labels', group = STYLE_GROUP)
+
+showSwingsInput = input.bool(true, 'Show Swings', group = STYLE_GROUP, inline = 'swings')
+swingColorInput = input.color(color.new(#787b86, 50), '', group = STYLE_GROUP, inline = 'swings')
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+// registers a confirmed pivot into a zigzag, returns 0 = no change, 1 = new swing point, 2 = last swing point extended
+f_addPivot(array<float> priceArray, array<int> barArray, array<int> dirArray, float pivotPrice, int pivotBar, int pivotDir, int maxSize) =>
+    int changeType = 0
+    int n = array.size(priceArray)
+    if n == 0
+        array.push(priceArray, pivotPrice)
+        array.push(barArray, pivotBar)
+        array.push(dirArray, pivotDir)
+        changeType := 1
+    else
+        if pivotDir == array.get(dirArray, n - 1)
+            float lastPrice = array.get(priceArray, n - 1)
+            if (pivotDir == 1 and pivotPrice >= lastPrice) or (pivotDir == -1 and pivotPrice <= lastPrice)
+                array.set(priceArray, n - 1, pivotPrice)
+                array.set(barArray, n - 1, pivotBar)
+                changeType := 2
+        else
+            array.push(priceArray, pivotPrice)
+            array.push(barArray, pivotBar)
+            array.push(dirArray, pivotDir)
+            changeType := 1
+            if array.size(priceArray) > maxSize
+                array.shift(priceArray)
+                array.shift(barArray)
+                array.shift(dirArray)
+    changeType
+
+// counts the sub-wave pivots strictly inside a wave, a proxy for its sub-wave structure
+f_interiorCount(array<int> barArray, int startBar, int endBar) =>
+    int interiorCount = 0
+    int n = array.size(barArray)
+    if n > 0
+        for i = 0 to n - 1
+            int subBar = array.get(barArray, i)
+            if subBar >= endBar
+                break
+            if subBar > startBar
+                interiorCount += 1
+    interiorCount
+
+// sub-wave check for a corrective three, per the selected validation mode
+f_isThree(int interiorCount, bool requireVisible) =>
+    bool result = true
+    if subwaveModeInput == SUB_LOOSE
+        result := interiorCount <= 3
+    else if subwaveModeInput == SUB_STRICT
+        result := interiorCount <= 3 and (not requireVisible or interiorCount >= 1)
+    result
+
+// sub-wave check for an impulsive five, per the selected validation mode
+f_isFive(int interiorCount) =>
+    bool result = true
+    if subwaveModeInput == SUB_STRICT
+        result := interiorCount >= 4
+    result
+
+// draws or extends the faint zigzag segment joining the two most recent swing points
+f_swingSegment(array<float> priceArray, array<int> barArray, int changeType, line previousSegment) =>
+    line segment = previousSegment
+    if showSwingsInput
+        int n = array.size(priceArray)
+        if changeType == 1 and n >= 2
+            segment := line.new(array.get(barArray, n - 2), array.get(priceArray, n - 2), array.get(barArray, n - 1), array.get(priceArray, n - 1), color = swingColorInput, style = line.style_dotted)
+        else if changeType == 2 and not na(previousSegment)
+            line.set_xy2(previousSegment, array.get(barArray, n - 1), array.get(priceArray, n - 1))
+    segment
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Swing Detection
+//---------------------------------------------------------------------------------------------------------------------{
+
+int minorLengthEff = math.max(1, math.min(minorLengthInput, majorLengthInput - 1))
+
+var array<float> majorPriceArray = array.new<float>()
+var array<int>   majorBarArray   = array.new<int>()
+var array<int>   majorDirArray   = array.new<int>()
+
+var array<float> minorPriceArray = array.new<float>()
+var array<int>   minorBarArray   = array.new<int>()
+var array<int>   minorDirArray   = array.new<int>()
+
+var line lastSwingSegment = na
+
+float majorPivotHigh = ta.pivothigh(majorLengthInput, majorLengthInput)
+float majorPivotLow  = ta.pivotlow(majorLengthInput, majorLengthInput)
+float minorPivotHigh = ta.pivothigh(minorLengthEff, minorLengthEff)
+float minorPivotLow  = ta.pivotlow(minorLengthEff, minorLengthEff)
+
+if not na(minorPivotHigh)
+    f_addPivot(minorPriceArray, minorBarArray, minorDirArray, minorPivotHigh, bar_index - minorLengthEff, 1, MAX_MINOR_PIVOTS)
+if not na(minorPivotLow)
+    f_addPivot(minorPriceArray, minorBarArray, minorDirArray, minorPivotLow, bar_index - minorLengthEff, -1, MAX_MINOR_PIVOTS)
+
+int majorChange = 0
+if not na(majorPivotHigh)
+    int changeType = f_addPivot(majorPriceArray, majorBarArray, majorDirArray, majorPivotHigh, bar_index - majorLengthInput, 1, MAX_MAJOR_PIVOTS)
+    if changeType != 0
+        majorChange := changeType
+        lastSwingSegment := f_swingSegment(majorPriceArray, majorBarArray, changeType, lastSwingSegment)
+if not na(majorPivotLow)
+    int changeType = f_addPivot(majorPriceArray, majorBarArray, majorDirArray, majorPivotLow, bar_index - majorLengthInput, -1, MAX_MAJOR_PIVOTS)
+    if changeType != 0
+        majorChange := changeType
+        lastSwingSegment := f_swingSegment(majorPriceArray, majorBarArray, changeType, lastSwingSegment)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Flat Detection
+//---------------------------------------------------------------------------------------------------------------------{
+
+var int currentPatternKey = -1
+var int currentVariant    = 0
+var int patternEndGuard   = -1
+var int lastSetupKey      = -1
+var int lastTrapKey       = -1
+
+var array<line>  patternLineArray  = array.new<line>()
+var array<label> patternLabelArray = array.new<label>()
+var box patternZoneBox = na
+
+var bool  projectionActive = false
+var line  targetLine1      = na
+var line  targetLine2      = na
+var line  extremeLine      = na
+var line  startLine        = na
+var box   targetBox        = na
+var label targetLabel1     = na
+var label targetLabel2     = na
+
+bool bullSetupAlert = false
+bool bearSetupAlert = false
+bool trapAlert      = false
+bool regularAlert   = false
+bool expandedAlert  = false
+bool runningAlert   = false
+bool completedAlert = false
+
+if majorChange != 0
+    int n = array.size(majorPriceArray)
+    bool completedValid = false
+
+    // completed flat, evaluated on the last four swing points as the A-B-C sequence
+    if n >= 4
+        float p0 = array.get(majorPriceArray, n - 4)
+        float p1 = array.get(majorPriceArray, n - 3)
+        float p2 = array.get(majorPriceArray, n - 2)
+        float p3 = array.get(majorPriceArray, n - 1)
+        int   b0 = array.get(majorBarArray, n - 4)
+        int   b1 = array.get(majorBarArray, n - 3)
+        int   b2 = array.get(majorBarArray, n - 2)
+        int   b3 = array.get(majorBarArray, n - 1)
+        int dirA = array.get(majorDirArray, n - 3)
+        bool legsValid = b0 < b1 and b1 < b2 and b2 < b3 and (dirA == 1 ? p1 > p0 and p2 < p1 and p3 > p2 : p1 < p0 and p2 > p1 and p3 < p2)
+        float lengthA = math.abs(p1 - p0)
+        if legsValid and lengthA > 0
+            float retraceB      = math.abs(p2 - p1) / lengthA
+            bool  deepB         = retraceB >= waveBMinInput and retraceB <= waveBMaxInput
+            bool  beyondExtreme = dirA == 1 ? p3 > p1 : p3 < p1
+            bool  threeWaveA    = f_isThree(f_interiorCount(minorBarArray, b0, b1), true)
+            bool  threeWaveB    = f_isThree(f_interiorCount(minorBarArray, b1, b2), false)
+            bool  fiveWaveC     = f_isFive(f_interiorCount(minorBarArray, b2, b3))
+            int   variant       = 0
+            if deepB and threeWaveA and threeWaveB and fiveWaveC
+                variant := retraceB <= expandedBeyondInput ? (beyondExtreme ? 1 : 0) : (beyondExtreme ? 2 : 3)
+            int  patternKey  = b2
+            bool samePattern = patternKey == currentPatternKey
+            if variant != 0 and (samePattern or b0 >= patternEndGuard)
+                completedValid := true
+                if samePattern
+                    int lineCount = array.size(patternLineArray)
+                    if lineCount > 0
+                        for i = 0 to lineCount - 1
+                            line.delete(array.get(patternLineArray, i))
+                    int labelCount = array.size(patternLabelArray)
+                    if labelCount > 0
+                        for i = 0 to labelCount - 1
+                            label.delete(array.get(patternLabelArray, i))
+                    box.delete(patternZoneBox)
+                array.clear(patternLineArray)
+                array.clear(patternLabelArray)
+
+                color patternColor = dirA == 1 ? bearColorInput : bullColorInput
+                array.push(patternLineArray, line.new(b0, p0, b1, p1, color = patternColor, width = 2))
+                array.push(patternLineArray, line.new(b1, p1, b2, p2, color = patternColor, width = 2))
+                array.push(patternLineArray, line.new(b2, p2, b3, p3, color = patternColor, width = 2))
+                patternZoneBox := box.new(b0, math.max(p0, p1), b3, math.min(p0, p1), border_color = color.new(patternColor, 60), border_style = line.style_dotted, bgcolor = color.new(patternColor, 92))
+
+                string endStyle   = dirA == 1 ? label.style_label_down : label.style_label_up
+                string innerStyle = dirA == 1 ? label.style_label_up : label.style_label_down
+                if showWaveLabelsInput
+                    array.push(patternLabelArray, label.new(b1, p1, 'A', color = TRANSPARENT_COLOR, textcolor = patternColor, style = endStyle, size = size.small))
+                    array.push(patternLabelArray, label.new(b2, p2, 'B', color = TRANSPARENT_COLOR, textcolor = patternColor, style = innerStyle, size = size.small))
+                    array.push(patternLabelArray, label.new(b3, p3, 'C', color = TRANSPARENT_COLOR, textcolor = patternColor, style = endStyle, size = size.small))
+
+                float ratioC = math.abs(p3 - p2) / lengthA
+                string variantText = variant == 1 ? REGULAR_TXT : variant == 2 ? EXPANDED_TXT : RUNNING_TXT
+                string titleText = variantText + '\nB ≈ ' + str.tostring(retraceB, '#.##') + ' × A, C ≈ ' + str.tostring(ratioC, '#.##') + ' × A'
+                int   midBar   = math.round(math.avg(b0, b3))
+                float extremeY = dirA == 1 ? math.max(p1, p3) : math.min(p1, p3)
+                array.push(patternLabelArray, label.new(midBar, extremeY, titleText, color = TRANSPARENT_COLOR, textcolor = patternColor, style = endStyle, size = size.small))
+
+                patternEndGuard := b3
+                if not samePattern
+                    currentPatternKey := patternKey
+                    completedAlert := true
+                    regularAlert   := variant == 1
+                    expandedAlert  := variant == 2
+                    runningAlert   := variant == 3
+                else if variant != currentVariant
+                    regularAlert  := variant == 1
+                    expandedAlert := variant == 2
+                    runningAlert  := variant == 3
+                currentVariant := variant
+
+    // clear any previous projection, it is rebuilt from the latest swings below
+    if projectionActive
+        line.delete(targetLine1)
+        line.delete(targetLine2)
+        line.delete(extremeLine)
+        line.delete(startLine)
+        box.delete(targetBox)
+        label.delete(targetLabel1)
+        label.delete(targetLabel2)
+        projectionActive := false
+
+    // developing flat, a deep three-wave B ahead of a projected five-wave C
+    if n >= 3 and not completedValid
+        float a0 = array.get(majorPriceArray, n - 3)
+        float a1 = array.get(majorPriceArray, n - 2)
+        float a2 = array.get(majorPriceArray, n - 1)
+        int   s0 = array.get(majorBarArray, n - 3)
+        int   s1 = array.get(majorBarArray, n - 2)
+        int   s2 = array.get(majorBarArray, n - 1)
+        int   dirSetup = array.get(majorDirArray, n - 2)
+        bool  setupLegsValid = s0 < s1 and s1 < s2 and (dirSetup == 1 ? a1 > a0 and a2 < a1 : a1 < a0 and a2 > a1)
+        float lengthSetupA = math.abs(a1 - a0)
+        if setupLegsValid and lengthSetupA > 0 and s0 >= patternEndGuard
+            float retraceSetupB = math.abs(a2 - a1) / lengthSetupA
+            bool  deepSetupB    = retraceSetupB >= waveBMinInput and retraceSetupB <= waveBMaxInput
+            bool  threeSetupA   = f_isThree(f_interiorCount(minorBarArray, s0, s1), true)
+            bool  threeSetupB   = f_isThree(f_interiorCount(minorBarArray, s1, s2), false)
+            if deepSetupB and threeSetupA and threeSetupB
+                int setupKey = s1
+                if setupKey != lastSetupKey
+                    lastSetupKey := setupKey
+                    bullSetupAlert := dirSetup == -1
+                    bearSetupAlert := dirSetup == 1
+                if retraceSetupB > expandedBeyondInput and setupKey != lastTrapKey
+                    lastTrapKey := setupKey
+                    trapAlert := true
+                if showProjectionInput
+                    color setupColor = dirSetup == 1 ? bearColorInput : bullColorInput
+                    float target1 = a2 + dirSetup * extension1Input * lengthSetupA
+                    float target2 = a2 + dirSetup * extension2Input * lengthSetupA
+                    int rightBar = bar_index + PROJ_RIGHT_OFFSET
+                    targetLine1 := line.new(s2, target1, rightBar, target1, color = color.new(setupColor, 30), style = line.style_dotted)
+                    targetLine2 := line.new(s2, target2, rightBar, target2, color = color.new(setupColor, 30), style = line.style_dotted)
+                    extremeLine := line.new(s1, a1, rightBar, a1, color = color.new(setupColor, 50), style = line.style_dashed)
+                    startLine   := line.new(s0, a0, rightBar, a0, color = color.new(setupColor, 65), style = line.style_dashed)
+                    targetBox   := box.new(s2, math.max(target1, target2), rightBar, math.min(target1, target2), border_color = na, bgcolor = color.new(setupColor, 90))
+                    targetLabel1 := label.new(rightBar, target1, str.tostring(extension1Input, '#.###') + ' × A', color = TRANSPARENT_COLOR, textcolor = color.new(setupColor, 20), style = label.style_label_left, size = size.tiny)
+                    targetLabel2 := label.new(rightBar, target2, str.tostring(extension2Input, '#.###') + ' × A', color = TRANSPARENT_COLOR, textcolor = color.new(setupColor, 20), style = label.style_label_left, size = size.tiny)
+                    projectionActive := true
+
+// keep the active projection anchored to the latest bar
+if projectionActive
+    int rightBar = bar_index + PROJ_RIGHT_OFFSET
+    line.set_x2(targetLine1, rightBar)
+    line.set_x2(targetLine2, rightBar)
+    line.set_x2(extremeLine, rightBar)
+    line.set_x2(startLine, rightBar)
+    box.set_right(targetBox, rightBar)
+    label.set_x(targetLabel1, rightBar)
+    label.set_x(targetLabel2, rightBar)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(bullSetupAlert, 'Bullish Flat Setup', 'Potential bullish flat: deep three-wave B complete, five-wave C projected lower toward the target zone')
+alertcondition(bearSetupAlert, 'Bearish Flat Setup', 'Potential bearish flat: deep three-wave B complete, five-wave C projected higher toward the target zone')
+alertcondition(trapAlert, 'Wave B Trap Warning', 'Wave B exceeded the start of wave A: the marginal new extreme may be an expanded or running flat B wave rather than trend continuation')
+alertcondition(regularAlert, 'Regular Flat', 'Regular flat completed (3-3-5): wave B retraced to near the start of wave A and wave C ended slightly beyond its extreme')
+alertcondition(expandedAlert, 'Expanded Flat', 'Expanded flat completed (3-3-5): wave B exceeded the start of wave A and wave C traveled beyond its extreme')
+alertcondition(runningAlert, 'Running Flat', 'Running flat completed (3-3-5): wave B exceeded the start of wave A but wave C fell short of its extreme, a possible sign of a strong larger trend')
+alertcondition(completedAlert, 'Flat Completed', 'A 3-3-5 flat correction has completed')
+
+//---------------------------------------------------------------------------------------------------------------------}

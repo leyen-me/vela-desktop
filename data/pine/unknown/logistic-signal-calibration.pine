@@ -1,0 +1,312 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Logistic Signal Calibration", shorttitle = "Logistic Signal Calibration", overlay = false, format = format.price, precision = 2)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+NEUTRAL_COLOR = #787b86
+GUIDE_COLOR   = #787b86
+CAUTION_COLOR = #ff9800 // the one accent - overconfidence and calibration decay
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+// Reliability diagram resolution and the Brier score of a constant always-0.5 forecast
+BIN_COUNT      = 5
+BIN_WIDTH      = 1.0 / BIN_COUNT
+NO_SKILL_BRIER = 0.25
+
+// Input groups
+G_MODEL      = "Logistic Model"
+G_THRESHOLDS = "Decision Thresholds"
+G_CALIBRATION = "Calibration Check"
+G_DASHBOARD  = "Dashboard"
+G_STYLE      = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+srcInput = input.source(close, "Source", group = G_MODEL,
+     tooltip = "Price series feeding the momentum and trend features.")
+
+momentumLengthInput = input.int(14, "Momentum", minval = 1, maxval = 500, inline = "momentum", group = G_MODEL,
+     tooltip = "Momentum feature - rate of change of the source over this lookback, standardized to a z-score over the normalization window before it is weighted. The number on the right is the feature's logistic coefficient.")
+momentumWeightInput = input.float(1.0, "", minval = -10, maxval = 10, step = 0.1, inline = "momentum", group = G_MODEL,
+     tooltip = "Logistic coefficient of the momentum feature. Positive values push the probability toward 1 when standardized momentum is positive, 0 removes the feature from the score, negative flips its direction. In a fitted model these coefficients come from regression on labeled history; here they are set directly so the fusion stays transparent.")
+
+trendLengthInput = input.int(50, "Trend", minval = 1, maxval = 500, inline = "trend", group = G_MODEL,
+     tooltip = "Trend feature - distance of the source from its simple moving average of this length, standardized to a z-score over the normalization window. The number on the right is the feature's logistic coefficient.")
+trendWeightInput = input.float(1.0, "", minval = -10, maxval = 10, step = 0.1, inline = "trend", group = G_MODEL,
+     tooltip = "Logistic coefficient of the trend feature.")
+
+volumeLengthInput = input.int(20, "Volume", minval = 1, maxval = 500, inline = "volume", group = G_MODEL,
+     tooltip = "Volume feature - net On Balance Volume change over this many bars, a signed volume-flow reading standardized to a z-score over the normalization window. Reads 0 on symbols without volume data. The number on the right is the feature's logistic coefficient.")
+volumeWeightInput = input.float(1.0, "", minval = -10, maxval = 10, step = 0.1, inline = "volume", group = G_MODEL,
+     tooltip = "Logistic coefficient of the volume feature.")
+
+interceptInput = input.float(0.0, "Intercept (Bias)", minval = -10, maxval = 10, step = 0.1, group = G_MODEL,
+     tooltip = "Intercept of the logistic model - the baseline log-odds before any feature contribution. 0 corresponds to a resting score of 0.5; positive values shift the base rate above 50%.")
+normalizationWindowInput = input.int(100, "Normalization Window", minval = 2, maxval = 2000, group = G_MODEL,
+     tooltip = "Trailing window used to standardize every feature into a z-score - each reading is expressed in standard deviations from its own recent mean, so the coefficients are comparable across features and the weighted sum behaves like log-odds.")
+
+upperThresholdInput = input.float(0.7, "Bullish", minval = 0.5, maxval = 0.99, step = 0.01, inline = "thresholds", group = G_THRESHOLDS,
+     tooltip = "Decision threshold for bullish readings. An underlying setup is only rated bullish once the calibrated probability clears this level above 0.5, so marginal scores are skipped - the signal-filter use of a logistic score.")
+lowerThresholdInput = input.float(0.3, "Bearish", minval = 0.01, maxval = 0.5, step = 0.01, inline = "thresholds", group = G_THRESHOLDS,
+     tooltip = "Decision threshold for bearish readings - the bearish mirror of the bullish level. Scores between the two thresholds read as no-edge, stand-aside conditions.")
+
+horizonInput = input.int(10, "Prediction Horizon", minval = 1, maxval = 200, group = G_CALIBRATION,
+     tooltip = "Bars ahead each score is resolved against - a score issued on a bar is graded on whether the close is higher this many bars later. This is the label the probability speaks about, so the calibration check is always relative to it.")
+evaluationWindowInput = input.int(200, "Evaluation Window", minval = 20, maxval = 2000, group = G_CALIBRATION,
+     tooltip = "Most recent resolved scores kept in the rolling calibration sample. The dashboard grades the scores on this window only, because calibration is measured on past data and decays as conditions drift - shorter windows track the current regime, longer windows are more stable.")
+
+showDashboardInput = input.bool(true, "Show Calibration Dashboard", group = G_DASHBOARD,
+     tooltip = "Displays the reliability dashboard - resolved scores grouped into probability bins with average predicted versus observed frequencies, the direction hit rate against the average confidence claimed, and the rolling Brier score.")
+dashboardLocationInput = input.string("Top Right", "Location", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left", "Middle Right"], group = G_DASHBOARD,
+     tooltip = "Position of the dashboard on the pane.")
+dashboardSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = G_DASHBOARD,
+     tooltip = "Text size of the dashboard.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "colors", group = G_STYLE,
+     tooltip = "Color of confident bullish scores and the bullish threshold.")
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "colors", group = G_STYLE,
+     tooltip = "Colors of confident bullish and bearish scores and their thresholds.")
+guideColorInput = input.color(GUIDE_COLOR, "No-Edge", group = G_STYLE,
+     tooltip = "Color of no-edge readings near 0.5 and of the dotted midline.")
+lineWidthInput = input.int(1, "Line Width", minval = 1, maxval = 4, group = G_STYLE,
+     tooltip = "Width of the calibrated probability line.")
+gradientFillInput = input.bool(true, "Gradient Fill", group = G_STYLE,
+     tooltip = "Fills the area between the 0.5 midline and the probability with a directional gradient - green above, red below.")
+showMarkersInput = input.bool(false, "Threshold Cross Markers", group = G_STYLE,
+     tooltip = "Draws small circles on the pane where the probability crosses a decision threshold. Off by default - alerts carry these events; enable when a visual record is preferred.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+getLocation(string positionText) =>
+    switch positionText
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        "Bottom Left"  => position.bottom_left
+        => position.middle_right
+
+getSize(string sizeText) =>
+    sizeText == "Tiny" ? size.tiny : sizeText == "Small" ? size.small : size.normal
+
+// Logistic (sigmoid) link - maps log-odds onto a 0-1 probability-style score
+sigmoid(float value) =>
+    1.0 / (1.0 + math.exp(-math.max(-50.0, math.min(50.0, value))))
+
+// Reliability bin of a probability, clamped to the last bin at exactly 1
+getBin(float probabilityValue) =>
+    math.min(BIN_COUNT - 1, math.max(0, int(probabilityValue * BIN_COUNT)))
+
+// Confidence gradient - red at 0, neutral at the 0.5 no-edge point, green at 1
+gradeColor(float probabilityValue) =>
+    probabilityValue >= 0.5 ? color.from_gradient(probabilityValue, 0.5, 1.0, guideColorInput, bullColorInput) : color.from_gradient(probabilityValue, 0.0, 0.5, bearColorInput, guideColorInput)
+
+formatValue(float value, string formatString) =>
+    na(value) ? "—" : str.tostring(value, formatString)
+
+// Dashboard is created once, with its header and summary rows pre-merged
+createDashboardTable() =>
+    tableId = table.new(getLocation(dashboardLocationInput), 5, 9, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+    table.merge_cells(tableId, 0, 0, 4, 0)
+    table.merge_cells(tableId, 0, 7, 4, 7)
+    table.merge_cells(tableId, 0, 8, 4, 8)
+    tableId
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Logistic Score
+//---------------------------------------------------------------------------------------------------------------------{
+// Raw features - momentum, trend and volume flow, per the concept's fused-feature score
+momentumRaw = ta.roc(srcInput, momentumLengthInput)
+trendRaw    = srcInput - ta.sma(srcInput, trendLengthInput)
+volumeRaw   = ta.change(ta.obv, volumeLengthInput)
+
+// Rolling z-score standardization - features enter the model on a common scale, past-window statistics only
+momentumMean = ta.sma(momentumRaw, normalizationWindowInput)
+momentumDev  = nz(ta.stdev(momentumRaw, normalizationWindowInput))
+momentumZ    = momentumDev > 0 ? (momentumRaw - momentumMean) / momentumDev : 0.0
+
+trendMean = ta.sma(trendRaw, normalizationWindowInput)
+trendDev  = nz(ta.stdev(trendRaw, normalizationWindowInput))
+trendZ    = trendDev > 0 ? (trendRaw - trendMean) / trendDev : 0.0
+
+volumeMean = ta.sma(volumeRaw, normalizationWindowInput)
+volumeDev  = nz(ta.stdev(volumeRaw, normalizationWindowInput))
+volumeZ    = volumeDev > 0 ? (volumeRaw - volumeMean) / volumeDev : 0.0
+
+// Weighted feature combination -> log-odds -> sigmoid -> calibrated 0-1 confidence
+momentumTerm = momentumWeightInput * momentumZ
+trendTerm    = trendWeightInput * trendZ
+volumeTerm   = volumeWeightInput * volumeZ
+
+logOdds     = interceptInput + momentumTerm + trendTerm + volumeTerm
+probability = sigmoid(logOdds)
+
+// Decision threshold events - the score as a signal filter
+bullishCross    = ta.crossover(probability, upperThresholdInput)
+bearishCross    = ta.crossunder(probability, lowerThresholdInput)
+standAside      = ta.crossunder(probability, upperThresholdInput) or ta.crossover(probability, lowerThresholdInput)
+biasFlipBullish = ta.crossover(probability, 0.5)
+biasFlipBearish = ta.crossunder(probability, 0.5)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calibration Tracking
+//---------------------------------------------------------------------------------------------------------------------{
+// Every score is resolved against its label once the horizon has elapsed: close higher than when it was issued
+featureWarmupBars = normalizationWindowInput + math.max(momentumLengthInput, math.max(trendLengthInput, volumeLengthInput))
+resolvedReady     = bar_index >= featureWarmupBars + horizonInput
+
+pastProbability = probability[horizonInput]
+priorClose      = close[horizonInput]
+outcomeUp       = close > priorClose
+
+var predictionsArray = array.new_float()
+var outcomesArray    = array.new_float()
+
+// Running sums cancel exactly on removal, keeping the rolling statistics O(1) per bar
+var float brierSum          = 0.0
+var float directionHitCount = 0.0
+var float confidenceSum     = 0.0
+
+if resolvedReady and not na(pastProbability) and not na(priorClose)
+    outcomeValue = outcomeUp ? 1.0 : 0.0
+    array.push(predictionsArray, pastProbability)
+    array.push(outcomesArray, outcomeValue)
+    brierSum          += math.pow(pastProbability - outcomeValue, 2)
+    directionHitCount += (pastProbability >= 0.5 ? outcomeUp : not outcomeUp) ? 1.0 : 0.0
+    confidenceSum     += math.max(pastProbability, 1 - pastProbability)
+    if array.size(predictionsArray) > evaluationWindowInput
+        oldProbability = array.shift(predictionsArray)
+        oldOutcome     = array.shift(outcomesArray)
+        brierSum          -= math.pow(oldProbability - oldOutcome, 2)
+        directionHitCount -= (oldProbability >= 0.5 ? oldOutcome > 0.5 : oldOutcome < 0.5) ? 1.0 : 0.0
+        confidenceSum     -= math.max(oldProbability, 1 - oldProbability)
+
+resolvedCount = array.size(predictionsArray)
+
+// Brier score - mean squared error of the probabilities; 0.25 is the always-0.5 no-skill baseline
+brierScore    = resolvedCount > 0 ? brierSum / resolvedCount : na
+hitRate       = resolvedCount > 0 ? directionHitCount / resolvedCount : na
+avgConfidence = resolvedCount > 0 ? confidenceSum / resolvedCount : na
+
+// Overconfidence caution - claimed confidence exceeding the delivered hit rate beyond one standard error
+hitRateError         = resolvedCount > 0 and not na(hitRate) ? math.sqrt(math.max(hitRate * (1 - hitRate), 0.0) / resolvedCount) : na
+overconfidentSummary = not na(hitRate) and not na(avgConfidence) and not na(hitRateError) and avgConfidence - hitRate > hitRateError
+
+calibrationDecay = ta.crossover(brierScore, NO_SKILL_BRIER)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Plots
+//---------------------------------------------------------------------------------------------------------------------{
+probabilityColor = gradeColor(probability)
+
+hline(upperThresholdInput, "Bullish Threshold", color = color.new(bullColorInput, 50), linestyle = hline.style_dashed)
+hline(0.5, "No-Edge Midline", color = color.new(guideColorInput, 50), linestyle = hline.style_dotted)
+hline(lowerThresholdInput, "Bearish Threshold", color = color.new(bearColorInput, 50), linestyle = hline.style_dashed)
+
+probabilityPlotId = plot(probability, "Calibrated Probability", color = probabilityColor, linewidth = lineWidthInput)
+midlinePlotId     = plot(0.5, "Midline Anchor", color = na, editable = false, display = display.none)
+
+fillTopColor    = gradientFillInput ? (probability > 0.5 ? color.new(bullColorInput, 50) : color.new(bearColorInput, 100)) : na
+fillBottomColor = gradientFillInput ? (probability > 0.5 ? color.new(bullColorInput, 100) : color.new(bearColorInput, 50)) : na
+fill(probabilityPlotId, midlinePlotId, top_value = math.max(probability, 0.5), bottom_value = math.min(probability, 0.5), top_color = fillTopColor, bottom_color = fillBottomColor)
+
+plotshape(showMarkersInput and bullishCross ? probability : na, "Bullish Cross Marker", style = shape.circle, location = location.absolute, color = bullColorInput, size = size.tiny)
+plotshape(showMarkersInput and bearishCross ? probability : na, "Bearish Cross Marker", style = shape.circle, location = location.absolute, color = bearColorInput, size = size.tiny)
+
+plot(logOdds, "Log-Odds (z)", color = color.new(NEUTRAL_COLOR, 0), editable = false, display = display.data_window)
+plot(momentumTerm, "Momentum Contribution", color = color.new(NEUTRAL_COLOR, 0), editable = false, display = display.data_window)
+plot(trendTerm, "Trend Contribution", color = color.new(NEUTRAL_COLOR, 0), editable = false, display = display.data_window)
+plot(volumeTerm, "Volume Contribution", color = color.new(NEUTRAL_COLOR, 0), editable = false, display = display.data_window)
+plot(brierScore, "Brier Score", color = color.new(NEUTRAL_COLOR, 0), editable = false, display = display.data_window)
+plot(100 * hitRate, "Direction Hit Rate %", color = color.new(NEUTRAL_COLOR, 0), editable = false, display = display.data_window)
+plot(100 * avgConfidence, "Average Confidence %", color = color.new(NEUTRAL_COLOR, 0), editable = false, display = display.data_window)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table calibrationTable = showDashboardInput ? createDashboardTable() : na
+
+if showDashboardInput and barstate.islast
+    textSizeValue = getSize(dashboardSizeInput)
+    textColor     = DASH_TEXT
+    dimColor      = DASH_HEADER
+    highlightBg   = color.new(CAUTION_COLOR, 85)
+
+    headerText = "Calibration • " + str.tostring(resolvedCount) + "/" + str.tostring(evaluationWindowInput) + " resolved • " + str.tostring(horizonInput) + "-bar horizon"
+    table.cell(calibrationTable, 0, 0, headerText, text_color = dimColor, text_size = textSizeValue, text_halign = text.align_left,
+         tooltip = "Rolling reliability check of the calibrated scores. Each score is resolved after the prediction horizon: did the close end higher than when the score was issued?")
+
+    table.cell(calibrationTable, 0, 1, "P(up) bin", text_color = dimColor, text_size = textSizeValue, text_halign = text.align_left)
+    table.cell(calibrationTable, 1, 1, "Avg P", text_color = dimColor, text_size = textSizeValue, text_halign = text.align_right,
+         tooltip = "Average calibrated probability of the resolved scores in this bin.")
+    table.cell(calibrationTable, 2, 1, "Obs", text_color = dimColor, text_size = textSizeValue, text_halign = text.align_right,
+         tooltip = "Observed share of those bars that closed higher after the prediction horizon. A calibrated score keeps Obs close to Avg P - around a 0.7 bin, roughly 70% should resolve higher.")
+    table.cell(calibrationTable, 3, 1, "Δ", text_color = dimColor, text_size = textSizeValue, text_halign = text.align_right,
+         tooltip = "Observed minus predicted. Highlighted when the bin claims more edge than the window delivered by more than one standard error - the overconfidence caution.")
+    table.cell(calibrationTable, 4, 1, "N", text_color = dimColor, text_size = textSizeValue, text_halign = text.align_right,
+         tooltip = "Resolved scores in the bin.")
+
+    float[] binProbabilitySumArray = array.new_float(BIN_COUNT, 0.0)
+    float[] binOutcomeSumArray     = array.new_float(BIN_COUNT, 0.0)
+    int[]   binCountArray          = array.new_int(BIN_COUNT, 0)
+
+    if resolvedCount > 0
+        for i = 0 to resolvedCount - 1
+            sampleProbability = array.get(predictionsArray, i)
+            sampleOutcome     = array.get(outcomesArray, i)
+            binIndex          = getBin(sampleProbability)
+            array.set(binProbabilitySumArray, binIndex, array.get(binProbabilitySumArray, binIndex) + sampleProbability)
+            array.set(binOutcomeSumArray, binIndex, array.get(binOutcomeSumArray, binIndex) + sampleOutcome)
+            array.set(binCountArray, binIndex, array.get(binCountArray, binIndex) + 1)
+
+    currentBin = getBin(probability)
+
+    for b = 0 to BIN_COUNT - 1
+        rowIndex     = 2 + (BIN_COUNT - 1 - b)
+        binSamples   = array.get(binCountArray, b)
+        avgPredicted = binSamples > 0 ? array.get(binProbabilitySumArray, b) / binSamples : na
+        observedFreq = binSamples > 0 ? array.get(binOutcomeSumArray, b) / binSamples : na
+        deltaValue   = binSamples > 0 ? observedFreq - avgPredicted : na
+        // Overconfident when the score's claim, read toward its own side, exceeds reality beyond sampling noise
+        standardError   = binSamples > 0 ? math.sqrt(math.max(observedFreq * (1 - observedFreq), 0.0) / binSamples) : na
+        overconfident   = binSamples > 0 and (avgPredicted >= 0.5 ? avgPredicted - observedFreq > standardError : observedFreq - avgPredicted > standardError)
+        binMid          = (b + 0.5) * BIN_WIDTH
+        binLabel        = str.tostring(b * BIN_WIDTH, "0.0") + "–" + str.tostring((b + 1) * BIN_WIDTH, "0.0")
+        deltaText       = na(deltaValue) ? "—" : (deltaValue >= 0 ? "+" : "") + str.tostring(deltaValue, "0.00")
+        rowBg           = b == currentBin ? highlightBg : na
+        table.cell(calibrationTable, 0, rowIndex, binLabel, text_color = gradeColor(binMid), text_size = textSizeValue, text_halign = text.align_left, bgcolor = rowBg)
+        table.cell(calibrationTable, 1, rowIndex, formatValue(avgPredicted, "0.00"), text_color = textColor, text_size = textSizeValue, text_halign = text.align_right)
+        table.cell(calibrationTable, 2, rowIndex, formatValue(observedFreq, "0.00"), text_color = textColor, text_size = textSizeValue, text_halign = text.align_right)
+        table.cell(calibrationTable, 3, rowIndex, deltaText, text_color = overconfident ? CAUTION_COLOR : dimColor, text_size = textSizeValue, text_halign = text.align_right)
+        table.cell(calibrationTable, 4, rowIndex, str.tostring(binSamples), text_color = dimColor, text_size = textSizeValue, text_halign = text.align_right)
+
+    directionSummaryText = resolvedCount > 0 ? "Hit rate " + str.tostring(100 * hitRate, "0.0") + "% • avg confidence " + str.tostring(100 * avgConfidence, "0.0") + "%" + (overconfidentSummary ? " • overconfident" : "") : "Awaiting resolved scores"
+    table.cell(calibrationTable, 0, 7, directionSummaryText, text_color = overconfidentSummary ? CAUTION_COLOR : dimColor, text_size = textSizeValue, text_halign = text.align_left,
+         tooltip = "Share of resolved scores whose predicted side of 0.5 matched the outcome, against the average confidence the scores claimed. Confidence persistently above the hit rate is the overconfidence the concept warns about - read scores as ranked confidence, not promised win rates.")
+
+    brierText = na(brierScore) ? "Brier —" : "Brier " + str.tostring(brierScore, "0.000") + " • always-0.5 baseline " + str.tostring(NO_SKILL_BRIER, "0.00") + (brierScore > NO_SKILL_BRIER ? " • worse than baseline" : "")
+    table.cell(calibrationTable, 0, 8, brierText, text_color = not na(brierScore) and brierScore > NO_SKILL_BRIER ? CAUTION_COLOR : dimColor, text_size = textSizeValue, text_halign = text.align_left,
+         tooltip = "Mean squared error between each probability and its 0/1 outcome - the standard proper score for probability forecasts. A constant 0.5 forecast scores 0.25; staying above that baseline means the scores carried no edge over the window.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(bullishCross, "Bullish Threshold Cleared", "Logistic Signal Calibration: calibrated probability crossed above the bullish threshold - long filter passes ({{ticker}}, {{interval}})")
+alertcondition(bearishCross, "Bearish Threshold Cleared", "Logistic Signal Calibration: calibrated probability crossed below the bearish threshold - short filter passes ({{ticker}}, {{interval}})")
+alertcondition(standAside, "Returned to Stand-Aside", "Logistic Signal Calibration: calibrated probability returned to the no-edge band between the thresholds ({{ticker}}, {{interval}})")
+alertcondition(biasFlipBullish, "Bias Flipped Bullish", "Logistic Signal Calibration: calibrated probability crossed above 0.5 ({{ticker}}, {{interval}})")
+alertcondition(biasFlipBearish, "Bias Flipped Bearish", "Logistic Signal Calibration: calibrated probability crossed below 0.5 ({{ticker}}, {{interval}})")
+alertcondition(calibrationDecay, "Calibration Decay Warning", "Logistic Signal Calibration: rolling Brier score crossed above the 0.25 always-0.5 baseline - scores carried no edge over the evaluation window ({{ticker}}, {{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

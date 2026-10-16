@@ -1,0 +1,190 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Dark Cloud Cover", shorttitle = "Dark Cloud Cover", overlay = true, format = format.price, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR = #089981
+BEAR_COLOR = #f23645
+LABEL_BG   = #00000000
+
+HIGHLIGHT_BORDER_TRANSP = 60
+HIGHLIGHT_FILL_TRANSP   = 90
+MIDPOINT_TRANSP         = 40
+
+OPEN_STRICT  = "Above Prior High (Strict)"
+OPEN_RELAXED = "Above Prior Close (Relaxed)"
+
+TRIGGER_LOW   = "Pattern Low"
+TRIGGER_CLOSE = "Second Candle Close"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+openRuleInput = input.string(OPEN_STRICT, "Open Requirement", options = [OPEN_STRICT, OPEN_RELAXED], group = "Pattern Detection",
+     tooltip = "How the second candle must open. The strict, classic form demands an open above the first candle's high - a true gap into new ground. The relaxed reading, standard in 24-hour markets where genuine gaps are rare, accepts an open above the prior close and preserves the failed-push logic; relaxed instances are conventionally treated as slightly weaker evidence.")
+
+bodyLenInput = input.int(14, "Body Average Length", minval = 2, maxval = 100, group = "Pattern Detection",
+     tooltip = "Number of candles in the average real body used to size the first candle. The average is taken over the bars immediately preceding the pattern, so the pattern's own candles do not distort their own yardstick.")
+
+longBodyInput = input.float(1.0, "Strong Body Multiplier", minval = 0.1, maxval = 5, step = 0.1, group = "Pattern Detection",
+     tooltip = "Minimum real body of the first candle, as a multiple of the average real body. The pattern needs a strong bullish candle for the sell-off to invade - a longer first body gives the close more ground to cover, so higher values keep only the more meaningful prints.")
+
+depthInput = input.float(50, "Minimum Close Depth %", minval = 0, maxval = 95, step = 5, group = "Pattern Detection",
+     tooltip = "How far down into the first candle's real body the second candle must close, measured from the body's top. 50 is the standard below-the-midpoint threshold, and deeper closes are stronger evidence. The close must also hold above the first candle's open - a close through the entire body is a bearish engulfing, a separate pattern this script deliberately leaves out.")
+
+trendFilterInput = input.bool(true, "Uptrend Filter", inline = "trend", group = "Context Filters",
+     tooltip = "Require an advance into the pattern: the first candle must close above the moving average, so the failed push into new highs extends an established up leg instead of printing as mid-range noise, where the same two candles carry far less weight.")
+
+trendLenInput = input.int(50, "SMA Length", minval = 2, maxval = 500, inline = "trend", group = "Context Filters",
+     tooltip = "Length of the simple moving average used by the uptrend filter.")
+
+swingFilterInput = input.bool(false, "New High Location", inline = "swing", group = "Context Filters",
+     tooltip = "Only keep patterns printing at the top of the recent window: the pattern's high must be the highest high of the location window. Buyers being handed new highs and failing to hold them is the point of the pattern, and instances buried mid-range usually deserve less chart time.")
+
+swingLenInput = input.int(20, "Window", minval = 2, maxval = 500, inline = "swing", group = "Context Filters",
+     tooltip = "Number of bars in the location window used by the new-high location filter, the pattern's two candles included.")
+
+volumeFilterInput = input.bool(false, "Volume Filter", inline = "volume", group = "Context Filters",
+     tooltip = "Require elevated participation on the second candle: heavier volume on the sell-off implies more meaningful distribution. Supporting evidence rather than part of the definition. Automatically bypassed when the symbol reports no volume data.")
+
+volMultInput = input.float(1.0, "Multiple", minval = 0.1, maxval = 5, step = 0.1, inline = "volume", group = "Context Filters",
+     tooltip = "Minimum second-candle volume as a multiple of the trailing volume average.")
+
+volLenInput = input.int(20, "Length", minval = 1, maxval = 500, inline = "volume", group = "Context Filters",
+     tooltip = "Number of bars in the trailing volume average. The average is taken one bar back so the second candle's own volume does not inflate the threshold.")
+
+showLevelsInput = input.bool(true, "Trigger & Stop Levels", group = "Trigger & Invalidation",
+     tooltip = "Draw each pattern's reference points as dashed levels: the conventional entry trigger, and the invalidation above the second candle's high - the failed new high, since a trade back above it says buyers were not actually rejected.")
+
+triggerModeInput = input.string(TRIGGER_LOW, "Trigger Level", options = [TRIGGER_LOW, TRIGGER_CLOSE], group = "Trigger & Invalidation",
+     tooltip = "Entry convention marked by the trigger level. 'Pattern Low' waits for downside follow-through - a break of the two candles' low - before the reversal is treated as active. 'Second Candle Close' records the signal candle's closing price for immediate entries. The trigger-break alert fires once price trades below this level after the pattern completes.")
+
+extendInput = input.int(10, "Levels Extension", minval = 1, maxval = 250, group = "Trigger & Invalidation",
+     tooltip = "Number of bars the trigger and stop levels extend to the right of the pattern.")
+
+showLabelsInput = input.bool(true, "Pattern Labels", group = "Style",
+     tooltip = "Mark each pattern with a Dark Cloud Cover label above the two candles; hovering a label reports how the open qualified, the close's depth into the first body, the second candle's volume versus its average, and the trigger and stop prices.")
+
+highlightInput = input.bool(true, "Pattern Highlight", group = "Style",
+     tooltip = "Shade the two candles of each detected pattern and mark the first body's midpoint - the standard close-depth threshold - with a dotted tick.")
+
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "colors", group = "Style",
+     tooltip = "Color of pattern labels, highlights and trigger levels.")
+
+invalidColorInput = input.color(BULL_COLOR, "Invalidation", inline = "colors", group = "Style",
+     tooltip = "Color of the invalidation level above the second candle's high.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Pattern Detection
+//---------------------------------------------------------------------------------------------------------------------{
+// Trailing context series, computed unconditionally on every bar
+body         = math.abs(close - open)
+bodyAvg      = ta.sma(body, bodyLenInput)
+trendSma     = ta.sma(close, trendLenInput)
+volSma       = ta.sma(volume, volLenInput)
+swingHighest = ta.highest(high, swingLenInput)
+
+// Baselines: the body average is taken from the candles immediately preceding the two-candle pattern, and the
+// volume average one bar back, so the pattern's own candles do not inflate their own thresholds
+refBody    = bodyAvg[2]
+volSmaPrev = volSma[1]
+
+// Act one - a strong bullish candle extending the advance
+firstBullish = close[1] > open[1]
+firstLong    = body[1] >= refBody * longBodyInput
+firstBodyMid = (open[1] + close[1]) / 2
+
+// Act two - buyers are handed new ground and cannot hold it: an open above the first candle answered by a sell-off
+// closing deep inside its real body, yet above its open (a close through the open would be a bearish engulfing)
+gapOpen        = open > high[1]
+openOk         = openRuleInput == OPEN_STRICT ? gapOpen : open > close[1]
+secondBearish  = close < open
+closeDeep      = close < close[1] - body[1] * depthInput / 100
+staysAboveOpen = close > open[1]
+
+// Pattern extremes - the second candle's high is the failed new high, the two candles' low the follow-through line
+patternHigh = math.max(high, high[1])
+patternLow  = math.min(low, low[1])
+
+// Context filters - trend, location and participation separate tradable prints from mid-range noise
+inUptrend = not trendFilterInput or (not na(trendSma[1]) and close[1] > trendSma[1])
+swingOk   = not swingFilterInput or (not na(swingHighest) and patternHigh >= swingHighest)
+
+hasVolumeData = not na(volume) and not na(volSmaPrev)
+volumeOk      = not volumeFilterInput or not hasVolumeData or volume > volSmaPrev * volMultInput
+
+darkCloudCover = not na(refBody) and firstBullish and firstLong and openOk and secondBearish and closeDeep and staysAboveOpen and inUptrend and swingOk and volumeOk
+
+// Grading figures reported in label tooltips - deeper closes and heavier volume imply more meaningful distribution
+achievedDepth = firstBullish ? (close[1] - close) / body[1] * 100 : na
+volumeRatio   = hasVolumeData and volSmaPrev > 0 ? volume / volSmaPrev : na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Trigger & Invalidation Tracking
+//---------------------------------------------------------------------------------------------------------------------{
+triggerPrice = triggerModeInput == TRIGGER_LOW ? patternLow : close
+
+// Reference points of the most recent pattern, cleared once price resolves them
+var float triggerLevel = na
+var float stopLevel    = na
+
+bool triggerBreak      = false
+bool invalidationBreak = false
+
+if darkCloudCover
+    triggerLevel := triggerPrice
+    stopLevel    := high
+else
+    if not na(triggerLevel) and low < triggerLevel
+        triggerBreak := true
+        triggerLevel := na
+    if not na(stopLevel) and high > stopLevel
+        invalidationBreak := true
+        stopLevel         := na
+        triggerLevel      := na
+
+// The conventional next-candle confirmation - a bearish follow-through candle immediately after the pattern
+followThrough = darkCloudCover[1] and close < open
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+if darkCloudCover
+    if highlightInput
+        box.new(bar_index - 1, patternHigh, bar_index, patternLow, border_color = color.new(bearColorInput, HIGHLIGHT_BORDER_TRANSP), bgcolor = color.new(bearColorInput, HIGHLIGHT_FILL_TRANSP))
+        line.new(bar_index - 1, firstBodyMid, bar_index, firstBodyMid, color = color.new(bearColorInput, MIDPOINT_TRANSP), style = line.style_dotted)
+
+    if showLabelsInput
+        openText   = gapOpen ? "gapped above the prior high" : "opened above the prior close (relaxed)"
+        volumeText = na(volumeRatio) ? "" : "\nSecond-candle volume: " + str.tostring(volumeRatio, "#.##") + "x its " + str.tostring(volLenInput) + "-bar average"
+        patternTip = "Dark Cloud Cover - " + openText
+          + "\nClose depth into first body: " + str.tostring(achievedDepth, "#.#") + "%"
+          + volumeText
+          + "\nTrigger: " + str.tostring(triggerPrice, format.mintick)
+          + "\nStop (second candle high): " + str.tostring(high, format.mintick)
+
+        label.new(bar_index, patternHigh, "Dark Cloud Cover"
+          , style     = label.style_label_down
+          , color     = bearColorInput
+          , textcolor = chart.bg_color
+          , size      = size.small
+          , tooltip   = patternTip)
+
+    if showLevelsInput
+        line.new(bar_index, triggerPrice, bar_index + extendInput, triggerPrice, color = bearColorInput, style = line.style_dashed)
+        line.new(bar_index, high, bar_index + extendInput, high, color = invalidColorInput, style = line.style_dashed)
+        label.new(bar_index + extendInput, triggerPrice, "Trigger", style = label.style_label_left, color = LABEL_BG, textcolor = bearColorInput, size = size.tiny)
+        label.new(bar_index + extendInput, high, "Stop", style = label.style_label_left, color = LABEL_BG, textcolor = invalidColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(darkCloudCover, "Dark Cloud Cover", "Dark Cloud Cover on {{ticker}} ({{interval}}) - a strong bullish candle answered by an open above it and a deep close into its real body, with all active filters passed")
+alertcondition(followThrough, "Bearish Follow-Through", "Bearish follow-through candle after a Dark Cloud Cover on {{ticker}} ({{interval}}) - the conventional next-candle confirmation printed")
+alertcondition(triggerBreak, "Trigger Level Break", "Dark Cloud Cover trigger broken on {{ticker}} ({{interval}}) - price traded below the pattern's trigger level")
+alertcondition(invalidationBreak, "Pattern Invalidated", "Dark Cloud Cover invalidated on {{ticker}} ({{interval}}) - price traded back above the second candle's high, the failed new high")
+
+//---------------------------------------------------------------------------------------------------------------------}

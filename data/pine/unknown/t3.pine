@@ -1,0 +1,215 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("T3", shorttitle = "T3", overlay = true)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR        = #089981
+BEAR_COLOR        = #f23645
+NEUTRAL_COLOR     = #5b9cf6
+FAST_COLOR        = #787b86
+EMA_REF_COLOR     = #ff9800
+CASCADE_REF_COLOR = #e040fb
+
+FILL_PRICE_TRANSP = 60  // gradient transparency at the price end of the fill
+FILL_LINE_TRANSP  = 100 // gradient transparency at the T3 end of the fill
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+srcInput          = input.source(close, "Source", group = "Settings",
+     tooltip = "Series the T3 smooths. Tillson presented T3 as a series-agnostic substitute for the moving averages inside other indicators — beyond price, it is routinely run over oscillators or volume to strip flicker before signal rules, each stage of smoothing deferring the signal slightly.")
+
+lengthInput       = input.int(14, "T3 Length", minval = 1, group = "Settings",
+     tooltip = "Length N shared by every one of the six cascaded EMA stages. There is no universal T3 standard — longer values smooth and lag more, as with any moving-average length — but because T3 already smooths heavily, equal lengths are not comparable across MA types; judge settings on the chart rather than copying them.")
+
+volumeFactorInput = input.float(0.7, "Volume Factor", minval = 0, maxval = 1, step = 0.05, group = "Settings",
+     tooltip = "Tillson's volume factor v — a dial between 0 and 1 with no connection to traded volume, setting how much lag correction each GD stage adds back. At 0 the construction collapses into a triple-cascaded EMA, maximally smooth and maximally laggy; at 1 every stage becomes a full DEMA, fastest but overshoot-prone at sharp turns. Tillson's published 0.7 is the standard compromise; lower values shrink the overshoot along with the lag correction.")
+
+pairInput         = input.bool(false, "Fast T3", group = "Crossover Pair",
+     tooltip = "Adds a second, faster T3 to form a crossover pair against the main smooth line, which produces fewer but later crosses than the equivalent EMA setup. Crossings between the two lines are covered by the pair alerts.")
+
+pairLengthInput   = input.int(5, "Fast T3 Length", minval = 1, group = "Crossover Pair",
+     tooltip = "Length of the fast T3. Keep it shorter than the main line so the pair reads fast against smooth — e.g. 5 against 14. Both lines share the same volume factor.")
+
+showEmaInput      = input.bool(false, "EMA — Same Length", group = "Comparison",
+     tooltip = "Overlays a plain EMA of the same length — the first stage of the cascade, plotted raw. One stage of recency weighting against six compensated stages: the EMA is choppier bar to bar yet can never leave the range of its inputs, while the T3 runs dramatically smoother and can poke beyond price at violent turns — the side-by-side measure of what the cascade buys and what it pays.")
+
+showCascadeInput  = input.bool(false, "Triple EMA Cascade (v = 0)", group = "Comparison",
+     tooltip = "Overlays the v = 0 skeleton of the construction — the same three stages with the lag correction switched off, i.e. a triple-cascaded EMA (EMA of EMA of EMA). The gap between it and the T3 is exactly what the volume factor adds back: same smoothness family, no lag compensation, no overshoot.")
+
+showDashboardInput     = input.bool(true, "Show Dashboard", group = "Dashboard",
+     tooltip = "Displays a compact panel with the volume factor and its temperament, the slope read, price's position against the line, and whether the curve is currently overshooting — sitting beyond the last N bars of the source, something a simple or plain exponential average can never do.")
+
+dashboardLocationInput = input.string("Top Right", "Location", options = ["Top Right", "Bottom Right", "Bottom Left", "Top Left"], group = "Dashboard",
+     tooltip = "Chart corner the dashboard is anchored to.")
+
+dashboardSizeInput     = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = "Dashboard",
+     tooltip = "Text size of the dashboard.")
+
+trendColorInput   = input.bool(true, "Slope Trend Coloring", group = "Style",
+     tooltip = "Colors the T3 by its slope — bullish while the line rises, bearish while it falls. The curve is smooth enough that its direction changes rarely, so rising versus falling serves as a bias that does not flip on every candle, at the cost of a late turn at real reversals; disable to draw the line in the neutral color.")
+
+bullColorInput    = input.color(BULL_COLOR, "Bullish", inline = "direction", group = "Style",
+     tooltip = "Bullish color, used while the T3 slopes upward and for bullish crossings/fill.")
+
+bearColorInput    = input.color(BEAR_COLOR, "Bearish", inline = "direction", group = "Style",
+     tooltip = "Bearish color, used while the T3 slopes downward and for bearish crossings/fill.")
+
+neutralColorInput = input.color(NEUTRAL_COLOR, "Neutral", group = "Style",
+     tooltip = "Line color used when slope trend coloring is disabled, or when the slope is flat.")
+
+fastColorInput    = input.color(FAST_COLOR, "Fast T3", group = "Style",
+     tooltip = "Color of the fast T3 of the crossover pair.")
+
+emaColorInput     = input.color(EMA_REF_COLOR, "EMA", inline = "reference", group = "Style",
+     tooltip = "Color of the same-length EMA comparison line.")
+
+cascadeColorInput = input.color(CASCADE_REF_COLOR, "v = 0", inline = "reference", group = "Style",
+     tooltip = "Color of the triple-EMA cascade (v = 0) comparison line.")
+
+lineWidthInput    = input.int(2, "Line Width", minval = 1, maxval = 5, group = "Style",
+     tooltip = "Width of the T3 lines.")
+
+showFillInput     = input.bool(true, "Price / T3 Gradient Fill", group = "Style",
+     tooltip = "Fills the area between the source and the T3 with a vertical gradient — bullish while price holds above the line, bearish while below — fading to fully transparent at the T3. In sustained trends the stable curve gives pullbacks a visible dynamic support/resistance reference, though price is not obliged to respect it.")
+
+showMarkersInput  = input.bool(false, "Price Crossing Markers", group = "Style",
+     tooltip = "Displays small triangle markers when the source crosses over or under the T3. Off by default to keep the chart clean — the crossing alerts work regardless.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+// Tim Tillson's T3 — "Smoothing Techniques For More Accurate Signals" (TASC, January 1998).
+// Building block, the generalized DEMA:  GD(x) = (1 + v) * EMA(x) - v * EMA(EMA(x)),
+// with volume factor v in [0, 1] (no connection to traded volume). T3 applies it three times,
+// T3 = GD(GD(GD(price))), which expands into a cascade of six EMAs of length N whose last four
+// are combined with fixed coefficients that depend only on v:
+//   c1 = -v^3,  c2 = 3v^2 + 3v^3,  c3 = -6v^2 - 3v - 3v^3,  c4 = 1 + 3v + v^3 + 3v^2
+//   T3 = c1 * ema6 + c2 * ema5 + c3 * ema4 + c4 * ema3
+// Each GD stage adds back an estimate of what smoothing removed — projecting the recent slope
+// slightly forward — which is why the curve is unusually smooth for its lag and can briefly run
+// beyond price after a sharp reversal.
+v2 = volumeFactorInput * volumeFactorInput
+v3 = v2 * volumeFactorInput
+
+c1 = -v3
+c2 = 3 * v2 + 3 * v3
+c3 = -6 * v2 - 3 * volumeFactorInput - 3 * v3
+c4 = 1 + 3 * volumeFactorInput + v3 + 3 * v2
+
+// Six-EMA cascade of the main line — ema1 doubles as the same-length EMA comparison,
+// ema3 as the v = 0 triple-cascaded EMA comparison
+ema1 = ta.ema(srcInput, lengthInput)
+ema2 = ta.ema(ema1, lengthInput)
+ema3 = ta.ema(ema2, lengthInput)
+ema4 = ta.ema(ema3, lengthInput)
+ema5 = ta.ema(ema4, lengthInput)
+ema6 = ta.ema(ema5, lengthInput)
+
+t3Value = c1 * ema6 + c2 * ema5 + c3 * ema4 + c4 * ema3
+
+// Fast T3 of the optional crossover pair — same volume factor, shorter length,
+// computed on every bar so its history stays consistent while hidden
+fastEma1 = ta.ema(srcInput, pairLengthInput)
+fastEma2 = ta.ema(fastEma1, pairLengthInput)
+fastEma3 = ta.ema(fastEma2, pairLengthInput)
+fastEma4 = ta.ema(fastEma3, pairLengthInput)
+fastEma5 = ta.ema(fastEma4, pairLengthInput)
+fastEma6 = ta.ema(fastEma5, pairLengthInput)
+
+fastValue = c1 * fastEma6 + c2 * fastEma5 + c3 * fastEma4 + c4 * fastEma3
+
+// Slope of the T3 — the rarely-flipping bias read of the smoother
+slope = t3Value - nz(t3Value[1], t3Value)
+
+// Price crossings and slope reversals of the main line
+crossUp       = ta.crossover(srcInput, t3Value)
+crossDown     = ta.crossunder(srcInput, t3Value)
+slopeTurnUp   = slope > 0 and nz(slope[1]) <= 0
+slopeTurnDown = slope < 0 and nz(slope[1]) >= 0
+
+// Crossings of the pair — the fast T3 against the main smooth T3
+pairCrossUp   = ta.crossover(fastValue, t3Value)
+pairCrossDown = ta.crossunder(fastValue, t3Value)
+
+// Overshoot read — the one way T3 behaves unlike a classic average: the lag correction can carry
+// the curve beyond the range of its recent inputs (last N bars of the source) after a violent turn
+highestSrc    = ta.highest(srcInput, lengthInput)
+lowestSrc     = ta.lowest(srcInput, lengthInput)
+overshootUp   = not na(t3Value) and t3Value > highestSrc
+overshootDown = not na(t3Value) and t3Value < lowestSrc
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+t3Color = trendColorInput ? (slope > 0 ? bullColorInput : slope < 0 ? bearColorInput : neutralColorInput) : neutralColorInput
+
+priceAbove      = srcInput > t3Value
+fillTopColor    = showFillInput ? (priceAbove ? color.new(bullColorInput, FILL_PRICE_TRANSP) : color.new(bearColorInput, FILL_LINE_TRANSP)) : na
+fillBottomColor = showFillInput ? (priceAbove ? color.new(bullColorInput, FILL_LINE_TRANSP) : color.new(bearColorInput, FILL_PRICE_TRANSP)) : na
+
+srcPlotId = plot(srcInput, "Source", color = na, editable = false, display = display.none)
+t3PlotId  = plot(t3Value, "T3", color = t3Color, linewidth = lineWidthInput)
+
+plot(pairInput ? fastValue : na, "Fast T3", color = fastColorInput, linewidth = lineWidthInput)
+plot(showEmaInput ? ema1 : na, "EMA (Same Length)", color = emaColorInput)
+plot(showCascadeInput ? ema3 : na, "Triple EMA Cascade (v = 0)", color = cascadeColorInput)
+
+fill(srcPlotId, t3PlotId, top_value = math.max(srcInput, t3Value), bottom_value = math.min(srcInput, t3Value), top_color = fillTopColor, bottom_color = fillBottomColor, title = "Price / T3 Gradient Fill")
+
+plotshape(showMarkersInput and crossUp, "Bullish Price Cross", shape.triangleup, location.belowbar, color = bullColorInput, size = size.tiny)
+plotshape(showMarkersInput and crossDown, "Bearish Price Cross", shape.triangledown, location.abovebar, color = bearColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+dashboardLocation = switch dashboardLocationInput
+    "Top Right"    => position.top_right
+    "Bottom Right" => position.bottom_right
+    "Bottom Left"  => position.bottom_left
+    => position.top_left
+
+dashboardTextSize = switch dashboardSizeInput
+    "Tiny"  => size.tiny
+    "Small" => size.small
+    => size.normal
+
+var table dashboardTable = table.new(dashboardLocation, 2, 4, bgcolor = color.new(chart.bg_color, 25), frame_color = color.new(chart.fg_color, 85), frame_width = 1)
+
+if barstate.islast and showDashboardInput
+    // The temperament dial — at the endpoints the construction degenerates into its published extremes
+    vfText = volumeFactorInput <= 0 ? "0 — triple EMA" : volumeFactorInput >= 1 ? "1 — full DEMA" : str.tostring(volumeFactorInput, "#.##")
+
+    slopeNow   = nz(slope)
+    slopeText  = slopeNow > 0 ? "Rising" : slopeNow < 0 ? "Falling" : "Flat"
+    slopeColor = slopeNow > 0 ? bullColorInput : slopeNow < 0 ? bearColorInput : chart.fg_color
+
+    aboveNow  = not na(t3Value) and srcInput > t3Value
+    biasText  = na(t3Value) ? "—" : aboveNow ? "Above T3" : "Below T3"
+    biasColor = na(t3Value) ? chart.fg_color : aboveNow ? bullColorInput : bearColorInput
+
+    overshootText = overshootUp ? "Above price" : overshootDown ? "Below price" : "None"
+
+    table.cell(dashboardTable, 0, 0, "Volume Factor", text_color = chart.fg_color, text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 0, vfText,          text_color = chart.fg_color, text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 1, "Slope",         text_color = chart.fg_color, text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 1, slopeText,       text_color = slopeColor,     text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 2, "Price",         text_color = chart.fg_color, text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 2, biasText,        text_color = biasColor,      text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 3, "Overshoot",     text_color = chart.fg_color, text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 3, overshootText,   text_color = chart.fg_color, text_size = dashboardTextSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(crossUp, "Bullish Price Cross", "Price crossed above the T3 on {{ticker}} ({{interval}})")
+alertcondition(crossDown, "Bearish Price Cross", "Price crossed below the T3 on {{ticker}} ({{interval}})")
+alertcondition(slopeTurnUp, "T3 Slope Up", "T3 slope turned upward on {{ticker}} ({{interval}})")
+alertcondition(slopeTurnDown, "T3 Slope Down", "T3 slope turned downward on {{ticker}} ({{interval}})")
+alertcondition(pairInput and pairCrossUp, "Pair Bullish Cross", "Fast T3 crossed above the main T3 on {{ticker}} ({{interval}})")
+alertcondition(pairInput and pairCrossDown, "Pair Bearish Cross", "Fast T3 crossed below the main T3 on {{ticker}} ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

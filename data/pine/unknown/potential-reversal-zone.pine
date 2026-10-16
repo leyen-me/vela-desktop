@@ -1,0 +1,570 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Potential Reversal Zone", shorttitle = "Potential Reversal Zone", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 100, max_bars_back = 200)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+TARGET_COLOR  = #ff9800 // the one accent - the AD projection targets
+STRUCT_COLOR  = #787b86
+
+C_MIN         = 0.382 // published C-point retracement window of AB, shared by the four templates
+C_MAX         = 0.886
+T1_RATIO      = 0.382 // common initial targets: retracements of the AD swing
+T2_RATIO      = 0.618
+EXT_MAX_BARS  = 500   // stop extending / expire a zone this many bars after creation
+PIVOT_KEEP    = 12    // zigzag pivots kept in memory (only the last four are used)
+
+AUTO_TPL      = "Auto (Best Fit)"
+AUTO_BC       = "Auto (Reciprocal of C)"
+AUTO_CD       = "Auto (Template)"
+
+// Published harmonic template table (Scott Carney's ratio sets) — B-point window of XA,
+// pattern-defining XA ratio for D, allowed BC projection range, AB=CD alternate ratio
+var TPL_NAMES  = array.from("Gartley", "Bat", "Butterfly", "Crab")
+var TPL_B_MIN  = array.from(0.618, 0.382, 0.786, 0.382)
+var TPL_B_MAX  = array.from(0.618, 0.500, 0.786, 0.618)
+var TPL_R_XA   = array.from(0.786, 0.886, 1.272, 1.618)
+var TPL_BC_MIN = array.from(1.130, 1.618, 1.618, 2.618)
+var TPL_BC_MAX = array.from(1.618, 2.618, 2.240, 3.618)
+var TPL_R_CD   = array.from(1.000, 1.272, 1.272, 1.618)
+
+// Standard harmonic ratio set the auto BC projection snaps to
+var BC_RATIO_SET = array.from(1.13, 1.272, 1.414, 1.618, 2.0, 2.24, 2.618, 3.14, 3.618)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+swingLenInput    = input.int(10, "Swing Length", minval = 2, maxval = 100, group = "Swing Detection",
+     tooltip = "Bars to the left and right that must be lower (higher) for a swing point to confirm. The last four confirmed, alternating swings form the pattern's X, A, B and C pivots; larger values read bigger XABCD structures.")
+
+templateInput    = input.string(AUTO_TPL, "Ratio Template", options = [AUTO_TPL, "Gartley", "Bat", "Butterfly", "Crab"], group = "Pattern Ratios",
+     tooltip = "Named ratio set that supplies the pattern-defining XA measurement, the allowed BC projection range and the AB=CD alternate: Gartley 0.786 XA / AB=CD, Bat 0.886 XA / 1.272 AB=CD, Butterfly 1.272 XA, Crab 1.618 XA. Auto keeps the template whose B-point window best fits the measured B retracement.")
+
+tolInput         = input.float(0.05, "Ratio Tolerance", minval = 0.0, maxval = 0.25, step = 0.01, group = "Pattern Ratios",
+     tooltip = "Fixed margin, in ratio units, around the template's ideal ratios — a measured B (and C) leg ratio qualifies only when it sits within this margin (commonly 0.03 to 0.05). Also sets the price tolerance (this value × the XA swing) used by the confluence score.")
+
+bcInput          = input.string(AUTO_BC, "BC Projection (r_BC)", options = [AUTO_BC, "1.13", "1.272", "1.414", "1.618", "2.0", "2.24", "2.618", "3.14", "3.618"], group = "Pattern Ratios",
+     tooltip = "Fibonacci projection of the BC leg used for the D_BC measurement. Auto takes the reciprocal of the measured C retracement (e.g. C at 0.618 of AB → 1.618 BC), snapped to the standard harmonic set and kept inside the template's allowed range; pick a fixed ratio to override.")
+
+cdInput          = input.string(AUTO_CD, "AB=CD Ratio (r_CD)", options = [AUTO_CD, "1.0", "1.272", "1.618"], group = "Pattern Ratios",
+     tooltip = "CD-to-AB length ratio for the embedded AB=CD completion: 1.0 for the pure pattern, 1.272 or 1.618 for the alternates. Auto uses the selected template's published value.")
+
+minScoreInput    = input.int(1, "Minimum Confluence Score", minval = 1, maxval = 3, group = "Pattern Ratios",
+     tooltip = "Confluence score counts how many of the three measurements (D from XA, from the BC projection and from AB=CD) land within tolerance of the pattern-defining XA level. Zones scoring below this are skipped — raise it to keep only tight clusters, as wide, sloppy zones are commonly passed on.")
+
+invRefInput      = input.string("Zone Far Edge", "Invalidation Reference", options = ["Zone Far Edge", "X Point"], group = "Zone",
+     tooltip = "Level whose decisive close-through invalidates the zone: the far edge of the PRZ, or the pattern's X point when it lies beyond the zone (for extension patterns, where completion is past X, it falls back to the far edge). Stops are commonly parked beyond this level.")
+
+showLevelsInput  = input.bool(true, "Measurement Levels", group = "Zone",
+     tooltip = "Draws the three converging measurements as separate levels — D from XA (solid), from the BC projection (dashed) and from AB=CD (dotted) — plus the invalidation level when it differs from the zone edge.")
+
+showTargetsInput = input.bool(true, "AD Retracement Targets", group = "Zone",
+     tooltip = "Once price enters the zone, projects the 0.382 and 0.618 retracements of the AD swing — the common initial targets that fix the trade's geometry. The levels update while price works deeper into the zone.")
+
+showLegsInput    = input.bool(true, "XABC Structure", group = "Zone",
+     tooltip = "Connects the X, A, B and C swing points the zone is projected from, with small letter markers at each pivot.")
+
+maxZonesInput    = input.int(3, "Show Last Zones", minval = 1, maxval = 15, group = "Zone",
+     tooltip = "Number of most recent Potential Reversal Zones kept on the chart; older ones are removed.")
+
+bullColorInput   = input.color(BULL_COLOR, "Bullish", inline = "direction", group = "Style",
+     tooltip = "Color of bullish zones (patterns completing below C), their measurement levels and labels.")
+
+bearColorInput   = input.color(BEAR_COLOR, "Bearish", inline = "direction", group = "Style",
+     tooltip = "Color of bearish zones (patterns completing above C), their measurement levels and labels.")
+
+targetColorInput = input.color(TARGET_COLOR, "Targets", inline = "aux", group = "Style",
+     tooltip = "Color of the 0.382 / 0.618 AD retracement target levels.")
+
+structColorInput = input.color(STRUCT_COLOR, "Structure", inline = "aux", group = "Style",
+     tooltip = "Color of the XABC legs, pivot letters and the separate invalidation level.")
+
+markersInput     = input.bool(false, "Event Markers", group = "Style",
+     tooltip = "Tiny on-chart marks when a zone is entered, rejected (reversal confirmed) or invalidated. Off by default to keep the chart clean — the alerts fire regardless.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types & State
+//---------------------------------------------------------------------------------------------------------------------{
+// state: 0 pending · 1 entered · 2 rejection confirmed · 3 invalidated · 4 voided/superseded · 5 completed/expired
+type Przone
+    bool  isBull
+    int   state
+    int   createdBar
+    float aP
+    float przHi
+    float przLo
+    float invalidLvl
+    float dExt
+    float t1
+    float t2
+    color zCol
+    box   zBox
+    line  lnXA
+    line  lnBC
+    line  lnCD
+    line  lnInv
+    line  lnT1
+    line  lnT2
+    label lbSum
+    label lbXA
+    label lbBC
+    label lbCD
+    label lbT1
+    label lbT2
+    array<line>  legLines
+    array<label> pivLabels
+
+var pivPrice = array.new<float>()
+var pivBar   = array.new<int>()
+var pivDir   = array.new<int>()
+var zones    = array.new<Przone>()
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Targets are the 0.382 / 0.618 retracements of the AD swing, measured back from the running D extreme
+computeTargets(Przone z) =>
+    z.t1 := z.dExt + T1_RATIO * (z.aP - z.dExt)
+    z.t2 := z.dExt + T2_RATIO * (z.aP - z.dExt)
+
+createTargets(Przone z) =>
+    computeTargets(z)
+    if showTargetsInput
+        z.lnT1 := line.new(bar_index, z.t1, bar_index + 1, z.t1, color = color.new(targetColorInput, 30), style = line.style_dotted)
+        z.lbT1 := label.new(bar_index + 1, z.t1, "0.382 AD", color = #00000000, style = label.style_label_left, textcolor = targetColorInput, size = size.tiny)
+        z.lnT2 := line.new(bar_index, z.t2, bar_index + 1, z.t2, color = color.new(targetColorInput, 30), style = line.style_dotted)
+        z.lbT2 := label.new(bar_index + 1, z.t2, "0.618 AD", color = #00000000, style = label.style_label_left, textcolor = targetColorInput, size = size.tiny)
+
+refreshTargets(Przone z) =>
+    computeTargets(z)
+    if not na(z.lnT1)
+        line.set_y1(z.lnT1, z.t1)
+        line.set_y2(z.lnT1, z.t1)
+        label.set_y(z.lbT1, z.t1)
+    if not na(z.lnT2)
+        line.set_y1(z.lnT2, z.t2)
+        line.set_y2(z.lnT2, z.t2)
+        label.set_y(z.lbT2, z.t2)
+
+// preState is the zone's state at the start of the bar, so drawings extend through the bar of a transition
+extendZone(Przone z, int preState) =>
+    if bar_index - z.createdBar <= EXT_MAX_BARS
+        if preState <= 1
+            if not na(z.zBox)
+                box.set_right(z.zBox, bar_index)
+            if not na(z.lbSum)
+                label.set_x(z.lbSum, bar_index)
+            if not na(z.lnXA)
+                line.set_x2(z.lnXA, bar_index)
+                label.set_x(z.lbXA, bar_index)
+            if not na(z.lnBC)
+                line.set_x2(z.lnBC, bar_index)
+                label.set_x(z.lbBC, bar_index)
+            if not na(z.lnCD)
+                line.set_x2(z.lnCD, bar_index)
+                label.set_x(z.lbCD, bar_index)
+            if not na(z.lnInv)
+                line.set_x2(z.lnInv, bar_index)
+        if preState >= 1 and preState <= 2
+            if not na(z.lnT1)
+                line.set_x2(z.lnT1, bar_index)
+                label.set_x(z.lbT1, bar_index)
+            if not na(z.lnT2)
+                line.set_x2(z.lnT2, bar_index)
+                label.set_x(z.lbT2, bar_index)
+
+fadeZone(Przone z) =>
+    color dim    = color.new(z.zCol, 88)
+    color dimTxt = color.new(z.zCol, 65)
+    if not na(z.zBox)
+        box.set_bgcolor(z.zBox, color.new(z.zCol, 94))
+        box.set_border_color(z.zBox, dim)
+    if not na(z.lbSum)
+        label.set_textcolor(z.lbSum, dimTxt)
+    if not na(z.lnXA)
+        line.set_color(z.lnXA, dim)
+        label.set_textcolor(z.lbXA, dimTxt)
+    if not na(z.lnBC)
+        line.set_color(z.lnBC, dim)
+        label.set_textcolor(z.lbBC, dimTxt)
+    if not na(z.lnCD)
+        line.set_color(z.lnCD, dim)
+        label.set_textcolor(z.lbCD, dimTxt)
+    if not na(z.lnInv)
+        line.set_color(z.lnInv, color.new(structColorInput, 70))
+    if not na(z.lnT1)
+        line.set_color(z.lnT1, color.new(targetColorInput, 80))
+        label.set_textcolor(z.lbT1, color.new(targetColorInput, 75))
+    if not na(z.lnT2)
+        line.set_color(z.lnT2, color.new(targetColorInput, 80))
+        label.set_textcolor(z.lbT2, color.new(targetColorInput, 75))
+
+destroyZone(Przone z) =>
+    if not na(z.zBox)
+        box.delete(z.zBox)
+    if not na(z.lbSum)
+        label.delete(z.lbSum)
+    if not na(z.lnXA)
+        line.delete(z.lnXA)
+    if not na(z.lnBC)
+        line.delete(z.lnBC)
+    if not na(z.lnCD)
+        line.delete(z.lnCD)
+    if not na(z.lnInv)
+        line.delete(z.lnInv)
+    if not na(z.lnT1)
+        line.delete(z.lnT1)
+    if not na(z.lnT2)
+        line.delete(z.lnT2)
+    if not na(z.lbXA)
+        label.delete(z.lbXA)
+    if not na(z.lbBC)
+        label.delete(z.lbBC)
+    if not na(z.lbCD)
+        label.delete(z.lbCD)
+    if not na(z.lbT1)
+        label.delete(z.lbT1)
+    if not na(z.lbT2)
+        label.delete(z.lbT2)
+    if not na(z.legLines)
+        for ln in z.legLines
+            line.delete(ln)
+    if not na(z.pivLabels)
+        for lb in z.pivLabels
+            label.delete(lb)
+
+// Alternating zigzag pivot store — same-direction, more-extreme pivots replace the last one
+addPivot(float price, int pBar, int dir) =>
+    bool changed = false
+    int n = array.size(pivDir)
+    if n == 0
+        array.push(pivPrice, price)
+        array.push(pivBar, pBar)
+        array.push(pivDir, dir)
+        changed := true
+    else
+        int lastDir     = array.get(pivDir, n - 1)
+        float lastPrice = array.get(pivPrice, n - 1)
+        if dir == lastDir
+            if (dir == 1 and price > lastPrice) or (dir == -1 and price < lastPrice)
+                array.set(pivPrice, n - 1, price)
+                array.set(pivBar, n - 1, pBar)
+                changed := true
+        else
+            array.push(pivPrice, price)
+            array.push(pivBar, pBar)
+            array.push(pivDir, dir)
+            changed := true
+    if array.size(pivDir) > PIVOT_KEEP
+        array.shift(pivPrice)
+        array.shift(pivBar)
+        array.shift(pivDir)
+    changed
+
+// Ratio tolerance system — accept the template only when the measured B ratio sits within
+// the tolerance margin of its ideal window; Auto keeps the closest-fitting template
+pickTemplate(float bRatio) =>
+    int result = -1
+    if templateInput == AUTO_TPL
+        float bestD   = 1e10
+        float bestMid = 1e10
+        for i = 0 to 3
+            float bMin = array.get(TPL_B_MIN, i)
+            float bMax = array.get(TPL_B_MAX, i)
+            float d    = bRatio < bMin ? bMin - bRatio : bRatio > bMax ? bRatio - bMax : 0.0
+            float midD = math.abs(bRatio - (bMin + bMax) / 2)
+            if d < bestD - 1e-9 or (math.abs(d - bestD) <= 1e-9 and midD < bestMid)
+                bestD   := d
+                bestMid := midD
+                result  := i
+        if bestD > tolInput
+            result := -1
+    else
+        int idx    = templateInput == "Gartley" ? 0 : templateInput == "Bat" ? 1 : templateInput == "Butterfly" ? 2 : 3
+        float bMin = array.get(TPL_B_MIN, idx)
+        float bMax = array.get(TPL_B_MAX, idx)
+        float d    = bRatio < bMin ? bMin - bRatio : bRatio > bMax ? bRatio - bMax : 0.0
+        if d <= tolInput
+            result := idx
+    result
+
+// Auto BC projection: reciprocal of the measured C retracement, snapped to the standard
+// harmonic ratio set, then kept inside the template's allowed projection range
+snapBc(float recip, float bcMin, float bcMax) =>
+    float best  = array.get(BC_RATIO_SET, 0)
+    float bestD = math.abs(recip - best)
+    for i = 1 to array.size(BC_RATIO_SET) - 1
+        float v = array.get(BC_RATIO_SET, i)
+        float d = math.abs(recip - v)
+        if d < bestD
+            bestD := d
+            best  := v
+    math.min(math.max(best, bcMin), bcMax)
+
+fmtP(float p) =>
+    str.tostring(p, format.mintick)
+
+fmtR(float r) =>
+    str.tostring(r, "#.###")
+
+// Build a PRZ from the last four alternating pivots (X, A, B, C); returns [formed, entered, confirmed]
+tryBuild() =>
+    bool formed    = false
+    bool entered   = false
+    bool confirmed = false
+    int n = array.size(pivDir)
+    if n >= 4
+        int cDir    = array.get(pivDir, n - 1)
+        bool isBull = cDir == 1
+        float xP = array.get(pivPrice, n - 4)
+        float aP = array.get(pivPrice, n - 3)
+        float bP = array.get(pivPrice, n - 2)
+        float cP = array.get(pivPrice, n - 1)
+        int xB = array.get(pivBar, n - 4)
+        int aB = array.get(pivBar, n - 3)
+        int bB = array.get(pivBar, n - 2)
+        int cB = array.get(pivBar, n - 1)
+        bool structOk = isBull ? aP > xP and aP > bP and cP > bP : aP < xP and aP < bP and cP < bP
+        float xaAbs = math.abs(aP - xP)
+        float abAbs = math.abs(aP - bP)
+        if structOk and xaAbs > 0 and abAbs > 0
+            float bRatio = abAbs / xaAbs
+            float cRatio = math.abs(cP - bP) / abAbs
+            bool cOk     = cRatio >= C_MIN - tolInput and cRatio <= C_MAX + tolInput
+            int tplIdx   = cOk ? pickTemplate(bRatio) : -1
+            if tplIdx >= 0
+                string tplName = array.get(TPL_NAMES, tplIdx)
+                float rXA      = array.get(TPL_R_XA, tplIdx)
+                float bcMin    = array.get(TPL_BC_MIN, tplIdx)
+                float bcMax    = array.get(TPL_BC_MAX, tplIdx)
+                float manualBc = na
+                if bcInput != AUTO_BC
+                    manualBc := str.tonumber(bcInput)
+                float rBC      = na(manualBc) ? snapBc(1.0 / cRatio, bcMin, bcMax) : manualBc
+                float manualCd = na
+                if cdInput != AUTO_CD
+                    manualCd := str.tonumber(cdInput)
+                float rCD      = na(manualCd) ? array.get(TPL_R_CD, tplIdx) : manualCd
+                // "How it's calculated" — bullish: D = level minus ratio × leg; bearish mirror: minus becomes plus
+                // D_XA   = A - r_XA  × abs(A - X)
+                // D_BC   = C - r_BC  × abs(C - B)
+                // D_ABCD = C - r_CD  × abs(B - A)
+                float sgn   = isBull ? -1.0 : 1.0
+                float dXA   = aP + sgn * rXA * math.abs(aP - xP)
+                float dBC   = cP + sgn * rBC * math.abs(cP - bP)
+                float dCD   = cP + sgn * rCD * math.abs(bP - aP)
+                // PRZ_high = max(D_XA, D_BC, D_ABCD) · PRZ_low = min(...) · Width = high - low
+                float przHi  = math.max(dXA, math.max(dBC, dCD))
+                float przLo  = math.min(dXA, math.min(dBC, dCD))
+                float zWidth = przHi - przLo
+                // Confluence scoring — qualifying measurements within tolerance of the pattern-defining XA level
+                float tolPx = tolInput * xaAbs
+                int score   = 1 + (math.abs(dBC - dXA) <= tolPx ? 1 : 0) + (math.abs(dCD - dXA) <= tolPx ? 1 : 0)
+                bool zoneOk = (isBull ? przHi < cP and przLo > 0 : przLo > cP) and score >= minScoreInput
+                if zoneOk
+                    float farEdge    = isBull ? przLo : przHi
+                    float invalidLvl = invRefInput == "X Point" ? (isBull ? math.min(xP, farEdge) : math.max(xP, farEdge)) : farEdge
+                    // scan the bars since C: skip zones already invalidated, catch already-started entries
+                    bool dead     = false
+                    float extreme = na
+                    int span      = bar_index - cB
+                    if span >= 1
+                        for i = 0 to span - 1
+                            if isBull
+                                if close[i] < invalidLvl
+                                    dead := true
+                                if low[i] <= przHi
+                                    extreme := na(extreme) ? low[i] : math.min(extreme, low[i])
+                            else
+                                if close[i] > invalidLvl
+                                    dead := true
+                                if high[i] >= przLo
+                                    extreme := na(extreme) ? high[i] : math.max(extreme, high[i])
+                    if not dead
+                        color zCol      = isBull ? bullColorInput : bearColorInput
+                        string gradeTxt = score == 3 ? "Tight" : score == 2 ? "Moderate" : "Loose"
+                        float widthPct  = zWidth / xaAbs * 100
+                        string sumTxt   = "PRZ · " + tplName + "\n" + str.tostring(score) + "/3 · W " + str.tostring(widthPct, "#.#") + "% XA"
+                        string tipTxt   = (isBull ? "Bullish" : "Bearish") + " Potential Reversal Zone — " + tplName + " ratios"
+                          + "\nD from XA ×" + fmtR(rXA) + ": " + fmtP(dXA)
+                          + "\nD from BC ×" + fmtR(rBC) + ": " + fmtP(dBC)
+                          + "\nD from AB=CD ×" + fmtR(rCD) + ": " + fmtP(dCD)
+                          + "\nZone: " + fmtP(przLo) + " - " + fmtP(przHi) + " · Width " + fmtP(zWidth) + " (" + str.tostring(widthPct, "#.##") + "% of XA)"
+                          + "\nConfluence: " + str.tostring(score) + "/3 (" + gradeTxt + ") within " + fmtR(tolInput) + " × XA of the defining level"
+                          + "\nB: " + fmtR(bRatio) + " of XA · C: " + fmtR(cRatio) + " of AB"
+                          + "\nInvalidation: decisive close " + (isBull ? "below " : "above ") + fmtP(invalidLvl)
+                          + "\nTargets: 0.382 / 0.618 retracements of AD"
+                        box zBox    = box.new(cB, przHi, bar_index, przLo, border_color = color.new(zCol, 60), border_width = 1, border_style = line.style_solid, bgcolor = color.new(zCol, 85))
+                        label lbSum = label.new(bar_index, isBull ? przLo : przHi, sumTxt, color = #00000000, style = isBull ? label.style_label_up : label.style_label_down, textcolor = zCol, size = size.small, tooltip = tipTxt)
+                        line lnXA  = na
+                        line lnBC  = na
+                        line lnCD  = na
+                        line lnInv = na
+                        label lbXA = na
+                        label lbBC = na
+                        label lbCD = na
+                        if showLevelsInput
+                            lnXA := line.new(cB, dXA, bar_index, dXA, color = color.new(zCol, 25), style = line.style_solid)
+                            lbXA := label.new(bar_index, dXA, fmtR(rXA) + " XA", color = #00000000, style = label.style_label_left, textcolor = zCol, size = size.tiny)
+                            lnBC := line.new(cB, dBC, bar_index, dBC, color = color.new(zCol, 25), style = line.style_dashed)
+                            lbBC := label.new(bar_index, dBC, fmtR(rBC) + " BC", color = #00000000, style = label.style_label_left, textcolor = zCol, size = size.tiny)
+                            lnCD := line.new(cB, dCD, bar_index, dCD, color = color.new(zCol, 25), style = line.style_dotted)
+                            lbCD := label.new(bar_index, dCD, rCD == 1.0 ? "AB=CD" : fmtR(rCD) + " AB=CD", color = #00000000, style = label.style_label_left, textcolor = zCol, size = size.tiny)
+                            if invalidLvl != farEdge
+                                lnInv := line.new(cB, invalidLvl, bar_index, invalidLvl, color = color.new(structColorInput, 20), style = line.style_dashed)
+                        array<line> legs     = array.new<line>()
+                        array<label> letters = array.new<label>()
+                        if showLegsInput
+                            array.push(legs, line.new(xB, xP, aB, aP, color = color.new(structColorInput, 30), style = line.style_dotted))
+                            array.push(legs, line.new(aB, aP, bB, bP, color = color.new(structColorInput, 30), style = line.style_dotted))
+                            array.push(legs, line.new(bB, bP, cB, cP, color = color.new(structColorInput, 30), style = line.style_dotted))
+                            array.push(letters, label.new(xB, xP, "X", color = #00000000, style = isBull ? label.style_label_up : label.style_label_down, textcolor = structColorInput, size = size.tiny))
+                            array.push(letters, label.new(aB, aP, "A", color = #00000000, style = isBull ? label.style_label_down : label.style_label_up, textcolor = structColorInput, size = size.tiny))
+                            array.push(letters, label.new(bB, bP, "B", color = #00000000, style = isBull ? label.style_label_up : label.style_label_down, textcolor = structColorInput, size = size.tiny))
+                            array.push(letters, label.new(cB, cP, "C", color = #00000000, style = isBull ? label.style_label_down : label.style_label_up, textcolor = structColorInput, size = size.tiny))
+                        // a fresh read supersedes pending zones of the same direction
+                        int zn = array.size(zones)
+                        if zn > 0
+                            for i = 0 to zn - 1
+                                Przone zo = array.get(zones, i)
+                                if zo.isBull == isBull and zo.state == 0
+                                    zo.state := 4
+                                    fadeZone(zo)
+                        Przone z = Przone.new(isBull = isBull, state = 0, createdBar = bar_index, aP = aP, przHi = przHi, przLo = przLo, invalidLvl = invalidLvl, zCol = zCol, zBox = zBox, lnXA = lnXA, lnBC = lnBC, lnCD = lnCD, lnInv = lnInv, lbSum = lbSum, lbXA = lbXA, lbBC = lbBC, lbCD = lbCD, legLines = legs, pivLabels = letters)
+                        formed := true
+                        if not na(extreme)
+                            z.state   := 1
+                            z.dExt    := extreme
+                            entered   := true
+                            createTargets(z)
+                            if (isBull and close > przHi) or (not isBull and close < przLo)
+                                z.state   := 2
+                                confirmed := true
+                        array.push(zones, z)
+                        while array.size(zones) > maxZonesInput
+                            Przone old = array.shift(zones)
+                            destroyZone(old)
+    [formed, entered, confirmed]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+float ph = ta.pivothigh(swingLenInput, swingLenInput)
+float pl = ta.pivotlow(swingLenInput, swingLenInput)
+
+bool bullFormedA      = false
+bool bearFormedA      = false
+bool bullEnteredA     = false
+bool bearEnteredA     = false
+bool bullConfirmedA   = false
+bool bearConfirmedA   = false
+bool bullInvalidatedA = false
+bool bearInvalidatedA = false
+
+// a confirmed swing low can complete a bearish XABC (C low, D projected above)
+if not na(pl)
+    if addPivot(pl, bar_index - swingLenInput, -1)
+        [f1, e1, c1] = tryBuild()
+        if f1
+            bearFormedA := true
+        if e1
+            bearEnteredA := true
+        if c1
+            bearConfirmedA := true
+
+// a confirmed swing high can complete a bullish XABC (C high, D projected below)
+if not na(ph)
+    if addPivot(ph, bar_index - swingLenInput, 1)
+        [f2, e2, c2] = tryBuild()
+        if f2
+            bullFormedA := true
+        if e2
+            bullEnteredA := true
+        if c2
+            bullConfirmedA := true
+
+// zone lifecycle: entry watch → in-zone extreme tracking → rejection confirmation ↔ invalidation
+int zTotal = array.size(zones)
+if zTotal > 0
+    for i = 0 to zTotal - 1
+        Przone z = array.get(zones, i)
+        if z.createdBar != bar_index and z.state <= 2
+            if bar_index - z.createdBar > EXT_MAX_BARS
+                if z.state == 0
+                    z.state := 4
+                    fadeZone(z)
+                else
+                    z.state := 5
+            else
+                int preState = z.state
+                // structure void: close beyond A before the zone is ever reached
+                if z.state == 0
+                    if (z.isBull and close > z.aP) or (not z.isBull and close < z.aP)
+                        z.state := 4
+                        fadeZone(z)
+                // price enters the zone — pattern on watch
+                if z.state == 0
+                    bool touched = z.isBull ? low <= z.przHi : high >= z.przLo
+                    if touched
+                        z.state := 1
+                        z.dExt  := z.isBull ? low : high
+                        createTargets(z)
+                        if z.isBull
+                            bullEnteredA := true
+                        else
+                            bearEnteredA := true
+                // track the running D extreme and keep the AD targets current
+                if z.state == 1 or z.state == 2
+                    z.dExt := z.isBull ? math.min(z.dExt, low) : math.max(z.dExt, high)
+                    refreshTargets(z)
+                // rejection confirmation: close back through the near edge after testing the zone
+                if z.state == 1
+                    bool rejected = z.isBull ? close > z.przHi : close < z.przLo
+                    if rejected
+                        z.state := 2
+                        if z.isBull
+                            bullConfirmedA := true
+                        else
+                            bearConfirmedA := true
+                // second target reached — geometry complete, freeze the drawings
+                if z.state == 2
+                    if (z.isBull and high >= z.t2) or (not z.isBull and low <= z.t2)
+                        z.state := 5
+                // invalidation: decisive close through the far boundary (or X) — continuation evidence
+                if z.state <= 2
+                    if (z.isBull and close < z.invalidLvl) or (not z.isBull and close > z.invalidLvl)
+                        z.state := 3
+                        fadeZone(z)
+                        if z.isBull
+                            bullInvalidatedA := true
+                        else
+                            bearInvalidatedA := true
+                extendZone(z, preState)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+plotshape(markersInput and bullEnteredA, "Bullish PRZ Entry", shape.circle, location.belowbar, color = bullColorInput, size = size.tiny)
+plotshape(markersInput and bullConfirmedA, "Bullish PRZ Confirmation", shape.triangleup, location.belowbar, color = bullColorInput, size = size.tiny)
+plotshape(markersInput and bullInvalidatedA, "Bullish PRZ Invalidation", shape.xcross, location.belowbar, color = bearColorInput, size = size.tiny)
+plotshape(markersInput and bearEnteredA, "Bearish PRZ Entry", shape.circle, location.abovebar, color = bearColorInput, size = size.tiny)
+plotshape(markersInput and bearConfirmedA, "Bearish PRZ Confirmation", shape.triangledown, location.abovebar, color = bearColorInput, size = size.tiny)
+plotshape(markersInput and bearInvalidatedA, "Bearish PRZ Invalidation", shape.xcross, location.abovebar, color = bullColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(bullFormedA, "Bullish PRZ Projected", "New bullish Potential Reversal Zone projected on {{ticker}} ({{interval}})")
+alertcondition(bearFormedA, "Bearish PRZ Projected", "New bearish Potential Reversal Zone projected on {{ticker}} ({{interval}})")
+alertcondition(bullEnteredA, "Price Entered Bullish PRZ", "Price entered the bullish Potential Reversal Zone on {{ticker}} ({{interval}}) — watch for reversal confirmation")
+alertcondition(bearEnteredA, "Price Entered Bearish PRZ", "Price entered the bearish Potential Reversal Zone on {{ticker}} ({{interval}}) — watch for reversal confirmation")
+alertcondition(bullConfirmedA, "Bullish PRZ Rejection Confirmed", "Close back above the bullish Potential Reversal Zone after testing it on {{ticker}} ({{interval}})")
+alertcondition(bearConfirmedA, "Bearish PRZ Rejection Confirmed", "Close back below the bearish Potential Reversal Zone after testing it on {{ticker}} ({{interval}})")
+alertcondition(bullInvalidatedA, "Bullish PRZ Invalidated", "Decisive close through the far boundary of the bullish Potential Reversal Zone on {{ticker}} ({{interval}}) — pattern failed")
+alertcondition(bearInvalidatedA, "Bearish PRZ Invalidated", "Decisive close through the far boundary of the bearish Potential Reversal Zone on {{ticker}} ({{interval}}) — pattern failed")
+
+//---------------------------------------------------------------------------------------------------------------------}

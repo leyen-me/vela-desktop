@@ -1,0 +1,326 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Bid/ask Imbalance", shorttitle = "Bid/ask Imbalance", overlay = true, max_boxes_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+string GROUP_IMB   = "Imbalance Detection"
+string GROUP_STACK = "Stacked Imbalances"
+string GROUP_STYLE = "Style"
+
+int MAX_MARK_BOXES   = 350
+int MAX_ACTIVE_BANDS = 50
+int MAX_BROKEN_BANDS = 60
+int MARK_TRANSP      = 30
+int BAND_FILL_TRANSP = 85
+int BAND_LINE_TRANSP = 60
+int FADE_FILL_TRANSP = 94
+int FADE_LINE_TRANSP = 85
+
+autoTfInput = input.bool(true, "Auto Intrabar Timeframe"
+  , group   = GROUP_IMB
+  , tooltip = "Each chart bar is rebuilt as a bid x ask footprint from a lower timeframe: every intrabar's volume is classified as ask-executed (buy) or bid-executed (sell) by the tick rule, then stacked into the bar's price levels. Auto picks that intrabar timeframe from the chart timeframe; disable it to set a custom one below. Without aggressor-tagged data the flags are approximations by construction.")
+
+ltfInput = input.timeframe("1", "Custom Intrabar Timeframe"
+  , group   = GROUP_IMB
+  , tooltip = "Intrabar timeframe used when Auto is disabled. Values above the chart timeframe are clamped to the chart timeframe, which reduces the bar to a single one-sided print and leaves no usable footprint.")
+
+rowsInput = input.int(10, "Price Levels per Bar"
+  , minval  = 2
+  , maxval  = 25
+  , group   = GROUP_IMB
+  , tooltip = "Number of price levels each bar's range is divided into. Classified intrabar volume is distributed across the levels an intrabar's range covers, building the footprint the diagonal comparison reads.")
+
+ratioInput = input.float(3, "Imbalance Ratio"
+  , minval  = 1.5
+  , step    = 0.25
+  , group   = GROUP_IMB
+  , tooltip = "Diagonal aggression multiple required to flag a level: ask volume at each price is compared against bid volume one level below, because aggressive buyers lift the offer at one level while aggressive sellers hit the bid just beneath it. 3 is the common 300% setting and roughly 2.5 to 4 is the usual range - lower surfaces more flags and more noise, higher isolates only extreme one-sidedness.")
+
+minVolumeInput = input.float(2, "Minimum Volume %"
+  , minval  = 0
+  , maxval  = 100
+  , step    = 0.5
+  , group   = GROUP_IMB
+  , tooltip = "Minimum volume on the flagged side of the diagonal, as a percentage of the bar's total volume, so near-empty levels cannot trigger flags - a 3:1 ratio built on a handful of contracts means very little.")
+
+stackCountInput = input.int(3, "Stacked Levels"
+  , minval  = 2
+  , group   = GROUP_STACK
+  , tooltip = "Consecutive same-side imbalance levels required for a stacked imbalance. Three or more is the standard reading: a stack outlines a band where aggression overwhelmed passive liquidity, which matters more than an isolated flag.")
+
+showBandsInput = input.bool(true, "Stacked Imbalance Bands"
+  , group   = GROUP_STACK
+  , tooltip = "Mark the price band a stack spans and extend it to the right as prospective intrabar support or resistance. The first retest is the real test: defense confirms the band, while a close through its far side says the aggressors were absorbed or have left.")
+
+keepBrokenInput = input.bool(false, "Keep Broken Bands"
+  , group   = GROUP_STACK
+  , tooltip = "Keep bands on the chart after price closes through them, faded and truncated at the breaking bar, instead of removing them.")
+
+showMarksInput = input.bool(true, "Imbalance Marks"
+  , group   = GROUP_STYLE
+  , tooltip = "Highlight each flagged level inside its bar, footprint-style: buy imbalances on the ask (right) half of the bar, sell imbalances on the bid (left) half.")
+
+markHistoryInput = input.int(50, "Mark History (Bars)"
+  , minval  = 1
+  , maxval  = 200
+  , group   = GROUP_STYLE
+  , tooltip = "Number of recent bars that keep their individual imbalance marks, additionally capped at 350 marks with the oldest dropped first. Stacked imbalance bands are managed separately and persist until broken.")
+
+buyColorInput = input.color(#089981, "Buy"
+  , inline  = "colors"
+  , group   = GROUP_STYLE
+  , tooltip = "Color of buy imbalances - levels where ask-side volume overwhelmed the bid one level below.")
+
+sellColorInput = input.color(#f23645, " Sell"
+  , inline  = "colors"
+  , group   = GROUP_STYLE
+  , tooltip = "Color of sell imbalances - levels where bid-side volume overwhelmed the ask one level above.")
+
+// intrabar inspection timeframe: fine enough to resolve the levels, always at or below the chart timeframe
+int chartSeconds  = timeframe.in_seconds()
+int autoSeconds   = chartSeconds >= 604800 ? 3600 : chartSeconds >= 86400 ? 1800 : chartSeconds >= 14400 ? 900 : chartSeconds >= 3600 ? 300 : chartSeconds > 60 ? 60 : chartSeconds
+int customSeconds = math.min(math.max(timeframe.in_seconds(ltfInput), 1), chartSeconds)
+string intrabarTf = timeframe.from_seconds(autoTfInput ? autoSeconds : customSeconds)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// scans a flag column bottom-to-top and collects every run of consecutive flagged levels at least minCount tall,
+// returning the [first, last] level indices of each qualifying stack
+findStacks(array<bool> flagArray, int minCount) =>
+    firstArray     = array.new_int()
+    lastArray      = array.new_int()
+    int levelCount = flagArray.size()
+    int runStart   = -1
+    if levelCount > 0
+        for i = 0 to levelCount - 1
+            bool flagged = flagArray.get(i)
+            if flagged and runStart < 0
+                runStart := i
+            if runStart >= 0 and (not flagged or i == levelCount - 1)
+                int runEnd = flagged ? i : i - 1
+                if runEnd - runStart + 1 >= minCount
+                    firstArray.push(runStart)
+                    lastArray.push(runEnd)
+                runStart := -1
+    [firstArray, lastArray]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Intrabar footprint
+//---------------------------------------------------------------------------------------------------------------------{
+[openArray, highArray, lowArray, closeArray, volumeArray] = request.security_lower_tf(syminfo.tickerid, intrabarTf, [open, high, low, close, volume])
+
+float cumulativeVolume = ta.cum(nz(volume))
+if barstate.islast and cumulativeVolume == 0
+    runtime.error("No volume is available for this symbol. Bid/ask imbalance detection requires volume data.")
+
+int   intrabarCount = na(closeArray) ? 0 : closeArray.size()
+float levelSize     = (high - low) / rowsInput
+bool  footprintOk   = intrabarCount > 1 and levelSize > 0 and nz(volume) > 0
+
+askVolumeArray = array.new_float(rowsInput, 0.)
+bidVolumeArray = array.new_float(rowsInput, 0.)
+
+if footprintOk
+    float lastIntrabarClose = close[1]
+    for i = 0 to intrabarCount - 1
+        float ibOpen   = openArray.get(i)
+        float ibHigh   = highArray.get(i)
+        float ibLow    = lowArray.get(i)
+        float ibClose  = closeArray.get(i)
+        float ibVolume = nz(volumeArray.get(i))
+        if not na(ibOpen) and not na(ibClose) and not na(ibHigh) and not na(ibLow) and ibHigh >= ibLow
+            // tick rule: rising intrabars print at the ask (aggressive buying), falling ones at the bid
+            // (aggressive selling); unchanged intrabars inherit the sign of the change from the previous
+            // intrabar close and stay ambiguous otherwise, splitting evenly
+            int lean = ibClose > ibOpen ? 1 : ibClose < ibOpen ? -1 : na(lastIntrabarClose) ? 0 : ibClose > lastIntrabarClose ? 1 : ibClose < lastIntrabarClose ? -1 : 0
+            lastIntrabarClose := ibClose
+            if ibVolume > 0
+                float askVolume = lean > 0 ? ibVolume : lean == 0 ? ibVolume / 2 : 0
+                float bidVolume = lean < 0 ? ibVolume : lean == 0 ? ibVolume / 2 : 0
+                float rangeLow  = math.max(math.min(ibLow, high), low)
+                float rangeHigh = math.min(math.max(ibHigh, low), high)
+                float rangeSpan = rangeHigh - rangeLow
+                int levelLow    = math.min(rowsInput - 1, math.max(0, math.floor((rangeLow - low) / levelSize)))
+                int levelHigh   = math.min(rowsInput - 1, math.max(0, math.floor((rangeHigh - low) / levelSize)))
+                // the intrabar's classified volume is spread across the levels its range covers, in
+                // proportion to the share of that range falling inside each level
+                for lvl = levelLow to levelHigh
+                    float slice = 1.0
+                    if rangeSpan > 0
+                        float sliceLow  = math.max(rangeLow, low + lvl * levelSize)
+                        float sliceHigh = math.min(rangeHigh, low + (lvl + 1) * levelSize)
+                        slice := math.max(sliceHigh - sliceLow, 0) / rangeSpan
+                    askVolumeArray.set(lvl, askVolumeArray.get(lvl) + askVolume * slice)
+                    bidVolumeArray.set(lvl, bidVolumeArray.get(lvl) + bidVolume * slice)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Diagonal imbalance detection
+//---------------------------------------------------------------------------------------------------------------------{
+buyFlagArray  = array.new_bool(rowsInput, false)
+sellFlagArray = array.new_bool(rowsInput, false)
+
+float minLevelVolume = nz(volume) * minVolumeInput / 100
+int   buyLevelCount  = 0
+int   sellLevelCount = 0
+
+if footprintOk
+    // footprint diagonal: ask volume at each level is measured against bid volume one level below, aligning
+    // the buyers and sellers who were actually competing at the same moment rather than mixing market states
+    for lvl = 1 to rowsInput - 1
+        float askAtLevel = askVolumeArray.get(lvl)
+        float bidBelow   = bidVolumeArray.get(lvl - 1)
+        if askAtLevel > 0 and askAtLevel >= minLevelVolume and askAtLevel >= ratioInput * bidBelow
+            buyFlagArray.set(lvl, true)
+            buyLevelCount += 1
+        if bidBelow > 0 and bidBelow >= minLevelVolume and bidBelow >= ratioInput * askAtLevel
+            sellFlagArray.set(lvl - 1, true)
+            sellLevelCount += 1
+
+[buyStackFirstArray, buyStackLastArray]   = findStacks(buyFlagArray, stackCountInput)
+[sellStackFirstArray, sellStackLastArray] = findStacks(sellFlagArray, stackCountInput)
+
+int buyStackCount  = buyStackFirstArray.size()
+int sellStackCount = sellStackFirstArray.size()
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Imbalance marks
+//---------------------------------------------------------------------------------------------------------------------{
+var array<box> markArray    = array.new<box>()
+var array<int> markBarArray = array.new<int>()
+
+if barstate.isconfirmed and showMarksInput and footprintOk and bar_index > 0 and not na(time_close)
+    // marks follow footprint reading order: the candle slot's left half is the bid column, its right half the
+    // ask column, so a buy flag highlights the ask cell and a sell flag the bid cell one level lower
+    int halfSpan = (time_close - time) / 2
+    for lvl = 0 to rowsInput - 1
+        float levelBottom = low + lvl * levelSize
+        float levelTop    = levelBottom + levelSize
+        if buyFlagArray.get(lvl)
+            markArray.push(box.new(time, levelTop, time + halfSpan, levelBottom, xloc = xloc.bar_time, border_color = color(na), bgcolor = color.new(buyColorInput, MARK_TRANSP)))
+            markBarArray.push(bar_index)
+        if sellFlagArray.get(lvl)
+            markArray.push(box.new(time - halfSpan, levelTop, time, levelBottom, xloc = xloc.bar_time, border_color = color(na), bgcolor = color.new(sellColorInput, MARK_TRANSP)))
+            markBarArray.push(bar_index)
+
+while markArray.size() > 0 and (bar_index - markBarArray.get(0) > markHistoryInput or markArray.size() > MAX_MARK_BOXES)
+    box.delete(markArray.shift())
+    markBarArray.shift()
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Stacked imbalance bands
+//---------------------------------------------------------------------------------------------------------------------{
+var array<box>  bandArray       = array.new<box>()
+var array<int>  bandSideArray   = array.new<int>()
+var array<int>  bandBornArray   = array.new<int>()
+var array<bool> bandArmedArray  = array.new<bool>()
+var array<bool> bandRetestArray = array.new<bool>()
+var array<box>  brokenArray     = array.new<box>()
+
+if barstate.isconfirmed and showBandsInput and footprintOk
+    if buyStackCount > 0
+        for s = 0 to buyStackCount - 1
+            float bandBottom = low + buyStackFirstArray.get(s) * levelSize
+            float bandTop    = low + (buyStackLastArray.get(s) + 1) * levelSize
+            bandArray.push(box.new(bar_index, bandTop, bar_index, bandBottom, border_color = color.new(buyColorInput, BAND_LINE_TRANSP), bgcolor = color.new(buyColorInput, BAND_FILL_TRANSP)))
+            bandSideArray.push(1)
+            bandBornArray.push(bar_index)
+            bandArmedArray.push(false)
+            bandRetestArray.push(false)
+    if sellStackCount > 0
+        for s = 0 to sellStackCount - 1
+            float bandBottom = low + sellStackFirstArray.get(s) * levelSize
+            float bandTop    = low + (sellStackLastArray.get(s) + 1) * levelSize
+            bandArray.push(box.new(bar_index, bandTop, bar_index, bandBottom, border_color = color.new(sellColorInput, BAND_LINE_TRANSP), bgcolor = color.new(sellColorInput, BAND_FILL_TRANSP)))
+            bandSideArray.push(-1)
+            bandBornArray.push(bar_index)
+            bandArmedArray.push(false)
+            bandRetestArray.push(false)
+
+while bandArray.size() > MAX_ACTIVE_BANDS
+    box.delete(bandArray.shift())
+    bandSideArray.shift()
+    bandBornArray.shift()
+    bandArmedArray.shift()
+    bandRetestArray.shift()
+
+// band lifecycle: a band extends while it holds, arms once price has traded fully clear of it, flags the first
+// return into it as the retest to watch, and dies on a close through its far side - the trade-through that says
+// the aggressors were absorbed or have left
+bool buyBandRetest  = false
+bool sellBandRetest = false
+bool buyBandBroken  = false
+bool sellBandBroken = false
+
+int bandIndex = 0
+while bandIndex < bandArray.size()
+    box  bandBox  = bandArray.get(bandIndex)
+    int  bandSide = bandSideArray.get(bandIndex)
+    bool removed  = false
+    box.set_right(bandBox, bar_index)
+    if bar_index > bandBornArray.get(bandIndex)
+        float bandTop      = box.get_top(bandBox)
+        float bandBottom   = box.get_bottom(bandBox)
+        bool tradedThrough = bandSide > 0 ? close < bandBottom : close > bandTop
+        if tradedThrough and barstate.isconfirmed
+            if bandSide > 0
+                buyBandBroken := true
+            else
+                sellBandBroken := true
+            if keepBrokenInput
+                color fadeColor = bandSide > 0 ? buyColorInput : sellColorInput
+                box.set_bgcolor(bandBox, color.new(fadeColor, FADE_FILL_TRANSP))
+                box.set_border_color(bandBox, color.new(fadeColor, FADE_LINE_TRANSP))
+                box.set_border_style(bandBox, line.style_dotted)
+                brokenArray.push(bandBox)
+            else
+                box.delete(bandBox)
+            bandArray.remove(bandIndex)
+            bandSideArray.remove(bandIndex)
+            bandBornArray.remove(bandIndex)
+            bandArmedArray.remove(bandIndex)
+            bandRetestArray.remove(bandIndex)
+            removed := true
+        else
+            bool clearOfBand = bandSide > 0 ? low > bandTop : high < bandBottom
+            bool backInside  = bandSide > 0 ? low <= bandTop : high >= bandBottom
+            if barstate.isconfirmed and not bandArmedArray.get(bandIndex) and clearOfBand
+                bandArmedArray.set(bandIndex, true)
+            else if bandArmedArray.get(bandIndex) and not bandRetestArray.get(bandIndex) and backInside
+                bandRetestArray.set(bandIndex, true)
+                if bandSide > 0
+                    buyBandRetest := true
+                else
+                    sellBandRetest := true
+    if not removed
+        bandIndex += 1
+
+while brokenArray.size() > MAX_BROKEN_BANDS
+    box.delete(brokenArray.shift())
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Data window & alerts
+//---------------------------------------------------------------------------------------------------------------------{
+plot(buyLevelCount, "Buy Imbalance Levels", buyColorInput, 1, display = display.data_window)
+plot(sellLevelCount, "Sell Imbalance Levels", sellColorInput, 1, display = display.data_window)
+plot(buyStackCount, "Buy Stacks", buyColorInput, 1, display = display.data_window)
+plot(sellStackCount, "Sell Stacks", sellColorInput, 1, display = display.data_window)
+
+bool buyImbalanceEvent  = barstate.isconfirmed and buyLevelCount > 0
+bool sellImbalanceEvent = barstate.isconfirmed and sellLevelCount > 0
+bool stackedBuyEvent    = barstate.isconfirmed and buyStackCount > 0
+bool stackedSellEvent   = barstate.isconfirmed and sellStackCount > 0
+
+alertcondition(buyImbalanceEvent, "Buy Imbalance", "Buy imbalance on {{ticker}} ({{interval}}) - ask-side volume cleared the imbalance ratio against the bid one level below")
+alertcondition(sellImbalanceEvent, "Sell Imbalance", "Sell imbalance on {{ticker}} ({{interval}}) - bid-side volume cleared the imbalance ratio against the ask one level above")
+alertcondition(stackedBuyEvent, "Stacked Buy Imbalances", "Stacked buy imbalances on {{ticker}} ({{interval}}) - consecutive buy-imbalanced levels outline a band where aggressive buying ran through passive sellers")
+alertcondition(stackedSellEvent, "Stacked Sell Imbalances", "Stacked sell imbalances on {{ticker}} ({{interval}}) - consecutive sell-imbalanced levels outline a band where aggressive selling ran through passive buyers")
+alertcondition(buyBandRetest, "Buy Band Retest", "First retest of a stacked buy imbalance band on {{ticker}} ({{interval}}) - defense here confirms it as intrabar support")
+alertcondition(sellBandRetest, "Sell Band Retest", "First retest of a stacked sell imbalance band on {{ticker}} ({{interval}}) - defense here confirms it as intrabar resistance")
+alertcondition(buyBandBroken, "Buy Band Broken", "Price closed through a stacked buy imbalance band on {{ticker}} ({{interval}}) - the aggressive buyers were absorbed or have left")
+alertcondition(sellBandBroken, "Sell Band Broken", "Price closed through a stacked sell imbalance band on {{ticker}} ({{interval}}) - the aggressive sellers were absorbed or have left")
+
+//---------------------------------------------------------------------------------------------------------------------}

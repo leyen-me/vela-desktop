@@ -1,0 +1,338 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Volume-adjusted Time"
+  , shorttitle      = "Volume-adjusted Time"
+  , overlay         = false
+  , format          = format.price
+  , max_boxes_count = 500
+  , max_lines_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+NEUTRAL_COLOR = #787b86 // print marks on the price chart - structure grey
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+MS_PER_DAY  = 86400000.0
+MS_PER_HOUR = 3600000.0
+MS_PER_MIN  = 60000.0
+
+AUTO_OPT    = "Auto (daily average / target bars)"
+MANUAL_OPT  = "Manual amount"
+CARRY_OPT   = "Carry over"
+DISCARD_OPT = "Discard"
+VOLAXIS_OPT = "Volume Axis (equal width)"
+CALAXIS_OPT = "Calendar Axis (true span)"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+thresholdModeInput = input.string(AUTO_OPT, "Volume per Bar", options = [AUTO_OPT, MANUAL_OPT], group = "Sampling",
+  tooltip = "Traded volume required to complete one volume bar. 'Auto' uses the classic rule of thumb — average daily volume divided by the target number of bars per day. 'Manual' uses the fixed amount set below and must be scaled to the instrument's typical turnover.")
+
+targetBarsInput = input.int(12, "Target Bars per Day", minval = 1, maxval = 500, group = "Sampling",
+  tooltip = "Auto mode: how many volume bars a typical day should produce. The sampler can print at most one volume bar per chart bar, so use a chart timeframe well below the intended volume-bar duration and keep this target below the chart's own bars per day.")
+
+avgDaysInput = input.int(20, "Daily Volume Lookback", minval = 1, maxval = 250, group = "Sampling",
+  tooltip = "Auto mode: number of past days averaged to estimate typical daily volume (on daily or higher charts, chart bars are used instead). Revisit the volume-per-bar setting when the instrument's turnover changes materially.")
+
+manualVolInput = input.float(1000000, "Manual Volume per Bar", minval = 0, group = "Sampling",
+  tooltip = "Manual mode: fixed traded volume per volume bar.")
+
+excessInput = input.string(CARRY_OPT, "Excess Volume", options = [CARRY_OPT, DISCARD_OPT], group = "Sampling",
+  tooltip = "When a chart bar overfills the bucket: 'Carry over' rolls the excess into the next volume bar, keeping the bar count proportional to total traded volume. 'Discard' drops it, so every volume bar spans a fresh window holding at least the threshold.")
+
+chartModeInput = input.string(VOLAXIS_OPT, "Chart Mode", options = [VOLAXIS_OPT, CALAXIS_OPT], group = "Display",
+  tooltip = "'Volume Axis' gives every volume bar equal width — the volume-time view where horizontal space measures participation, so busy periods stretch out and quiet periods compress. 'Calendar Axis' stretches each volume bar across the clock time it took to fill, showing where the volume clock runs fast or slow against the calendar.")
+
+shownInput = input.int(200, "Volume Bars Shown", minval = 10, maxval = 400, group = "Display",
+  tooltip = "Number of most recent completed volume bars kept on the chart (drawing capped by Pine object limits). Zoom out to see the full strip in Volume Axis mode.")
+
+spacingInput = input.int(3, "Bar Spacing", minval = 2, maxval = 6, group = "Display",
+  tooltip = "Volume Axis mode: horizontal slots (in chart bars) allocated to each volume bar. 2 packs bars edge to edge, larger values add breathing room.")
+
+showFormingInput = input.bool(true, "Show Forming Bar", group = "Display",
+  tooltip = "Preview the bucket currently filling toward the volume threshold, drawn with a dotted border. Its fill progress is reported in the dashboard.")
+
+showMarksInput = input.bool(false, "Mark Prints on Price Chart", group = "Display",
+  tooltip = "Tick mark on the price chart each time a volume bar prints — the volume clock made visible: dense marks when the market is busy, sparse when it is quiet. Alerts cover prints even when marks are hidden.")
+
+showDashInput = input.bool(true, "Dashboard", inline = "dash", group = "Display",
+  tooltip = "Summary panel: effective volume per bar, forming-bar progress, printed bar count, and the average clock time each volume bar takes.")
+
+dashPosInput = input.string("Top Right", "", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], inline = "dash", group = "Display",
+  tooltip = "Dashboard position on the pane.")
+
+dashSizeInput = input.string("Small", "", options = ["Tiny", "Small", "Normal"], inline = "dash", group = "Display",
+  tooltip = "Dashboard text size.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "bodies", group = "Style")
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "bodies", group = "Style")
+markColorInput = input.color(NEUTRAL_COLOR, "Print Marks", group = "Style")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Human readable duration from a span in milliseconds
+formatDuration(float ms) =>
+    string result = na
+    if na(ms) or ms <= 0
+        result := "—"
+    else
+        dd = math.floor(ms / MS_PER_DAY)
+        hh = math.floor(ms % MS_PER_DAY / MS_PER_HOUR)
+        mm = math.floor(ms % MS_PER_HOUR / MS_PER_MIN)
+        result := dd >= 1 ? str.tostring(dd) + "d " + str.tostring(hh) + "h" : hh >= 1 ? str.tostring(hh) + "h " + str.tostring(mm) + "m" : str.tostring(math.max(mm, 1)) + "m"
+    result
+
+// Compact volume formatting
+formatVolume(float value) =>
+    na(value) ? "—" : str.tostring(value, format.volume)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Volume Clock — threshold estimation
+//---------------------------------------------------------------------------------------------------------------------{
+float barVolume = nz(volume)
+float cumVolume = ta.cum(barVolume)
+
+tfDays   = timeframe.in_seconds() / 86400.0
+dayStart = time("D")
+newDay   = nz(ta.change(dayStart)) != 0
+
+smaBarVolume = ta.sma(barVolume, avgDaysInput)
+
+var dayVolumeArray     = array.new<float>()
+var float curDayVolume = 0.0
+
+if newDay and bar_index > 0
+    array.push(dayVolumeArray, curDayVolume)
+    if array.size(dayVolumeArray) > avgDaysInput
+        array.shift(dayVolumeArray)
+    curDayVolume := 0.0
+
+curDayVolume += barVolume
+
+float avgDailyVolume = na
+if tfDays >= 1.0
+    avgDailyVolume := na(smaBarVolume) ? cumVolume / (bar_index + 1) / tfDays : smaBarVolume / tfDays
+else if array.size(dayVolumeArray) > 0
+    avgDailyVolume := array.avg(dayVolumeArray)
+
+float threshold = thresholdModeInput == AUTO_OPT ? avgDailyVolume / targetBarsInput : manualVolInput
+bool  canSample = not na(threshold) and threshold > 0
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Volume Sampler
+//---------------------------------------------------------------------------------------------------------------------{
+var openArray      = array.new<float>()
+var highArray      = array.new<float>()
+var lowArray       = array.new<float>()
+var closeArray     = array.new<float>()
+var startIdxArray  = array.new<int>()
+var endIdxArray    = array.new<int>()
+var printTimeArray = array.new<int>()
+
+var float accVolume    = 0.0
+var bool  bucketActive = false
+var float bucketOpen   = na
+var float bucketHigh   = na
+var float bucketLow    = na
+var int   bucketStart  = na
+var int   totalPrints  = 0
+var float rangeHigh    = na
+var float rangeLow     = na
+
+bool  printedBar   = false
+float printedOpen  = na
+float printedClose = na
+
+if barstate.isconfirmed and canSample
+    if not bucketActive
+        bucketActive := true
+        bucketOpen   := open
+        bucketHigh   := high
+        bucketLow    := low
+        bucketStart  := bar_index
+    else
+        bucketHigh := math.max(bucketHigh, high)
+        bucketLow  := math.min(bucketLow, low)
+
+    accVolume += barVolume
+
+    if accVolume >= threshold
+        array.push(openArray, bucketOpen)
+        array.push(highArray, bucketHigh)
+        array.push(lowArray, bucketLow)
+        array.push(closeArray, close)
+        array.push(startIdxArray, bucketStart)
+        array.push(endIdxArray, bar_index)
+        array.push(printTimeArray, time_close)
+
+        if array.size(openArray) > shownInput
+            array.shift(openArray)
+            array.shift(highArray)
+            array.shift(lowArray)
+            array.shift(closeArray)
+            array.shift(startIdxArray)
+            array.shift(endIdxArray)
+            array.shift(printTimeArray)
+
+        rangeHigh := array.max(highArray)
+        rangeLow  := array.min(lowArray)
+
+        totalPrints  += 1
+        printedBar   := true
+        printedOpen  := bucketOpen
+        printedClose := close
+
+        accVolume    := excessInput == CARRY_OPT ? accVolume - threshold : 0.0
+        bucketActive := false
+
+// Forming bucket preview values (committed state plus the live, unconfirmed bar)
+bool  liveBar     = barstate.islast and not barstate.isconfirmed
+float formingAcc  = accVolume + (liveBar ? barVolume : 0.0)
+float formingOpen = bucketActive ? bucketOpen : open
+float formingHigh = bucketActive ? (liveBar ? math.max(bucketHigh, high) : bucketHigh) : high
+float formingLow  = bucketActive ? (liveBar ? math.min(bucketLow, low) : bucketLow) : low
+int   formingStart = bucketActive ? bucketStart : bar_index
+float formingProg  = canSample ? formingAcc / threshold : na
+
+// Invisible anchors keeping the pane scale fitted to the drawn candles
+float scaleHigh = math.max(nz(rangeHigh, high), nz(formingHigh, high))
+float scaleLow  = math.min(nz(rangeLow, low), nz(formingLow, low))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Volume-Time Chart
+//---------------------------------------------------------------------------------------------------------------------{
+var bodyArray = array.new<box>()
+var wickArray = array.new<line>()
+
+bool volumeAxis = chartModeInput == VOLAXIS_OPT
+int  halfWidth  = math.max(1, (spacingInput - 1) / 2)
+
+if barstate.islast
+    for eachBox in bodyArray
+        box.delete(eachBox)
+    for eachWick in wickArray
+        line.delete(eachWick)
+    array.clear(bodyArray)
+    array.clear(wickArray)
+
+    int stored = array.size(closeArray)
+
+    if stored > 0
+        for k = 0 to stored - 1
+            int i = stored - 1 - k
+            float barOpen  = array.get(openArray, i)
+            float barHigh  = array.get(highArray, i)
+            float barLow   = array.get(lowArray, i)
+            float barClose = array.get(closeArray, i)
+
+            int xLeft  = na
+            int xRight = na
+            int xWick  = na
+
+            if volumeAxis
+                int slotCenter = bar_index - (k + 1) * spacingInput
+                xLeft  := slotCenter - halfWidth
+                xRight := slotCenter + halfWidth
+                xWick  := slotCenter
+            else
+                xLeft  := array.get(startIdxArray, i)
+                xRight := array.get(endIdxArray, i)
+                xWick  := math.round((xLeft + xRight) / 2.0)
+
+            if xLeft < 0
+                break
+
+            color candleColor = barClose >= barOpen ? bullColorInput : bearColorInput
+            array.push(wickArray, line.new(xWick, barHigh, xWick, barLow, color = candleColor, width = 1))
+            array.push(bodyArray, box.new(xLeft, math.max(barOpen, barClose), xRight, math.min(barOpen, barClose), border_color = candleColor, border_width = 1, bgcolor = candleColor))
+
+    if showFormingInput and canSample and not na(formingOpen) and not na(formingHigh)
+        color formingColor = close >= formingOpen ? bullColorInput : bearColorInput
+        color formingSoft  = color.new(formingColor, 40)
+
+        int fLeft  = na
+        int fRight = na
+        int fWick  = na
+
+        if volumeAxis
+            fLeft  := bar_index - halfWidth
+            fRight := bar_index + halfWidth
+            fWick  := bar_index
+        else
+            fLeft  := formingStart
+            fRight := bar_index
+            fWick  := math.round((fLeft + fRight) / 2.0)
+
+        array.push(wickArray, line.new(fWick, formingHigh, fWick, formingLow, color = formingSoft, width = 1))
+        array.push(bodyArray, box.new(fLeft, math.max(formingOpen, close), fRight, math.min(formingOpen, close), border_color = formingSoft, border_width = 1, border_style = line.style_dotted, bgcolor = color.new(formingColor, 75)))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+dashPosition = switch dashPosInput
+    "Top Right"    => position.top_right
+    "Top Left"     => position.top_left
+    "Bottom Right" => position.bottom_right
+    => position.bottom_left
+
+dashTextSize = switch dashSizeInput
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    => size.small
+
+var table dashTable = na
+
+if barstate.islast and showDashInput
+    if na(dashTable)
+        dashTable := table.new(dashPosition, 2, 6, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+        table.merge_cells(dashTable, 0, 0, 1, 0)
+
+    color headColor  = DASH_TEXT
+    color labelColor = DASH_HEADER
+
+    int   printCount = array.size(printTimeArray)
+    float avgBarMs   = printCount >= 2 ? 1.0 * (array.get(printTimeArray, printCount - 1) - array.get(printTimeArray, 0)) / (printCount - 1) : na
+    float barsPerDay = na(avgBarMs) or avgBarMs <= 0 ? na : MS_PER_DAY / avgBarMs
+
+    string modeTag     = thresholdModeInput == AUTO_OPT ? " (auto)" : " (manual)"
+    bool   noVolumeData = bar_index > 20 and cumVolume <= 0
+    // The no-volume warning is folded into the Forming value instead of occupying a row of its own
+    string formingText = noVolumeData ? "No volume data" : canSample ? str.tostring(formingProg * 100, "#.#") + "%" : "warming up"
+    color  formingColor = noVolumeData ? BEAR_COLOR : headColor
+
+    table.cell(dashTable, 0, 0, "Volume-Adjusted Time", text_color = headColor, text_size = dashTextSize)
+    table.cell(dashTable, 0, 1, "Volume / Bar", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 1, formatVolume(threshold) + modeTag, text_color = headColor, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 2, "Forming", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 2, formingText, text_color = formingColor, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 3, "Printed", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 3, str.tostring(totalPrints) + " · " + str.tostring(printCount) + " shown", text_color = headColor, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 4, "Avg Time / Bar", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 4, formatDuration(avgBarMs), text_color = headColor, text_size = dashTextSize, text_halign = text.align_right)
+    table.cell(dashTable, 0, 5, "≈ Bars / Day", text_color = labelColor, text_size = dashTextSize, text_halign = text.align_left)
+    table.cell(dashTable, 1, 5, na(barsPerDay) ? "—" : str.tostring(barsPerDay, "#.#"), text_color = headColor, text_size = dashTextSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Plots & Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+plot(scaleHigh, "Scale Anchor High", color = na, display = display.pane, editable = false)
+plot(scaleLow, "Scale Anchor Low", color = na, display = display.pane, editable = false)
+
+plotchar(showMarksInput and printedBar, "Volume Bar Print", "│", location.bottom, markColorInput, size = size.tiny, force_overlay = true)
+
+alertcondition(printedBar, "New Volume Bar", "volume-adjusted time: the volume bucket filled — a new volume bar printed on {{ticker}} ({{interval}})")
+alertcondition(printedBar and nz(printedClose) > nz(printedOpen), "New Bullish Volume Bar", "volume-adjusted time: a new bullish volume bar (close above open) printed on {{ticker}} ({{interval}})")
+alertcondition(printedBar and nz(printedClose) < nz(printedOpen), "New Bearish Volume Bar", "volume-adjusted time: a new bearish volume bar (close below open) printed on {{ticker}} ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

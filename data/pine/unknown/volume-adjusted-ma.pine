@@ -1,0 +1,252 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Volume-adjusted MA", shorttitle = "Volume-adjusted MA", overlay = true)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+ALL_BARS_SAMPLE = "All Bars (Arms)"
+WINDOW_SAMPLE   = "Fixed Window"
+
+ARMS_INCREMENT_FACTOR = 0.67
+
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+NEUTRAL_COLOR = #787b86 // flat or uncolored line - structure grey
+SMA_REF_COLOR = color.new(#787b86, 40) // comparison line is structure - faded grey
+
+DASH_BG     = #161616
+DASH_FRAME  = #2E2E2E
+DASH_HEADER = #808080
+DASH_TEXT   = #DBDBDB
+
+FILL_PRICE_TRANSP = 60  // gradient transparency at the price end of the fill
+FILL_LINE_TRANSP  = 100 // gradient transparency at the VAMA end of the fill
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+srcInput             = input.source(close, "Source", group = "Settings",
+     tooltip = "Price series each bar contributes to the average. Arms computed on the close; whichever source is used, a bar's price enters the line in proportion to the business the bar carried.")
+
+lengthInput          = input.int(20, "Length (Volume Increments)", minval = 1, group = "Settings",
+     tooltip = "The volume budget N, measured in increments of typical volume rather than in bars. The window reaches back over however many bars are needed to accumulate N increments — a handful when tape is busy, far more in drift — so the effective lookback stretches in thin trade and compresses when activity surges. With the default 0.67 factor a budget of N increments spans roughly two-thirds of N bars on steady volume.")
+
+incrementFactorInput = input.float(ARMS_INCREMENT_FACTOR, "Increment Factor", minval = 0.05, maxval = 5, step = 0.01, group = "Settings",
+     tooltip = "Arms' published scaling of the volume increment: one increment equals the average bar volume multiplied by this factor (0.67 in his construction), making a typical bar worth about one and a half increments. Raise the factor for coarser increments and a longer reach; lower it for a shorter, faster window. On symbols with no volume feed every bar counts as exactly one increment and the line degrades to a time-weighted window.")
+
+sampleModeInput      = input.string(ALL_BARS_SAMPLE, "Average Volume Sample", options = [ALL_BARS_SAMPLE, WINDOW_SAMPLE], group = "Settings",
+     tooltip = "Volume average the increment is scaled from. All Bars is Arms' original reading — the mean volume of the entire charted history, taken causally up to each bar. Fixed Window substitutes a rolling mean, which keeps the increment representative on symbols whose typical volume has drifted across regimes.")
+
+sampleLengthInput    = input.int(100, "Sample Length", minval = 2, group = "Settings",
+     tooltip = "Bars in the rolling volume mean when Fixed Window is selected; the all-bars mean fills in while fewer bars exist. Long samples read as stable typical volume; short samples let the increment itself chase recent activity, dampening the elastic behavior.")
+
+maxLookbackInput     = input.int(500, "Max Lookback (Bars)", minval = 20, maxval = 2000, group = "Settings",
+     tooltip = "Hard cap on how many bars the elastic window may reach back when thin volume is slow to fill the budget. If the cap or the start of history is hit first, the average is taken over the weight accumulated so far — the dashboard's budget fill shows when this happens. Also bounds the computation cost per bar.")
+
+showSmaInput         = input.bool(false, "Comparison SMA", group = "Comparison",
+     tooltip = "Overlays a simple moving average — the pure time-weight benchmark in which every bar counts once, however dead or frantic its trade. The gap between the two lines is volume's opinion: they separate exactly where heavy trade disagrees with the calendar. Crossings between the pair are covered by the pair alerts.")
+
+smaLengthInput       = input.int(20, "SMA Length", minval = 1, group = "Comparison",
+     tooltip = "Length of the comparison SMA in bars. Matching the budget (20) compares like for like in Arms' increment terms; with the default 0.67 factor the volume-adjusted window spans about 13 bars on steady volume, so a 13-bar SMA is the speed-matched choice.")
+
+showDashboardInput     = input.bool(true, "Show Dashboard", group = "Dashboard",
+     tooltip = "Displays a compact panel with the current size of one volume increment, the elastic window's effective lookback in bars, how much of the budget was filled, the slope read, price's side of the line, and the percentage gap against the comparison SMA.")
+
+dashboardLocationInput = input.string("Top Right", "Location", options = ["Top Right", "Bottom Right", "Bottom Left", "Top Left"], group = "Dashboard",
+     tooltip = "Chart corner the dashboard is anchored to.")
+
+dashboardSizeInput     = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = "Dashboard",
+     tooltip = "Text size of the dashboard.")
+
+trendColorInput   = input.bool(true, "Slope Trend Coloring", group = "Style",
+     tooltip = "Colors the line by its slope — bullish while rising, bearish while falling, neutral on bars that leave it unchanged (no traded volume). Quiet bars barely move the line, so its slope is a participation-weighted trend read; disable to draw the line in the neutral color.")
+
+bullColorInput    = input.color(BULL_COLOR, "Bullish", inline = "direction", group = "Style",
+     tooltip = "Bullish color, used while the line slopes upward and for bullish crossings/fill.")
+
+bearColorInput    = input.color(BEAR_COLOR, "Bearish", inline = "direction", group = "Style",
+     tooltip = "Bearish color, used while the line slopes downward and for bearish crossings/fill.")
+
+neutralColorInput = input.color(NEUTRAL_COLOR, "Neutral", group = "Style",
+     tooltip = "Line color used when slope trend coloring is disabled, or on bars whose volume left the line unchanged.")
+
+smaColorInput     = input.color(SMA_REF_COLOR, "SMA", group = "Style",
+     tooltip = "Color of the comparison SMA line.")
+
+lineWidthInput    = input.int(2, "Line Width", minval = 1, maxval = 5, group = "Style",
+     tooltip = "Width of the Volume-adjusted MA line.")
+
+showFillInput     = input.bool(true, "Price / VAMA Gradient Fill", group = "Style",
+     tooltip = "Fills the area between the source and the average with a vertical gradient — bullish while price holds above the line, bearish while below — fading to fully transparent at the line. Price walking away from a flat line on thin volume shows up as a widening fill the average refuses to follow.")
+
+showMarkersInput  = input.bool(false, "Price Crossing Markers", group = "Style",
+     tooltip = "Displays small triangle markers when the source crosses over or under the Volume-adjusted MA. Off by default to keep the chart clean — the crossing alerts work regardless.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Compact display of volume amounts for the dashboard
+formatVolume(float value) =>
+    float absValue = math.abs(value)
+    switch
+        absValue >= 1e12 => str.tostring(value / 1e12, "#.##") + "T"
+        absValue >= 1e9  => str.tostring(value / 1e9, "#.##") + "B"
+        absValue >= 1e6  => str.tostring(value / 1e6, "#.##") + "M"
+        absValue >= 1e3  => str.tostring(value / 1e3, "#.##") + "K"
+        => str.tostring(value, "#.##")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+// Arms' volume-adjusted moving average (Volume Cycles in the Stock Market, 1994) — the average measured in units
+// of business rather than bars:
+//   1. one volume increment = average bar volume * increment factor (Arms' constant 0.67)
+//   2. each bar's volume ratio = its volume / the increment — the bar's weight and its share of the budget
+//   3. reaching back from the current bar, price * ratio accumulates until the budget of N increments is spent,
+//      the oldest bar entering fractionally so the total weight equals the budget exactly
+//   4. VAMA = accumulated price weight / accumulated weight
+// Heavy bars spend the budget within a few bars and shorten the window; thin tape forces it far back.
+
+// Average volume the increment is scaled from — Arms' whole-chart mean taken causally, or a rolling window
+var float cumVolumeSum  = 0.0
+var int   cumVolumeBars = 0
+if not na(volume)
+    cumVolumeSum  += volume
+    cumVolumeBars += 1
+
+cumAvgVolume    = cumVolumeBars > 0 ? cumVolumeSum / cumVolumeBars : float(na)
+windowAvgVolume = nz(ta.sma(nz(volume), sampleLengthInput), cumAvgVolume)
+avgVolume       = sampleModeInput == ALL_BARS_SAMPLE ? cumAvgVolume : windowAvgVolume
+
+volumeIncrement = avgVolume * incrementFactorInput
+hasVolumeFeed   = not na(volumeIncrement) and volumeIncrement > 0
+
+// Rolling buffers of the elastic window's raw material, capped at the lookback bound
+var srcArray = array.new<float>()
+var volArray = array.new<float>()
+
+array.push(srcArray, srcInput)
+array.push(volArray, nz(volume))
+if array.size(srcArray) > maxLookbackInput
+    array.shift(srcArray)
+    array.shift(volArray)
+
+// Reach back until the volume budget is spent — bars with no traded volume contribute nothing and consume
+// nothing, and symbols without a volume feed count every bar as one increment (time-weighted degradation)
+int   spanSize    = array.size(srcArray)
+float budget      = lengthInput
+float weightedSum = 0.0
+float weightSum   = 0.0
+int   barsSpanned = 0
+
+for i = 0 to spanSize - 1
+    int   sourceIndex = spanSize - 1 - i
+    float barPrice    = array.get(srcArray, sourceIndex)
+    float barRatio    = hasVolumeFeed ? array.get(volArray, sourceIndex) / volumeIncrement : 1.0
+    if na(barPrice) or barRatio <= 0
+        continue
+    float barWeight = math.min(barRatio, budget - weightSum)
+    weightedSum += barPrice * barWeight
+    weightSum   += barWeight
+    barsSpanned := i + 1
+    if weightSum >= budget
+        break
+
+// The weighted mean — identical to Arms' weighted sum divided by N once the budget fills, and taken over the
+// weight actually accumulated when history or the lookback cap runs out first
+vamaValue     = weightSum > 0 ? weightedSum / weightSum : float(na)
+budgetFillPct = weightSum / budget * 100
+
+// Comparison SMA — the pure time-weight benchmark; the gap between the lines is volume's opinion
+smaValue = ta.sma(srcInput, smaLengthInput)
+gapPct   = na(vamaValue) or na(smaValue) or smaValue == 0 ? float(na) : (vamaValue - smaValue) / smaValue * 100
+
+// Slope of the line — the participation-weighted trend read; exactly zero when no traded volume moved it
+slope = vamaValue - nz(vamaValue[1], vamaValue)
+
+// Price crossings, slope reversals, and crossings against the time-weighted twin
+crossUp       = ta.crossover(srcInput, vamaValue)
+crossDown     = ta.crossunder(srcInput, vamaValue)
+slopeTurnUp   = slope > 0 and nz(slope[1]) <= 0
+slopeTurnDown = slope < 0 and nz(slope[1]) >= 0
+pairCrossUp   = ta.crossover(vamaValue, smaValue)
+pairCrossDown = ta.crossunder(vamaValue, smaValue)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+vamaColor = trendColorInput ? (slope > 0 ? bullColorInput : slope < 0 ? bearColorInput : neutralColorInput) : neutralColorInput
+
+priceAbove      = srcInput > vamaValue
+fillTopColor    = showFillInput ? (priceAbove ? color.new(bullColorInput, FILL_PRICE_TRANSP) : color.new(bearColorInput, FILL_LINE_TRANSP)) : na
+fillBottomColor = showFillInput ? (priceAbove ? color.new(bullColorInput, FILL_LINE_TRANSP) : color.new(bearColorInput, FILL_PRICE_TRANSP)) : na
+
+srcPlotId  = plot(srcInput, "Source", color = na, editable = false, display = display.none)
+vamaPlotId = plot(vamaValue, "Volume-adjusted MA", color = vamaColor, linewidth = lineWidthInput)
+
+plot(showSmaInput ? smaValue : na, "Comparison SMA", color = smaColorInput)
+
+fill(srcPlotId, vamaPlotId, top_value = math.max(srcInput, vamaValue), bottom_value = math.min(srcInput, vamaValue), top_color = fillTopColor, bottom_color = fillBottomColor, title = "Price / VAMA Gradient Fill")
+
+plotshape(showMarkersInput and crossUp, "Bullish Price Cross", shape.triangleup, location.belowbar, color = bullColorInput, size = size.tiny)
+plotshape(showMarkersInput and crossDown, "Bearish Price Cross", shape.triangledown, location.abovebar, color = bearColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+dashboardLocation = switch dashboardLocationInput
+    "Top Right"    => position.top_right
+    "Bottom Right" => position.bottom_right
+    "Bottom Left"  => position.bottom_left
+    => position.top_left
+
+dashboardTextSize = switch dashboardSizeInput
+    "Tiny"  => size.tiny
+    "Small" => size.small
+    => size.normal
+
+var table dashboardTable = table.new(dashboardLocation, 2, 6, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+if barstate.islast and showDashboardInput
+    // One increment in volume units, and the elastic reach — bars the window needed to fill the budget
+    incrementText = hasVolumeFeed ? formatVolume(volumeIncrement) : "—"
+    lookbackText  = barsSpanned > 0 ? str.tostring(barsSpanned) + (barsSpanned == 1 ? " bar" : " bars") : "—"
+    fillText      = na(vamaValue) ? "—" : str.tostring(math.min(budgetFillPct, 100), "#.#") + "%"
+
+    slopeNow   = nz(slope)
+    slopeText  = slopeNow > 0 ? "Rising" : slopeNow < 0 ? "Falling" : "Flat"
+    slopeColor = slopeNow > 0 ? bullColorInput : slopeNow < 0 ? bearColorInput : neutralColorInput
+
+    aboveNow  = not na(vamaValue) and srcInput > vamaValue
+    biasText  = na(vamaValue) ? "—" : aboveNow ? "Above VAMA" : "Below VAMA"
+    biasColor = na(vamaValue) ? neutralColorInput : aboveNow ? bullColorInput : bearColorInput
+
+    gapText  = na(gapPct) ? "—" : (gapPct >= 0 ? "+" : "") + str.tostring(gapPct, "#.##") + "%"
+    gapColor = na(gapPct) ? DASH_TEXT : gapPct > 0 ? bullColorInput : gapPct < 0 ? bearColorInput : DASH_TEXT
+
+    table.cell(dashboardTable, 0, 0, "Increment",     text_color = DASH_HEADER,    text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 0, incrementText,   text_color = DASH_TEXT,      text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 1, "Eff. Lookback", text_color = DASH_HEADER,    text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 1, lookbackText,    text_color = DASH_TEXT,      text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 2, "Budget Fill",   text_color = DASH_HEADER,    text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 2, fillText,        text_color = DASH_TEXT,      text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 3, "Slope",         text_color = DASH_HEADER,    text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 3, slopeText,       text_color = slopeColor,     text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 4, "Price",         text_color = DASH_HEADER,    text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 4, biasText,        text_color = biasColor,      text_size = dashboardTextSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 0, 5, "Gap vs SMA",    text_color = DASH_HEADER,    text_size = dashboardTextSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 5, gapText,         text_color = gapColor,       text_size = dashboardTextSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(crossUp, "Bullish Price Cross", "Price crossed above the Volume-adjusted MA on {{ticker}} ({{interval}})")
+alertcondition(crossDown, "Bearish Price Cross", "Price crossed below the Volume-adjusted MA on {{ticker}} ({{interval}})")
+alertcondition(slopeTurnUp, "VAMA Slope Up", "Volume-adjusted MA slope turned upward on {{ticker}} ({{interval}})")
+alertcondition(slopeTurnDown, "VAMA Slope Down", "Volume-adjusted MA slope turned downward on {{ticker}} ({{interval}})")
+alertcondition(showSmaInput and pairCrossUp, "Bullish SMA Pair Cross", "Volume-adjusted MA crossed above the comparison SMA on {{ticker}} ({{interval}}) — heavy trade disagrees with the calendar to the upside")
+alertcondition(showSmaInput and pairCrossDown, "Bearish SMA Pair Cross", "Volume-adjusted MA crossed below the comparison SMA on {{ticker}} ({{interval}}) — heavy trade disagrees with the calendar to the downside")
+
+//---------------------------------------------------------------------------------------------------------------------}

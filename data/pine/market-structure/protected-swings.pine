@@ -1,0 +1,193 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Protected Swings", "Protected Swings", overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants & Inputs
+//---------------------------------------------------------------------------------------------------------------------{
+color BULL_COLOR = #089981
+color BEAR_COLOR = #f23645
+
+// Groups
+G_LOGIC = "Logic Settings"
+G_VIS   = "Visualization"
+
+// Inputs
+sweepSensitivityInput = input.int(5, "Sweep Sensitivity", minval = 1, group = G_LOGIC, tooltip = "Number of bars required on both sides to confirm a swing level.")
+fvgDetectionInput     = input.bool(true, "Include FVG Mitigations", group = G_LOGIC, tooltip = "If enabled, swings that trade into a Fair Value Gap (but don't necessarily sweep liquidity) can also be protected.")
+fvgLookbackInput      = input.int(50, "FVG Search Lookback", minval = 10, group = G_LOGIC)
+
+// Styling Inputs
+showLabelsInput    = input.bool(true, "Show Labels", group = G_VIS)
+showLevelsInput    = input.bool(true, "Show Confirmation Levels", group = G_VIS)
+showFvgInput       = input.bool(true, "Show Fair Value Gaps", group = G_VIS)
+showSweepsInput    = input.bool(true, "Highlight Liquidity Sweeps", group = G_VIS)
+fvgTranspInput     = input.int(85, "FVG Transparency", minval = 0, maxval = 100, group = G_VIS)
+sweepTranspInput   = input.int(70, "Sweep Transparency", minval = 0, maxval = 100, group = G_VIS)
+bullColorInput     = input.color(BULL_COLOR, "Bullish Color", group = G_VIS, inline = "bull")
+bearColorInput     = input.color(BEAR_COLOR, "Bearish Color", group = G_VIS, inline = "bear")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types & UDTs
+//---------------------------------------------------------------------------------------------------------------------{
+type FVG
+    float top
+    float bottom
+    int   dir // 1 for bullish (gap up), -1 for bearish (gap down)
+    box   boxId
+    bool  mitigated = false
+
+type PendingSwing
+    float swingPrice
+    float level
+    int   swingBar
+    int   levelBar
+    bool  isBullish
+    bool  swept
+    bool  fvgMitigated
+    bool  active = true
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+var fvgArray = array.new<FVG>()
+var pendingSwings = array.new<PendingSwing>()
+
+// 1. Detect structural swings & Highlight Liquidity Sweeps
+var float lastPivotHigh = na
+var float lastPivotLow  = na
+var int   lastPivotHighBar = na
+var int   lastPivotLowBar  = na
+
+var line originHighLine = na
+var line originLowLine  = na
+
+ph = ta.pivothigh(high, sweepSensitivityInput, sweepSensitivityInput)
+pl = ta.pivotlow(low, sweepSensitivityInput, sweepSensitivityInput)
+
+if not na(ph)
+    lastPivotHigh := ph
+    lastPivotHighBar := bar_index - sweepSensitivityInput
+if not na(pl)
+    lastPivotLow  := pl
+    lastPivotLowBar  := bar_index - sweepSensitivityInput
+
+float prevHighest = lastPivotHigh
+float prevLowest  = lastPivotLow
+
+// A sweep is only valid if the wick exceeds the level but the body remains within it
+bool isSweepHigh = high > prevHighest and math.max(open, close) <= prevHighest
+bool isSweepLow  = low < prevLowest and math.min(open, close) >= prevLowest
+
+// Highlight the swing of origin with a dotted gray line
+if isSweepHigh and not na(lastPivotHighBar)
+    if not na(originHighLine) and line.get_x1(originHighLine) == lastPivotHighBar
+        line.set_x2(originHighLine, bar_index)
+    else
+        originHighLine := line.new(lastPivotHighBar, lastPivotHigh, bar_index, lastPivotHigh, color = color.gray, style = line.style_dotted)
+
+if isSweepLow and not na(lastPivotLowBar)
+    if not na(originLowLine) and line.get_x1(originLowLine) == lastPivotLowBar
+        line.set_x2(originLowLine, bar_index)
+    else
+        originLowLine := line.new(lastPivotLowBar, lastPivotLow, bar_index, lastPivotLow, color = color.gray, style = line.style_dotted)
+
+// Highlight the part of the candle body that "swept" the previous level
+plotcandle(showSweepsInput and isSweepHigh ? prevHighest : na, high, isSweepHigh ? prevHighest : na, high, "Sweep High Highlight", color.new(bearColorInput, sweepTranspInput), bordercolor = na, wickcolor = na)
+plotcandle(showSweepsInput and isSweepLow ? prevLowest : na, low, isSweepLow ? prevLowest : na, low, "Sweep Low Highlight", color.new(bullColorInput, sweepTranspInput), bordercolor = na, wickcolor = na)
+
+// 2. Detect FVGs
+if showFvgInput
+    if high[2] < low[0]
+        box b = box.new(bar_index - 2, low[0], bar_index, high[2], bgcolor = color.new(bullColorInput, fvgTranspInput), border_color = color.new(bullColorInput, fvgTranspInput))
+        fvgArray.unshift(FVG.new(low[0], high[2], 1, b))
+    else if low[2] > high[0]
+        box b = box.new(bar_index - 2, low[2], bar_index, high[0], bgcolor = color.new(bearColorInput, fvgTranspInput), border_color = color.new(bearColorInput, fvgTranspInput))
+        fvgArray.unshift(FVG.new(low[2], high[0], -1, b))
+
+// 3. Manage FVGs (Extension & Mitigation)
+if fvgArray.size() > 0
+    for i = fvgArray.size() - 1 to 0
+        FVG f = fvgArray.get(i)
+        if not f.mitigated
+            box.set_right(f.boxId, bar_index)
+            if f.dir == 1 and low <= f.top
+                f.mitigated := true
+            else if f.dir == -1 and high >= f.bottom
+                f.mitigated := true
+        if i > fvgLookbackInput
+            box.delete(f.boxId)
+            fvgArray.remove(i)
+
+// 4. Check for Context (Sweep or FVG Mitigation)
+bool isSwingLow  = low[1] < low[0] and low[1] < low[2]
+bool isSwingHigh = high[1] > high[0] and high[1] > high[2]
+
+// Check if the swing point was a wick-only sweep
+bool sweptLow  = low[1] < prevLowest and math.min(open[1], close[1]) >= prevLowest
+bool sweptHigh = high[1] > prevHighest and math.max(open[1], close[1]) <= prevHighest
+
+bool mitigatedFVG_Bull = false
+bool mitigatedFVG_Bear = false
+
+if fvgDetectionInput
+    for f in fvgArray
+        if f.dir == 1 and low[1] <= f.top and low[1] >= f.bottom
+            mitigatedFVG_Bull := true
+        if f.dir == -1 and high[1] >= f.bottom and high[1] <= f.top
+            mitigatedFVG_Bear := true
+
+// 5. Identify Candle Series & Level
+// For Bullish: Swing low must be a down-close candle
+if isSwingLow and (sweptLow or mitigatedFVG_Bull) and close[1] < open[1]
+    int i = 1
+    while i < 15 and close[i+1] < open[i+1]
+        i += 1
+    float level = open[i]
+    int levelBar = bar_index - i
+    pendingSwings.unshift(PendingSwing.new(low[1], level, bar_index - 1, levelBar, true, sweptLow, mitigatedFVG_Bull, true))
+
+// For Bearish: Swing high must be an up-close candle
+if isSwingHigh and (sweptHigh or mitigatedFVG_Bear) and close[1] > open[1]
+    int i = 1
+    while i < 15 and close[i+1] > open[i+1]
+        i += 1
+    float level = open[i]
+    int levelBar = bar_index - i
+    pendingSwings.unshift(PendingSwing.new(high[1], level, bar_index - 1, levelBar, false, sweptHigh, mitigatedFVG_Bear, true))
+
+// 6. Confirmation Logic (CISD)
+if pendingSwings.size() > 0
+    for i = pendingSwings.size() - 1 to 0
+        PendingSwing ps = pendingSwings.get(i)
+        if not ps.active
+            continue
+        bool confirmed = false
+        if ps.isBullish
+            if low < ps.swingPrice
+                ps.active := false
+            else if close > ps.level
+                confirmed := true
+        else
+            if high > ps.swingPrice
+                ps.active := false
+            else if close < ps.level
+                confirmed := true
+        if confirmed
+            ps.active := false
+            color mainColor = ps.isBullish ? bullColorInput : bearColorInput
+            if showLevelsInput
+                line.new(ps.levelBar, ps.level, bar_index, ps.level, color = mainColor, width = 1)
+            line.new(ps.swingBar, ps.swingPrice, ps.swingBar, ps.level, color = chart.fg_color, style = line.style_dotted)
+            if showLabelsInput
+                string labelTxt = ps.isBullish ? "PSL" : "PSH"
+                string tooltipTxt = "Cause: " + (ps.swept and ps.fvgMitigated ? "Liquidity Sweep & FVG Mitigation" : ps.swept ? "Liquidity Sweep" : "FVG Mitigation")
+                label.new(ps.swingBar, ps.swingPrice, labelTxt, color = #00000000, style = ps.isBullish ? label.style_label_up : label.style_label_down, textcolor = mainColor, size = size.small, tooltip = tooltipTxt)
+            pendingSwings.remove(i)
+
+if pendingSwings.size() > 50
+    pendingSwings.pop()
+
+//---------------------------------------------------------------------------------------------------------------------}

@@ -1,0 +1,122 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Roofing Filter", shorttitle = "Roofing Filter", overlay = false, format = format.price)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+SQRT2      = math.sqrt(2)     // Ehlers' published 1.414
+HALF_SQRT2 = math.sqrt(2) / 2 // Ehlers' published .707 — places the -3 dB point of the two-pole high-pass at the cutoff period
+
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+NEUTRAL_COLOR = #787b86
+
+FILL_VALUE_TRANSP = 50  // gradient transparency at the roofed output value
+FILL_ZERO_TRANSP  = 100 // gradient transparency at the zero line
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+srcInput      = input.source(close, "Source", group = "Settings",
+     tooltip = "Price series the roofing filter preprocesses. Ehlers' published roofing filter code works on the close.")
+
+hpPeriodInput = input.int(48, "High-Pass Period", minval = 4, group = "Settings",
+     tooltip = "Upper cutoff of the passband, in bars. The two-pole high-pass stage removes trend and drift — every component with a period longer than this — so the output stays zero-mean even while price trends. Ehlers' published default is 48 bars. Keep it well above the Low-Pass Period; the two cutoffs should bracket the swing length you trade.")
+
+lpPeriodInput = input.int(10, "Low-Pass Period", minval = 2, group = "Settings",
+     tooltip = "Lower cutoff of the passband, in bars. The SuperSmoother stage removes bar-to-bar noise and aliasing — every component with a period shorter than this. Ehlers' published default is 10 bars. Narrow the band too far and the output starts ringing at whatever period the filter favors.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "direction", group = "Style",
+     tooltip = "Color of the roofed output, its gradient fill and the zero-cross marker while the output holds above zero.")
+
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "direction", group = "Style",
+     tooltip = "Color of the roofed output, its gradient fill and the zero-cross marker while the output holds below zero.")
+
+gradientInput  = input.bool(true, "Gradient Fill", group = "Style",
+     tooltip = "Fills the span between the zero line and the roofed output with a vertical gradient — fully transparent at zero, strongest at the current value.")
+
+markersInput   = input.bool(false, "Zero-Cross Markers", group = "Style",
+     tooltip = "Displays a small circle where the roofed output crosses the zero line — the cycle-scale swing shift the filter exposes. Off by default to keep the pane clean; the zero-cross alerts work regardless.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Two-pole high-pass — the front end of Ehlers' published roofing filter:
+// alpha1 = (cos(.707 * 2pi / P) + sin(.707 * 2pi / P) - 1) / cos(.707 * 2pi / P),
+// hp = (1 - alpha1/2)^2 * (src - 2*src[1] + src[2]) + 2*(1 - alpha1)*hp[1] - (1 - alpha1)^2*hp[2]
+// Removes components with periods longer than P — trend and drift — leaving a zero-mean residue,
+// and corrects the spectral dilation that lets slow swings drown out tradable cycles.
+highPass2(float src, simple int period) =>
+    angle  = HALF_SQRT2 * 2 * math.pi / period
+    alpha1 = (math.cos(angle) + math.sin(angle) - 1) / math.cos(angle)
+    k      = 1 - alpha1 / 2
+    float hp = na
+    hp := k * k * (src - 2 * nz(src[1], src) + nz(src[2], src)) + 2 * (1 - alpha1) * nz(hp[1]) - (1 - alpha1) * (1 - alpha1) * nz(hp[2])
+    hp
+
+// Two-pole SuperSmoother — Ehlers' published Butterworth-derived recipe:
+// a1 = e^(-sqrt(2)*pi/P), b1 = 2*a1*cos(sqrt(2)*pi/P), c2 = b1, c3 = -a1^2, c1 = 1 - c2 - c3,
+// filt = c1*(src + src[1])/2 + c2*filt[1] + c3*filt[2]
+// Removes components with periods shorter than P — bar-to-bar noise and aliasing.
+superSmoother2(float src, simple int period) =>
+    arg = SQRT2 * math.pi / period
+    a1  = math.exp(-arg)
+    b1  = 2 * a1 * math.cos(arg)
+    c2  = b1
+    c3  = -a1 * a1
+    c1  = 1 - c2 - c3
+    float filt = na
+    filt := c1 * (src + nz(src[1], src)) / 2 + c2 * nz(filt[1], src) + c3 * nz(filt[2], src)
+    filt
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+// na-proof source — the recursive filter chain must never ingest na
+float src = nz(srcInput, close)
+
+// Stage 1: high-pass strips everything slower than the upper cutoff (trend, drift)
+float highPass = highPass2(src, hpPeriodInput)
+
+// Stage 2: SuperSmoother strips everything faster than the lower cutoff (noise, aliasing).
+// What survives is the roof — the tradable cycle band between the two cutoffs.
+float roof = superSmoother2(highPass, lpPeriodInput)
+
+// Zero crossings and turns of the roofed output mark cycle-scale swing shifts
+bool crossUp   = ta.crossover(roof, 0)
+bool crossDown = ta.crossunder(roof, 0)
+
+float slope = roof - nz(roof[1], roof)
+
+bool turnUp   = not na(slope[1]) and slope > 0 and slope[1] <= 0
+bool turnDown = not na(slope[1]) and slope < 0 and slope[1] >= 0
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+bool roofPositive = roof > 0
+
+color valueFillColor = gradientInput ? color.new(roofPositive ? bullColorInput : bearColorInput, FILL_VALUE_TRANSP) : na
+color zeroFillColor  = gradientInput ? color.new(roofPositive ? bullColorInput : bearColorInput, FILL_ZERO_TRANSP) : na
+
+roofPlotId = plot(roof, "Roofing Filter", color = roofPositive ? bullColorInput : bearColorInput, linewidth = 2)
+zeroPlotId = plot(0, "Zero Line", color = color.new(chart.fg_color, 80))
+
+fill(roofPlotId, zeroPlotId, top_value = math.max(roof, 0), bottom_value = math.min(roof, 0), top_color = roofPositive ? valueFillColor : zeroFillColor, bottom_color = roofPositive ? zeroFillColor : valueFillColor, title = "Output Gradient Fill")
+
+plotshape(markersInput and crossUp ? roof : na, "Zero-Cross Up Marker", shape.circle, location.absolute, color = bullColorInput, size = size.tiny)
+plotshape(markersInput and crossDown ? roof : na, "Zero-Cross Down Marker", shape.circle, location.absolute, color = bearColorInput, size = size.tiny)
+
+plot(highPass, "High-Pass Stage", color = NEUTRAL_COLOR, display = display.data_window, editable = false)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(crossUp, "Zero Cross Up", "Roofing Filter on {{ticker}}: roofed output crossed above zero — cycle-scale upswing ({{interval}})")
+alertcondition(crossDown, "Zero Cross Down", "Roofing Filter on {{ticker}}: roofed output crossed below zero — cycle-scale downswing ({{interval}})")
+alertcondition(turnUp, "Turn Up", "Roofing Filter on {{ticker}}: roofed output turned up — cycle trough forming ({{interval}})")
+alertcondition(turnDown, "Turn Down", "Roofing Filter on {{ticker}}: roofed output turned down — cycle crest forming ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

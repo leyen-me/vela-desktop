@@ -1,0 +1,126 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Coral Trend", shorttitle = "Coral Trend", overlay = true)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR = #089981
+BEAR_COLOR = #f23645
+FLAT_COLOR = #787b86
+
+FILL_PRICE_TRANSP = 60  // gradient transparency at the price end of the fill
+FILL_LINE_TRANSP  = 100 // gradient transparency at the Coral end of the fill
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+srcInput             = input.source(close, "Source", group = "Settings",
+     tooltip = "Series fed into the smoothing cascade. Close is the standard choice — whatever is selected is run through all six exponential stages before the slope coloring is read.")
+
+smoothingPeriodInput = input.int(21, "Smoothing Period", minval = 1, group = "Settings",
+     tooltip = "Sets how slow the curve is. The period converts into the single pole shared by all six cascaded smoothing stages (di = (period − 1) / 2 + 1, coefficient 2 / (di + 1)) — longer periods give a rounder line with fewer, later color flips; shorter periods flip earlier but more often. Popular versions ship around 21 bars; defaults differ between implementations, so treat any pair of settings as a starting point rather than a definition.")
+
+constantDInput       = input.float(0.4, "Constant D", minval = 0, maxval = 1, step = 0.05, group = "Settings",
+     tooltip = "Lag-compensation constant weighting the recombination of the cascade's last four stages. Pushing it harder makes the line livelier but introduces overshoot around sharp turns — the standard trade-off in lag-compensated smoothers; smaller values give a smoother, slower curve with fewer, later flips. Popular versions sit near 0.4; at 0 the compensation switches off entirely and the line collapses into the bare triple-smoothed cascade stage.")
+
+bullColorInput       = input.color(BULL_COLOR, "Rising", inline = "direction", group = "Style",
+     tooltip = "Color of the Coral line while it is rising. The line is almost always read through its color — the slope itself is the signal being presented.")
+
+bearColorInput       = input.color(BEAR_COLOR, "Falling", inline = "direction", group = "Style",
+     tooltip = "Color of the Coral line while it is falling.")
+
+flatColorInput       = input.color(FLAT_COLOR, "Flat", group = "Style",
+     tooltip = "Color used on the rare bars where the line's value is exactly unchanged and no slope read exists — typically only the very first bars or dead markets.")
+
+lineWidthInput       = input.int(2, "Line Width", minval = 1, maxval = 5, group = "Style",
+     tooltip = "Width of the Coral Trend line.")
+
+showFillInput        = input.bool(true, "Price Gradient Fill", group = "Style",
+     tooltip = "Fills the area between the source and the Coral line with a vertical gradient in the current trend color, fading to fully transparent at the line — a quick read of how far price has stretched from the curve it is trending around, and of pullbacks returning to a still-rising line.")
+
+showMarkersInput     = input.bool(false, "Color Flip Markers", group = "Style",
+     tooltip = "Draws a small dot on the line wherever its color flips to bullish or bearish. Off by default to keep the chart clean — the color-flip alerts fire regardless. Repeated flips in a tight area are the ranging warning the color is meant to expose.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+// The Coral Trend Filter — a heavily smoothed trend line from the moving-average lineage, closely
+// related to T3. The source is passed through a cascade of six identical one-pole exponential
+// smoothing stages whose coefficient derives from the smoothing period:
+//   di = (period − 1) / 2 + 1,   c1 = 2 / (di + 1),   c2 = 1 − c1
+//   stageK = c1 * stageK−1 + c2 * previous(stageK)
+// The last four stages are then recombined with weights that depend only on the constant d:
+//   coral = −d³ * stage6 + c3 * stage5 + c4 * stage4 + c5 * stage3
+//   c3 = 3 * (d² + d³),   c4 = −3 * (2d² + d + d³),   c5 = 3d + 1 + d³ + 3d²
+// The four weights sum to exactly one: the repeated smoothing strips out most bar-to-bar noise,
+// while the weighted recombination claws back part of the lag that stacking that many passes would
+// otherwise add. The result is a slow, rounded curve that turns cleanly rather than wiggling.
+di = (smoothingPeriodInput - 1.0) / 2.0 + 1.0
+c1 = 2.0 / (di + 1.0)
+c2 = 1.0 - c1
+
+d1 = constantDInput
+d2 = d1 * d1
+d3 = d2 * d1
+
+c3 = 3.0 * (d2 + d3)
+c4 = -3.0 * (2.0 * d2 + d1 + d3)
+c5 = 3.0 * d1 + 1.0 + d3 + 3.0 * d2
+
+// Six cascaded one-pole exponential smoothing stages, each seeded with its own input so the curve
+// starts on price instead of drifting in from zero
+var float stage1 = na
+var float stage2 = na
+var float stage3 = na
+var float stage4 = na
+var float stage5 = na
+var float stage6 = na
+
+stage1 := c1 * srcInput + c2 * nz(stage1[1], srcInput)
+stage2 := c1 * stage1   + c2 * nz(stage2[1], stage1)
+stage3 := c1 * stage2   + c2 * nz(stage3[1], stage2)
+stage4 := c1 * stage3   + c2 * nz(stage4[1], stage3)
+stage5 := c1 * stage4   + c2 * nz(stage5[1], stage4)
+stage6 := c1 * stage5   + c2 * nz(stage6[1], stage5)
+
+// Weighted recombination compensating the stacked smoothing lag
+coralValue = -d3 * stage6 + c3 * stage5 + c4 * stage4 + c5 * stage3
+
+// Slope read — the color of the line is the trend signal: +1 rising, -1 falling, 0 flat
+coralPrev = nz(coralValue[1], coralValue)
+trendDir  = coralValue > coralPrev ? 1 : coralValue < coralPrev ? -1 : 0
+
+// Color flips of the line and price crossings of the slow leg
+bullFlip  = trendDir == 1  and nz(trendDir[1]) != 1
+bearFlip  = trendDir == -1 and nz(trendDir[1]) != -1
+crossUp   = ta.crossover(srcInput, coralValue)
+crossDown = ta.crossunder(srcInput, coralValue)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+coralColor = trendDir == 1 ? bullColorInput : trendDir == -1 ? bearColorInput : flatColorInput
+
+priceAbove      = srcInput > coralValue
+fillTopColor    = showFillInput ? color.new(coralColor, priceAbove ? FILL_PRICE_TRANSP : FILL_LINE_TRANSP) : na
+fillBottomColor = showFillInput ? color.new(coralColor, priceAbove ? FILL_LINE_TRANSP : FILL_PRICE_TRANSP) : na
+
+srcPlotId   = plot(srcInput, "Source", color = na, editable = false, display = display.none)
+coralPlotId = plot(coralValue, "Coral Trend", color = coralColor, linewidth = lineWidthInput)
+
+fill(srcPlotId, coralPlotId, top_value = math.max(srcInput, coralValue), bottom_value = math.min(srcInput, coralValue), top_color = fillTopColor, bottom_color = fillBottomColor, title = "Price / Coral Gradient Fill")
+
+plotshape(showMarkersInput and bullFlip ? coralValue : na, "Bullish Flip Marker", shape.circle, location.absolute, color = bullColorInput, size = size.tiny)
+plotshape(showMarkersInput and bearFlip ? coralValue : na, "Bearish Flip Marker", shape.circle, location.absolute, color = bearColorInput, size = size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(bullFlip, "Bullish Color Flip", "Coral Trend turned bullish — the line's slope flipped upward on {{ticker}} ({{interval}})")
+alertcondition(bearFlip, "Bearish Color Flip", "Coral Trend turned bearish — the line's slope flipped downward on {{ticker}} ({{interval}})")
+alertcondition(crossUp, "Bullish Price Cross", "Price crossed above the Coral Trend line on {{ticker}} ({{interval}})")
+alertcondition(crossDown, "Bearish Price Cross", "Price crossed below the Coral Trend line on {{ticker}} ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

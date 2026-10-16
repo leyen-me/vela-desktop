@@ -1,0 +1,123 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Monte Carlo Expected Move Distribution", "MC Expected Move", overlay = true, max_boxes_count = 500, max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants & Inputs
+//---------------------------------------------------------------------------------------------------------------------{
+// --- Colors ---
+color BULL_COLOR            = #089981
+color BEAR_COLOR            = #f23645
+color NEUTRAL_COLOR         = #787b86
+color DATA                  = #DBDBDB
+color HEADERS               = #808080
+color BACKGROUND            = #161616
+color BORDERS               = #2E2E2E
+
+// --- Monte Carlo Settings ---
+string MC_GROUP             = "Monte Carlo Simulation"
+int simCountInput           = input.int(200, "Simulations", minval = 50, maxval = 500, group = MC_GROUP, tooltip = "Number of simulated paths to generate. Higher values create a smoother distribution.")
+int projLenInput            = input.int(30, "Projection Length", minval = 5, maxval = 100, group = MC_GROUP, tooltip = "Number of bars into the future to calculate the expected move.")
+int volLookbackInput        = input.int(50, "Volatility Lookback", minval = 5, group = MC_GROUP, tooltip = "Lookback period for calculating log-volatility.")
+bool driftInput             = input.bool(true, "Include Trend (Drift)", group = MC_GROUP)
+
+// --- Visualization ---
+string VIS_GROUP            = "Distribution Visuals"
+int priceBinsInput          = input.int(25, "Price Bins", minval = 10, maxval = 50, group = VIS_GROUP, tooltip = "Vertical resolution of the probability distribution.")
+color distColorInput        = input.color(color.new(#2196f3, 20), "Distribution Color", group = VIS_GROUP)
+int maxWidthInput           = input.int(20, "Max Distribution Width", minval = 5, maxval = 50, group = VIS_GROUP, tooltip = "The maximum horizontal width (in bars) of the distribution profile.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// User Defined Functions
+//---------------------------------------------------------------------------------------------------------------------{
+getGaussian() =>
+    float rand = 0.0
+    for j = 0 to 11
+        rand += math.random(0, 1)
+    rand - 6.0
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+// 1. Volatility (Log-returns)
+float logReturns = math.log(close / nz(close[1], close))
+float vol = ta.stdev(logReturns, volLookbackInput)
+
+// 2. Log-Drift (Approximate trend)
+float ma = ta.sma(close, volLookbackInput)
+float logDrift = driftInput ? math.log(ma / nz(ma[1], ma)) : 0.0
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Simulation Logic
+//---------------------------------------------------------------------------------------------------------------------{
+if barstate.islast
+    var float[] finalPrices = array.new_float(0)
+    array.clear(finalPrices)
+    
+    // Core Simulation Loop: Collect only the end-price of each path
+    for i = 0 to simCountInput - 1
+        float currentSimPrice = close
+        for step = 1 to projLenInput
+            currentSimPrice *= math.exp(logDrift + vol * getGaussian())
+        array.push(finalPrices, currentSimPrice)
+    
+    // Sort for percentile calculation
+    array.sort(finalPrices)
+    
+    // Stats
+    float p16 = array.get(finalPrices, math.floor(simCountInput * 0.16)) // ~ -1 SD
+    float p50 = array.get(finalPrices, math.floor(simCountInput * 0.50)) // Median
+    float p84 = array.get(finalPrices, math.floor(simCountInput * 0.84)) // ~ +1 SD
+    
+    // Define Bin Range for the Distribution
+    float minPrice = array.min(finalPrices)
+    float maxPrice = array.max(finalPrices)
+    float priceRange = maxPrice - minPrice
+    float binSize = priceRange / priceBinsInput
+    
+    // Count prices in each bin
+    int[] binCounts = array.new_int(priceBinsInput, 0)
+    for price in finalPrices
+        int binIdx = math.min(priceBinsInput - 1, math.max(0, math.floor((price - minPrice) / binSize)))
+        array.set(binCounts, binIdx, array.get(binCounts, binIdx) + 1)
+        
+    int maxBinCount = array.max(binCounts)
+    int targetBar = bar_index + projLenInput
+    
+    //---------------------------------------------------------------------------------------------------------------------}
+    // Visualization: Distribution Profile
+    //---------------------------------------------------------------------------------------------------------------------{
+    for b = 0 to priceBinsInput - 1
+        int count = array.get(binCounts, b)
+        if count > 0
+            float binTop = minPrice + (b + 1) * binSize
+            float binBot = minPrice + b * binSize
+            
+            // Width of the box represents the density (frequency)
+            float width = (float(count) / maxBinCount) * maxWidthInput
+            
+            // Determine if bin is within the "Expected Move" (1 Std Dev range)
+            bool isInsideEM = binTop <= p84 and binBot >= p16
+            color binColor  = isInsideEM ? distColorInput : color.new(NEUTRAL_COLOR, 60)
+            
+            box.new(
+              left          = targetBar, 
+              top           = binTop, 
+              right         = targetBar + math.round(width), 
+              bottom        = binBot,
+              border_color  = na,
+              bgcolor       = binColor
+              )
+
+    // Expected Move Labels
+    label.new(targetBar + maxWidthInput, p84, "Exp. Upper (+1 SD): " + str.tostring(p84, format.mintick), style = label.style_label_left, color = #00000000, textcolor = BULL_COLOR, size = size.small)
+    label.new(targetBar + maxWidthInput, p50, "Median Outcome: " + str.tostring(p50, format.mintick), style = label.style_label_left, color = #00000000, textcolor = DATA, size = size.small)
+    label.new(targetBar + maxWidthInput, p16, "Exp. Lower (-1 SD): " + str.tostring(p16, format.mintick), style = label.style_label_left, color = #00000000, textcolor = BEAR_COLOR, size = size.small)
+
+    // Projection Lines
+    line.new(bar_index, close, targetBar, p84, color = BULL_COLOR, style = line.style_dashed)
+    line.new(bar_index, close, targetBar, p16, color = BEAR_COLOR, style = line.style_dashed)
+
+//---------------------------------------------------------------------------------------------------------------------}

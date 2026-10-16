@@ -1,0 +1,419 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Decision Trees", "Decision Trees", overlay = false, format = format.price, precision = 2, calc_bars_count = 3000)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+int    N_FEATURES     = 5
+int    TABLE_ROWS     = 36
+float  GAIN_EPS       = 1e-10
+
+string TARGET_DIR     = "Direction (Up/Down)"
+string TARGET_RET     = "Forward Return %"
+string TARGET_VOL     = "Forward Volatility %"
+
+string GRP_TREE       = "Decision Tree"
+string GRP_FEAT       = "Features"
+string GRP_TABLE      = "Rules Table"
+string GRP_STYLE      = "Style"
+
+color  BULL_COLOR     = #089981
+color  BEAR_COLOR     = #f23645
+color  METRIC_COLOR   = #ff9800 // the one accent - the direction-free volatility target
+color  GUIDE_COLOR    = #787b86
+
+color  DASH_BG        = #161616
+color  DASH_FRAME     = #2E2E2E
+color  DASH_HEADER    = #808080
+color  DASH_TEXT      = #DBDBDB
+
+LOG2 = math.log(2.0)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+targetInput     = input.string(TARGET_DIR, "Target", options = [TARGET_DIR, TARGET_RET, TARGET_VOL], group = GRP_TREE, tooltip = "What each leaf of the tree predicts from the bar's features. Direction is a classification target: the leaf stores the probability that close rises over the horizon. Forward Return and Forward Volatility are regression targets: the leaf stores a numeric value, the mean forward percent return or the mean forward realized volatility of its training samples.")
+impurityInput   = input.string("Gini", "Impurity Measure", options = ["Gini", "Entropy"], group = GRP_TREE, tooltip = "Split-quality criterion for the Direction target: Gini impurity, 1 - sum(p_c^2), or entropy, -sum(p_c * log2(p_c)). Regression targets always use variance. Gini and entropy usually produce similar trees; depth and leaf-size limits matter more.")
+horizonInput    = input.int(10, "Prediction Horizon (bars)", minval = 1, maxval = 100, group = GRP_TREE, tooltip = "Bars ahead used to label each training sample: the direction, percent return, or realized volatility of close over the next N bars. Use a horizon of at least 5 bars for the volatility target.")
+trainInput      = input.int(200, "Training Window (samples)", minval = 20, maxval = 500, group = GRP_TREE, tooltip = "Number of most recent labeled bars the tree is grown on. Larger windows give steadier trees but adapt more slowly and cost more computation.")
+depthInput      = input.int(3, "Maximum Depth", minval = 1, maxval = 5, group = GRP_TREE, tooltip = "Stopping rule: the maximum number of yes/no questions on any root-to-leaf path. Shallow trees of depth 2 to 4 keep the rules readable and resist overfitting; each additional level doubles the number of regions available to fit noise.")
+leafInput       = input.int(20, "Minimum Leaf Size", minval = 1, maxval = 100, group = GRP_TREE, tooltip = "Stopping rule: the smallest number of training samples a leaf may hold. Generous leaf sizes prevent the tree from memorizing chance patterns in noisy market data.")
+gainInput       = input.float(0.0, "Minimum Gain", minval = 0, step = 0.001, group = GRP_TREE, tooltip = "Pre-pruning: a split is only kept when its impurity gain, I(parent) - (n_L/n)*I(left) - (n_R/n)*I(right), exceeds this value. 0 accepts any strictly positive gain.")
+candInput       = input.int(24, "Split Candidates", minval = 8, maxval = 48, group = GRP_TREE, tooltip = "Number of quantile-based candidate thresholds scanned per feature at each node (histogram split finding, as used by modern tree libraries). The gain formula is evaluated exactly at every candidate; more candidates give finer thresholds at a higher computational cost.")
+retrainInput    = input.int(10, "Retrain Every (bars)", minval = 1, maxval = 200, group = GRP_TREE, tooltip = "Walk-forward cadence: the tree is regrown from the most recent window every N closed bars, and bars in between are classified by the last fitted tree. Low values adapt faster but are heavier to compute.")
+confidenceInput = input.float(70, "High-Confidence Level %", minval = 50, maxval = 100, step = 1, group = GRP_TREE, tooltip = "Direction target only: dashed guides and the high-confidence alerts trigger when P(up) rises above this level or falls below 100 minus this level. Useful for gating other strategies on regime confidence.")
+
+rsiOnInput   = input.bool(true, "RSI", inline = "f1", group = GRP_FEAT, tooltip = "Momentum feature: Relative Strength Index of close. Bounded and stationary, so its split thresholds stay meaningful over time.")
+rsiLenInput  = input.int(14, "Length", minval = 2, maxval = 200, inline = "f1", group = GRP_FEAT, tooltip = "RSI lookback length.")
+rvOnInput    = input.bool(true, "Relative Volume", inline = "f2", group = GRP_FEAT, tooltip = "Participation feature: volume divided by its N-bar average. Automatically excluded from splitting when the symbol provides no volume data.")
+rvLenInput   = input.int(20, "Length", minval = 2, maxval = 200, inline = "f2", group = GRP_FEAT, tooltip = "Volume average lookback length.")
+rocOnInput   = input.bool(true, "Rate of Change %", inline = "f3", group = GRP_FEAT, tooltip = "Trend feature: percent change of close over the last N bars. A return-based feature rather than raw price, whose scale would drift and make thresholds stop making sense.")
+rocLenInput  = input.int(10, "Length", minval = 1, maxval = 200, inline = "f3", group = GRP_FEAT, tooltip = "Rate of change lookback length.")
+stochOnInput = input.bool(true, "Stochastic %K", inline = "f4", group = GRP_FEAT, tooltip = "Position feature: where close sits within the N-bar high-low range, from 0 to 100.")
+stochLenInput = input.int(14, "Length", minval = 2, maxval = 200, inline = "f4", group = GRP_FEAT, tooltip = "Stochastic lookback length.")
+atrOnInput   = input.bool(true, "ATR %", inline = "f5", group = GRP_FEAT, tooltip = "Volatility feature: Average True Range as a percentage of close, a scale-free volatility reading the tree can threshold for regime splits.")
+atrLenInput  = input.int(14, "Length", minval = 1, maxval = 200, inline = "f5", group = GRP_FEAT, tooltip = "ATR lookback length.")
+
+showTableInput = input.bool(true, "Show Rules Table", group = GRP_TABLE, tooltip = "Display the fitted tree as an explicit, auditable list of if-then rules: one row per leaf with its path conditions, prediction, and training-sample count. The row marked with an arrow is the leaf the current bar routes to.")
+tablePosInput  = input.string("Top Right", "Location", options = ["Top Right", "Top Left", "Middle Right", "Middle Left", "Bottom Right", "Bottom Left"], group = GRP_TABLE, tooltip = "Rules table position on the chart.")
+textSizeInput  = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = GRP_TABLE, tooltip = "Rules table text size.")
+
+bullColorInput   = input.color(BULL_COLOR, "Bullish", inline = "clr1", group = GRP_STYLE)
+bearColorInput   = input.color(BEAR_COLOR, "Bearish", inline = "clr1", group = GRP_STYLE)
+metricColorInput = input.color(METRIC_COLOR, "Volatility Target", inline = "clr2", group = GRP_STYLE)
+guideColorInput  = input.color(GUIDE_COLOR, "Center / Guides", inline = "clr2", group = GRP_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types
+//---------------------------------------------------------------------------------------------------------------------{
+type TreeNode
+    int   featureIdx = -1
+    float threshold  = na
+    float prediction = na
+    float gain       = na
+    int   count      = 0
+    int   depth      = 0
+    int   parentId   = -1
+    int   leftId     = -1
+    int   rightId    = -1
+    bool  isLeft     = false
+    bool  isLeaf     = true
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Node impurity from sufficient statistics. Labels are 0/1 for classification, so the class share p is the mean.
+// kind 0: Gini(node) = 1 - sum(p_c^2) | kind 1: Entropy(node) = -sum(p_c * log2(p_c)) | kind 2: variance (regression)
+impurityOf(float cnt, float sumVal, float ssqVal, int impurityKind) =>
+    float result = 0.0
+    if cnt > 0
+        float meanVal = sumVal / cnt
+        if impurityKind == 2
+            result := math.max(ssqVal / cnt - meanVal * meanVal, 0)
+        else
+            float p = math.min(math.max(meanVal, 0), 1)
+            float q = 1 - p
+            if impurityKind == 0
+                result := 1 - (p * p + q * q)
+            else
+                float pTerm = p > 0 ? p * math.log(p) / LOG2 : 0.0
+                float qTerm = q > 0 ? q * math.log(q) / LOG2 : 0.0
+                result := -(pTerm + qTerm)
+    result
+
+// Greedy CART split search: the feature/threshold pair with the highest impurity gain,
+// Gain(split) = I(parent) - (n_L / n) * I(left) - (n_R / n) * I(right),
+// evaluated exactly at quantile-based candidate thresholds of each usable feature.
+findBestSplit(array<int> nodeSamples, matrix<float> featMat, array<int> rowsArr, array<float> labelsArr, array<bool> usableArr, int impurityKind, int minLeaf, int candCount) =>
+    int   n        = nodeSamples.size()
+    int   bestFeat = -1
+    float bestThr  = na
+    float bestGain = 0.0
+    if n >= 2 * minLeaf and n >= 2
+        array<float> labs = array.new_float()
+        float totalSum = 0.0
+        float totalSsq = 0.0
+        for j = 0 to n - 1
+            float lb = labelsArr.get(nodeSamples.get(j))
+            labs.push(lb)
+            totalSum += lb
+            totalSsq += lb * lb
+        float parentImp = impurityOf(n, totalSum, totalSsq, impurityKind)
+        if parentImp > GAIN_EPS
+            for f = 0 to N_FEATURES - 1
+                if usableArr.get(f)
+                    array<float> vals = array.new_float()
+                    for j = 0 to n - 1
+                        vals.push(featMat.get(rowsArr.get(nodeSamples.get(j)), f))
+                    array<float> sortedVals = vals.copy()
+                    sortedVals.sort()
+                    array<float> candArr = array.new_float()
+                    for q = 1 to candCount - 1
+                        int pos = q * n / candCount
+                        if pos >= 1 and pos <= n - 1
+                            float lo = sortedVals.get(pos - 1)
+                            float hi = sortedVals.get(pos)
+                            if hi > lo
+                                float cand = (lo + hi) / 2
+                                if candArr.size() == 0 or cand > candArr.get(candArr.size() - 1)
+                                    candArr.push(cand)
+                    if candArr.size() > 0
+                        for c = 0 to candArr.size() - 1
+                            float thr     = candArr.get(c)
+                            int   leftCnt = 0
+                            float leftSum = 0.0
+                            float leftSsq = 0.0
+                            for j = 0 to n - 1
+                                if vals.get(j) <= thr
+                                    float lb = labs.get(j)
+                                    leftCnt += 1
+                                    leftSum += lb
+                                    leftSsq += lb * lb
+                            int rightCnt = n - leftCnt
+                            if leftCnt >= minLeaf and rightCnt >= minLeaf
+                                float leftImp  = impurityOf(leftCnt, leftSum, leftSsq, impurityKind)
+                                float rightImp = impurityOf(rightCnt, totalSum - leftSum, totalSsq - leftSsq, impurityKind)
+                                float gainVal  = parentImp - (1.0 * leftCnt / n) * leftImp - (1.0 * rightCnt / n) * rightImp
+                                if gainVal > bestGain + GAIN_EPS
+                                    bestGain := gainVal
+                                    bestFeat := f
+                                    bestThr  := thr
+    [bestFeat, bestThr, bestGain]
+
+// Grows one CART tree on the most recent window: labels each sample over the horizon, then repeatedly takes the
+// split with the highest gain, level by level, until max depth, min leaf size, or the minimum gain stops it.
+trainTree(matrix<float> featMat, array<float> closeArr, int targetKind, int impurityKind, int horizon, int trainN, int maxDepth, int minLeaf, float minGain, int candCount, array<bool> enabledArr) =>
+    int lastRow = matrix.rows(featMat) - 1
+    array<int>   rowsArr   = array.new_int()
+    array<float> labelsArr = array.new_float()
+    for s = 0 to trainN - 1
+        int r = lastRow - horizon - s
+        rowsArr.push(r)
+        float baseClose = closeArr.get(r)
+        float endClose  = closeArr.get(r + horizon)
+        float labelVal  = 0.0
+        if targetKind == 0
+            labelVal := endClose > baseClose ? 1.0 : 0.0
+        else if targetKind == 1
+            labelVal := (endClose / baseClose - 1) * 100
+        else
+            float retSum = 0.0
+            float retSsq = 0.0
+            for k = 1 to horizon
+                float stepRet = (closeArr.get(r + k) / closeArr.get(r + k - 1) - 1) * 100
+                retSum += stepRet
+                retSsq += stepRet * stepRet
+            float meanRet = retSum / horizon
+            labelVal := math.sqrt(math.max(retSsq / horizon - meanRet * meanRet, 0))
+        labelsArr.push(labelVal)
+    // a feature is usable when enabled and free of na values within the training window
+    array<bool> usableArr = array.new_bool(N_FEATURES, false)
+    for f = 0 to N_FEATURES - 1
+        if enabledArr.get(f)
+            bool clean = true
+            for j = 0 to trainN - 1
+                if na(featMat.get(rowsArr.get(j), f))
+                    clean := false
+                    break
+            usableArr.set(f, clean)
+    // root node
+    array<TreeNode> nodes = array.new<TreeNode>()
+    float rootSum = 0.0
+    for s = 0 to trainN - 1
+        rootSum += labelsArr.get(s)
+    nodes.push(TreeNode.new(prediction = rootSum / trainN, count = trainN, depth = 0))
+    // level-order growth; each sample tracks the node it currently belongs to
+    array<int> sampleNodeId = array.new_int(trainN, 0)
+    array<int> currentLevel = array.from(0)
+    for d = 0 to maxDepth - 1
+        array<int> nextLevel = array.new_int()
+        if currentLevel.size() > 0
+            for li = 0 to currentLevel.size() - 1
+                int nodeId = currentLevel.get(li)
+                array<int> nodeSamples = array.new_int()
+                for j = 0 to trainN - 1
+                    if sampleNodeId.get(j) == nodeId
+                        nodeSamples.push(j)
+                [bestFeat, bestThr, bestGain] = findBestSplit(nodeSamples, featMat, rowsArr, labelsArr, usableArr, impurityKind, minLeaf, candCount)
+                if bestFeat >= 0 and bestGain > minGain
+                    int   leftId   = nodes.size()
+                    int   rightId  = leftId + 1
+                    int   leftCnt  = 0
+                    int   rightCnt = 0
+                    float leftSum  = 0.0
+                    float rightSum = 0.0
+                    for j = 0 to nodeSamples.size() - 1
+                        int   sIdx   = nodeSamples.get(j)
+                        float sVal   = featMat.get(rowsArr.get(sIdx), bestFeat)
+                        float sLab   = labelsArr.get(sIdx)
+                        bool  goLeft = na(sVal) ? true : sVal <= bestThr
+                        if goLeft
+                            leftCnt += 1
+                            leftSum += sLab
+                            sampleNodeId.set(sIdx, leftId)
+                        else
+                            rightCnt += 1
+                            rightSum += sLab
+                            sampleNodeId.set(sIdx, rightId)
+                    TreeNode parentNode = nodes.get(nodeId)
+                    parentNode.featureIdx := bestFeat
+                    parentNode.threshold  := bestThr
+                    parentNode.gain       := bestGain
+                    parentNode.isLeaf     := false
+                    parentNode.leftId     := leftId
+                    parentNode.rightId    := rightId
+                    nodes.push(TreeNode.new(prediction = leftSum / leftCnt, count = leftCnt, depth = d + 1, parentId = nodeId, isLeft = true))
+                    nodes.push(TreeNode.new(prediction = rightSum / rightCnt, count = rightCnt, depth = d + 1, parentId = nodeId, isLeft = false))
+                    nextLevel.push(leftId)
+                    nextLevel.push(rightId)
+        currentLevel := nextLevel
+    nodes
+
+// Routes the current bar's feature vector down the fitted tree and returns [leaf prediction, leaf node id].
+predictTree(array<TreeNode> nodes, array<float> featureVals, int maxDepth) =>
+    float result = na
+    int   leafId = -1
+    if nodes.size() > 0
+        int nodeId = 0
+        for step = 0 to maxDepth
+            TreeNode nd = nodes.get(nodeId)
+            if nd.isLeaf
+                result := nd.prediction
+                leafId := nodeId
+                break
+            float v = featureVals.get(nd.featureIdx)
+            if na(v)
+                result := nd.prediction
+                leafId := nodeId
+                break
+            nodeId := v <= nd.threshold ? nd.leftId : nd.rightId
+    [result, leafId]
+
+// Rebuilds a leaf's decision path as readable text, one condition per level from root to leaf.
+ruleText(array<TreeNode> nodes, int leafId, array<string> namesArr, int maxDepth) =>
+    string txt = ""
+    int    cur = leafId
+    for step = 0 to maxDepth
+        int par = nodes.get(cur).parentId
+        if par < 0
+            break
+        TreeNode parentNode = nodes.get(par)
+        string cond = namesArr.get(parentNode.featureIdx) + (nodes.get(cur).isLeft ? " ≤ " : " > ") + str.tostring(parentNode.threshold, "#.##")
+        txt := txt == "" ? cond : cond + "\n" + txt
+        cur := par
+    txt == "" ? "always (root leaf)" : txt
+
+getTablePosition(string txt) =>
+    switch txt
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Middle Right" => position.middle_right
+        "Middle Left"  => position.middle_left
+        "Bottom Left"  => position.bottom_left
+        => position.bottom_right
+
+getTextSize(string txt) =>
+    switch txt
+        "Tiny"   => size.tiny
+        "Normal" => size.normal
+        => size.small
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Logic
+//---------------------------------------------------------------------------------------------------------------------{
+int targetKind   = targetInput == TARGET_DIR ? 0 : targetInput == TARGET_RET ? 1 : 2
+int impurityKind = targetKind == 0 ? (impurityInput == "Gini" ? 0 : 1) : 2
+int windowCap    = trainInput + horizonInput
+
+// stationary features computed from OHLCV
+float volAvg   = ta.sma(volume, rvLenInput)
+float rsiVal   = ta.rsi(close, rsiLenInput)
+float relVol   = volume / volAvg
+float rocVal   = ta.roc(close, rocLenInput)
+float stochVal = ta.stoch(close, high, low, stochLenInput)
+float atrPct   = ta.atr(atrLenInput) / close * 100
+
+var matrix<float>   featureMatrix = matrix.new<float>(0, N_FEATURES)
+var array<float>    closeHistory  = array.new_float()
+var array<TreeNode> treeNodes     = array.new<TreeNode>()
+var array<string>   featureNames  = array.from("RSI", "Rel Volume", "ROC %", "Stoch %K", "ATR %")
+var int             lastTrainBar  = na
+
+// rolling history of features and closes; the tree is refit walk-forward on closed bars only,
+// using samples whose forward horizon is fully realized — no lookahead
+if barstate.isconfirmed
+    matrix.add_row(featureMatrix, matrix.rows(featureMatrix), array.from(rsiVal, relVol, rocVal, stochVal, atrPct))
+    array.push(closeHistory, close)
+    if matrix.rows(featureMatrix) > windowCap
+        matrix.remove_row(featureMatrix, 0)
+        array.shift(closeHistory)
+    if matrix.rows(featureMatrix) >= windowCap and (na(lastTrainBar) or bar_index - lastTrainBar >= retrainInput)
+        treeNodes    := trainTree(featureMatrix, closeHistory, targetKind, impurityKind, horizonInput, trainInput, depthInput, leafInput, gainInput, candInput, array.from(rsiOnInput, rvOnInput, rocOnInput, stochOnInput, atrOnInput))
+        lastTrainBar := bar_index
+
+// route the live bar down the last fitted tree
+[rawPred, activeLeafId] = predictTree(treeNodes, array.from(rsiVal, relVol, rocVal, stochVal, atrPct), depthInput)
+
+float oscVal      = targetKind == 0 ? rawPred * 100 : rawPred
+float centerLevel = targetKind == 0 ? 50.0 : 0.0
+bool  aboveCenter = oscVal >= centerLevel
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+color oscColor = targetKind == 2 ? metricColorInput : aboveCenter ? bullColorInput : bearColorInput
+
+oscPlotId    = plot(oscVal, "Prediction", oscColor, 2, plot.style_linebr)
+centerPlotId = plot(centerLevel, "Center", color.new(guideColorInput, 30), 1)
+
+fill(oscPlotId, centerPlotId,
+     top_value    = math.max(oscVal, centerLevel),
+     bottom_value = math.min(oscVal, centerLevel),
+     top_color    = targetKind == 2 ? color.new(metricColorInput, 50) : aboveCenter ? color.new(bullColorInput, 50) : color.new(bearColorInput, 100),
+     bottom_color = targetKind == 2 ? color.new(metricColorInput, 100) : aboveCenter ? color.new(bullColorInput, 100) : color.new(bearColorInput, 50),
+     title        = "Prediction Gradient")
+
+hline(confidenceInput, "High-Confidence Up Level", color.new(GUIDE_COLOR, 40), hline.style_dashed, display = targetKind == 0 ? display.all : display.none)
+hline(100 - confidenceInput, "High-Confidence Down Level", color.new(GUIDE_COLOR, 40), hline.style_dashed, display = targetKind == 0 ? display.all : display.none)
+
+// the fitted tree as an auditable list of if-then rules, one row per leaf
+var table rulesTable = table.new(getTablePosition(tablePosInput), 3, TABLE_ROWS, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+if barstate.islast and showTableInput
+    string txtSize = getTextSize(textSizeInput)
+    color  fgColor = DASH_TEXT
+    table.clear(rulesTable, 0, 0, 2, TABLE_ROWS - 1)
+    table.cell(rulesTable, 0, 0, "Decision Tree · If-Then Rules", text_color = fgColor, text_size = txtSize, text_halign = text.align_left)
+    table.cell(rulesTable, 1, 0, "")
+    table.cell(rulesTable, 2, 0, "")
+    if treeNodes.size() == 0
+        table.cell(rulesTable, 0, 1, "Collecting history: " + str.tostring(matrix.rows(featureMatrix)) + " / " + str.tostring(windowCap) + " closed bars before the first fit", text_color = DASH_HEADER, text_size = txtSize, text_halign = text.align_left)
+    else
+        string modeTxt = targetKind == 0 ? "Direction" : targetKind == 1 ? "Fwd Return" : "Fwd Volatility"
+        string impTxt  = impurityKind == 0 ? "Gini" : impurityKind == 1 ? "Entropy" : "Variance"
+        string agoTxt  = na(lastTrainBar) ? "" : " · refit " + str.tostring(bar_index - lastTrainBar) + " bars ago"
+        table.cell(rulesTable, 0, 1, modeTxt + " · " + impTxt + " · n = " + str.tostring(trainInput) + " · h = " + str.tostring(horizonInput) + " bars" + agoTxt, text_color = DASH_HEADER, text_size = txtSize, text_halign = text.align_left)
+        TreeNode rootNode = treeNodes.get(0)
+        string topTxt = rootNode.isLeaf ? "Top split: none (no candidate cleared the minimum gain)" : "Top split: " + featureNames.get(rootNode.featureIdx) + " ≤ " + str.tostring(rootNode.threshold, "#.##") + " · gain " + str.tostring(rootNode.gain, "#.####")
+        table.cell(rulesTable, 0, 2, topTxt, text_color = DASH_HEADER, text_size = txtSize, text_halign = text.align_left)
+        table.cell(rulesTable, 0, 3, "Rule (root → leaf)", text_color = DASH_HEADER, text_size = txtSize, text_halign = text.align_left)
+        table.cell(rulesTable, 1, 3, "Prediction", text_color = DASH_HEADER, text_size = txtSize)
+        table.cell(rulesTable, 2, 3, "n", text_color = DASH_HEADER, text_size = txtSize)
+        int rowIdx = 4
+        for i = 0 to treeNodes.size() - 1
+            TreeNode nd = treeNodes.get(i)
+            if nd.isLeaf and rowIdx < TABLE_ROWS
+                string predTxt   = ""
+                color  predColor = metricColorInput
+                if targetKind == 0
+                    bool leafUp = nd.prediction >= 0.5
+                    predTxt   := (leafUp ? "UP · P(up) " : "DOWN · P(up) ") + str.tostring(nd.prediction * 100, "#.#") + "%"
+                    predColor := leafUp ? bullColorInput : bearColorInput
+                else if targetKind == 1
+                    predTxt   := (nd.prediction >= 0 ? "+" : "") + str.tostring(nd.prediction, "#.##") + "%"
+                    predColor := nd.prediction >= 0 ? bullColorInput : bearColorInput
+                else
+                    predTxt := str.tostring(nd.prediction, "#.##") + "%"
+                bool isActiveLeaf = i == activeLeafId
+                table.cell(rulesTable, 0, rowIdx, (isActiveLeaf ? "► " : "") + ruleText(treeNodes, i, featureNames, depthInput), text_color = fgColor, text_size = txtSize, text_halign = text.align_left, bgcolor = isActiveLeaf ? color.new(predColor, 85) : DASH_BG)
+                table.cell(rulesTable, 1, rowIdx, predTxt, text_color = predColor, text_size = txtSize)
+                table.cell(rulesTable, 2, rowIdx, str.tostring(nd.count), text_color = DASH_HEADER, text_size = txtSize)
+                rowIdx += 1
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+bool crossUpCenter = ta.crossover(oscVal, centerLevel)
+bool crossDnCenter = ta.crossunder(oscVal, centerLevel)
+bool crossUpConf   = ta.crossover(oscVal, confidenceInput)
+bool crossDnConf   = ta.crossunder(oscVal, 100 - confidenceInput)
+
+alertcondition(crossUpCenter and targetKind != 2, "Bullish Flip", "decision trees: the routed leaf's prediction crossed above the center line — the tree now favors upside over the horizon.")
+alertcondition(crossDnCenter and targetKind != 2, "Bearish Flip", "decision trees: the routed leaf's prediction crossed below the center line — the tree now favors downside over the horizon.")
+alertcondition(crossUpConf and targetKind == 0, "High-Confidence Bullish", "decision trees: P(up) crossed above the high-confidence level.")
+alertcondition(crossDnConf and targetKind == 0, "High-Confidence Bearish", "decision trees: P(up) crossed below 100 minus the high-confidence level.")
+
+//---------------------------------------------------------------------------------------------------------------------}

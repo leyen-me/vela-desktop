@@ -1,0 +1,279 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Participation Divergence at Index Highs", shorttitle = "Participation Divergence at Index Highs", overlay = false, format = format.price, precision = 1)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+color ORANGE = #ff9800                 // the one accent - the participation witnesses
+color ORANGE_DIM = color.new(#ff9800, 50) // second witness, same accent family, dimmed
+color GRAY   = #787b86
+color GREEN  = #089981
+color RED    = #f23645
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+float srcInput      = input.source(close, "Index Source", group = "Index Highs", tooltip = "Index series used for the new-high check. Closing prices are the standard basis for breadth non-confirmation studies.")
+int   lookbackInput = input.int(252, "New-High Lookback", minval = 10, group = "Index Highs", tooltip = "Number of chart bars defining a new high and the range-position scale. 252 daily bars approximates the 52-week window.")
+float pressTolInput = input.float(0, "Pressing Tolerance %", minval = 0, step = 0.1, group = "Index Highs", tooltip = "Treats bars within this percentage below the prior lookback high as pressing the prior high, so tests of the old high are graded as well. 0 demands a strict new high.")
+
+string sym1Input   = input.symbol("INDEX:S5TH", "Witness 1", group = "Participation", tooltip = "First participation witness. The default is the percentage of S&P 500 members above their 200-day average (INDEX:S5TH); INDEX:S5FI (above the 50-day) or INDEX:MMTH (US stocks above their 200-day) are common alternatives, as are net new highs or cumulative advance/decline series matching your index.")
+bool   use2Input   = input.bool(true, "Witness 2", inline = "w2", group = "Participation", tooltip = "Second participation witness, an equal-weight counterpart of the S&P 500 by default. Agreement across witnesses upgrades a reading - a divergence flagged by one witness but contradicted by the other is treated as noise, so divergence events require every enabled witness to fail.")
+string sym2Input   = input.symbol("AMEX:RSP", "", inline = "w2", group = "Participation")
+bool   ratio2Input = input.bool(true, "Witness 2 as Ratio to Chart Symbol", group = "Participation", tooltip = "Reads Witness 2 divided by the chart symbol, turning an equal-weight counterpart into the equal-weight versus cap-weight ratio - the single-series lens on narrowing participation.")
+string tfInput     = input.timeframe("", "Participation Timeframe", group = "Participation", tooltip = "Timeframe the participation symbols are sampled from, leave empty to use the chart timeframe. Higher-timeframe values are taken from the last completed bar so they do not repaint.")
+
+int confirmBarsInput   = input.int(10, "Confirmation Window", minval = 1, group = "Divergence", tooltip = "A witness confirms an index high when it printed its own lookback high within this many bars, otherwise it fails to confirm. Larger windows tolerate witnesses that peak slightly before the index does.")
+int persistEventsInput = input.int(3, "Persistence", minval = 1, inline = "pers", group = "Divergence", tooltip = "One soft session proves nothing: the divergence is only treated as persistent once this many non-confirmed index highs occur inside the rolling window, arming the repair and structure-break signals.")
+int persistWindowInput = input.int(20, "non-confirmed highs within", minval = 2, inline = "pers", group = "Divergence")
+int pivotLenInput      = input.int(5, "Support Pivot Length", minval = 1, group = "Divergence", tooltip = "Swing length of the support pivot used as the price trigger. A close below the most recent swing low while a persistent divergence is armed produces the structure-break signal.")
+
+bool   showDashInput = input.bool(true, "Show Dashboard", group = "Dashboard", tooltip = "Table grading the latest bar: each witness's range position, bars since its own high and confirmation status, plus the overall participation state. Witnesses without usable data are reported here.")
+string dashPosInput  = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], inline = "dash", group = "Dashboard", tooltip = "Dashboard position on the pane.")
+string dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], inline = "dash", group = "Dashboard", tooltip = "Dashboard text size.")
+
+color indexColorInput  = input.color(GRAY, "Index Line", group = "Style", tooltip = "Color of the index range-position line.")
+color w1ColorInput     = input.color(ORANGE, "Witness 1 Line", group = "Style", tooltip = "Color of the Witness 1 range-position line.")
+color w2ColorInput     = input.color(ORANGE_DIM, "Witness 2 Line", group = "Style", tooltip = "Color of the Witness 2 range-position line.")
+color bullColorInput   = input.color(GREEN, "Confirmation", group = "Style", tooltip = "Color used for confirmation: confirmed highs, divergence repairs, and the participation gap while breadth leads the index.")
+color bearColorInput   = input.color(RED, "Divergence", group = "Style", tooltip = "Color used for divergence: non-confirmed highs, the armed-regime background, structure breaks, and the participation gap while the index leads breadth.")
+bool  gradientInput    = input.bool(true, "Participation Gap Gradient", group = "Style", tooltip = "Gradient fill of the gap between the index line and the participation average, strongest at the leading series and fading toward the lagging one.")
+bool  markersInput     = input.bool(true, "Chart Markers", group = "Style", tooltip = "Marks non-confirmed index highs, structure breaks and divergence repairs on the price chart.")
+bool  markConfirmInput = input.bool(false, "Mark Confirmed Highs", group = "Style", tooltip = "Also marks the first bar of each run of fully confirmed index highs on the price chart. Off by default to keep the chart clean.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Strips the exchange prefix for compact dashboard display
+symbolName(string symRaw) =>
+    array<string> parts = str.split(symRaw, ":")
+    array.size(parts) > 1 ? array.get(parts, 1) : symRaw
+
+// Writes one witness row into the dashboard
+witnessCells(table tbl, int rowIndex, string witnessName, bool enabled, bool live, bool counted, float posValue, int sinceValue, bool confirms, string sizeTxt, color textColor) =>
+    string posText     = enabled and live and not na(posValue) ? str.tostring(posValue, "#.#") + "%" : "—"
+    string sinceText   = enabled and counted ? str.tostring(sinceValue) : "—"
+    string statusText  = not enabled ? "Disabled" : not live ? "No data" : not counted ? "Warming up" : confirms ? "Confirms" : "Fails"
+    color  statusColor = not enabled or not live or not counted ? GRAY : confirms ? bullColorInput : bearColorInput
+    table.cell(tbl, 0, rowIndex, witnessName, text_color = textColor, text_size = sizeTxt, text_halign = text.align_left)
+    table.cell(tbl, 1, rowIndex, posText, text_color = textColor, text_size = sizeTxt, text_halign = text.align_right)
+    table.cell(tbl, 2, rowIndex, sinceText, text_color = textColor, text_size = sizeTxt, text_halign = text.align_right)
+    table.cell(tbl, 3, rowIndex, statusText, text_color = statusColor, text_size = sizeTxt, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Participation Data
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Empty symbol slots request the chart symbol as a placeholder so every request stays unconditional,
+// they are excluded from the divergence arithmetic by their 'enabled' flags
+bool   w1Enabled = sym1Input != ""
+bool   w2Enabled = use2Input and sym2Input != ""
+string reqSym1   = w1Enabled ? sym1Input : syminfo.tickerid
+string reqSym2   = sym2Input != "" ? sym2Input : syminfo.tickerid
+
+// Higher-timeframe requests return the prior completed bar with lookahead (non-repainting),
+// chart-timeframe requests are used as-is
+string reqTfCandidate = tfInput == "" ? timeframe.period : tfInput
+bool   useHtf         = timeframe.in_seconds(reqTfCandidate) > timeframe.in_seconds(timeframe.period)
+string reqTf          = useHtf ? reqTfCandidate : timeframe.period
+
+float w1Raw = request.security(reqSym1, reqTf, useHtf ? close[1] : close, lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+float w2Raw = request.security(reqSym2, reqTf, useHtf ? close[1] : close, lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+
+float indexSrc = srcInput
+float w1Val    = w1Raw
+float w2Val    = ratio2Input ? (indexSrc != 0 ? w2Raw / indexSrc : na) : w2Raw
+
+//---------------------------------------------------------------------------------------------------------------------}
+// New-High Grading
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Range positions rescale each series to its own lookback range so the index and the witnesses share one 0-100 pane,
+// a series sits at 100 exactly when it prints a new lookback high
+float indexRollHigh = ta.highest(indexSrc, lookbackInput)
+float indexRollLow  = ta.lowest(indexSrc, lookbackInput)
+float w1RollHigh    = ta.highest(w1Val, lookbackInput)
+float w1RollLow     = ta.lowest(w1Val, lookbackInput)
+float w2RollHigh    = ta.highest(w2Val, lookbackInput)
+float w2RollLow     = ta.lowest(w2Val, lookbackInput)
+
+float indexRange = indexRollHigh - indexRollLow
+float w1Range    = w1RollHigh - w1RollLow
+float w2Range    = w2RollHigh - w2RollLow
+
+float indexPos = na(indexRange) or na(indexSrc) ? na : indexRange == 0 ? 50.0 : 100 * (indexSrc - indexRollLow) / indexRange
+float w1Pos    = na(w1Range) or na(w1Val) ? na : w1Range == 0 ? 50.0 : 100 * (w1Val - w1RollLow) / w1Range
+float w2Pos    = na(w2Range) or na(w2Val) ? na : w2Range == 0 ? 50.0 : 100 * (w2Val - w2RollLow) / w2Range
+
+// The event: the index printing a new lookback high, or pressing the prior one within the tolerance
+float indexPriorHigh = indexRollHigh[1]
+bool  indexAtHigh    = not na(indexPriorHigh) and indexSrc >= indexPriorHigh * (1 - pressTolInput / 100)
+
+// The confirmation check: each witness must have printed its own lookback high within the confirmation window
+bool w1NewHigh = not na(w1RollHigh[1]) and not na(w1Val) and w1Val >= w1RollHigh[1]
+bool w2NewHigh = not na(w2RollHigh[1]) and not na(w2Val) and w2Val >= w2RollHigh[1]
+
+int indexBarsSince = ta.barssince(indexAtHigh)
+int w1BarsSince    = ta.barssince(w1NewHigh)
+int w2BarsSince    = ta.barssince(w2NewHigh)
+
+bool w1Live = w1Enabled and not na(w1Val)
+bool w2Live = w2Enabled and not na(w2Val)
+
+bool w1Counted = w1Live and not na(w1BarsSince)
+bool w2Counted = w2Live and not na(w2BarsSince)
+
+bool w1Confirms = w1Counted and w1BarsSince <= confirmBarsInput
+bool w2Confirms = w2Counted and w2BarsSince <= confirmBarsInput
+
+int witnessCount = (w1Counted ? 1 : 0) + (w2Counted ? 1 : 0)
+int confirmCount = (w1Confirms ? 1 : 0) + (w2Confirms ? 1 : 0)
+
+bool allFail    = witnessCount > 0 and confirmCount == 0
+bool allConfirm = witnessCount > 0 and confirmCount == witnessCount
+
+// Session grading at the highs
+bool divergentHigh  = indexAtHigh and allFail
+bool confirmedHigh  = indexAtHigh and allConfirm
+bool confirmedFresh = confirmedHigh and not confirmedHigh[1]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Divergence State
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Persistence: enough non-confirmed highs inside the rolling window arms the divergence regime
+float divEventCount = math.sum(divergentHigh ? 1 : 0, persistWindowInput)
+bool  persistActive = nz(divEventCount) >= persistEventsInput
+bool  persistFresh  = persistActive and not persistActive[1]
+
+// Price trigger: the most recent confirmed swing low is the structure the divergence waits on
+float pivotRaw = ta.pivotlow(low, pivotLenInput, pivotLenInput)
+
+var float supportLevel = na
+if not na(pivotRaw)
+    supportLevel := pivotRaw
+
+bool belowSupport = not na(supportLevel) and close < supportLevel
+bool supportBreak = belowSupport and not belowSupport[1]
+
+// Armed on persistence, released by a repair (participation broadens back out) or by the structure break
+var bool divergenceArmed = false
+
+bool breakSignal  = divergenceArmed and supportBreak
+bool repairSignal = divergenceArmed and allConfirm
+
+if breakSignal or repairSignal
+    divergenceArmed := false
+if persistFresh
+    divergenceArmed := true
+
+// Composite participation line anchoring the gap fill
+bool w1PosLive = w1Live and not na(w1Pos)
+bool w2PosLive = w2Live and not na(w2Pos)
+
+float partSum = (w1PosLive ? w1Pos : 0) + (w2PosLive ? w2Pos : 0)
+int   partN   = (w1PosLive ? 1 : 0) + (w2PosLive ? 1 : 0)
+
+float participationPos = partN > 0 ? partSum / partN : na
+bool  indexLeading     = indexPos > participationPos
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+
+string dashPos = switch dashPosInput
+    "Top Right"    => position.top_right
+    "Top Left"     => position.top_left
+    "Bottom Right" => position.bottom_right
+    =>                position.bottom_left
+
+string dashSize = switch dashSizeInput
+    "Tiny"  => size.tiny
+    "Small" => size.small
+    =>         size.normal
+
+bool w1Missing  = w1Enabled and na(w1Raw)
+bool w2Missing  = w2Enabled and na(w2Raw)
+bool noWitness  = not w1Live and not w2Live
+bool showNotice = w1Missing or w2Missing or noWitness
+
+var table dashTable = na
+
+if barstate.islast and (showDashInput or showNotice)
+    if na(dashTable)
+        dashTable := table.new(dashPos, 4, 5, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+        table.merge_cells(dashTable, 0, 4, 3, 4)
+    color headerColor = DASH_HEADER
+    color textColor   = DASH_TEXT
+    if showDashInput
+        table.cell(dashTable, 0, 0, "Series", text_color = headerColor, text_size = dashSize, text_halign = text.align_left)
+        table.cell(dashTable, 1, 0, "Range Pos", text_color = headerColor, text_size = dashSize, text_halign = text.align_right)
+        table.cell(dashTable, 2, 0, "Since High", text_color = headerColor, text_size = dashSize, text_halign = text.align_right)
+        table.cell(dashTable, 3, 0, "Status", text_color = headerColor, text_size = dashSize, text_halign = text.align_right)
+        string indexStatus = indexAtHigh ? "New high" : not na(indexBarsSince) and indexBarsSince <= confirmBarsInput ? "Near highs" : "Off highs"
+        table.cell(dashTable, 0, 1, syminfo.ticker, text_color = textColor, text_size = dashSize, text_halign = text.align_left)
+        table.cell(dashTable, 1, 1, na(indexPos) ? "—" : str.tostring(indexPos, "#.#") + "%", text_color = textColor, text_size = dashSize, text_halign = text.align_right)
+        table.cell(dashTable, 2, 1, na(indexBarsSince) ? "—" : str.tostring(indexBarsSince), text_color = textColor, text_size = dashSize, text_halign = text.align_right)
+        table.cell(dashTable, 3, 1, indexStatus, text_color = textColor, text_size = dashSize, text_halign = text.align_right)
+        string w1Name = sym1Input == "" ? "Witness 1" : symbolName(sym1Input)
+        string w2Name = sym2Input == "" ? "Witness 2" : symbolName(sym2Input) + (ratio2Input ? " / " + syminfo.ticker : "")
+        witnessCells(dashTable, 2, w1Name, w1Enabled, w1Live, w1Counted, w1Pos, w1BarsSince, w1Confirms, dashSize, textColor)
+        witnessCells(dashTable, 3, w2Name, w2Enabled, w2Live, w2Counted, w2Pos, w2BarsSince, w2Confirms, dashSize, textColor)
+        string triggerText = not na(supportLevel) ? " — trigger below " + str.tostring(supportLevel, format.mintick) : ""
+        string stateText = witnessCount == 0 ? (noWitness ? "No usable participation witness" : "Witnesses warming up") : divergenceArmed ? "Persistent divergence" + triggerText : nz(divEventCount) > 0 ? "Non-confirmed index highs in window" : confirmedHigh ? "Participation confirms the highs" : "No divergence at the highs"
+        color stateColor = witnessCount == 0 ? GRAY : divergenceArmed ? bearColorInput : nz(divEventCount) > 0 ? ORANGE : confirmedHigh ? bullColorInput : GRAY
+        table.cell(dashTable, 0, 4, stateText, text_color = stateColor, text_size = dashSize, text_halign = text.align_center)
+    else
+        string missingText = (w1Missing ? sym1Input : "") + (w1Missing and w2Missing ? ", " : "") + (w2Missing ? sym2Input : "")
+        string noticeText  = missingText != "" ? "No data: " + missingText : "No usable participation witness"
+        table.cell(dashTable, 0, 0, noticeText, text_color = ORANGE, text_size = dashSize, text_halign = text.align_left)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Plots
+//---------------------------------------------------------------------------------------------------------------------{
+
+indexPlotId = plot(indexPos, "Index Range Position", color = indexColorInput, linewidth = 2, style = plot.style_linebr)
+
+plot(w1Enabled ? w1Pos : na, "Witness 1 Range Position", color = w1ColorInput, linewidth = 1, style = plot.style_linebr)
+plot(w2Enabled ? w2Pos : na, "Witness 2 Range Position", color = w2ColorInput, linewidth = 1, style = plot.style_linebr)
+
+participationPlotId = plot(participationPos, "Participation Average", color = na, editable = false)
+
+// Participation gap, strongest at the leading series and fading toward the lagging one
+color gapStrong = color.new(indexLeading ? bearColorInput : bullColorInput, 55)
+color gapFaint  = color.new(indexLeading ? bearColorInput : bullColorInput, 100)
+
+fill(indexPlotId, participationPlotId, math.max(indexPos, participationPos), math.min(indexPos, participationPos), gradientInput ? gapStrong : na, gradientInput ? gapFaint : na, title = "Participation Gap")
+
+hline(100, "New-High Level", color = color.new(GRAY, 50), linestyle = hline.style_dashed)
+hline(0, "Range Low", color = color.new(GRAY, 70), linestyle = hline.style_dotted)
+
+bgcolor(divergenceArmed ? color.new(bearColorInput, 92) : na, title = "Persistent Divergence Regime")
+
+plotshape(markersInput and divergentHigh, "Non-Confirmed High", style = shape.triangledown, location = location.abovebar, color = bearColorInput, size = size.tiny, force_overlay = true)
+plotshape(markConfirmInput and confirmedFresh, "Confirmed High", style = shape.circle, location = location.abovebar, color = bullColorInput, size = size.tiny, force_overlay = true)
+plotshape(markersInput and breakSignal, "Structure Break", style = shape.xcross, location = location.belowbar, color = bearColorInput, size = size.small, force_overlay = true)
+plotshape(markersInput and repairSignal, "Divergence Repaired", style = shape.circle, location = location.belowbar, color = bullColorInput, size = size.tiny, force_overlay = true)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(divergentHigh, "Non-Confirmed Index High", "Index printed a new high while every participation witness failed to confirm")
+alertcondition(confirmedFresh, "Confirmed Index High", "Index printed a new high with every participation witness confirming")
+alertcondition(persistFresh, "Persistent Participation Divergence", "Non-confirmed index highs reached the persistence threshold - narrowing leadership")
+alertcondition(repairSignal, "Participation Divergence Repaired", "Participation broadened back out - every witness printed a fresh high and the divergence dissolved")
+alertcondition(breakSignal, "Structure Break After Divergence", "Price closed below the last swing low while a persistent participation divergence was armed")
+
+//---------------------------------------------------------------------------------------------------------------------}

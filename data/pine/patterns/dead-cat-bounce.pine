@@ -1,0 +1,487 @@
+// This work is licensed under Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Dead Cat Bounce"
+  , shorttitle       = "Dead Cat Bounce"
+  , overlay          = true
+  , format           = format.price
+  , max_lines_count  = 500
+  , max_labels_count = 500
+  , max_boxes_count  = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+color BULL_COLOR    = #089981
+color BEAR_COLOR    = #f23645
+color NEUTRAL_COLOR = #787b86
+color LABEL_BG      = #00000000
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+// Setup lifecycle: collapse found -> bounce qualified -> short after the rollover
+int ST_IDLE     = 0
+int ST_COLLAPSE = 1
+int ST_BOUNCE   = 2
+int ST_SHORT    = 3
+
+int GAP_BG_TRANSP      = 88
+int POSITION_BG_TRANSP = 88
+int GUIDE_TRANSP       = 45
+
+string TARGET_MEASURED  = "Bounce Height Below Event Low"
+string TARGET_EVENT_LOW = "Event Low"
+
+string GROUP_COLLAPSE = "Collapse"
+string GROUP_BOUNCE   = "Bounce & Rollover"
+string GROUP_TRADE    = "Trade Plan"
+string GROUP_DASH     = "Dashboard"
+string GROUP_STYLE    = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+minDropInput = input.float(15, "Collapse (%)", minval = 1, maxval = 95, step = 0.5, inline = "drop", group = GROUP_COLLAPSE)
+maxDropInput = input.float(70, "to", minval = 2, maxval = 99, step = 0.5, inline = "drop", group = GROUP_COLLAPSE
+  , tooltip = "Close-to-close decline from the close before the event, as a percentage. Bulkowski's event pattern is a one-day collapse of 15 to 70 percent, usually on a downward gap after bad news. Lower the floor for indices and slow movers.")
+
+dropWindowInput = input.int(1, "Collapse Window (Bars)", minval = 1, maxval = 3, group = GROUP_COLLAPSE
+  , tooltip = "Bars the collapse may take. 1 is the strict event definition, a single session. 2 also catches collapses split across two sessions, such as a weekend in a 24-hour market.")
+
+minDropAtrInput = input.float(3, "Minimum Collapse (ATR)", minval = 0, maxval = 20, step = 0.5, group = GROUP_COLLAPSE
+  , tooltip = "The decline must also measure at least this many 14-bar ATRs taken before the event, so the collapse stands out from the symbol's normal swings. 0 disables the check.")
+
+eventWindowInput = input.int(10, "Event Low Window (Bars)", minval = 1, maxval = 60, group = GROUP_COLLAPSE
+  , tooltip = "Price often keeps sliding for a few sessions after the event day. New lows within this many bars of the event extend the event trend low, the low the bounce is measured from and the level whose break confirms the pattern. A decline still making new lows after this window is a plain downtrend and the event is dropped.")
+
+minBounceInput = input.float(15, "Minimum Bounce (% of Drop)", minval = 1, maxval = 90, step = 1, group = GROUP_BOUNCE
+  , tooltip = "Rebound off the event trend low, as a share of the collapse from the pre-event close, that qualifies the bounce. Smaller rebounds are noise inside the selloff.")
+
+recoverInput = input.float(100, "Recovery Void (% of Drop)", minval = 30, maxval = 150, step = 5, group = GROUP_BOUNCE
+  , tooltip = "A dead cat bounce stalls below the pre-event price. A close that retraces this much of the collapse voids the setup: the shock was absorbed and the rebound reads as a base or a V-bottom. 100% is a close back above the pre-event close.")
+
+maxBounceBarsInput = input.int(40, "Maximum Bounce Length (Bars)", minval = 5, maxval = 300, group = GROUP_BOUNCE
+  , tooltip = "Bars from the event low the bounce may run without rolling over. A rebound that keeps building past this is no longer read as a dead cat bounce.")
+
+rollLengthInput = input.int(5, "Rollover Length (Bars)", minval = 2, maxval = 30, group = GROUP_BOUNCE
+  , tooltip = "The bounce has rolled over into a lower high when a bar closes below the lowest low of up to this many previous bounce bars (bars after the event low only), once the bounce has qualified and topped. That close is the Rollover signal and the short entry.")
+
+targetModeInput = input.string(TARGET_MEASURED, "Final Target", options = [TARGET_MEASURED, TARGET_EVENT_LOW], group = GROUP_TRADE
+  , tooltip = "The event low is always the first objective: its break confirms the dead cat bounce. Bounce Height Below Event Low keeps the short open for the bounce's height projected beneath that low, the post-bounce decline. Event Low closes the short at the first objective.")
+
+stopBufferInput = input.float(0.1, "Stop Buffer (ATR)", minval = 0, maxval = 2, step = 0.05, group = GROUP_TRADE
+  , tooltip = "Distance above the bounce high, in ATR, for the protective stop. Trading through it means the bounce is still alive.")
+
+maxAttemptsInput = input.int(2, "Maximum Attempts", minval = 1, maxval = 5, group = GROUP_TRADE
+  , tooltip = "Rollover signals allowed per event. After a stop the setup re-arms on the new bounce high, while the bounce is still inside its maximum length, until this many shorts have been taken.")
+
+maxHoldInput = input.int(60, "Maximum Hold (Bars)", minval = 5, maxval = 500, group = GROUP_TRADE
+  , tooltip = "A short that reaches neither its final target nor its stop within this many bars is closed and recorded as Timed Out.")
+
+showDashInput = input.bool(true, "Show Dashboard", group = GROUP_DASH
+  , tooltip = "Grades the active or last event: collapse size, depth to the event low, bounce depth, length and volume, the entry and the reward to risk of both objectives.")
+
+dashPosInput  = input.string("Top Right", "Position", options = ["Top Right", "Bottom Right", "Bottom Left", "Top Left"], group = GROUP_DASH
+  , tooltip = "Top right stays clear of the candles once the decline resumes.")
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = GROUP_DASH)
+
+showGapInput = input.bool(true, "Show Event Gap", group = GROUP_STYLE
+  , tooltip = "Shade the price gap the collapse left. Bounces often stall at or under it, as holders trapped above it sell into the rebound.")
+
+showGuidesInput = input.bool(false, "Show Retracement Guides", group = GROUP_STYLE
+  , tooltip = "Draw the 38.2%, 50% and 61.8% retracements of the collapse while the bounce runs, as yardsticks for how much of the drop the rebound has recovered.")
+
+bullColorInput    = input.color(BULL_COLOR, "Bounce", inline = "colors", group = GROUP_STYLE)
+bearColorInput    = input.color(BEAR_COLOR, "Collapse", inline = "colors", group = GROUP_STYLE)
+neutralColorInput = input.color(NEUTRAL_COLOR, "Guides", inline = "colors", group = GROUP_STYLE)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Variables
+//---------------------------------------------------------------------------------------------------------------------{
+var int   state       = ST_IDLE
+var int   preBar      = na
+var float preClose    = na
+var int   eventBar    = na
+var float dropPct     = na
+var int   dropBars    = na
+var float eventVolume = na
+var float eventLow    = na
+var int   eventLowBar = na
+var bool  lowBroken   = false
+var float bounceHigh  = na
+var int   bounceHiBar = na
+var float bounceVol   = 0.0
+var int   bounceCount = 0
+var int   attempts    = 0
+
+var float entryPrice  = na
+var float stopPrice   = na
+var float targetPrice = na
+var int   entryBar    = na
+
+var string statusText     = "Scanning"
+var color  statusColor    = DASH_HEADER
+var float  lastRetrace    = na
+var int    lastBounceBars = na
+var float  lastVolRatio   = na
+
+// Drawings of the event in progress
+var line  collapseLine  = na
+var label collapseLabel = na
+var box   gapBox        = na
+var line  eventLowLine  = na
+var label eventLowLabel = na
+var line  bounceLine    = na
+var label bounceLabel   = na
+var line  fib382Line    = na
+var line  fib500Line    = na
+var line  fib618Line    = na
+
+// Drawings of the open short
+var line  entryLine  = na
+var line  stopLine   = na
+var line  targetLine = na
+var box   rewardBox  = na
+var box   riskBox    = na
+var label stopLabel  = na
+var label tgtLabel   = na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+getTablePosition(string positionText) =>
+    switch positionText
+        "Top Right"   => position.top_right
+        "Top Left"    => position.top_left
+        "Bottom Left" => position.bottom_left
+        =>               position.bottom_right
+
+getTableSize(string sizeText) =>
+    switch sizeText
+        "Tiny"   => size.tiny
+        "Normal" => size.normal
+        =>          size.small
+
+fmtPct(float value) =>
+    str.tostring(value, "#.#") + "%"
+
+barsText(int count) =>
+    str.tostring(count) + (count == 1 ? " bar" : " bars")
+
+// Keeps the collapse label at the event trend low, text to its left (the space the collapse fell through)
+placeCollapseLabel() =>
+    float depth = 100 * (preClose - eventLow) / preClose
+    label.set_xy(collapseLabel, eventLowBar, eventLow)
+    label.set_text(collapseLabel, "Collapse -" + str.tostring(depth, "#.#") + "%")
+    label.set_tooltip(collapseLabel, "Event: close-to-close decline of " + fmtPct(dropPct) + " in " + barsText(dropBars) + "\nPre-event close " + str.tostring(preClose, format.mintick) + ", event trend low " + str.tostring(eventLow, format.mintick) + " (-" + fmtPct(depth) + ")")
+    line.set_xy1(eventLowLine, eventLowBar, eventLow)
+    line.set_xy2(eventLowLine, bar_index, eventLow)
+    label.set_xy(eventLowLabel, bar_index, eventLow)
+
+// Lowest low of up to `rollLengthInput` previous bars, counting only bars printed after the event low
+rollLow(int fromBar) =>
+    float lowest = na
+    for k = 1 to rollLengthInput
+        if bar_index - k > fromBar
+            lowest := na(lowest) ? low[k] : math.min(lowest, low[k])
+    lowest
+
+// Removes the bounce drawings when the event low is re-based or the event is dropped
+clearBounce() =>
+    line.delete(bounceLine)
+    label.delete(bounceLabel)
+    line.delete(fib382Line)
+    line.delete(fib500Line)
+    line.delete(fib618Line)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+float atrValue = ta.atr(14)
+float priorAtr = atrValue[dropWindowInput]
+
+// Largest close-to-close decline within the collapse window
+float bestDrop = 0.0
+int   bestBars = 0
+for k = 1 to dropWindowInput
+    float base = close[k]
+    if base > 0
+        float d = 100 * (base - close) / base
+        if d > bestDrop
+            bestDrop := d
+            bestBars := k
+
+bool collapseNow = bestDrop >= minDropInput and bestDrop <= maxDropInput and (minDropAtrInput == 0 or na(priorAtr) or close[bestBars] - close >= minDropAtrInput * priorAtr)
+
+bool collapseEvent  = false
+bool bounceEvent    = false
+bool rolloverEvent  = false
+bool confirmEvent   = false
+bool targetEvent    = false
+bool stopEvent      = false
+bool voidEvent      = false
+
+if barstate.isconfirmed
+    // -- event low line runs until the low is broken ------------------------------------------------------------
+    if state != ST_IDLE and not lowBroken
+        line.set_x2(eventLowLine, bar_index)
+        label.set_x(eventLowLabel, bar_index)
+
+    // -- open short: stop first, then the event low (confirmation), then the final target ---------------------------
+    if state == ST_SHORT
+        line.set_x2(entryLine, bar_index)
+        line.set_x2(stopLine, bar_index)
+        line.set_x2(targetLine, bar_index)
+        box.set_right(rewardBox, bar_index)
+        box.set_right(riskBox, bar_index)
+        label.set_x(stopLabel, bar_index)
+        label.set_x(tgtLabel, bar_index)
+        if high >= stopPrice
+            stopEvent  := true
+            bool rearm = attempts < maxAttemptsInput and not lowBroken and bar_index - eventLowBar <= maxBounceBarsInput
+            statusText  := rearm ? "Stopped, re-armed" : "Stopped"
+            statusColor := bullColorInput
+            label.new(bar_index, high, "Stopped", style = label.style_label_down, color = LABEL_BG, textcolor = bullColorInput, size = size.small
+              , tooltip = "Price traded through the stop above the bounce high: the rebound is still alive." + (rearm ? " The setup re-arms on the new bounce high and waits for the next rollover." : ""))
+            bounceHigh  := high
+            bounceHiBar := bar_index
+            state       := rearm ? ST_BOUNCE : ST_IDLE
+        else
+            if low < eventLow and not lowBroken
+                lowBroken    := true
+                confirmEvent := true
+                statusText   := "Confirmed"
+                statusColor  := bearColorInput
+                line.set_x2(eventLowLine, bar_index)
+                label.delete(eventLowLabel)
+                label.new(bar_index, low, "Confirmed", style = label.style_label_up, color = bearColorInput, textcolor = color.white, size = size.small
+                  , tooltip = "The decline broke the event trend low " + str.tostring(eventLow, format.mintick) + ", " + barsText(bar_index - entryBar) + " after the rollover. The bounce is settled as a dead cat bounce; the event low was the first objective.")
+            if low <= targetPrice and targetModeInput == TARGET_MEASURED
+                targetEvent := true
+                statusText  := "Target reached"
+                statusColor := bearColorInput
+                label.new(bar_index, low, "Target", style = label.style_label_up, color = LABEL_BG, textcolor = bearColorInput, size = size.small
+                  , tooltip = "Final target " + str.tostring(targetPrice, format.mintick) + " reached " + barsText(bar_index - entryBar) + " after the rollover: the bounce's height projected beneath the event low.")
+                state := ST_IDLE
+            else if lowBroken and targetModeInput == TARGET_EVENT_LOW
+                targetEvent := true
+                state       := ST_IDLE
+            else if bar_index - entryBar >= maxHoldInput
+                statusText  := lowBroken ? "Confirmed, timed out" : "Timed out"
+                statusColor := DASH_HEADER
+                state       := ST_IDLE
+
+    // -- collapse: extend the event trend low, wait for the bounce to qualify --------------------------------------
+    else if state == ST_COLLAPSE
+        bool plainDecline = false
+        if low < eventLow
+            if bar_index - eventBar <= eventWindowInput
+                eventLow    := low
+                eventLowBar := bar_index
+                line.set_xy2(collapseLine, eventLowBar, eventLow)
+                placeCollapseLabel()
+            else
+                plainDecline := true
+        float dropSize = preClose - eventLow
+        if plainDecline
+            voidEvent   := true
+            statusText  := "Plain decline"
+            statusColor := DASH_HEADER
+            state       := ST_IDLE
+            line.delete(eventLowLine)
+            label.delete(eventLowLabel)
+        else if high - eventLow >= minBounceInput / 100 * dropSize and bar_index > eventLowBar
+            bounceEvent := true
+            state       := ST_BOUNCE
+            bounceHigh  := high
+            bounceHiBar := bar_index
+            // Bounce volume counts every bar after the event low; this bar is added by the tracking block below
+            bounceVol   := 0.0
+            bounceCount := 0
+            int priorBounceBars = bar_index - eventLowBar - 1
+            if priorBounceBars > 0
+                for k = 1 to priorBounceBars
+                    bounceVol   += nz(volume[k])
+                    bounceCount += 1
+            statusText  := "Bounce underway"
+            statusColor := bullColorInput
+            bounceLine  := line.new(eventLowBar, eventLow, bounceHiBar, bounceHigh, color = bullColorInput, width = 2, style = line.style_dashed)
+            bounceLabel := label.new(bounceHiBar, bounceHigh, "", style = label.style_label_down, color = LABEL_BG, textcolor = bullColorInput, size = size.small)
+            if showGuidesInput
+                float f382 = eventLow + 0.382 * dropSize
+                float f500 = eventLow + 0.5 * dropSize
+                float f618 = eventLow + 0.618 * dropSize
+                fib382Line := line.new(eventBar, f382, bar_index, f382, color = color.new(neutralColorInput, GUIDE_TRANSP), style = line.style_dotted)
+                fib500Line := line.new(eventBar, f500, bar_index, f500, color = color.new(neutralColorInput, GUIDE_TRANSP), style = line.style_dotted)
+                fib618Line := line.new(eventBar, f618, bar_index, f618, color = color.new(neutralColorInput, GUIDE_TRANSP), style = line.style_dotted)
+        else if bar_index - eventLowBar > eventWindowInput
+            voidEvent   := true
+            statusText  := "No bounce"
+            statusColor := DASH_HEADER
+            state       := ST_IDLE
+            line.delete(eventLowLine)
+            label.delete(eventLowLabel)
+
+    // -- bounce: a new low before any rollover re-bases the event low while the event is young ---------------------
+    if state == ST_BOUNCE and not stopEvent and low < eventLow
+        clearBounce()
+        if bar_index - eventBar <= eventWindowInput
+            eventLow    := low
+            eventLowBar := bar_index
+            line.set_xy2(collapseLine, eventLowBar, eventLow)
+            placeCollapseLabel()
+            state          := ST_COLLAPSE
+            statusText     := "Collapse"
+            statusColor    := bearColorInput
+            lastRetrace    := na
+            lastBounceBars := na
+        else
+            voidEvent   := true
+            statusText  := "New low, no rollover"
+            statusColor := DASH_HEADER
+            state       := ST_IDLE
+
+    // -- bounce: track the high, wait for the rollover ---------------------------------------------------------------
+    if state == ST_BOUNCE and not stopEvent
+        float dropSize = preClose - eventLow
+        if high > bounceHigh
+            bounceHigh  := high
+            bounceHiBar := bar_index
+        bounceVol   += nz(volume)
+        bounceCount += 1
+        float retrace = 100 * (bounceHigh - eventLow) / dropSize
+        lastRetrace    := retrace
+        lastBounceBars := bounceHiBar - eventLowBar
+        lastVolRatio   := eventVolume > 0 ? (bounceVol / bounceCount) / eventVolume : na
+        line.set_xy2(bounceLine, bounceHiBar, bounceHigh)
+        label.set_xy(bounceLabel, bounceHiBar, bounceHigh)
+        label.set_text(bounceLabel, "Bounce " + fmtPct(retrace) + " of drop")
+        label.set_tooltip(bounceLabel, "Rebound of " + str.tostring(bounceHigh - eventLow, format.mintick) + " off the event trend low over " + barsText(bounceHiBar - eventLowBar) + ", " + fmtPct(retrace) + " of the collapse" + (not na(lastVolRatio) ? "\nBounce volume " + str.tostring(lastVolRatio, "#.##") + "x the collapse bar" : ""))
+        if showGuidesInput
+            line.set_x2(fib382Line, bar_index)
+            line.set_x2(fib500Line, bar_index)
+            line.set_x2(fib618Line, bar_index)
+        if showGapInput and not na(gapBox)
+            box.set_right(gapBox, bar_index)
+
+        if close >= eventLow + recoverInput / 100 * dropSize
+            voidEvent   := true
+            statusText  := "Recovered, void"
+            statusColor := DASH_HEADER
+            label.new(bar_index, high, "Recovered", style = label.style_label_down, color = LABEL_BG, textcolor = neutralColorInput, size = size.small
+              , tooltip = "Close retraced " + fmtPct(recoverInput) + " of the collapse: the shock was absorbed, so the rebound reads as a base or a V-bottom rather than a dead cat bounce.")
+            state := ST_IDLE
+            line.delete(eventLowLine)
+            label.delete(eventLowLabel)
+        else if bar_index - eventLowBar > maxBounceBarsInput
+            voidEvent   := true
+            statusText  := "Bounce held, void"
+            statusColor := DASH_HEADER
+            state       := ST_IDLE
+            line.delete(eventLowLine)
+            label.delete(eventLowLabel)
+        else if bar_index > bounceHiBar and close < rollLow(eventLowBar)
+            // The rollover: a lower high is in and the bounce has turned back down, the short is planned
+            rolloverEvent := true
+            attempts    += 1
+            state       := ST_SHORT
+            entryPrice  := close
+            entryBar    := bar_index
+            stopPrice   := bounceHigh + stopBufferInput * atrValue
+            float measured = eventLow - (bounceHigh - eventLow)
+            targetPrice := targetModeInput == TARGET_EVENT_LOW ? eventLow : measured
+            statusText  := "Rollover, short"
+            statusColor := bearColorInput
+            float risk   = math.max(stopPrice - entryPrice, syminfo.mintick)
+            string tip = "Collapse -" + fmtPct(dropPct) + " in " + barsText(dropBars) + ", trend low -" + fmtPct(100 * dropSize / preClose) + "\nBounce " + fmtPct(retrace) + " of the drop over " + barsText(bounceHiBar - eventLowBar) + "\nRollover: close below the low of the last " + str.tostring(rollLengthInput) + " bounce bars\nEntry " + str.tostring(entryPrice, format.mintick) + ", stop " + str.tostring(stopPrice, format.mintick) + "\nEvent low " + str.tostring(eventLow, format.mintick) + " (" + str.tostring((entryPrice - eventLow) / risk, "#.#") + "R), final target " + str.tostring(targetPrice, format.mintick) + " (" + str.tostring((entryPrice - targetPrice) / risk, "#.#") + "R)"
+            label.new(bar_index, high, attempts > 1 ? "Rollover " + str.tostring(attempts) : "Rollover", style = label.style_label_down, color = bearColorInput, textcolor = color.white, size = size.small, tooltip = tip)
+            entryLine  := line.new(bar_index, entryPrice, bar_index, entryPrice, color = neutralColorInput)
+            stopLine   := line.new(bar_index, stopPrice, bar_index, stopPrice, color = bearColorInput, style = line.style_dashed)
+            targetLine := line.new(bar_index, targetPrice, bar_index, targetPrice, color = bullColorInput, style = line.style_dashed)
+            rewardBox  := box.new(bar_index, entryPrice, bar_index, targetPrice, border_color = LABEL_BG, bgcolor = color.new(bullColorInput, POSITION_BG_TRANSP))
+            riskBox    := box.new(bar_index, stopPrice, bar_index, entryPrice, border_color = LABEL_BG, bgcolor = color.new(bearColorInput, POSITION_BG_TRANSP))
+            stopLabel  := label.new(bar_index, stopPrice, "Stop " + str.tostring(stopPrice, format.mintick), style = label.style_label_left, color = LABEL_BG, textcolor = bearColorInput, size = size.tiny)
+            tgtLabel   := label.new(bar_index, targetPrice, "Target " + str.tostring(targetPrice, format.mintick), style = label.style_label_left, color = LABEL_BG, textcolor = bullColorInput, size = size.tiny)
+
+    // -- idle: a new collapse starts an event ------------------------------------------------------------------------
+    if state == ST_IDLE and collapseNow and not rolloverEvent and not targetEvent and not confirmEvent
+        collapseEvent  := true
+        state          := ST_COLLAPSE
+        attempts       := 0
+        lowBroken      := false
+        preBar         := bar_index - bestBars
+        preClose       := close[bestBars]
+        eventBar       := bar_index - bestBars + 1
+        dropPct        := bestDrop
+        dropBars       := bestBars
+        eventLow       := low
+        eventLowBar    := bar_index
+        lastRetrace    := na
+        lastBounceBars := na
+        lastVolRatio   := na
+        entryPrice     := na
+        stopPrice      := na
+        targetPrice    := na
+        float evVol = 0.0
+        for k = 0 to bestBars - 1
+            evVol += nz(volume[k])
+        eventVolume := evVol / bestBars
+        statusText  := "Collapse"
+        statusColor := bearColorInput
+        collapseLine  := line.new(preBar, preClose, eventLowBar, eventLow, color = bearColorInput, width = 2)
+        collapseLabel := label.new(eventLowBar, eventLow, "", style = label.style_label_right, color = LABEL_BG, textcolor = bearColorInput, size = size.small)
+        eventLowLine  := line.new(eventLowBar, eventLow, bar_index, eventLow, color = color.new(bearColorInput, 30), style = line.style_dotted)
+        eventLowLabel := label.new(bar_index, eventLow, "Event low", style = label.style_label_left, color = LABEL_BG, textcolor = color.new(bearColorInput, 20), size = size.tiny
+          , tooltip = "Event trend low: the first objective of the short, and the level whose break confirms the dead cat bounce")
+        placeCollapseLabel()
+        // The gap the collapse left: between the low before the event and the high of the first event bar
+        float gapTop    = low[bestBars]
+        float gapBottom = high[bestBars - 1]
+        if showGapInput and gapBottom < gapTop
+            gapBox := box.new(eventBar, gapTop, bar_index, gapBottom, border_color = color.new(bearColorInput, 70), bgcolor = color.new(bearColorInput, GAP_BG_TRANSP)
+              , text = "Gap", text_color = color.new(bearColorInput, 30), text_size = size.tiny, text_halign = text.align_right, text_valign = text.align_top)
+        else
+            gapBox := na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+var table dashTable = table.new(getTablePosition(dashPosInput), 2, 8, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+
+dashRow(int row, string labelText, string valueText, color valueColor, string textSize) =>
+    table.cell(dashTable, 0, row, labelText, text_color = DASH_HEADER, text_halign = text.align_left, text_size = textSize)
+    table.cell(dashTable, 1, row, valueText, text_color = valueColor, text_halign = text.align_right, text_size = textSize)
+
+if showDashInput and barstate.islast
+    string dashSize = getTableSize(dashSizeInput)
+    bool   hasEvent = not na(dropPct)
+    string rrText   = "-"
+    if not na(entryPrice) and not na(stopPrice) and stopPrice > entryPrice
+        float risk = stopPrice - entryPrice
+        rrText := str.tostring((entryPrice - eventLow) / risk, "#.#") + "R / " + str.tostring((entryPrice - targetPrice) / risk, "#.#") + "R"
+    table.cell(dashTable, 0, 0, "Dead Cat Bounce", text_color = DASH_TEXT, text_halign = text.align_left, text_size = dashSize)
+    table.cell(dashTable, 1, 0, statusText, text_color = statusColor, text_halign = text.align_right, text_size = dashSize)
+    dashRow(1, "Event", hasEvent ? "-" + fmtPct(dropPct) + " in " + barsText(dropBars) : "-", hasEvent ? bearColorInput : DASH_TEXT, dashSize)
+    dashRow(2, "Collapse to trend low", hasEvent ? "-" + fmtPct(100 * (preClose - eventLow) / preClose) : "-", DASH_TEXT, dashSize)
+    dashRow(3, "Bounce", not na(lastRetrace) ? fmtPct(lastRetrace) + " of drop" : "-", DASH_TEXT, dashSize)
+    dashRow(4, "Bounce length", not na(lastBounceBars) ? barsText(lastBounceBars) : "-", DASH_TEXT, dashSize)
+    dashRow(5, "Bounce volume", not na(lastVolRatio) ? str.tostring(lastVolRatio, "#.##") + "x collapse" : "-", not na(lastVolRatio) ? (lastVolRatio < 1 ? bearColorInput : bullColorInput) : DASH_TEXT, dashSize)
+    dashRow(6, "Entry", not na(entryPrice) ? str.tostring(entryPrice, format.mintick) : "-", DASH_TEXT, dashSize)
+    dashRow(7, "Event low / target", rrText, DASH_TEXT, dashSize)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(collapseEvent, "Collapse", "Collapse on {{ticker}} ({{interval}}): a one-session decline cleared the dead cat bounce event threshold. Watch the event trend low and the bounce.")
+alertcondition(bounceEvent, "Bounce Qualified", "Bounce on {{ticker}} ({{interval}}): the rebound off the event trend low reached the minimum share of the collapse.")
+alertcondition(rolloverEvent, "Rollover", "Rollover on {{ticker}} ({{interval}}): the bounce turned down into a lower high. Short planned with the stop above the bounce high and the event low as the first objective.")
+alertcondition(confirmEvent, "Dead Cat Confirmed", "Dead cat bounce confirmed on {{ticker}} ({{interval}}): the decline broke the event trend low after the rollover.")
+alertcondition(targetEvent, "Target Reached", "Dead cat bounce final target reached on {{ticker}} ({{interval}}).")
+alertcondition(stopEvent, "Stopped", "Dead cat bounce short stopped on {{ticker}} ({{interval}}): price traded above the bounce high.")
+alertcondition(voidEvent, "Event Void", "Dead cat bounce event void on {{ticker}} ({{interval}}): no bounce, a plain decline, a recovery above the pre-event close, or a bounce that outlasted the window.")
+
+//---------------------------------------------------------------------------------------------------------------------}

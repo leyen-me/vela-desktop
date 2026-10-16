@@ -1,0 +1,273 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Spring", "Spring", overlay = true, format = format.price, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 250)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+GROUP_RANGE  = "Trading Range"
+GROUP_SPRING = "Spring Detection"
+GROUP_TEST   = "Test Confirmation"
+GROUP_STYLE  = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+swingLengthInput = input.int(5, "Swing Length", minval = 2, group = GROUP_RANGE, tooltip = "Number of bars on each side of a swing low used to detect the pivots that build and test range support")
+
+minRangeBarsInput = input.int(20, "Minimum Range Duration", minval = 5, group = GROUP_RANGE, tooltip = "Minimum number of bars price must range above support before the level counts as established, giving stops time to accumulate below the lows")
+
+minTouchesInput = input.int(2, "Minimum Support Tests", minval = 1, group = GROUP_RANGE, tooltip = "Minimum number of swing lows forming within the support zone, including the initial low, before the range counts as established")
+
+zoneWidthInput = input.float(0.5, "Support Zone Width", minval = 0, step = 0.05, group = GROUP_RANGE, tooltip = "Width of the support zone as an ATR multiple, swing lows within this distance of the level count as tests of the same support")
+
+atrLengthInput = input.int(14, "ATR Length", minval = 1, group = GROUP_RANGE, tooltip = "Average True Range length used to normalize the support zone width and the penetration depth grading")
+
+maxReclaimBarsInput = input.int(5, "Maximum Bars Below Support", minval = 1, group = GROUP_SPRING, tooltip = "Maximum number of bars between the undercut of support and the close back inside the range, longer stays below support are treated as breakdowns rather than springs")
+
+deepPenetrationInput = input.float(1.0, "Deep Penetration Threshold", minval = 0.1, step = 0.1, group = GROUP_SPRING, tooltip = "Penetration depth in ATR multiples above which the undercut grades as deep, a deep undercut on heavy volume is labeled as a terminal shakeout")
+
+heavyVolumeInput = input.float(1.5, "Heavy Probe Volume", minval = 0.5, step = 0.1, group = GROUP_SPRING, tooltip = "Probe volume relative to its average above which the undercut grades as heavy, a spring ideally breaks support without volume expanding")
+
+fastReclaimInput = input.int(2, "Fast Reclaim Threshold", minval = 1, group = GROUP_SPRING, tooltip = "Maximum number of bars below support for the reclaim speed to grade as fast")
+
+volLengthInput = input.int(20, "Volume Average Length", minval = 1, group = GROUP_SPRING, tooltip = "Length of the volume moving average used as the reference when grading probe volume")
+
+testWindowInput = input.int(30, "Test Window", minval = 5, group = GROUP_TEST, tooltip = "Maximum number of bars after a spring within which a quiet pullback can confirm it as a successful test")
+
+testVolumeInput = input.float(0.75, "Maximum Test Volume", minval = 0.1, step = 0.05, group = GROUP_TEST, tooltip = "Volume on the test swing low must stay below this fraction of the probe volume to qualify as a quiet test")
+
+showSupportInput = input.bool(true, "Show Support Line", group = GROUP_STYLE, tooltip = "Display the established range support level")
+
+showZoneInput = input.bool(true, "Show Spring Zone", group = GROUP_STYLE, tooltip = "Display the zone between range support and the spring low while the spring is active")
+
+showSpringLowInput = input.bool(true, "Show Spring Low Level", group = GROUP_STYLE, tooltip = "Display the spring low as a dashed invalidation level, a close below it cancels the spring")
+
+labelSizeInput = input.string("Small", "Label Size", options = ["Tiny", "Small", "Normal"], group = GROUP_STYLE, tooltip = "Size of the spring, test and failure labels")
+
+bullColorInput = input.color(#089981, "Bullish Elements", group = GROUP_STYLE, tooltip = "Color of spring labels, test labels and the spring zone")
+
+bearColorInput = input.color(#f23645, "Bearish Elements", group = GROUP_STYLE, tooltip = "Color of failure labels and the spring low invalidation level")
+
+supportColorInput = input.color(#787b86, "Support Level", group = GROUP_STYLE, tooltip = "Color of the range support line")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations & Detection
+//---------------------------------------------------------------------------------------------------------------------{
+atrValue   = ta.atr(atrLengthInput)
+volAverage = ta.sma(nz(volume), volLengthInput)
+pivotLow   = ta.pivotlow(low, swingLengthInput, swingLengthInput)
+highWindow = ta.highest(high, swingLengthInput + 1)
+
+hasVolume = nz(volAverage) > 0
+tolerance = zoneWidthInput * atrValue
+labelSize = labelSizeInput == "Tiny" ? size.tiny : labelSizeInput == "Small" ? size.small : size.normal
+
+// Range state
+var float supportLevel     = na
+var int   supportAnchor    = na
+var int   supportTouches   = 0
+var float rangeTop         = na
+var bool  rangeEstablished = false
+
+// Undercut episode state
+var bool  undercutActive = false
+var int   undercutStart  = na
+var float probeLow       = na
+var int   probeLowBar    = na
+var float probeVolume    = na
+
+// Spring state
+var bool  springActive     = false
+var bool  springTested     = false
+var int   springBar        = na
+var float springLow        = na
+var float springSupport    = na
+var float springCeiling    = na
+var float springProbeVol   = na
+var int   lastEpisodeStart = na
+var int   lastEpisodeEnd   = na
+var int   belowCount       = 0
+
+// Drawing references
+var line supportLine   = na
+var line springLowLine = na
+var box  springZone    = na
+
+// Per-bar event flags
+bool springDetected = false
+bool testCompleted  = false
+bool springFailed   = false
+bool resetRange     = false
+
+// Track the range top while a support candidate exists
+if not na(supportLevel)
+    rangeTop := math.max(nz(rangeTop, high), high)
+
+// Swing low processing, support construction and test confirmation
+if not na(pivotLow) and not na(atrValue)
+    plBar   = bar_index - swingLengthInput
+    plPrice = pivotLow
+
+    bool inEpisode = undercutActive and plBar >= undercutStart
+    if not inEpisode and not na(lastEpisodeStart)
+        inEpisode := plBar >= lastEpisodeStart and plBar <= lastEpisodeEnd
+
+    // Test confirmation, a quiet pullback holding at or above the spring low
+    if springActive and not springTested and plBar > springBar and plBar - springBar <= testWindowInput
+        float testVolume = nz(volume[swingLengthInput])
+        bool  holdsAbove = plPrice >= springLow
+        bool  nearLows   = plPrice <= springSupport + tolerance
+        bool  quietVol   = not hasVolume or testVolume < testVolumeInput * springProbeVol
+        if holdsAbove and nearLows and quietVol
+            springTested  := true
+            testCompleted := true
+            string testTip = hasVolume and springProbeVol > 0 ? "Test volume: " + str.tostring(testVolume / springProbeVol, "#.##") + "x probe" : "Volume data unavailable"
+            label.new(plBar, plPrice, "Test", style = label.style_label_up, color = #00000000, textcolor = bullColorInput, size = labelSize, tooltip = testTip)
+
+    // Support construction while no spring is being worked
+    if not springActive and not inEpisode
+        if na(supportLevel) or plPrice < supportLevel - tolerance
+            supportLevel     := plPrice
+            supportAnchor    := plBar
+            supportTouches   := 1
+            rangeTop         := highWindow
+            rangeEstablished := false
+            undercutActive   := false
+        else if plPrice <= supportLevel + tolerance
+            supportTouches += 1
+            if not rangeEstablished
+                supportLevel := math.min(supportLevel, plPrice)
+
+// Candidate invalidation before establishment, price must keep ranging above support
+if not rangeEstablished and not na(supportLevel) and close < supportLevel
+    supportLevel   := na
+    supportAnchor  := na
+    supportTouches := 0
+    rangeTop       := na
+    undercutActive := false
+
+// Establishment, enough time above support and enough tests of it
+if not na(supportLevel) and not rangeEstablished and bar_index - supportAnchor >= minRangeBarsInput and supportTouches >= minTouchesInput
+    rangeEstablished := true
+    if showSupportInput
+        supportLine := line.new(supportAnchor, supportLevel, bar_index, supportLevel, color = supportColorInput, width = 1)
+
+// Undercut episodes, springs only exist against an established range
+if rangeEstablished and not na(atrValue) and atrValue > 0
+    if not undercutActive
+        bool startProbe = springActive ? low < springLow : low < supportLevel
+        if startProbe
+            undercutActive := true
+            undercutStart  := bar_index
+            probeLow       := low
+            probeLowBar    := bar_index
+            probeVolume    := nz(volume)
+
+    if undercutActive
+        if low < probeLow
+            probeLow    := low
+            probeLowBar := bar_index
+        probeVolume := math.max(probeVolume, nz(volume))
+
+        // A close back below the marked spring low cancels the active spring read
+        if springActive and close < springLow
+            springFailed := true
+            springActive := false
+            springTested := false
+            label.new(bar_index, low, "Failed", style = label.style_label_up, color = bearColorInput, textcolor = chart.bg_color, size = labelSize, tooltip = "Close back below the spring low")
+
+        if close > supportLevel
+            // Spring detected, the undercut was reclaimed within the allowed window
+            int    reclaimBars = bar_index - undercutStart + 1
+            float  depthAtr    = (supportLevel - probeLow) / atrValue
+            float  probeRatio  = hasVolume ? probeVolume / volAverage : na
+            bool   shallowOk   = depthAtr <= deepPenetrationInput
+            bool   quietOk     = hasVolume ? probeRatio < heavyVolumeInput : true
+            bool   fastOk      = reclaimBars <= fastReclaimInput
+            int    gradeScore  = (shallowOk ? 1 : 0) + (quietOk ? 1 : 0) + (fastOk ? 1 : 0)
+            string gradeText   = gradeScore == 3 ? "A" : gradeScore == 2 ? "B" : "C"
+            bool   isShakeout  = not shallowOk and (hasVolume ? not quietOk : true)
+            string eventText   = isShakeout ? "Shakeout" : "Spring"
+            string springTip   = "Penetration: " + str.tostring(depthAtr, "#.##") + " ATR\nProbe volume: " + (hasVolume ? str.tostring(probeRatio, "#.##") + "x average" : "n/a") + "\nReclaim: " + str.tostring(reclaimBars) + (reclaimBars == 1 ? " bar" : " bars")
+
+            springDetected   := true
+            springActive     := true
+            springTested     := false
+            springBar        := bar_index
+            springLow        := probeLow
+            springSupport    := supportLevel
+            springCeiling    := rangeTop
+            springProbeVol   := probeVolume
+            lastEpisodeStart := undercutStart
+            lastEpisodeEnd   := bar_index
+            undercutActive   := false
+            belowCount       := 0
+
+            label.new(probeLowBar, springLow, eventText + " · " + gradeText, style = label.style_label_up, color = bullColorInput, textcolor = chart.bg_color, size = labelSize, tooltip = springTip)
+            if showZoneInput
+                springZone := box.new(lastEpisodeStart, springSupport, bar_index, springLow, border_color = color.new(bullColorInput, 70), bgcolor = color.new(bullColorInput, 90))
+            if showSpringLowInput
+                springLowLine := line.new(probeLowBar, springLow, bar_index, springLow, color = bearColorInput, style = line.style_dashed)
+        else if bar_index - undercutStart + 1 > maxReclaimBarsInput
+            // No reclaim within the window, price accepted below the range, breakdown
+            if springActive
+                springFailed := true
+                label.new(bar_index, low, "Failed", style = label.style_label_up, color = bearColorInput, textcolor = chart.bg_color, size = labelSize, tooltip = "Price accepted below the range")
+            undercutActive := false
+            resetRange     := true
+
+// Acceptance below support after a spring invalidates the read
+if springActive and not undercutActive
+    belowCount := close < springSupport ? belowCount + 1 : 0
+    if belowCount > maxReclaimBarsInput
+        springFailed := true
+        springActive := false
+        springTested := false
+        resetRange   := true
+        label.new(bar_index, low, "Failed", style = label.style_label_up, color = bearColorInput, textcolor = chart.bg_color, size = labelSize, tooltip = "Price accepted below the range")
+
+// A close above the range top resolves the spring, the range has played out
+if springActive and not undercutActive and close > springCeiling
+    springActive := false
+    springTested := false
+    resetRange   := true
+
+// Full range reset after breakdown, failure or resolution
+if resetRange
+    supportLevel     := na
+    supportAnchor    := na
+    supportTouches   := 0
+    rangeTop         := na
+    rangeEstablished := false
+    undercutActive   := false
+    springActive     := false
+    springTested     := false
+    springLow        := na
+    belowCount       := 0
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visualization
+//---------------------------------------------------------------------------------------------------------------------{
+if rangeEstablished and not na(supportLine)
+    line.set_x2(supportLine, bar_index)
+
+if springActive
+    if not na(springZone)
+        box.set_right(springZone, bar_index)
+    if not na(springLowLine)
+        line.set_x2(springLowLine, bar_index)
+
+plot(supportLevel, "Range Support", supportColorInput, 1, display = display.data_window)
+plot(springActive ? springLow : na, "Spring Low", bearColorInput, 1, display = display.data_window)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(springDetected, "Spring Detected", "Spring detected, price undercut range support and reclaimed it, awaiting a quiet test")
+alertcondition(testCompleted, "Spring Test Completed", "Spring test completed, pullback held above the spring low on lighter volume")
+alertcondition(springFailed, "Spring Failed", "Spring failed, price was accepted back below the range lows and the spring read is invalidated")
+
+//---------------------------------------------------------------------------------------------------------------------}

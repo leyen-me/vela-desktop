@@ -1,0 +1,255 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Kase Studies", shorttitle = "Kase Studies", overlay = false, max_bars_back = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+BULL_COLOR    = #089981
+BEAR_COLOR    = #f23645
+NEUTRAL_COLOR = #787b86
+
+FILL_VALUE_TRANSP  = 50     // gradient transparency at the oscillator value
+FILL_CENTER_TRANSP = 100    // gradient transparency at the zero line
+HISTOGRAM_TRANSP   = 60     // KaseCD columns sit behind the oscillator line
+THRESHOLD_TRANSP   = 30     // peak-out threshold lines
+WARNING_TRANSP     = 55     // DevStop warning line - the faintest rung of the ladder
+STOP1_TRANSP       = 35     // DevStop 1
+STOP2_TRANSP       = 18     // DevStop 2
+STOP3_TRANSP       = 0      // DevStop 3 - the disaster stop is the most prominent line
+
+KPO_GROUP   = "Peak Oscillator"
+PEAK_GROUP  = "Peak-Out Detection"
+KCD_GROUP   = "KaseCD"
+STOP_GROUP  = "Kase DevStops"
+STYLE_GROUP = "Style"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+scanFromInput = input.int(8, "Scan Lengths", minval = 2, maxval = 200, inline = "scan"
+  , group   = KPO_GROUP
+  , tooltip = "Shortest trend length in the scan. Kase's design measures each move in volatility units across a whole range of lookbacks instead of trusting a single fixed length, so signals adapt to conditions rather than being retuned per market.")
+
+scanToInput = input.int(65, "to", minval = 2, maxval = 200, inline = "scan"
+  , group   = KPO_GROUP
+  , tooltip = "Longest trend length in the scan. For every length in the range, the up statistic compares the log move from the lowest point that many bars back up to the current high - and the down statistic the mirror move - against what a random walk with the instrument's own return volatility would produce (deviation of one-bar log returns scaled by the square root of the length). The oscillator is the strongest up statistic minus the strongest down statistic across the scan.")
+
+peakMultiplierInput = input.float(2.0, "Peak-Out Threshold (Deviations)", minval = 0.5, step = 0.1
+  , group   = PEAK_GROUP
+  , tooltip = "Deviation multiple that builds the peak-out thresholds from the oscillator's own history - commonly around two standard deviations. A reading stretching beyond the threshold flags a move that is statistically extended for this instrument and timeframe: an exhaustion candidate, not an automatic reversal.")
+
+peakWindowInput = input.int(100, "Threshold History", minval = 20, maxval = 500
+  , group   = PEAK_GROUP
+  , tooltip = "Bars of oscillator history the deviation thresholds are measured over. The lines derive from the oscillator's own historical behavior rather than fixed constants, which is what lets one threshold serve a gas future and an equity index alike.")
+
+showKcdInput = input.bool(true, "Show KaseCD Histogram"
+  , group   = KCD_GROUP
+  , tooltip = "Plots KaseCD, the MACD-style derivative of the Peak Oscillator: a fast smoothing minus a slow smoothing, drawn as a histogram. Its job is divergence work - price pressing a new extreme while the histogram prints a weaker peak warns that the move's momentum internals are thinning.")
+
+kcdFastInput = input.int(12, "Fast Length", minval = 1, inline = "kcd"
+  , group   = KCD_GROUP
+  , tooltip = "Fast exponential smoothing of the Peak Oscillator, MACD-style default 12.")
+
+kcdSlowInput = input.int(26, "Slow Length", minval = 1, inline = "kcd"
+  , group   = KCD_GROUP
+  , tooltip = "Slow exponential smoothing of the Peak Oscillator, MACD-style default 26. KaseCD is the fast smoothing minus this one.")
+
+showStopsInput = input.bool(true, "Show DevStops on Price"
+  , group   = STOP_GROUP
+  , tooltip = "Draws the DevStop exit ladder on the price chart: a warning line at the mean of the two-bar true range behind the trend extreme, plus three stops stepped at increasing deviation multiples beyond it. Tighter lines exit sooner and give back less; the outer line is the disaster stop that only an outlier bar should reach. The ladder flips when the disaster stop is breached on a close, and the stop alerts stay armed whether or not the lines are shown.")
+
+devLengthInput = input.int(20, "Deviation Window", minval = 2, maxval = 250
+  , group   = STOP_GROUP
+  , tooltip = "Bars used for the mean and standard deviation of the two-bar true range the ladder is built from. Two-bar ranges budget for the way real exits get hit - by a pair of adverse bars, gaps included - rather than by a single average bar.")
+
+stopMult1Input = input.float(1.0, "Stop 1", minval = 0, step = 0.1, inline = "mults"
+  , group   = STOP_GROUP
+  , tooltip = "Deviation step of the first stop beyond the warning line's mean distance.")
+
+stopMult2Input = input.float(2.2, "Stop 2", minval = 0, step = 0.1, inline = "mults"
+  , group   = STOP_GROUP
+  , tooltip = "Deviation step of the second stop. Kase's skew-adjusted scheme renders it near 2.2 deviations rather than 2, correcting for the right skew of range distributions.")
+
+stopMult3Input = input.float(3.6, "Stop 3", minval = 0, step = 0.1, inline = "mults"
+  , group   = STOP_GROUP
+  , tooltip = "Deviation step of the outer disaster stop, near 3.6 deviations in the skew-adjusted scheme - it budgets for the occasional oversized bar instead of treating volatility as symmetric.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "direction"
+  , group   = STYLE_GROUP
+  , tooltip = "Oscillator, gradient and KaseCD columns while volatility-normalized up-moves dominate; DevStop ladder while it trails below an up-trend; bullish peak-out markers at the lower threshold.")
+
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "direction"
+  , group   = STYLE_GROUP
+  , tooltip = "Oscillator, gradient and KaseCD columns while volatility-normalized down-moves dominate; DevStop ladder while it trails above a down-trend; bearish peak-out markers at the upper threshold.")
+
+thresholdColorInput = input.color(NEUTRAL_COLOR, "Thresholds"
+  , group   = STYLE_GROUP
+  , tooltip = "Peak-out threshold lines derived from the oscillator's own history.")
+
+gradientFillInput = input.bool(true, "Oscillator Gradient"
+  , group   = STYLE_GROUP
+  , tooltip = "Vertical gradient between the Peak Oscillator and the zero line - fully transparent at zero, stronger at the value, bullish or bearish by the side the oscillator is on.")
+
+showPeakMarkersInput = input.bool(true, "Peak-Out Markers"
+  , group   = STYLE_GROUP
+  , tooltip = "Diamond on the oscillator when a reading stretches beyond a threshold - the suite's signature flag that a swing is statistically stretched. Grounds to take profits, tighten stops or watch for divergence; stretched markets can keep stretching.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+// Normalized scan bounds, so the loop is always well ordered
+scanFrom = math.min(scanFromInput, scanToInput)
+scanTo   = math.max(scanFromInput, scanToInput)
+
+// One-bar log return - the random-walk building block every statistic is normalized with
+logReturn = close > 0 and nz(close[1]) > 0 ? math.log(close / close[1]) : na
+
+// Kase Peak Oscillator: for every scanned length, the up statistic measures the log move from the
+// lowest point that many bars back up to the current high, and the down statistic the move from the
+// highest point back then down to the current low, each divided by the deviation of one-bar log
+// returns over the same window scaled by the square root of the length (the random-walk yardstick).
+// The oscillator is the strongest up statistic minus the strongest down statistic across the scan.
+float peakOscillator = na
+
+if bar_index > scanTo
+    float returnSum   = 0.0
+    float returnSumSq = 0.0
+    float maxUpStat   = na
+    float maxDownStat = na
+
+    for scanLength = 1 to scanTo
+        float barReturn = nz(logReturn[scanLength - 1])
+        returnSum   += barReturn
+        returnSumSq += barReturn * barReturn
+
+        if scanLength >= scanFrom and high > 0 and low > 0 and high[scanLength] > 0 and low[scanLength] > 0
+            float meanReturn = returnSum / scanLength
+            float variance   = returnSumSq / scanLength - meanReturn * meanReturn
+
+            if variance > 0
+                float scaledSigma = math.sqrt(variance) * math.sqrt(scanLength)
+                float upStat      = math.log(high / low[scanLength]) / scaledSigma
+                float downStat    = math.log(high[scanLength] / low) / scaledSigma
+
+                maxUpStat   := na(maxUpStat)   ? upStat   : math.max(maxUpStat, upStat)
+                maxDownStat := na(maxDownStat) ? downStat : math.max(maxDownStat, downStat)
+
+    if not na(maxUpStat) and not na(maxDownStat)
+        peakOscillator := maxUpStat - maxDownStat
+
+// Peak-out thresholds - derived from the oscillator's own history rather than fixed constants
+oscillatorDev  = ta.stdev(peakOscillator, peakWindowInput)
+upperThreshold = peakMultiplierInput * oscillatorDev
+lowerThreshold = -upperThreshold
+
+// KaseCD - the MACD-style derivative of the Peak Oscillator, for divergence work
+kcdFast = ta.ema(peakOscillator, kcdFastInput)
+kcdSlow = ta.ema(peakOscillator, kcdSlowInput)
+kaseCd  = kcdFast - kcdSlow
+
+// Oscillator events: peak-outs beyond the thresholds and zero-line regime crosses
+bearishPeakOut = ta.crossover(peakOscillator, upperThreshold)
+bullishPeakOut = ta.crossunder(peakOscillator, lowerThreshold)
+zeroCrossUp    = ta.crossover(peakOscillator, 0)
+zeroCrossDown  = ta.crossunder(peakOscillator, 0)
+
+// Kase DevStops: mean and deviation of the two-bar true range (gap-adjusted with the close two bars
+// back), spent as a ladder behind the trend extreme - warning at the mean, stops at deviation steps
+twoBarHigh      = math.max(high, nz(high[1], high))
+twoBarLow       = math.min(low, nz(low[1], low))
+trueRangeTwoBar = math.max(twoBarHigh - twoBarLow
+  , math.abs(twoBarHigh - nz(close[2], twoBarLow))
+  , math.abs(twoBarLow - nz(close[2], twoBarHigh)))
+
+rangeAverage   = ta.sma(trueRangeTwoBar, devLengthInput)
+rangeDeviation = ta.stdev(trueRangeTwoBar, devLengthInput)
+
+warningDistance = rangeAverage
+stopDistance1   = rangeAverage + stopMult1Input * rangeDeviation
+stopDistance2   = rangeAverage + stopMult2Input * rangeDeviation
+stopDistance3   = rangeAverage + stopMult3Input * rangeDeviation
+
+// The ladder trails the extreme reached since the trend began and flips when a close breaches the
+// outer disaster stop - the line only an outlier move should reach
+var int   stopDirection = 1
+var float trendAnchor   = na
+bool      trendFlip     = false
+
+if na(stopDistance3)
+    trendAnchor := high
+else
+    trendAnchor := stopDirection == 1 ? math.max(nz(trendAnchor, high), high) : math.min(nz(trendAnchor, low), low)
+    float disasterStop = stopDirection == 1 ? trendAnchor - stopDistance3 : trendAnchor + stopDistance3
+
+    if stopDirection == 1 and close < disasterStop
+        stopDirection := -1
+        trendAnchor   := low
+        trendFlip     := true
+    else if stopDirection == -1 and close > disasterStop
+        stopDirection := 1
+        trendAnchor   := high
+        trendFlip     := true
+
+warningLine = stopDirection == 1 ? trendAnchor - warningDistance : trendAnchor + warningDistance
+stopLine1   = stopDirection == 1 ? trendAnchor - stopDistance1 : trendAnchor + stopDistance1
+stopLine2   = stopDirection == 1 ? trendAnchor - stopDistance2 : trendAnchor + stopDistance2
+stopLine3   = stopDirection == 1 ? trendAnchor - stopDistance3 : trendAnchor + stopDistance3
+
+// Stop events: the first rung of the exit ladder giving way, and full trend flips
+flipToShort = trendFlip and stopDirection == -1
+flipToLong  = trendFlip and stopDirection == 1
+
+warningHitLong = stopDirection == 1 and stopDirection[1] == 1 and not trendFlip and not na(warningLine) and not na(warningLine[1]) and close < warningLine and close[1] >= warningLine[1]
+
+warningHitShort = stopDirection == -1 and stopDirection[1] == -1 and not trendFlip and not na(warningLine) and not na(warningLine[1]) and close > warningLine and close[1] <= warningLine[1]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visual Elements
+//---------------------------------------------------------------------------------------------------------------------{
+oscillatorColor = peakOscillator >= 0 ? bullColorInput : bearColorInput
+histogramColor  = kaseCd >= 0 ? color.new(bullColorInput, HISTOGRAM_TRANSP) : color.new(bearColorInput, HISTOGRAM_TRANSP)
+stopColor       = stopDirection == 1 ? bullColorInput : bearColorInput
+
+fillTopColor    = peakOscillator >= 0 ? color.new(bullColorInput, FILL_VALUE_TRANSP)  : color.new(bearColorInput, FILL_CENTER_TRANSP)
+fillBottomColor = peakOscillator >= 0 ? color.new(bullColorInput, FILL_CENTER_TRANSP) : color.new(bearColorInput, FILL_VALUE_TRANSP)
+
+plot(showKcdInput ? kaseCd : na, "KaseCD Histogram", histogramColor, 1, plot.style_columns, precision = 2)
+
+plot(upperThreshold, "Upper Peak-Out Threshold", color.new(thresholdColorInput, THRESHOLD_TRANSP), 1, precision = 2)
+plot(lowerThreshold, "Lower Peak-Out Threshold", color.new(thresholdColorInput, THRESHOLD_TRANSP), 1, precision = 2)
+
+zeroPlotId       = plot(0, "Zero Line", color = color.new(chart.fg_color, 90), linewidth = 1, editable = false)
+oscillatorPlotId = plot(peakOscillator, "Peak Oscillator", oscillatorColor, 2, plot.style_linebr, precision = 2)
+
+fill(oscillatorPlotId, zeroPlotId
+  , math.max(peakOscillator, 0)
+  , math.min(peakOscillator, 0)
+  , gradientFillInput ? fillTopColor : na
+  , gradientFillInput ? fillBottomColor : na
+  , title = "Oscillator Gradient")
+
+plotshape(showPeakMarkersInput and bearishPeakOut ? peakOscillator : na, "Bearish Peak-Out Marker", shape.diamond, location.absolute, bearColorInput, size = size.tiny)
+plotshape(showPeakMarkersInput and bullishPeakOut ? peakOscillator : na, "Bullish Peak-Out Marker", shape.diamond, location.absolute, bullColorInput, size = size.tiny)
+
+// DevStop exit ladder on the price chart - the outer disaster stop drawn strongest
+plot(showStopsInput and not trendFlip ? warningLine : na, "DevStop Warning", color.new(stopColor, WARNING_TRANSP), 1, plot.style_linebr, force_overlay = true)
+plot(showStopsInput and not trendFlip ? stopLine1 : na, "DevStop 1", color.new(stopColor, STOP1_TRANSP), 1, plot.style_linebr, force_overlay = true)
+plot(showStopsInput and not trendFlip ? stopLine2 : na, "DevStop 2", color.new(stopColor, STOP2_TRANSP), 1, plot.style_linebr, force_overlay = true)
+plot(showStopsInput and not trendFlip ? stopLine3 : na, "DevStop 3", color.new(stopColor, STOP3_TRANSP), 2, plot.style_linebr, force_overlay = true)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(bearishPeakOut, "Bearish Peak-Out", "Kase Studies: Peak Oscillator stretched above its upper deviation threshold on {{ticker}} - the up-move is statistically extended, exhaustion candidate ({{interval}})")
+alertcondition(bullishPeakOut, "Bullish Peak-Out", "Kase Studies: Peak Oscillator stretched below its lower deviation threshold on {{ticker}} - the down-move is statistically extended, exhaustion candidate ({{interval}})")
+alertcondition(zeroCrossUp, "Oscillator Cross Above Zero", "Kase Studies: Peak Oscillator crossed above zero on {{ticker}} - volatility-normalized up-moves now dominate ({{interval}})")
+alertcondition(zeroCrossDown, "Oscillator Cross Below Zero", "Kase Studies: Peak Oscillator crossed below zero on {{ticker}} - volatility-normalized down-moves now dominate ({{interval}})")
+alertcondition(warningHitLong, "DevStop Warning Hit (Long Trend)", "Kase Studies: close slipped under the DevStop warning line on {{ticker}} - first rung of the exit ladder giving way ({{interval}})")
+alertcondition(warningHitShort, "DevStop Warning Hit (Short Trend)", "Kase Studies: close pushed above the DevStop warning line on {{ticker}} - first rung of the exit ladder giving way ({{interval}})")
+alertcondition(flipToShort, "DevStop Flip Down", "Kase Studies: close breached the outer disaster stop on {{ticker}} - up-trend stopped out, ladder flipped above price ({{interval}})")
+alertcondition(flipToLong, "DevStop Flip Up", "Kase Studies: close breached the outer disaster stop on {{ticker}} - down-trend stopped out, ladder flipped below price ({{interval}})")
+
+//---------------------------------------------------------------------------------------------------------------------}

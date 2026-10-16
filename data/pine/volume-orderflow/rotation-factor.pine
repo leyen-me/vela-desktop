@@ -1,0 +1,277 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Rotation Factor", shorttitle = "Rotation Factor", overlay = false, format = format.price, precision = 0, max_lines_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+color BULL_COLOR    = #089981
+color BEAR_COLOR    = #f23645
+color NEUTRAL_COLOR = #787b86
+color WARN_COLOR    = #ff9800
+
+int COLUMN_TRANSP       = 55
+int LEVEL_TRANSP        = 65
+int BOUND_TRANSP        = 55
+int SESSION_LINE_TRANSP = 70
+int FILL_VALUE_TRANSP   = 50
+int FILL_ZERO_TRANSP    = 100
+int MUTED_TRANSP        = 45
+int LABEL_TEXT_TRANSP   = 30
+int CELL_TRANSP         = 90
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+anchorInput = input.timeframe("D", "Session Anchor", group = "Rotation Factor",
+     tooltip = "Session the rotation factor is tallied over and reset on — the statistic is a day-timeframe read, so 'D' matches the exchange day. On 24-hour markets choose the anchor deliberately (exchange day, regional session or a custom window) and keep it consistent: different anchors produce different counts.")
+
+bracketInput = input.timeframe("30", "TPO Bracket", group = "Rotation Factor",
+     tooltip = "Duration of one TPO bracket, the statistic's only parameter. Each completed bracket is compared with the one before it: a higher high scores +1 and a lower high -1, a higher low +1 and a lower low -1, unchanged extremes 0. Thirty minutes is the traditional Market Profile setting. Must not be lower than the chart timeframe.")
+
+strongThrInput = input.int(50, "Strong Rotation Threshold %", minval = 10, maxval = 100, step = 5, group = "Interpretation",
+     tooltip = "There is no universal fixed level — the possible total depends on the session's bracket count, so the count is judged against that day's own maximum. A running total reaching this percentage of its possible range reads as strongly one-sided; it drives the strong-rotation levels, the dashboard read and the extreme alerts.")
+
+balanceThrInput = input.int(15, "Balance Band %", minval = 0, maxval = 50, step = 5, group = "Interpretation",
+     tooltip = "Totals within this percentage of the session's possible range read as balance — a mixed, two-sided auction arguing for responsive, rotational tactics rather than trend-following.")
+
+showDashInput = input.bool(true, "Show Dashboard", group = "Dashboard",
+     tooltip = "Summary panel with the session count, its possible range, strength, the balance / one-sided read, bracket scores, the effort-versus-result check against price and the prior session's final rotation factor.")
+dashPosInput  = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], inline = "dash", group = "Dashboard",
+     tooltip = "Dashboard corner on the pane.")
+dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], inline = "dash", group = "Dashboard",
+     tooltip = "Dashboard text size.")
+
+showColumnsInput = input.bool(true, "Bracket Score Columns", group = "Style",
+     tooltip = "Plot each bracket's developing score (-2 to +2) as columns: +1/-1 for a higher/lower high plus +1/-1 for a higher/lower low versus the prior bracket. The column settles when its bracket completes; the session's first bracket is the unscored baseline.")
+
+gradientInput = input.bool(true, "Gradient Fill", group = "Style",
+     tooltip = "Shade the area between zero and the session count — green above, red below, fading toward the zero line.")
+
+showBoundInput = input.bool(true, "Possible Range Envelope", group = "Style",
+     tooltip = "Dotted envelope of the widest total the session could have reached so far (plus or minus 2 per scored bracket) — the day's own yardstick the count is judged against.")
+
+showThresholdInput = input.bool(true, "Strong Rotation Levels", group = "Style",
+     tooltip = "Plot the strong-rotation levels at the threshold percentage of the session's possible range; the count crossing them is the extreme the alerts fire on.")
+
+showBreaksInput = input.bool(true, "Session Breaks", group = "Style",
+     tooltip = "Draw a dotted vertical line where each new session anchor begins, marking where the tally resets.")
+
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline = "col1", group = "Style",
+     tooltip = "Color for positive rotation — buyers winning the bracket-by-bracket auction.")
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline = "col1", group = "Style",
+     tooltip = "Color for negative rotation — sellers winning the bracket-by-bracket auction.")
+neutralColorInput = input.color(NEUTRAL_COLOR, "Neutral", inline = "col2", group = "Style",
+     tooltip = "Color for balance readings, the possible-range envelope and session breaks.")
+warnColorInput = input.color(WARN_COLOR, "Warning", inline = "col2", group = "Style",
+     tooltip = "Color of the effort-versus-result warning shown when strong rotation is not matched by session price progress.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Rotation score of one bracket against the bracket before it: highs and lows each contribute +1 / -1 / 0
+bracketScore(float curH, float curL, float prevH, float prevL) =>
+    int highScore = curH > prevH ? 1 : curH < prevH ? -1 : 0
+    int lowScore  = curL > prevL ? 1 : curL < prevL ? -1 : 0
+    highScore + lowScore
+
+signedTxt(int v) =>
+    (v > 0 ? "+" : "") + str.tostring(v)
+
+pctTxt(float s) =>
+    (s > 0 ? "+" : "") + str.tostring(math.round(s)) + "%"
+
+// Interpretation of the count as a share of the session's own possible range
+readTxt(float strength) =>
+    na(strength) ? "Baseline" : math.abs(strength) <= balanceThrInput ? "Balance" : strength >= strongThrInput ? "Strong buy rotation" : strength <= -strongThrInput ? "Strong sell rotation" : strength > 0 ? "Buy rotation" : "Sell rotation"
+
+readCol(float strength) =>
+    na(strength) or math.abs(strength) <= balanceThrInput ? neutralColorInput : math.abs(strength) >= strongThrInput ? (strength > 0 ? bullColorInput : bearColorInput) : color.new(strength > 0 ? bullColorInput : bearColorInput, MUTED_TRANSP)
+
+scoreCol(int v) =>
+    v > 0 ? bullColorInput : v < 0 ? bearColorInput : neutralColorInput
+
+// One dashboard row: dimmed label on the left, contextual value on the right
+dashRow(table t, int row, string labelTxt, string valueTxt, color valueColor, string txtSize, string tip) =>
+    table.cell(t, 0, row, labelTxt, text_color = color.new(chart.fg_color, LABEL_TEXT_TRANSP), text_size = txtSize, text_halign = text.align_left)
+    table.cell(t, 1, row, valueTxt, text_color = valueColor, text_size = txtSize, text_halign = text.align_right, bgcolor = color.new(valueColor, CELL_TRANSP), tooltip = tip)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Bracket Engine
+//---------------------------------------------------------------------------------------------------------------------{
+if timeframe.in_seconds(timeframe.period) > timeframe.in_seconds(bracketInput)
+    runtime.error("The TPO bracket must be greater than or equal to the chart timeframe — lower the chart timeframe or raise the bracket.")
+if timeframe.in_seconds(bracketInput) >= timeframe.in_seconds(anchorInput)
+    runtime.error("The session anchor must be greater than the TPO bracket — raise the anchor or lower the bracket.")
+
+var float curHigh  = na
+var float curLow   = na
+var float prevHigh = na
+var float prevLow  = na
+
+var int   rfCompleted     = 0
+var int   scoredCount     = 0
+var int   lastScore       = 0
+var bool  hasLastScore    = false
+var int   lastNonZeroSign = 0
+var bool  strongBuyState  = false
+var bool  strongSellState = false
+var bool  divergeState    = false
+var float sessionOpen     = na
+
+var int   priorRf       = na
+var float priorStrength = na
+
+bool sessionRoll = timeframe.change(anchorInput)
+bool bracketRoll = timeframe.change(bracketInput)
+
+bool bracketClosedEvt = false
+bool strongBuyEvt     = false
+bool strongSellEvt    = false
+bool flipUpEvt        = false
+bool flipDnEvt        = false
+bool divergeEvt       = false
+bool sessionFinalEvt  = false
+
+// Close out the bracket that ended on the previous bar. The session's first bracket is the unscored baseline;
+// comparisons never span sessions. A session roll locks the closing total as the day's rotation factor.
+if (sessionRoll or bracketRoll) and not na(curHigh)
+    if not na(prevHigh)
+        int closedScore = bracketScore(curHigh, curLow, prevHigh, prevLow)
+        rfCompleted += closedScore
+        scoredCount += 1
+        if not sessionRoll
+            lastScore        := closedScore
+            hasLastScore     := true
+            bracketClosedEvt := true
+    if sessionRoll
+        if scoredCount > 0
+            priorRf         := rfCompleted
+            priorStrength   := 100.0 * rfCompleted / (2 * scoredCount)
+            sessionFinalEvt := true
+        rfCompleted     := 0
+        scoredCount     := 0
+        hasLastScore    := false
+        lastNonZeroSign := 0
+        strongBuyState  := false
+        strongSellState := false
+        divergeState    := false
+        prevHigh        := na
+        prevLow         := na
+    else
+        prevHigh := curHigh
+        prevLow  := curLow
+
+// Session-management events, evaluated on confirmed intra-session bracket closes only
+if bracketClosedEvt
+    float strengthClosed = 100.0 * rfCompleted / (2 * scoredCount)
+    bool  strongBuyNow   = strengthClosed >= strongThrInput
+    bool  strongSellNow  = strengthClosed <= -strongThrInput
+    strongBuyEvt    := strongBuyNow and not strongBuyState
+    strongSellEvt   := strongSellNow and not strongSellState
+    strongBuyState  := strongBuyNow
+    strongSellState := strongSellNow
+    flipUpEvt       := rfCompleted > 0 and lastNonZeroSign == -1
+    flipDnEvt       := rfCompleted < 0 and lastNonZeroSign == 1
+    if rfCompleted != 0
+        lastNonZeroSign := rfCompleted > 0 ? 1 : -1
+    // effort versus result — a strong count with no matching net price progress warns of absorption
+    float sessionProgress = nz(close[1], close) - sessionOpen
+    bool  divergeNow      = (strongBuyNow and sessionProgress <= 0) or (strongSellNow and sessionProgress >= 0)
+    divergeEvt   := divergeNow and not divergeState
+    divergeState := divergeNow
+
+// New session / bracket bookkeeping, then the running bracket absorbs each bar's range
+if sessionRoll or barstate.isfirst
+    sessionOpen := open
+if sessionRoll or bracketRoll or barstate.isfirst
+    curHigh := high
+    curLow  := low
+else
+    curHigh := math.max(nz(curHigh, high), high)
+    curLow  := math.min(nz(curLow, low), low)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Developing Session Read
+//---------------------------------------------------------------------------------------------------------------------{
+// Provisional score of the in-progress bracket, the live running total and the session's own possible range so far
+bool  devActive       = not na(prevHigh) and not na(curHigh)
+int   devScore        = devActive ? bracketScore(curHigh, curLow, prevHigh, prevLow) : 0
+int   rfLive          = rfCompleted + devScore
+int   liveComparisons = scoredCount + (devActive ? 1 : 0)
+float liveBound       = 2.0 * liveComparisons
+float strengthLive    = liveComparisons > 0 ? 100.0 * rfLive / liveBound : na
+float strongLevel     = liveBound * strongThrInput / 100
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visuals
+//---------------------------------------------------------------------------------------------------------------------{
+hline(0, "Zero Line", color = color.new(#787b86, 50), linestyle = hline.style_dashed)
+
+plot(showColumnsInput and devActive ? devScore : na, "Bracket Score", devScore > 0 ? color.new(bullColorInput, COLUMN_TRANSP) : devScore < 0 ? color.new(bearColorInput, COLUMN_TRANSP) : color.new(neutralColorInput, COLUMN_TRANSP), style = plot.style_columns)
+
+color rfColor = rfLive > 0 ? bullColorInput : rfLive < 0 ? bearColorInput : neutralColorInput
+rfPlotId   = plot(rfLive, "Session Rotation Factor", rfColor, 2, plot.style_stepline)
+zeroPlotId = plot(0, "Zero Anchor", color = color(na), editable = false, display = display.none)
+
+color fillTopColor    = rfLive >= 0 ? color.new(bullColorInput, FILL_VALUE_TRANSP) : color.new(bearColorInput, FILL_ZERO_TRANSP)
+color fillBottomColor = rfLive >= 0 ? color.new(bullColorInput, FILL_ZERO_TRANSP) : color.new(bearColorInput, FILL_VALUE_TRANSP)
+fill(rfPlotId, zeroPlotId, top_value = math.max(rfLive, 0), bottom_value = math.min(rfLive, 0), top_color = gradientInput ? fillTopColor : na, bottom_color = gradientInput ? fillBottomColor : na, title = "Rotation Gradient Fill")
+
+plot(showBoundInput and liveComparisons > 0 ? liveBound : na, "Max Possible (+)", color.new(neutralColorInput, BOUND_TRANSP), 1, plot.style_circles)
+plot(showBoundInput and liveComparisons > 0 ? -liveBound : na, "Max Possible (-)", color.new(neutralColorInput, BOUND_TRANSP), 1, plot.style_circles)
+
+plot(showThresholdInput and liveComparisons > 0 ? strongLevel : na, "Strong Rotation (+)", color.new(bullColorInput, LEVEL_TRANSP), 1, plot.style_stepline)
+plot(showThresholdInput and liveComparisons > 0 ? -strongLevel : na, "Strong Rotation (-)", color.new(bearColorInput, LEVEL_TRANSP), 1, plot.style_stepline)
+
+if showBreaksInput and sessionRoll
+    line.new(bar_index, 0, bar_index, 1, extend = extend.both, color = color.new(neutralColorInput, SESSION_LINE_TRANSP), style = line.style_dotted)
+
+plot(rfCompleted, "Completed Rotation Factor", editable = false, display = display.data_window)
+plot(strengthLive, "Strength % of Max", editable = false, display = display.data_window, precision = 1)
+plot(liveComparisons, "Scored Brackets", editable = false, display = display.data_window)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+string dashLocation = dashPosInput == "Top Left" ? position.top_left : dashPosInput == "Bottom Right" ? position.bottom_right : dashPosInput == "Bottom Left" ? position.bottom_left : position.top_right
+string dashTextSize = dashSizeInput == "Tiny" ? size.tiny : dashSizeInput == "Normal" ? size.normal : size.small
+
+var table dash = na
+
+if showDashInput and barstate.islast
+    if na(dash)
+        dash := table.new(dashLocation, 2, 8, bgcolor = color.new(chart.bg_color, 25), frame_color = color.new(chart.fg_color, 85), frame_width = 1, border_color = color.new(chart.fg_color, 85), border_width = 1)
+    float progressLive = not na(sessionOpen) ? close - sessionOpen : na
+    bool  directional  = not na(strengthLive) and math.abs(strengthLive) > balanceThrInput
+    string vsTxt = not directional or na(progressLive) ? "—" : rfLive * progressLive > 0 ? "Aligned" : "Diverging ⚠"
+    color  vsCol = not directional or na(progressLive) ? neutralColorInput : rfLive * progressLive > 0 ? scoreCol(rfLive) : warnColorInput
+    dashRow(dash, 0, "Session RF", signedTxt(rfLive), scoreCol(rfLive), dashTextSize,
+         "Running sum of bracket scores this session, including the developing bracket's provisional score. Each scored bracket contributes -2 to +2; the closing total is the day's rotation factor.")
+    dashRow(dash, 1, "Possible Range", liveComparisons > 0 ? "±" + str.tostring(2 * liveComparisons) + " (" + str.tostring(liveComparisons) + " scored)" : "—", neutralColorInput, dashTextSize,
+         "Widest total the count could have reached so far: plus or minus 2 per scored comparison. A 13-bracket day allows twelve comparisons, so its total can only span -24 to +24.")
+    dashRow(dash, 2, "Strength", na(strengthLive) ? "—" : pctTxt(strengthLive) + " of max", readCol(strengthLive), dashTextSize,
+         "The count as a share of the session's own possible range — how practitioners judge the number, rather than against a fixed level.")
+    dashRow(dash, 3, "Read", readTxt(strengthLive), readCol(strengthLive), dashTextSize,
+         "Balance argues for two-sided, responsive tactics around the edges; a steadily one-sided count supports trading with the rotations (trend-day tactics). Baseline means the session's first bracket is still forming.")
+    dashRow(dash, 4, "Developing Bracket", devActive ? signedTxt(devScore) : "—", devActive ? scoreCol(devScore) : neutralColorInput, dashTextSize,
+         "Provisional score of the in-progress bracket against the prior bracket's final high and low; it settles when the bracket completes. The session's first bracket is the unscored baseline.")
+    dashRow(dash, 5, "Last Bracket", hasLastScore ? signedTxt(lastScore) : "—", hasLastScore ? scoreCol(lastScore) : neutralColorInput, dashTextSize,
+         "Score of the last completed bracket: higher high +1, lower high -1, plus higher low +1, lower low -1; unchanged extremes 0.")
+    dashRow(dash, 6, "vs Price", vsTxt, vsCol, dashTextSize,
+         "Effort versus result: compares the count's direction with the session's net price change from its open. Strong rotation without matching progress warns that responsive traders are absorbing the attempts — cross-check with volume-based reads before trusting the count.")
+    dashRow(dash, 7, "Prior Session", na(priorRf) ? "—" : signedTxt(priorRf) + " (" + pctTxt(priorStrength) + ")", na(priorRf) ? neutralColorInput : scoreCol(priorRf), dashTextSize,
+         "The prior session's closing rotation factor and its share of that session's possible range — the day-timeframe statistic locked in at each session close.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(strongBuyEvt, "Strong Buy Rotation", "Rotation factor on {{ticker}} ({{interval}}) reached the strong buy-rotation threshold — buyers are winning the bracket-by-bracket auction. Check for matching range extension before treating it as continuation.")
+alertcondition(strongSellEvt, "Strong Sell Rotation", "Rotation factor on {{ticker}} ({{interval}}) reached the strong sell-rotation threshold — sellers are winning the bracket-by-bracket auction. Check for matching range extension before treating it as continuation.")
+alertcondition(flipUpEvt, "Rotation Factor Flip Positive", "Session rotation factor on {{ticker}} ({{interval}}) flipped from negative to positive — control of the bracket auctions changed hands to the buyers.")
+alertcondition(flipDnEvt, "Rotation Factor Flip Negative", "Session rotation factor on {{ticker}} ({{interval}}) flipped from positive to negative — control of the bracket auctions changed hands to the sellers.")
+alertcondition(divergeEvt, "Rotation Without Price Progress", "Strong rotation factor on {{ticker}} ({{interval}}) with no matching session price progress — an effort-versus-result warning that the attempts may be getting absorbed.")
+alertcondition(sessionFinalEvt, "Session Rotation Factor Locked", "Session closed on {{ticker}} ({{interval}}) — the day's rotation factor is final and kept on the dashboard as the prior-session reference.")
+
+//---------------------------------------------------------------------------------------------------------------------}

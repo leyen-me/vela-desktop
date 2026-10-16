@@ -1,0 +1,352 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Custom Indices/baskets", shorttitle = "Custom Indices/baskets", overlay = false, format = format.price, precision = 2)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+int TOTAL_SLOTS = 10
+
+color ORANGE = #ff9800 // the one accent - the rebased chart symbol comparison
+color GRAY   = #787b86
+color GREEN  = #089981
+color RED    = #f23645
+
+color DASH_BG     = #161616
+color DASH_FRAME  = #2E2E2E
+color DASH_HEADER = #808080
+color DASH_TEXT   = #DBDBDB
+
+string SYMBOL_TIP = "Basket constituent. Leave empty to disable the slot, empty slots are skipped in the basket arithmetic."
+string WEIGHT_TIP = "Weight applied to this constituent when 'Weighting' is set to 'Manual'."
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Settings
+//---------------------------------------------------------------------------------------------------------------------{
+
+string methodInput     = input.string("Rebased Prices", "Construction", options = ["Rebased Prices", "Compounded Returns"], group = "Basket", tooltip = "How the constituents aggregate into one series. 'Rebased Prices' rebases each constituent to the base value at the rebase start and takes the weighted average, so weights drift with price like a buy-and-hold portfolio. 'Compounded Returns' compounds the weighted average of the constituents' bar-to-bar returns, re-applying the weights every bar like a continuously rebalanced basket.")
+float  baseInput       = input.float(100, "Base Value", minval = 0.0001, group = "Basket", tooltip = "Starting value of the synthetic index. Each constituent, and the chart symbol comparison, is rebased so its series begins at this value.")
+string weightModeInput = input.string("Manual", "Weighting", options = ["Equal", "Manual", "Liquidity"], group = "Basket", tooltip = "'Equal' gives every constituent the same vote, 'Manual' uses the weight input next to each symbol, 'Liquidity' weights by average traded value (price × volume) to mirror economic size. Weights are always normalized across the constituents with valid data.")
+int    liqLengthInput  = input.int(50, "Liquidity Length", minval = 1, group = "Basket", tooltip = "Lookback, in bars, of the average traded value used by 'Liquidity' weighting. Constituents without volume data are excluded under this mode.")
+string tfInput         = input.timeframe("", "Basket Timeframe", group = "Basket", tooltip = "Timeframe the constituents are sampled from, leave empty to use the chart timeframe. Sampling daily closes reduces the artifacts a basket shows when its constituents trade different sessions.")
+string ccyInput        = input.string("None", "Currency Conversion", options = ["None", "USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD"], group = "Basket", tooltip = "Converts every constituent to a single currency before aggregation so the arithmetic compares like with like. Conversion uses daily FX rates and embeds that FX market inside the basket.")
+string startModeInput  = input.string("First Available Bar", "Rebase Start", options = ["First Available Bar", "Custom Date"], group = "Basket", tooltip = "'First Available Bar' rebases each constituent where its data begins. 'Custom Date' rebases every constituent from the selected date, giving all of them a common starting point.")
+int    startDateInput  = input.time(timestamp("01 Jan 2024 00:00 +0000"), "Custom Start Date", group = "Basket", tooltip = "Date the basket is rebased from when 'Rebase Start' is set to 'Custom Date'.")
+
+string sym1Input  = input.symbol("NASDAQ:AAPL",  "Symbol 1",  inline = "01", group = "Constituents", tooltip = SYMBOL_TIP)
+float  wgt1Input  = input.float(1, "", minval = 0, inline = "01", group = "Constituents", tooltip = WEIGHT_TIP)
+string sym2Input  = input.symbol("NASDAQ:MSFT",  "Symbol 2",  inline = "02", group = "Constituents", tooltip = SYMBOL_TIP)
+float  wgt2Input  = input.float(1, "", minval = 0, inline = "02", group = "Constituents", tooltip = WEIGHT_TIP)
+string sym3Input  = input.symbol("NASDAQ:NVDA",  "Symbol 3",  inline = "03", group = "Constituents", tooltip = SYMBOL_TIP)
+float  wgt3Input  = input.float(1, "", minval = 0, inline = "03", group = "Constituents", tooltip = WEIGHT_TIP)
+string sym4Input  = input.symbol("NASDAQ:AMZN",  "Symbol 4",  inline = "04", group = "Constituents", tooltip = SYMBOL_TIP)
+float  wgt4Input  = input.float(1, "", minval = 0, inline = "04", group = "Constituents", tooltip = WEIGHT_TIP)
+string sym5Input  = input.symbol("NASDAQ:GOOGL", "Symbol 5",  inline = "05", group = "Constituents", tooltip = SYMBOL_TIP)
+float  wgt5Input  = input.float(1, "", minval = 0, inline = "05", group = "Constituents", tooltip = WEIGHT_TIP)
+string sym6Input  = input.symbol("",             "Symbol 6",  inline = "06", group = "Constituents", tooltip = SYMBOL_TIP)
+float  wgt6Input  = input.float(1, "", minval = 0, inline = "06", group = "Constituents", tooltip = WEIGHT_TIP)
+string sym7Input  = input.symbol("",             "Symbol 7",  inline = "07", group = "Constituents", tooltip = SYMBOL_TIP)
+float  wgt7Input  = input.float(1, "", minval = 0, inline = "07", group = "Constituents", tooltip = WEIGHT_TIP)
+string sym8Input  = input.symbol("",             "Symbol 8",  inline = "08", group = "Constituents", tooltip = SYMBOL_TIP)
+float  wgt8Input  = input.float(1, "", minval = 0, inline = "08", group = "Constituents", tooltip = WEIGHT_TIP)
+string sym9Input  = input.symbol("",             "Symbol 9",  inline = "09", group = "Constituents", tooltip = SYMBOL_TIP)
+float  wgt9Input  = input.float(1, "", minval = 0, inline = "09", group = "Constituents", tooltip = WEIGHT_TIP)
+string sym10Input = input.symbol("",             "Symbol 10", inline = "10", group = "Constituents", tooltip = SYMBOL_TIP)
+float  wgt10Input = input.float(1, "", minval = 0, inline = "10", group = "Constituents", tooltip = WEIGHT_TIP)
+
+bool showCompInput = input.bool(true, "Chart Symbol Comparison", group = "Comparison", tooltip = "Plots the chart symbol processed exactly like the basket (same start, timeframe, currency and construction) to separate symbol-specific action from group action. Also useful as a sanity check, open a listed benchmark as the chart symbol and compare it with the basket.")
+
+float alertLevelInput = input.float(100, "Alert Level", inline = "lvl", group = "Alerts", tooltip = "Level on the index scale used by the level cross alert conditions. Alerts fire on the synthetic series, execution still happens leg by leg at each instrument's real quote.")
+bool  showLevelInput  = input.bool(false, "Show", inline = "lvl", group = "Alerts", tooltip = "Displays the alert level as a dashed line.")
+
+bool   showDashInput = input.bool(true, "Show Dashboard", group = "Dashboard", tooltip = "Table listing each constituent with its normalized weight, rebased level and data status. 'Stale' flags constituents whose venue has not printed the current bar, 'Invalid' flags symbols without usable data.")
+string dashPosInput  = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], inline = "dash", group = "Dashboard", tooltip = "Dashboard position on the pane.")
+string dashSizeInput = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], inline = "dash", group = "Dashboard", tooltip = "Dashboard text size.")
+
+color aboveColorInput  = input.color(GREEN, "Basket Above Base", inline = "bsk", group = "Style", tooltip = "Color of the custom index line and its gradient while the index sits above the base value.")
+color belowColorInput  = input.color(RED, "Below Base", inline = "bsk", group = "Style", tooltip = "Color of the custom index line and its gradient while the index sits below the base value.")
+bool  gradientInput    = input.bool(true, "Gradient Fill", group = "Style", tooltip = "Gradient fill between the base value and the index, fully transparent at the base and stronger toward the index value.")
+color compColorInput   = input.color(ORANGE, "Comparison Line", group = "Style", tooltip = "Color of the rebased chart symbol comparison line.")
+bool  showMembersInput = input.bool(false, "Show Constituent Lines", inline = "mem", group = "Style", tooltip = "Plots each constituent rebased to the base value, showing whether a move is idiosyncratic or shared across the basket.")
+color memberColorInput = input.color(GRAY, "", inline = "mem", group = "Style", tooltip = "Color of the constituent lines.")
+color baseColorInput   = input.color(GRAY, "Base Line", group = "Style", tooltip = "Color of the base value line.")
+color levelColorInput  = input.color(GRAY, "Alert Level", group = "Style", tooltip = "Color of the alert level line.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+
+// Per-slot state, captures the rebase anchor and returns the rebased series, the bar return,
+// the effective weight, and whether the slot ever produced usable data
+processSlot(bool active, float price, float weightIn, float liq) =>
+    var float basePrice = na
+    var bool  everValid = false
+    bool priceOk = active and not na(price) and price > 0
+    everValid := everValid or priceOk
+    bool startOk = startModeInput == "First Available Bar" or time >= startDateInput
+    if priceOk and na(basePrice) and startOk
+        basePrice := price
+    float rebased   = priceOk and not na(basePrice) ? baseInput * price / basePrice : na
+    float barReturn = priceOk and not na(price[1]) and price[1] > 0 ? price / price[1] - 1 : na
+    float weight = switch weightModeInput
+        "Equal"  => 1.0
+        "Manual" => weightIn
+        =>          liq
+    weight := active and not na(weight) ? math.max(weight, 0) : 0
+    [rebased, barReturn, weight, everValid]
+
+// Strips the exchange prefix for compact dashboard display
+symbolName(string symRaw) =>
+    array<string> parts = str.split(symRaw, ":")
+    array.size(parts) > 1 ? array.get(parts, 1) : symRaw
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Basket Calculation
+//---------------------------------------------------------------------------------------------------------------------{
+
+string fxCode = ccyInput == "None" ? "USD" : ccyInput
+bool   useFx  = ccyInput != "None"
+
+// Empty slots request the chart symbol as a placeholder so every request stays unconditional,
+// they are excluded from the basket arithmetic by their 'active' flag
+string efSym1  = sym1Input  == "" ? syminfo.tickerid : sym1Input
+string efSym2  = sym2Input  == "" ? syminfo.tickerid : sym2Input
+string efSym3  = sym3Input  == "" ? syminfo.tickerid : sym3Input
+string efSym4  = sym4Input  == "" ? syminfo.tickerid : sym4Input
+string efSym5  = sym5Input  == "" ? syminfo.tickerid : sym5Input
+string efSym6  = sym6Input  == "" ? syminfo.tickerid : sym6Input
+string efSym7  = sym7Input  == "" ? syminfo.tickerid : sym7Input
+string efSym8  = sym8Input  == "" ? syminfo.tickerid : sym8Input
+string efSym9  = sym9Input  == "" ? syminfo.tickerid : sym9Input
+string efSym10 = sym10Input == "" ? syminfo.tickerid : sym10Input
+
+[c1,  v1,  t1 ] = request.security(efSym1,  tfInput, [close, volume, time], ignore_invalid_symbol = true)
+[c2,  v2,  t2 ] = request.security(efSym2,  tfInput, [close, volume, time], ignore_invalid_symbol = true)
+[c3,  v3,  t3 ] = request.security(efSym3,  tfInput, [close, volume, time], ignore_invalid_symbol = true)
+[c4,  v4,  t4 ] = request.security(efSym4,  tfInput, [close, volume, time], ignore_invalid_symbol = true)
+[c5,  v5,  t5 ] = request.security(efSym5,  tfInput, [close, volume, time], ignore_invalid_symbol = true)
+[c6,  v6,  t6 ] = request.security(efSym6,  tfInput, [close, volume, time], ignore_invalid_symbol = true)
+[c7,  v7,  t7 ] = request.security(efSym7,  tfInput, [close, volume, time], ignore_invalid_symbol = true)
+[c8,  v8,  t8 ] = request.security(efSym8,  tfInput, [close, volume, time], ignore_invalid_symbol = true)
+[c9,  v9,  t9 ] = request.security(efSym9,  tfInput, [close, volume, time], ignore_invalid_symbol = true)
+[c10, v10, t10] = request.security(efSym10, tfInput, [close, volume, time], ignore_invalid_symbol = true)
+
+float x1  = request.security(efSym1,  tfInput, close, ignore_invalid_symbol = true, currency = fxCode)
+float x2  = request.security(efSym2,  tfInput, close, ignore_invalid_symbol = true, currency = fxCode)
+float x3  = request.security(efSym3,  tfInput, close, ignore_invalid_symbol = true, currency = fxCode)
+float x4  = request.security(efSym4,  tfInput, close, ignore_invalid_symbol = true, currency = fxCode)
+float x5  = request.security(efSym5,  tfInput, close, ignore_invalid_symbol = true, currency = fxCode)
+float x6  = request.security(efSym6,  tfInput, close, ignore_invalid_symbol = true, currency = fxCode)
+float x7  = request.security(efSym7,  tfInput, close, ignore_invalid_symbol = true, currency = fxCode)
+float x8  = request.security(efSym8,  tfInput, close, ignore_invalid_symbol = true, currency = fxCode)
+float x9  = request.security(efSym9,  tfInput, close, ignore_invalid_symbol = true, currency = fxCode)
+float x10 = request.security(efSym10, tfInput, close, ignore_invalid_symbol = true, currency = fxCode)
+
+float p1  = useFx ? x1  : c1
+float p2  = useFx ? x2  : c2
+float p3  = useFx ? x3  : c3
+float p4  = useFx ? x4  : c4
+float p5  = useFx ? x5  : c5
+float p6  = useFx ? x6  : c6
+float p7  = useFx ? x7  : c7
+float p8  = useFx ? x8  : c8
+float p9  = useFx ? x9  : c9
+float p10 = useFx ? x10 : c10
+
+float liq1  = ta.sma(nz(p1  * v1),  liqLengthInput)
+float liq2  = ta.sma(nz(p2  * v2),  liqLengthInput)
+float liq3  = ta.sma(nz(p3  * v3),  liqLengthInput)
+float liq4  = ta.sma(nz(p4  * v4),  liqLengthInput)
+float liq5  = ta.sma(nz(p5  * v5),  liqLengthInput)
+float liq6  = ta.sma(nz(p6  * v6),  liqLengthInput)
+float liq7  = ta.sma(nz(p7  * v7),  liqLengthInput)
+float liq8  = ta.sma(nz(p8  * v8),  liqLengthInput)
+float liq9  = ta.sma(nz(p9  * v9),  liqLengthInput)
+float liq10 = ta.sma(nz(p10 * v10), liqLengthInput)
+
+[reb1,  ret1,  w1,  ev1 ] = processSlot(sym1Input  != "", p1,  wgt1Input,  liq1)
+[reb2,  ret2,  w2,  ev2 ] = processSlot(sym2Input  != "", p2,  wgt2Input,  liq2)
+[reb3,  ret3,  w3,  ev3 ] = processSlot(sym3Input  != "", p3,  wgt3Input,  liq3)
+[reb4,  ret4,  w4,  ev4 ] = processSlot(sym4Input  != "", p4,  wgt4Input,  liq4)
+[reb5,  ret5,  w5,  ev5 ] = processSlot(sym5Input  != "", p5,  wgt5Input,  liq5)
+[reb6,  ret6,  w6,  ev6 ] = processSlot(sym6Input  != "", p6,  wgt6Input,  liq6)
+[reb7,  ret7,  w7,  ev7 ] = processSlot(sym7Input  != "", p7,  wgt7Input,  liq7)
+[reb8,  ret8,  w8,  ev8 ] = processSlot(sym8Input  != "", p8,  wgt8Input,  liq8)
+[reb9,  ret9,  w9,  ev9 ] = processSlot(sym9Input  != "", p9,  wgt9Input,  liq9)
+[reb10, ret10, w10, ev10] = processSlot(sym10Input != "", p10, wgt10Input, liq10)
+
+array<float>  rebasedArray = array.from(reb1, reb2, reb3, reb4, reb5, reb6, reb7, reb8, reb9, reb10)
+array<float>  returnArray  = array.from(ret1, ret2, ret3, ret4, ret5, ret6, ret7, ret8, ret9, ret10)
+array<float>  weightArray  = array.from(w1, w2, w3, w4, w5, w6, w7, w8, w9, w10)
+array<bool>   validArray   = array.from(ev1, ev2, ev3, ev4, ev5, ev6, ev7, ev8, ev9, ev10)
+array<int>    timeArray    = array.from(t1, t2, t3, t4, t5, t6, t7, t8, t9, t10)
+array<string> symbolArray  = array.from(sym1Input, sym2Input, sym3Input, sym4Input, sym5Input, sym6Input, sym7Input, sym8Input, sym9Input, sym10Input)
+
+float rebasedSum  = 0.0
+float rebasedWSum = 0.0
+float returnSum   = 0.0
+float returnWSum  = 0.0
+
+for i = 0 to TOTAL_SLOTS - 1
+    float rebasedValue = array.get(rebasedArray, i)
+    float returnValue  = array.get(returnArray, i)
+    float weightValue  = array.get(weightArray, i)
+    if weightValue > 0 and not na(rebasedValue)
+        rebasedSum  += weightValue * rebasedValue
+        rebasedWSum += weightValue
+    if weightValue > 0 and not na(returnValue)
+        returnSum  += weightValue * returnValue
+        returnWSum += weightValue
+
+bool  useReturns   = methodInput == "Compounded Returns"
+float rebasedIndex = rebasedWSum > 0 ? rebasedSum / rebasedWSum : na
+float basketReturn = returnWSum > 0 ? returnSum / returnWSum : 0.0
+
+var float compoundedIndex = na
+if na(compoundedIndex)
+    if rebasedWSum > 0
+        compoundedIndex := baseInput
+else
+    compoundedIndex := compoundedIndex * (1 + basketReturn)
+
+float indexSeries = useReturns ? compoundedIndex : rebasedIndex
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Chart Symbol Comparison
+//---------------------------------------------------------------------------------------------------------------------{
+
+float chartRaw   = request.security(syminfo.tickerid, tfInput, close, ignore_invalid_symbol = true)
+float chartFx    = request.security(syminfo.tickerid, tfInput, close, ignore_invalid_symbol = true, currency = fxCode)
+float chartPrice = useFx ? chartFx : chartRaw
+
+bool indexLive = not na(indexSeries)
+
+var float chartBase = na
+if na(chartBase) and indexLive and not na(chartPrice) and chartPrice > 0
+    chartBase := chartPrice
+
+float chartRebased = not na(chartBase) and not na(chartPrice) ? baseInput * chartPrice / chartBase : na
+float chartReturn  = not na(chartPrice) and not na(chartPrice[1]) and chartPrice[1] > 0 ? chartPrice / chartPrice[1] - 1 : na
+
+var float chartCompounded = na
+if na(chartCompounded)
+    if indexLive
+        chartCompounded := baseInput
+else
+    chartCompounded := chartCompounded * (1 + nz(chartReturn))
+
+float comparisonSeries = useReturns ? chartCompounded : chartRebased
+
+bool comparisonCrossUp   = ta.crossover(comparisonSeries, indexSeries)
+bool comparisonCrossDown = ta.crossunder(comparisonSeries, indexSeries)
+bool levelCrossUp        = ta.crossover(indexSeries, alertLevelInput)
+bool levelCrossDown      = ta.crossunder(indexSeries, alertLevelInput)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Dashboard
+//---------------------------------------------------------------------------------------------------------------------{
+
+string dashPos = switch dashPosInput
+    "Top Right"    => position.top_right
+    "Top Left"     => position.top_left
+    "Bottom Right" => position.bottom_right
+    =>                position.bottom_left
+
+string dashSize = switch dashSizeInput
+    "Tiny"  => size.tiny
+    "Small" => size.small
+    =>         size.normal
+
+int currentTfTime = time(tfInput)
+
+var table dashboardTable = na
+
+if showDashInput and barstate.islast
+    if na(dashboardTable)
+        dashboardTable := table.new(dashPos, 4, TOTAL_SLOTS + 2, bgcolor = DASH_BG, border_width = 0, frame_color = DASH_FRAME, frame_width = 1)
+    color headerColor = DASH_HEADER
+    color textColor   = DASH_TEXT
+    table.cell(dashboardTable, 0, 0, "Symbol", text_color = headerColor, text_size = dashSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 0, "Weight", text_color = headerColor, text_size = dashSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 2, 0, "Value",  text_color = headerColor, text_size = dashSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 3, 0, "Status", text_color = headerColor, text_size = dashSize, text_halign = text.align_right)
+    int rowIndex      = 1
+    int activeCount   = 0
+    int includedCount = 0
+    for i = 0 to TOTAL_SLOTS - 1
+        string slotSymbol = array.get(symbolArray, i)
+        if slotSymbol != ""
+            activeCount += 1
+            float rebasedValue = array.get(rebasedArray, i)
+            float weightValue  = array.get(weightArray, i)
+            bool  wasValid     = array.get(validArray, i)
+            int   lastBarTime  = array.get(timeArray, i)
+            bool  included     = weightValue > 0 and not na(rebasedValue)
+            if included
+                includedCount += 1
+            float share   = included and rebasedWSum > 0 ? 100 * weightValue / rebasedWSum : 0
+            bool  isStale = wasValid and not na(lastBarTime) and lastBarTime < nz(currentTfTime, time)
+            string statusText  = not wasValid ? "Invalid" : isStale ? "Stale" : "Live"
+            color  statusColor = not wasValid ? RED : isStale ? ORANGE : GREEN
+            table.cell(dashboardTable, 0, rowIndex, symbolName(slotSymbol), text_color = textColor, text_size = dashSize, text_halign = text.align_left)
+            table.cell(dashboardTable, 1, rowIndex, str.tostring(share, "#.#") + "%", text_color = textColor, text_size = dashSize, text_halign = text.align_right)
+            table.cell(dashboardTable, 2, rowIndex, na(rebasedValue) ? "—" : str.tostring(rebasedValue, "#.##"), text_color = textColor, text_size = dashSize, text_halign = text.align_right)
+            table.cell(dashboardTable, 3, rowIndex, statusText, text_color = statusColor, text_size = dashSize, text_halign = text.align_right)
+            rowIndex += 1
+    table.cell(dashboardTable, 0, rowIndex, "Basket", text_color = headerColor, text_size = dashSize, text_halign = text.align_left)
+    table.cell(dashboardTable, 1, rowIndex, weightModeInput, text_color = textColor, text_size = dashSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 2, rowIndex, na(indexSeries) ? "—" : str.tostring(indexSeries, "#.##"), text_color = na(indexSeries) ? textColor : indexSeries >= baseInput ? aboveColorInput : belowColorInput, text_size = dashSize, text_halign = text.align_right)
+    table.cell(dashboardTable, 3, rowIndex, str.tostring(includedCount) + "/" + str.tostring(activeCount), text_color = textColor, text_size = dashSize, text_halign = text.align_right)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Plots
+//---------------------------------------------------------------------------------------------------------------------{
+
+memberDisplay     = showMembersInput ? display.all : display.none
+comparisonDisplay = showCompInput    ? display.all : display.none
+
+color memberColor = color.new(memberColorInput, 55)
+
+plot(reb1,  "Constituent 1",  color = memberColor, linewidth = 1, style = plot.style_linebr, display = memberDisplay)
+plot(reb2,  "Constituent 2",  color = memberColor, linewidth = 1, style = plot.style_linebr, display = memberDisplay)
+plot(reb3,  "Constituent 3",  color = memberColor, linewidth = 1, style = plot.style_linebr, display = memberDisplay)
+plot(reb4,  "Constituent 4",  color = memberColor, linewidth = 1, style = plot.style_linebr, display = memberDisplay)
+plot(reb5,  "Constituent 5",  color = memberColor, linewidth = 1, style = plot.style_linebr, display = memberDisplay)
+plot(reb6,  "Constituent 6",  color = memberColor, linewidth = 1, style = plot.style_linebr, display = memberDisplay)
+plot(reb7,  "Constituent 7",  color = memberColor, linewidth = 1, style = plot.style_linebr, display = memberDisplay)
+plot(reb8,  "Constituent 8",  color = memberColor, linewidth = 1, style = plot.style_linebr, display = memberDisplay)
+plot(reb9,  "Constituent 9",  color = memberColor, linewidth = 1, style = plot.style_linebr, display = memberDisplay)
+plot(reb10, "Constituent 10", color = memberColor, linewidth = 1, style = plot.style_linebr, display = memberDisplay)
+
+float baseLine = not na(indexSeries) ? baseInput : na
+
+basePlotId  = plot(baseLine, "Base Value", color = color.new(baseColorInput, 40), linewidth = 1, style = plot.style_linebr)
+bool  aboveBase   = indexSeries >= baseInput
+color basketColor = aboveBase ? aboveColorInput : belowColorInput
+
+indexPlotId = plot(indexSeries, "Custom Index", color = basketColor, linewidth = 2, style = plot.style_linebr)
+
+plot(comparisonSeries, "Chart Symbol (Rebased)", color = compColorInput, linewidth = 1, style = plot.style_linebr, display = comparisonDisplay)
+
+float fillTop     = math.max(indexSeries, baseInput)
+float fillBottom  = math.min(indexSeries, baseInput)
+color strongColor = color.new(basketColor, 50)
+color faintColor  = color.new(basketColor, 100)
+
+fill(indexPlotId, basePlotId, fillTop, fillBottom, gradientInput ? (aboveBase ? strongColor : faintColor) : na, gradientInput ? (aboveBase ? faintColor : strongColor) : na, title = "Base Gradient")
+
+hline(alertLevelInput, "Alert Level", color = showLevelInput ? color.new(levelColorInput, 30) : na, linestyle = hline.style_dashed)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+
+alertcondition(levelCrossUp,        "Basket Crossing Above Level", "The custom index crossed above the alert level")
+alertcondition(levelCrossDown,      "Basket Crossing Below Level", "The custom index crossed below the alert level")
+alertcondition(comparisonCrossUp,   "Chart Symbol Leading Basket", "The chart symbol crossed above its custom basket, leading the group")
+alertcondition(comparisonCrossDown, "Chart Symbol Lagging Basket", "The chart symbol crossed below its custom basket, lagging the group")
+
+//---------------------------------------------------------------------------------------------------------------------}
