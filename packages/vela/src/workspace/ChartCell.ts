@@ -1187,10 +1187,10 @@ export class ChartCell {
 
     /** The picker's library rows: supported natives first (see {@link supportedNatives}),
      *  then the manifest in the host's own order. */
-    libraryRows(): Array<{ name: string; language?: string; category?: string; native?: boolean; nativeType?: string; beta?: boolean }> {
+    libraryRows(): Array<{ name: string; language?: string; category?: string; native?: boolean; nativeType?: string; beta?: boolean; editable?: boolean; id?: string }> {
         return [
             ...this.supportedNatives().map((n) => ({ name: n.title, category: 'Built-in', native: true, nativeType: n.type, beta: n.beta })),
-            ...this.manifest.map((e) => ({ name: e.name, language: e.language, category: e.category })),
+            ...this.manifest.map((e) => ({ name: e.name, language: e.language, category: e.category, editable: e.editable, id: e.id })),
         ];
     }
 

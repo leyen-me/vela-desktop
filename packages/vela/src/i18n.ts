@@ -517,6 +517,9 @@ const ZH_CN: Record<string, string> = {
     'Select an indicator': '选择一个指标',
     'Add to chart': '加入图表',
     'Nothing on the chart yet.': '图表上暂无指标。',
+    'New script': '新建脚本',
+    Edit: '编辑',
+    Delete: '删除',
 };
 
 // Case-insensitive index into the dictionary — a fallback for code/CSS-uppercased

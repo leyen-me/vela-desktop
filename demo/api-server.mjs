@@ -297,6 +297,34 @@ function listIndicators() {
   return out;
 }
 
+// ---------------- user scripts (custom indicators) ----------------
+const CUSTOM_FILE = path.join(ROOT, 'data', 'custom-indicators.json');
+
+function loadCustom() {
+  try {
+    const rows = JSON.parse(fs.readFileSync(CUSTOM_FILE, 'utf8'));
+    return Array.isArray(rows) ? rows : [];
+  } catch {
+    return [];
+  }
+}
+function saveCustom(rows) {
+  fs.mkdirSync(path.dirname(CUSTOM_FILE), { recursive: true });
+  fs.writeFileSync(CUSTOM_FILE, JSON.stringify(rows, null, 2));
+}
+function slugId(name) {
+  const base = String(name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'script';
+  return `${base}-${Date.now().toString(36)}`;
+}
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', (c) => { body += c; if (body.length > 1_000_000) req.destroy(); });
+    req.on('end', () => { try { resolve(body ? JSON.parse(body) : {}); } catch (e) { reject(e); } });
+    req.on('error', reject);
+  });
+}
+
 // Fallback catalogue if the live Longbridge list can't be fetched. US-only: this app
 // targets Longbridge US equities.
 const SYMBOLS = [
@@ -421,17 +449,70 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (u.pathname === '/api/indicators.json') {
-      return send(res, 200, JSON.stringify(listIndicators().map((it) => ({
+      const builtins = listIndicators().map((it) => ({
         name: it.name,
         url: `/api/indicators/raw?file=${encodeURIComponent(it.file)}`,
         language: 'pine',
         enabled: false,
         category: FAMILY_LABELS[it.family] ?? it.family,
-      }))));
+      }));
+      // User scripts ride the same manifest, under a dedicated, editable category.
+      const customs = loadCustom().map((s) => ({
+        name: s.name,
+        script: s.script,
+        language: 'pine',
+        enabled: false,
+        category: '我的脚本',
+        editable: true,
+        id: s.id,
+      }));
+      return send(res, 200, JSON.stringify([...customs, ...builtins]));
+    }
+
+    if (u.pathname === '/api/custom-indicators') {
+      if (req.method === 'GET') return send(res, 200, JSON.stringify(loadCustom()));
+      if (req.method === 'POST') {
+        const body = await readJsonBody(req);
+        const name = String(body.name || '').trim();
+        const script = String(body.script || '');
+        if (!name || !script.trim()) return send(res, 400, JSON.stringify({ error: 'name and script required' }));
+        const rows = loadCustom();
+        const existing = body.id ? rows.find((r) => r.id === body.id) : null;
+        if (existing) {
+          existing.name = name;
+          existing.script = script;
+          existing.updatedAt = Date.now();
+        } else {
+          rows.push({ id: slugId(name), name, script, createdAt: Date.now() });
+        }
+        saveCustom(rows);
+        return send(res, 200, JSON.stringify(existing ?? rows[rows.length - 1]));
+      }
+      if (req.method === 'DELETE') {
+        const id = u.searchParams.get('id');
+        saveCustom(loadCustom().filter((r) => r.id !== id));
+        return send(res, 200, JSON.stringify({ ok: true }));
+      }
+      return send(res, 405, JSON.stringify({ error: 'method not allowed' }));
     }
 
     if (u.pathname === '/api/indicators') {
       return send(res, 200, JSON.stringify(listIndicators()));
+    }
+
+    // Overwrite a bundled (vault) indicator's source in place — the "edit any indicator"
+    // path from the chart legend. Matched by declared name.
+    if (u.pathname === '/api/indicators/source' && req.method === 'POST') {
+      const body = await readJsonBody(req);
+      const name = String(body.name || '').trim();
+      const script = String(body.script || '');
+      const item = listIndicators().find((it) => it.name === name);
+      if (!item) return send(res, 404, JSON.stringify({ error: 'indicator not found' }));
+      const full = path.join(PINE_DIR, item.file);
+      if (!full.startsWith(PINE_DIR)) return send(res, 400, JSON.stringify({ error: 'bad path' }));
+      fs.writeFileSync(full, script);
+      idxCache = null;
+      return send(res, 200, JSON.stringify({ ok: true, file: item.file }));
     }
 
     if (u.pathname === '/api/indicators/raw') {

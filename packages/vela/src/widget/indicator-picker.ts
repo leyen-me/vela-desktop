@@ -18,10 +18,13 @@ export interface IndicatorRow {
     nativeType?: string;
     /** Beta badge (native catalog flag). */
     beta?: boolean;
+    /** Host-owned, user-editable script (a custom indicator) — offers edit/delete. */
+    editable?: boolean;
+    /** Host id for an editable script (round-trips on the picker's DOM events). */
+    id?: string;
 }
 
-const STYLE_ID = 'vela-widget-indpicker';
-const CSS = `
+const STYLE_ID = 'vela-widget-indpicker';const CSS = `
 .vela-ip-dialog { width: min(1000px, 96vw); max-width: min(1000px, 96vw); }
 .vela-ip-root { display: flex; flex-direction: column; height: 64vh; min-height: 420px; padding: 12px; gap: 12px; }
 .vela-ip-searchrow {
@@ -45,6 +48,9 @@ const CSS = `
 .vela-ip-rail-item[data-active='1'] { background: var(--vela-hover-strong); color: var(--vela-fg-bright); }
 .vela-ip-rail-item .vela-ip-rail-label { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .vela-ip-rail-item .vela-ip-rail-count { color: var(--vela-fg-faint); font-size: 12px; font-variant-numeric: tabular-nums; }
+.vela-ip-rail-new { color: var(--vela-accent); font-weight: 600; }
+.vela-ip-btn-ghost { background: transparent; color: var(--vela-fg); border-color: var(--vela-border); font-weight: 500; }
+.vela-ip-btn-ghost:hover { background: var(--vela-hover); }
 .vela-ip-grid { flex: 1; min-width: 0; overflow-y: auto; align-content: start;
     display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 10px; padding-right: 4px; }
 .vela-ip-grid-sec { grid-column: 1 / -1; color: var(--vela-fg-muted); font-size: 11px; font-weight: 700;
@@ -154,6 +160,7 @@ export class IndicatorPicker {
         this.rail.addEventListener('click', (e) => {
             const item = (e.target as HTMLElement).closest<HTMLElement>('.vela-ip-rail-item');
             if (!item) return;
+            if (item.dataset.key === '__new') { this.emit('vela-indicator-new'); return; }
             this.activeKey = item.dataset.key ?? 'all';
             this.selected = null;
             this.refresh();
@@ -245,6 +252,15 @@ export class IndicatorPicker {
             counts.set(c, (counts.get(c) ?? 0) + 1);
         }
         this.rail.replaceChildren();
+        const newItem = doc.createElement('div');
+        newItem.className = 'vela-ip-rail-item vela-ip-rail-new';
+        newItem.dataset.key = '__new';
+        newItem.append(iconEl('plus', doc));
+        const newLabel = doc.createElement('span');
+        newLabel.className = 'vela-ip-rail-label';
+        newLabel.textContent = t('New script');
+        newItem.appendChild(newLabel);
+        this.rail.appendChild(newItem);
         const item = (key: string, label: string, count: number): HTMLElement => {
             const el = doc.createElement('div');
             el.className = 'vela-ip-rail-item';
@@ -399,7 +415,27 @@ export class IndicatorPicker {
             btn.append(iconEl('plus', this.detail.ownerDocument), doc.createTextNode(t('Add to chart')));
             btn.addEventListener('click', () => { this.opts.onAdd(library); this.refresh(); });
             actions.appendChild(btn);
+            if (row.editable) {
+                const edit = doc.createElement('button');
+                edit.className = 'vela-ip-btn vela-ip-btn-ghost';
+                edit.textContent = t('Edit');
+                edit.addEventListener('click', () => this.emit('vela-indicator-edit', { id: row.id, name: row.name }));
+                const del = doc.createElement('button');
+                del.className = 'vela-ip-btn vela-ip-btn-ghost';
+                del.textContent = t('Delete');
+                del.addEventListener('click', () => this.emit('vela-indicator-delete', { id: row.id, name: row.name }));
+                actions.append(edit, del);
+            }
         }
         this.detail.append(name, meta, actions);
+    }
+
+    /** Ask the host to open its editor / handle a custom script. Dispatched on the
+     *  document so a host can listen once, without coupling the picker to its app. The
+     *  picker closes first — the host's dialog takes over the screen. */
+    private emit(type: string, detail?: unknown): void {
+        this.close();
+        if (typeof document === 'undefined') return;
+        document.dispatchEvent(new CustomEvent(type, { detail }));
     }
 }

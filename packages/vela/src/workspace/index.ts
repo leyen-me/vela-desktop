@@ -40,3 +40,8 @@ export { registerRendererDefaults, unregisterRendererDefaults, rendererDefaults 
 // module instance the symbol picker reads.
 export { registerSymbolRanking } from '../widget/contributions';
 export type { SymbolRankingHook } from '../widget/contributions';
+
+// Legend-row actions — re-exported so a workspace app can register them through
+// the SAME module instance the legend resolves.
+export { registerLegendAction, unregisterLegendAction, legendActions } from '../widget/contributions';
+export type { LegendActionDescriptor, LegendIndicatorInfo } from '../widget/contributions';

@@ -374,6 +374,8 @@ export class VelaWorkspace {
      *  edit/delete for these pairs). Cleared on reload / `applyState`. */
     private readonly drawingLinks = new Map<string, Map<string, string>>();
     private manifest: ResolvedIndicator[] = [];
+    /** The raw `indicators` config, kept so {@link reloadIndicators} can re-resolve it. */
+    private readonly indicatorsConfig: VelaWorkspaceOptions['indicators'];
     /** The shared manifest can no longer change instance sets — resolved, or no
      *  `indicators` option so nothing ever will. Gates the cells' ledger fallback. */
     private manifestSettled = false;
@@ -778,6 +780,7 @@ export class VelaWorkspace {
 
         // The shared manifest resolves once; every FRESH cell seeds its enabled entries.
         if (opts.indicators !== undefined) {
+            this.indicatorsConfig = opts.indicators;
             void resolveIndicators(opts.indicators).then((list) => {
                 if (this.destroyed) return;
                 this.manifest = list;
@@ -799,6 +802,22 @@ export class VelaWorkspace {
     }
 
     // ── access ──────────────────────────────────────────────────
+    /**
+     * Re-resolve the `indicators` manifest and refresh every cell's library (and the
+     * picker, when open). The seam for host scripts added/edited/removed at runtime —
+     * on-chart instances keep running; only the catalogue changes.
+     */
+    async reloadIndicators(): Promise<void> {
+        if (this.indicatorsConfig === undefined) return;
+        const list = await resolveIndicators(this.indicatorsConfig);
+        if (this.destroyed) return;
+        this.manifest = list;
+        this.manifestSettled = true;
+        for (const cell of this.cellsById.values()) cell.setManifest(list, false);
+        this.projectActiveCell();
+        this.indicatorPicker?.sync();
+    }
+
     /** The cell with identity `id` (its declared name, or `c<N>` when undeclared), or
      *  undefined when no live cell holds it. */
     cell(id: string): ChartCell | undefined {

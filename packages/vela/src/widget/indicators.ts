@@ -19,6 +19,10 @@ export interface IndicatorManifestEntry {
     enabled?: boolean;
     /** Picker grouping (default 'Indicators'). */
     category?: string;
+    /** Host-owned, user-editable entry (a custom script) — pickers may offer edit/delete. */
+    editable?: boolean;
+    /** Host id for an editable entry (round-trips back to the host on edit/delete). */
+    id?: string;
 }
 
 export type IndicatorManifest = IndicatorManifestEntry[] | { indicators: IndicatorManifestEntry[] };
@@ -30,6 +34,8 @@ export interface ResolvedIndicator {
     language?: string;
     enabled: boolean;
     category?: string;
+    editable?: boolean;
+    id?: string;
 }
 
 function entriesOf(manifest: IndicatorManifest): IndicatorManifestEntry[] {
@@ -63,30 +69,41 @@ export async function resolveIndicators(
         manifest = config;
     }
 
-    const out: ResolvedIndicator[] = [];
-    for (const entry of entriesOf(manifest)) {
-        try {
-            let script = entry.script;
-            if (script === undefined && entry.url !== undefined) {
-                let url = entry.url;
-                try {
-                    // Relative to the manifest URL (itself relative to the page, if any).
-                    const base = typeof location !== 'undefined' ? new URL(baseUrl ?? '.', location.href) : new URL(baseUrl ?? '');
-                    url = new URL(entry.url, base).href;
-                } catch {
-                    /* absolute or bare-path url — fetch it as written */
+    const entries = entriesOf(manifest);
+    const out: ResolvedIndicator[] = new Array(entries.length);
+    // Resolve with BOUNDED CONCURRENCY — a manifest of `url` entries (a big vault) would
+    // otherwise fetch one-at-a-time, which drags a catalogue reload to seconds. Order is
+    // preserved by index; a failing entry drops out with a warning.
+    const CONCURRENCY = 24;
+    let next = 0;
+    const worker = async (): Promise<void> => {
+        while (next < entries.length) {
+            const i = next++;
+            const entry = entries[i]!;
+            try {
+                let script = entry.script;
+                if (script === undefined && entry.url !== undefined) {
+                    let url = entry.url;
+                    try {
+                        // Relative to the manifest URL (itself relative to the page, if any).
+                        const base = typeof location !== 'undefined' ? new URL(baseUrl ?? '.', location.href) : new URL(baseUrl ?? '');
+                        url = new URL(entry.url, base).href;
+                    } catch {
+                        /* absolute or bare-path url — fetch it as written */
+                    }
+                    const res = await fetchImpl(url);
+                    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                    script = await res.text();
                 }
-                const res = await fetchImpl(url);
-                if (!res.ok) throw new Error(`HTTP ${res.status}`);
-                script = await res.text();
+                if (script === undefined) throw new Error('entry has neither script nor url');
+                out[i] = { name: entry.name, script, language: entry.language, enabled: entry.enabled !== false, category: entry.category, editable: entry.editable, id: entry.id };
+            } catch (err) {
+                console.warn(`[vela] indicator "${entry.name}" skipped:`, err);
             }
-            if (script === undefined) throw new Error('entry has neither script nor url');
-            out.push({ name: entry.name, script, language: entry.language, enabled: entry.enabled !== false, category: entry.category });
-        } catch (err) {
-            console.warn(`[vela] indicator "${entry.name}" skipped:`, err);
         }
-    }
-    return out;
+    };
+    await Promise.all(Array.from({ length: Math.min(CONCURRENCY, entries.length) }, worker));
+    return out.filter((r): r is ResolvedIndicator => r !== undefined);
 }
 
 /**

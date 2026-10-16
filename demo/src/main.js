@@ -1,6 +1,6 @@
 import { VelaWorkspace, setLocale, registerRendererDefaults } from '@luxalgo/vela/workspace';
-
 import { PineEngine } from '@luxalgo/vela-pinets';
+import { installIndicatorEditor } from './indicator-editor.js';
 
 const TF_MAP = {
   '1': '1m', '5': '5m', '15': '15m', '30': '30m',
@@ -262,5 +262,7 @@ function makeDropdown({ items, getValue, onSelect }) {
     styleDD.sync();
   }, 400);
 })(ws);
+
+installIndicatorEditor(ws);
 
 window.ws = ws;
