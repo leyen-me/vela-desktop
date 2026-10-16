@@ -3,6 +3,7 @@
 import { Dialog } from '../ui/components/dialog';
 import { injectStyles } from '../ui/styles';
 import { iconEl } from '../ui/icons';
+import { getLocale } from '../i18n';
 
 export interface IndicatorRow {
     name: string;
@@ -219,7 +220,7 @@ export class IndicatorPicker {
             card.className = 'vela-ip-oncard';
             const title = doc.createElement('div');
             title.className = 'vela-ip-group';
-            title.textContent = `On chart · ${onChart.length}`;
+            title.textContent = getLocale() === 'zh-CN' ? `图中 · ${onChart.length}` : `On chart · ${onChart.length}`;
             card.appendChild(title);
             for (const [r, i] of onChart) card.appendChild(rowEl(r, { instance: i }));
             this.list.appendChild(card);

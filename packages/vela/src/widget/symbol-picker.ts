@@ -47,6 +47,18 @@ export function foldGroups(list: readonly SymbolDescriptor[]): SymbolDescriptor[
 /** The pinned head of the empty-query list (majors first, like the reference picker). */
 const TOP_TICKERS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT', 'DOGEUSDT', 'ADAUSDT', 'LINKUSDT'];
 
+/** The `type` values each market tab matches. The tab row is built from the types the
+ *  provider actually serves, so categories with no symbols never appear — and a
+ *  single-asset-class provider shows no tab row at all. */
+const TAB_TYPES: Record<string, string[]> = {
+    Stocks: ['stock'],
+    ETFs: ['etf'],
+    Crypto: ['crypto', 'futures'],
+    Futures: ['futures', 'root'],
+    Forex: ['forex'],
+    Commodities: ['commodity'],
+};
+
 /** Deterministic avatar hue from a ticker (self-contained — no external icon service). */
 export function avatarColor(ticker: string): string {
     let h = 0;
@@ -150,6 +162,13 @@ const CSS = `
 }
 .vela-sp-input::placeholder { text-transform: none; }
 .vela-sp-tabs { display: flex; gap: 14px; margin: 12px 2px 0; border-bottom: 1px solid var(--vela-border); padding-bottom: 8px; }
+.vela-sp-tabs[hidden] { display: none !important; }
+/* A touch wider than the kit default — the picker's rows read better with more room. */
+.vela-sp-dialog { width: min(460px, 92vw); }
+/* Section headers (指数 / 热门股票 …): a compact label above a run of grouped rows. */
+.vela-sp-section { padding: 12px 14px 4px; font-size: 11px; font-weight: 600; letter-spacing: .08em; color: var(--vela-fg-muted); user-select: none; }
+.vela-sp-list > .vela-sp-section:first-child { padding-top: 6px; }
+.vela-sp-row[data-section] .vela-sp-ticker { color: var(--vela-fg-bright); }
 /* Mobile (fullscreen dialog): the asset-class strip scrolls sideways instead of
    overflowing the body, and the result list stops capping itself — it fills the
    rest of the screen. The bottom inset (+ safe area) is the kit's: every mobile
@@ -290,19 +309,6 @@ export class SymbolPicker {
         this.tabs.className = 'vela-sp-tabs';
         const head = doc.createElement('div');
         head.className = 'vela-sp-head';
-        for (const t of ['All', 'Stocks', 'ETFs', 'Crypto', 'Futures', 'Forex', 'Commodities']) {
-            const b = doc.createElement('button');
-            b.className = 'vela-sp-tab';
-            b.textContent = t;
-            if (t === this.activeTab) b.dataset.active = '1';
-            b.addEventListener('click', () => {
-                this.activeTab = t;
-                for (const c of this.tabs.children) delete (c as HTMLElement).dataset.active;
-                b.dataset.active = '1';
-                this.refresh();
-            });
-            this.tabs.appendChild(b);
-        }
         head.append(searchRow, this.tabs);
         this.list = doc.createElement('div');
         this.list.className = 'vela-sp-list';
@@ -320,6 +326,7 @@ export class SymbolPicker {
         this.dialog = new Dialog({
             title: 'Symbol Search',
             host: opts.host,
+            className: 'vela-sp-dialog',
             closeOnInteractOutside: true,
             flush: true,
             content: (body) => body.append(head, this.list),
@@ -327,6 +334,7 @@ export class SymbolPicker {
                 if (open) {
                     this.input.value = this.seed.toUpperCase();
                     this.seed = '';
+                    this.rebuildTabs();
                     this.refresh();
                     // Focus after the machine settles its own focus management.
                     setTimeout(() => {
@@ -377,6 +385,39 @@ export class SymbolPicker {
     /** Wire where symbols come from (re-called on every widget rebuild). */
     setSource(source: () => readonly SymbolDescriptor[]): void {
         this.source = source;
+    }
+
+    /**
+     * Build the market tabs from the types the provider actually serves. Categories
+     * with no symbols are dropped, and a provider that serves a single asset class
+     * shows no tab row — there is nothing to switch between.
+     */
+    private rebuildTabs(): void {
+        const doc = this.tabs.ownerDocument;
+        const types = new Set(this.pool().map((s) => (s.type ?? '').toLowerCase()));
+        const present = Object.keys(TAB_TYPES).filter((label) => TAB_TYPES[label]!.some((t) => types.has(t)));
+        if (present.length <= 1) {
+            this.tabs.replaceChildren();
+            this.tabs.hidden = true;
+            this.activeTab = 'All';
+            return;
+        }
+        this.tabs.hidden = false;
+        if (this.activeTab !== 'All' && !present.includes(this.activeTab)) this.activeTab = 'All';
+        this.tabs.replaceChildren();
+        for (const t of ['All', ...present]) {
+            const b = doc.createElement('button');
+            b.className = 'vela-sp-tab';
+            b.textContent = t;
+            if (t === this.activeTab) b.dataset.active = '1';
+            b.addEventListener('click', () => {
+                this.activeTab = t;
+                for (const c of this.tabs.children) delete (c as HTMLElement).dataset.active;
+                b.dataset.active = '1';
+                this.refresh();
+            });
+            this.tabs.appendChild(b);
+        }
     }
 
     open(initialQuery = ''): void {
@@ -484,12 +525,11 @@ export class SymbolPicker {
     }
 
     private computeRows(): SymbolDescriptor[] {
-        const TAB_TYPES: Record<string, string[]> = { Crypto: ['crypto'], Stocks: ['stock'], ETFs: ['etf'], Futures: ['futures', 'root'], Forex: ['forex'], Commodities: ['commodity'] };
         const all = this.pool();
         const pool =
             this.activeTab === 'All'
                 ? all
-                : all.filter((s) => TAB_TYPES[this.activeTab]?.includes((s.type ?? '').toLowerCase()) || (this.activeTab === 'Crypto' && (s.type ?? '').toLowerCase() === 'futures'));
+                : all.filter((s) => TAB_TYPES[this.activeTab]?.includes((s.type ?? '').toLowerCase()));
         // A registered ranking OWNS the empty-query head — the built-in majors pin
         // stands down and the pool's own order shows.
         const filtered = filterSymbols(pool, this.input.value, this.visible, symbolRanking() ? false : TOP_TICKERS);
@@ -527,7 +567,7 @@ export class SymbolPicker {
             this.list.appendChild(empty);
             return;
         }
-        this.rows.forEach((s, i) => this.list.appendChild(this.rowEl(s, i)));
+        this.appendRows(0);
         this.renderHighlight();
     }
 
@@ -535,7 +575,33 @@ export class SymbolPicker {
     private grow(): void {
         const already = this.rows.length;
         this.rows = this.computeRows();
-        this.rows.slice(already).forEach((s, j) => this.list.appendChild(this.rowEl(s, already + j)));
+        // Carry the last rendered section so a continued page doesn't repeat its header.
+        let last: string | undefined;
+        if (this.showSections) for (let i = 0; i < already; i++) if (this.rows[i]!.section) last = this.rows[i]!.section;
+        this.appendRows(already, last);
+    }
+
+    /** Section headers appear only on the empty/landing list — a search stays flat. */
+    private get showSections(): boolean {
+        return this.input.value.trim().length === 0;
+    }
+
+    private appendRows(start: number, prevSection?: string): void {
+        let section = prevSection;
+        this.rows.slice(start).forEach((s, j) => {
+            if (this.showSections && s.section && s.section !== section) {
+                this.list.appendChild(this.sectionEl(s.section));
+                section = s.section;
+            }
+            this.list.appendChild(this.rowEl(s, start + j));
+        });
+    }
+
+    private sectionEl(text: string): HTMLElement {
+        const el = this.list.ownerDocument.createElement('div');
+        el.className = 'vela-sp-section';
+        el.textContent = text;
+        return el;
     }
 
     private rowEl(s: SymbolDescriptor, i: number): HTMLElement {
@@ -544,6 +610,7 @@ export class SymbolPicker {
         row.className = 'vela-sp-row';
         row.dataset.i = String(i);
         row.dataset.ticker = s.ticker;
+        if (s.section) row.dataset.section = s.section;
         // The venue the user is pointing at travels with the pick — the same ticker can be
         // listed by several providers, and dropping it would silently route to another one.
         // The LISTING prefix wins over the provider id: it is the canonical spelling.

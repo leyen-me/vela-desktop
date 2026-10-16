@@ -16,7 +16,7 @@ process.env.LONGPORT_HTTP_URL ||= 'https://openapi.longportapp.com';
 process.env.LONGPORT_QUOTE_WS_URL ||= 'wss://openapi-quote.longportapp.com/v2';
 process.env.LONGPORT_TRADE_WS_URL ||= 'wss://openapi-trade.longportapp.com/v2';
 
-const { Config, QuoteContext, Period, AdjustType, TradeSessions, NaiveDate, NaiveDatetime, Time } =
+const { Config, QuoteContext, Period, AdjustType, TradeSessions, NaiveDate, NaiveDatetime, Time, Market } =
   await import('longport');
 
 const TF = {
@@ -252,6 +252,33 @@ function send(res, status, body, type = 'application/json; charset=utf-8') {
 }
 
 let idxCache = null;
+// Indicator folders → picker group labels, in display order. The picker groups the
+// catalogue by `category`, so this is both the label and the ordering.
+const FAMILY_LABELS = {
+  trend: '趋势',
+  momentum: '动量',
+  volatility: '波动率',
+  'volume-orderflow': '成交量与订单流',
+  levels: '关键价位',
+  'market-structure': '市场结构',
+  patterns: '形态',
+  'elliott-harmonics': '艾略特与谐波',
+  wyckoff: '威科夫',
+  'smc-ict': 'SMC / ICT',
+  statistics: '统计',
+  'machine-learning': '机器学习',
+  'meta-composition': '组合与元信号',
+  'risk-exits': '风控与离场',
+  'sentiment-breadth': '情绪与广度',
+  'time-seasonality': '时间与季节性',
+  unknown: '其他',
+};
+const FAMILY_ORDER = Object.keys(FAMILY_LABELS);
+const familyRank = (f) => {
+  const i = FAMILY_ORDER.indexOf(f);
+  return i < 0 ? FAMILY_ORDER.length : i;
+};
+
 function listIndicators() {
   if (idxCache) return idxCache;
   const out = [];
@@ -265,20 +292,73 @@ function listIndicators() {
       out.push({ name: m ? m[2] : f.replace(/\.pine$/, ''), file: `${fam}/${f}`, family: fam });
     }
   }
-  out.sort((a, b) => a.name.localeCompare(b.name));
+  out.sort((a, b) => familyRank(a.family) - familyRank(b.family) || a.name.localeCompare(b.name));
   idxCache = out;
   return out;
 }
 
+// Fallback catalogue if the live Longbridge list can't be fetched. US-only: this app
+// targets Longbridge US equities.
 const SYMBOLS = [
   ['AAPL.US', 'Apple Inc.', 'stock'], ['NVDA.US', 'NVIDIA', 'stock'],
   ['MSFT.US', 'Microsoft', 'stock'], ['TSLA.US', 'Tesla', 'stock'],
   ['AMZN.US', 'Amazon', 'stock'], ['GOOGL.US', 'Alphabet', 'stock'],
-  ['META.US', 'Meta Platforms', 'stock'], ['SPY.US', 'SPDR S&P 500 ETF', 'etf'],
-  ['QQQ.US', 'Invesco QQQ', 'etf'], ['700.HK', 'Tencent', 'stock'],
-  ['9988.HK', 'Alibaba', 'stock'], ['3690.HK', 'Meituan', 'stock'],
-  ['1810.HK', 'Xiaomi', 'stock'], ['00005.HK', 'HSBC', 'stock'],
+  ['META.US', 'Meta Platforms', 'stock'], ['SPY.US', 'SPDR S&P 500 ETF', 'stock'],
+  ['QQQ.US', 'Invesco QQQ', 'stock'],
 ];
+
+// The landing order for the symbol picker: the three US index ETFs first, then a set
+// of popular names. `section` groups them under a header in the picker.
+const RECOMMENDED = [
+  ['SPY.US', '指数'], ['QQQ.US', '指数'], ['DIA.US', '指数'],
+  ['AAPL.US', '热门股票'], ['NVDA.US', '热门股票'], ['MSFT.US', '热门股票'],
+  ['TSLA.US', '热门股票'], ['AMZN.US', '热门股票'], ['GOOGL.US', '热门股票'],
+  ['META.US', '热门股票'], ['AVGO.US', '热门股票'], ['AMD.US', '热门股票'],
+  ['NFLX.US', '热门股票'], ['GOOG.US', '热门股票'],
+];
+
+// The full US symbol universe from Longbridge (`securityList(Market.US)`), cached to
+// disk — it changes slowly and the round trip is heavy. Lazy + refreshed once a day.
+const US_SYMBOLS_FILE = path.join(CACHE_DIR, 'us-symbols.json');
+const US_SYMBOLS_TTL = 24 * 60 * 60_000;
+let usSymbolsMem = null;
+
+function orderUsSymbols(rows) {
+  const byTicker = new Map(rows.map((r) => [r.ticker, r]));
+  const head = [];
+  const seen = new Set();
+  for (const [ticker, section] of RECOMMENDED) {
+    const row = byTicker.get(ticker);
+    if (row) { head.push({ ...row, section }); seen.add(ticker); }
+  }
+  return [...head, ...rows.filter((r) => !seen.has(r.ticker))];
+}
+
+async function usSymbols() {
+  if (usSymbolsMem) return usSymbolsMem;
+  try {
+    if (Date.now() - fs.statSync(US_SYMBOLS_FILE).mtimeMs < US_SYMBOLS_TTL) {
+      const rows = JSON.parse(fs.readFileSync(US_SYMBOLS_FILE, 'utf8'));
+      if (Array.isArray(rows) && rows.length) {
+        usSymbolsMem = orderUsSymbols(rows);
+        return usSymbolsMem;
+      }
+    }
+  } catch {}
+  try {
+    const ctx = await getCtx();
+    const list = await ctx.securityList(Market.US);
+    const rows = list
+      .filter((s) => /^[A-Z0-9]+\.US$/.test(s.symbol)) // drop warrants/units/structured (suffixed) tickers
+      .map((s) => ({ ticker: s.symbol, description: s.nameEn || s.nameCn || '', type: 'stock' }));
+    usSymbolsMem = orderUsSymbols(rows);
+    try { fs.writeFileSync(US_SYMBOLS_FILE, JSON.stringify(usSymbolsMem)); } catch {}
+    return usSymbolsMem;
+  } catch (e) {
+    console.warn('securityList failed:', e.message);
+    return orderUsSymbols(SYMBOLS.map(([ticker, description, type]) => ({ ticker, description, type })));
+  }
+}
 
 // ---------------- server ----------------
 const server = http.createServer(async (req, res) => {
@@ -337,12 +417,16 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (u.pathname === '/api/symbols') {
-      return send(res, 200, JSON.stringify(SYMBOLS.map(([ticker, description, type]) => ({ ticker, description, type }))));
+      return send(res, 200, JSON.stringify(await usSymbols()));
     }
 
     if (u.pathname === '/api/indicators.json') {
       return send(res, 200, JSON.stringify(listIndicators().map((it) => ({
-        name: it.name, url: `/api/indicators/raw?file=${encodeURIComponent(it.file)}`, language: 'pine', enabled: false,
+        name: it.name,
+        url: `/api/indicators/raw?file=${encodeURIComponent(it.file)}`,
+        language: 'pine',
+        enabled: false,
+        category: FAMILY_LABELS[it.family] ?? it.family,
       }))));
     }
 
@@ -384,3 +468,8 @@ server.listen(PORT, () => console.log(`api on http://localhost:${PORT}`));
 fetchWindow('AAPL.US', '1d', null, null, 2)
   .then(() => console.log('longbridge warm-up ok'))
   .catch((e) => console.warn('longbridge warm-up failed:', e.message));
+
+// Pre-fetch the US symbol universe so the picker's first open is instant.
+usSymbols()
+  .then((rows) => console.log(`symbol universe ready: ${rows.length} US symbols`))
+  .catch((e) => console.warn('symbol universe failed:', e.message));

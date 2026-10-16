@@ -14,6 +14,12 @@ export interface SymbolDescriptor {
     /** Instrument class, free-form (e.g. `crypto`, `futures`, `stock`). */
     type?: string;
     /**
+     * Optional picker SECTION label (e.g. `指数`) — rows carrying one are visually
+     * grouped under a header, in list order. Purely presentational; leave unset for
+     * ordinary rows.
+     */
+    section?: string;
+    /**
      * The GROUP this row belongs to (futures: the product root — `ES1!` and `ES2!`
      * carry `group: "ES"`). The group's own row repeats the value in `ticker` with a
      * distinguishing `type` and is NOT directly loadable — pickers fold members under

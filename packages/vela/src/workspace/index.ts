@@ -35,3 +35,8 @@ export type { Locale } from '../i18n';
 // Re-exported here so a workspace app can set renderer defaults (e.g. attribution)
 // through the SAME module instance the workspace itself reads.
 export { registerRendererDefaults, unregisterRendererDefaults, rendererDefaults } from '../core/renderer-defaults';
+
+// Symbol ranking — re-exported so a workspace app can set it through the SAME
+// module instance the symbol picker reads.
+export { registerSymbolRanking } from '../widget/contributions';
+export type { SymbolRankingHook } from '../widget/contributions';

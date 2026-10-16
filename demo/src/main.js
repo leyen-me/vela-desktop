@@ -38,7 +38,7 @@ class LongbridgeProvider {
   async listSymbols() {
     const r = await fetch('/api/symbols');
     const rows = await r.json();
-    return rows.map((s) => ({ ticker: s.ticker, description: s.description, type: s.type }));
+    return rows.map((s) => ({ ticker: s.ticker, description: s.description, type: s.type, section: s.section }));
   }
 
   info() {
