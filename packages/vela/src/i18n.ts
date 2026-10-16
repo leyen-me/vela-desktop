@@ -507,6 +507,16 @@ const ZH_CN: Record<string, string> = {
     Weak: '弱',
     Strong: '强',
     Supersonic: '超音速',
+
+    // Indicator library
+    'Search indicators…': '搜索指标…',
+    Chart: '图表',
+    Library: '指标库',
+    Families: '分类',
+    'On chart': '已在图表',
+    'Select an indicator': '选择一个指标',
+    'Add to chart': '加入图表',
+    'Nothing on the chart yet.': '图表上暂无指标。',
 };
 
 // Case-insensitive index into the dictionary — a fallback for code/CSS-uppercased
