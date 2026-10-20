@@ -17,6 +17,87 @@ process.env.LONGPORT_QUOTE_WS_URL ||= 'wss://openapi-quote.longportapp.com/v2';
 process.env.LONGPORT_TRADE_WS_URL ||= 'wss://openapi-trade.longportapp.com/v2';
 process.env.LONGPORT_PUSH_CANDLESTICK_MODE ||= 'realtime';
 
+// Intraday analysis agent (DeepSeek V4.1 Flash, OpenAI-compatible API). The key comes
+// from the environment first, then from a local, git-ignored data/agent.json:
+//   { "apiKey": "...", "baseURL": "...", "model": "deepseek-flash", "reasoningEffort": "low" }
+// V4.1 Flash (`deepseek-flash`) is natively multimodal, so screenshots go straight into
+// the user message's `content` parts; no separate vision endpoint is needed.
+function loadAgentConfig() {
+  let file = {};
+  try {
+    file = JSON.parse(fs.readFileSync(path.join(ROOT, 'data', 'agent.json'), 'utf8'));
+  } catch {
+    /* no local config */
+  }
+  const envKey = process.env.DEEPSEEK_API_KEY || '';
+  return {
+    key: envKey || file.apiKey || '',
+    source: envKey ? 'env' : file.apiKey ? 'file' : null,
+    base: (process.env.DEEPSEEK_BASE_URL || file.baseURL || 'https://api.deepseek.com').replace(/\/+$/, ''),
+    model: process.env.DEEPSEEK_MODEL || file.model || 'deepseek-flash',
+    effort: process.env.AGENT_REASONING_EFFORT || file.reasoningEffort || 'low',
+  };
+}
+
+function startOfTodayMs(ms, tz) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+  }).formatToParts(new Date(ms));
+  const get = (type) => Number(parts.find((p) => p.type === type).value);
+  const localAsUtc = Date.UTC(get('year'), get('month') - 1, get('day'), get('hour') % 24, get('minute'), get('second'));
+  const offset = localAsUtc - Math.floor(ms / 1000) * 1000;
+  return Date.UTC(get('year'), get('month') - 1, get('day')) - offset;
+}
+
+function todayLabel(ms, tz) {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(ms));
+}
+
+function clockLabel(ms, tz) {
+  return new Intl.DateTimeFormat('en-GB', { timeZone: tz, hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(ms));
+}
+
+async function todayBars(symbol, tf) {
+  const tz = tzForSymbol(symbol);
+  const to = Date.now();
+  const from = startOfTodayMs(to, tz);
+  try {
+    const { bars } = await fetchWindow(symbol, tf, from, to, 2000);
+    return bars.filter((bar) => bar.time >= from && bar.time <= to);
+  } catch (e) {
+    console.warn('[agent] today bars failed:', e.message);
+    return [];
+  }
+}
+
+async function buildAgentPrompt(body, hasImages = false) {
+  const symbol = typeof body.symbol === 'string' ? body.symbol : '';
+  const ticker = symbol.split(':').pop();
+  const timeframe = agentTfLabel(typeof body.timeframe === 'string' ? body.timeframe : '');
+  const context = body.context && typeof body.context === 'object' ? body.context : {};
+  const tz = ticker ? tzForSymbol(ticker) : 'UTC';
+  const now = Date.now();
+  const bars = ticker ? await todayBars(ticker, agentTfLabel(body.timeframe)) : [];
+  const shown = bars.slice(-500);
+  const lines = shown.map((bar) => `${clockLabel(bar.time, tz)} ${bar.open} ${bar.high} ${bar.low} ${bar.close} ${bar.volume ?? 0}`);
+  return [
+    '你是桌面图表应用中的日内交易分析助手。刚刚有一根 K 线收盘，请根据最新结构为交易者做分析。',
+    `标的：${symbol || '未知'} ｜ 周期：${timeframe} ｜ 市场时区：${tz}`,
+    `交易日：${todayLabel(now, tz)} ｜ 当前时间：${clockLabel(now, tz)}（${new Date(now).toISOString()}）`,
+    `客户端上下文：${JSON.stringify(context).slice(0, 1500)}`,
+    `当日 K 线（共 ${shown.length} 根，按时间从旧到新；列依次为：时间 开盘 最高 最低 收盘 成交量）：`,
+    ...lines,
+    hasImages
+      ? '已附当前图表截图。请结合 K 线数据，解读截图中的 SMC 标记（BOS/CHoCH、订单块、FVG、等高/等低）。'
+      : '未附截图。请只依据 K 线数据和客户端上下文分析。',
+    '请用简体中文回答。先说这根收盘 K 线带来了什么变化，再给出倾向、关键价位、触发条件、失效条件和风险。',
+    '所有价位必须来自给定数据或明确说明的假设，禁止编造价格、新闻或指标数值。',
+    '保持简洁：每次收盘都会运行，不要重复整段历史。',
+    '这是分析辅助，不是确定性预测，也不构成投资建议；不涉及下单执行。',
+  ].join('\n');
+}
+
 const { Config, QuoteContext, Period, AdjustType, TradeSessions, NaiveDate, NaiveDatetime, Time, Market } =
   await import('longport');
 
@@ -25,6 +106,15 @@ const TF = {
   '1h': Period.Min_60, '2h': Period.Min_120, '4h': Period.Min_240,
   '1d': Period.Day, '1w': Period.Week, '1M': Period.Month,
 };
+
+// Chart UI values ('5', '60', 'D') -> the labels the agent prompt and UI speak.
+const AGENT_TF_LABEL = {
+  '1': '1m', '5': '5m', '15': '15m', '30': '30m', '60': '1h', '120': '2h', '240': '4h',
+  D: '1d', W: '1w', M: '1M',
+};
+function agentTfLabel(tf) {
+  return AGENT_TF_LABEL[tf] || tf || 'unknown';
+}
 
 // Longbridge caps a single candlestick request at 1000 bars — deeper windows page.
 const PAGE = 1000;
@@ -367,10 +457,10 @@ function slugId(name) {
   const base = String(name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'script';
   return `${base}-${Date.now().toString(36)}`;
 }
-function readJsonBody(req) {
+function readJsonBody(req, maxChars = 1_000_000) {
   return new Promise((resolve, reject) => {
     let body = '';
-    req.on('data', (c) => { body += c; if (body.length > 1_000_000) req.destroy(); });
+    req.on('data', (c) => { body += c; if (body.length > maxChars) req.destroy(); });
     req.on('end', () => { try { resolve(body ? JSON.parse(body) : {}); } catch (e) { reject(e); } });
     req.on('error', reject);
   });
@@ -482,6 +572,162 @@ const server = http.createServer(async (req, res) => {
           }
         })();
       });
+      return;
+    }
+
+    if (u.pathname === '/api/agent/status') {
+      const agent = loadAgentConfig();
+      return send(res, 200, JSON.stringify({
+        configured: Boolean(agent.key),
+        source: agent.source,
+        model: agent.model,
+        effort: agent.effort,
+      }));
+    }
+
+    // The system prompt for the current chart, so the panel can show it before the
+    // first candle closes.
+    if (u.pathname === '/api/agent/system') {
+      const agent = loadAgentConfig();
+      const symbol = u.searchParams.get('symbol') || '';
+      const timeframe = u.searchParams.get('timeframe') || '';
+      const content = await buildAgentPrompt({ symbol, timeframe, context: {} }, false);
+      return send(res, 200, JSON.stringify({
+        content,
+        meta: {
+          symbol,
+          timeframe: agentTfLabel(timeframe),
+          model: agent.model,
+          effort: agent.effort,
+          vision: false,
+          images: 0,
+        },
+      }));
+    }
+
+    // Intraday analysis agent. The DeepSeek key never reaches the renderer: the server
+    // calls the OpenAI-compatible endpoint and relays reasoning/content deltas as SSE.
+    if (u.pathname === '/api/agent') {
+      if (req.method !== 'POST') return send(res, 405, JSON.stringify({ error: 'method not allowed' }));
+      const agent = loadAgentConfig();
+      if (!agent.key) {
+        return send(res, 503, JSON.stringify({
+          error: '未检测到 DEEPSEEK_API_KEY，请设置环境变量后重启应用（或在 data/agent.json 中配置 apiKey）',
+        }));
+      }
+      const body = await readJsonBody(req, 8_000_000);
+      const messages = Array.isArray(body.messages)
+        ? body.messages
+            .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string')
+            .slice(-20)
+            .map((m) => ({ role: m.role, content: m.content }))
+        : [];
+      const images = Array.isArray(body.images) ? body.images.filter((img) => img && img.data).slice(0, 2) : [];
+      body.images = images;
+      const system = await buildAgentPrompt(body, images.length > 0);
+      res.writeHead(200, {
+        'content-type': 'text/event-stream; charset=utf-8',
+        'cache-control': 'no-cache, no-transform',
+        connection: 'keep-alive',
+        'access-control-allow-origin': '*',
+      });
+      res.on('error', () => {});
+      sendFrame(res, `data: ${JSON.stringify({
+        type: 'system',
+        content: system,
+        meta: {
+          symbol: body.symbol,
+          timeframe: agentTfLabel(body.timeframe),
+          model: agent.model,
+          effort: agent.effort,
+          vision: images.length > 0,
+          images: images.length,
+        },
+      })}\n\n`);
+      const abort = new AbortController();
+      res.on('close', () => abort.abort());
+      try {
+        let upstreamMessages = [{ role: 'system', content: system }, ...messages];
+        if (images.length > 0) {
+          const lastUser = [...upstreamMessages].reverse().find((m) => m.role === 'user');
+          if (lastUser) {
+            upstreamMessages = upstreamMessages.map((m) =>
+              m === lastUser
+                ? {
+                    role: 'user',
+                    content: [
+                      { type: 'text', text: m.content },
+                      ...images.map((img) => ({
+                        type: 'image_url',
+                        image_url: { url: `data:${img.mime || 'image/jpeg'};base64,${img.data}` },
+                      })),
+                    ],
+                  }
+                : m,
+            );
+          }
+        }
+        const upstream = await fetch(`${agent.base}/chat/completions`, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            authorization: `Bearer ${agent.key}`,
+          },
+          body: JSON.stringify({
+            model: agent.model,
+            reasoning_effort: agent.effort,
+            stream: true,
+            messages: upstreamMessages,
+          }),
+          signal: abort.signal,
+        });
+        if (!upstream.ok) {
+          const detail = (await upstream.text()).slice(0, 500);
+          sendFrame(res, `data: ${JSON.stringify({ type: 'error', message: `DeepSeek ${upstream.status}: ${detail}` })}\n\n`);
+          return res.end();
+        }
+        const reader = upstream.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          let cut;
+          while ((cut = buffer.indexOf('\n')) >= 0) {
+            const line = buffer.slice(0, cut).trim();
+            buffer = buffer.slice(cut + 1);
+            if (!line.startsWith('data:')) continue;
+            const data = line.slice(5).trim();
+            if (!data) continue;
+            if (data === '[DONE]') {
+              sendFrame(res, `data: ${JSON.stringify({ type: 'done' })}\n\n`);
+              return res.end();
+            }
+            let parsed;
+            try {
+              parsed = JSON.parse(data);
+            } catch {
+              continue;
+            }
+            const delta = parsed.choices?.[0]?.delta;
+            if (!delta) continue;
+            if (delta.reasoning_content) {
+              sendFrame(res, `data: ${JSON.stringify({ type: 'reasoning', delta: delta.reasoning_content })}\n\n`);
+            }
+            if (delta.content) {
+              sendFrame(res, `data: ${JSON.stringify({ type: 'content', delta: delta.content })}\n\n`);
+            }
+          }
+        }
+        sendFrame(res, `data: ${JSON.stringify({ type: 'done' })}\n\n`);
+        res.end();
+      } catch (e) {
+        if (!abort.signal.aborted) {
+          sendFrame(res, `data: ${JSON.stringify({ type: 'error', message: e.message })}\n\n`);
+          res.end();
+        }
+      }
       return;
     }
 
