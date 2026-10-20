@@ -1,6 +1,12 @@
 import { VelaWorkspace, setLocale, registerRendererDefaults } from '@luxalgo/vela/workspace';
-import { PineEngine } from '@luxalgo/vela-pinets';
+import { PineWorkerEngine } from '@luxalgo/vela-pinets';
 import { installIndicatorEditor } from './indicator-editor.js';
+
+// PineWorkerEngine builds its worker from a Blob URL and revokes that URL immediately
+// after `new Worker(url)`. In Electron that races the ~850 KB script load: the worker
+// never starts and script indicators stay stuck at "…". Defer the revocation.
+const revokeObjectURL = URL.revokeObjectURL.bind(URL);
+URL.revokeObjectURL = (url) => setTimeout(() => revokeObjectURL(url), 30_000);
 
 const TF_MAP = {
   '1': '1m', '5': '5m', '15': '15m', '30': '30m',
@@ -10,6 +16,23 @@ const TF_MAP = {
   '1h': '1h', '2h': '2h', '4h': '4h',
   '1d': '1d', '1w': '1w', '1M': '1M',
 };
+const TF_MS = {
+  '1m': 60_000, '5m': 300_000, '15m': 900_000, '30m': 1_800_000,
+  '1h': 3_600_000, '2h': 7_200_000, '4h': 14_400_000,
+  '1d': 86_400_000, '1w': 604_800_000, '1M': 2_592_000_000,
+};
+// TradingView's datafeed asks for the bars that fill the visible area — typically
+// around 300 — and fetches older history as the user scrolls. Mirror that: boot with
+// a small window and extend it page by page on demand.
+const INITIAL_BARS = 300;
+const SLIDE_BARS = 1000;
+const MAX_BARS = 20_000;
+
+// Provider-side bookkeeping for the lazy history: the oldest bar delivered for each
+// market, and whether the source ran out of older data.
+const oldestByMarket = new Map();
+const newestByMarket = new Map();
+const exhaustedMarkets = new Set();
 
 class LongbridgeProvider {
   async getBars(ticker, timeframe, range) {
@@ -26,13 +49,53 @@ class LongbridgeProvider {
       try {
         const r = await fetch(`/api/bars?${params}`);
         if (!r.ok) throw new Error(`longbridge ${r.status}`);
-        return (await r.json()).bars;
+        const bars = (await r.json()).bars;
+        const key = `${ticker}|${tf}`;
+        const unbounded = range?.from == null && range?.to == null;
+        if (bars.length > 0) {
+          // A full request redefines the window (symbol/timeframe switch); an older
+          // window only ever pushes the left edge further back.
+          if (unbounded || !oldestByMarket.has(key) || bars[0].time < oldestByMarket.get(key)) {
+            oldestByMarket.set(key, bars[0].time);
+          }
+          const newest = bars[bars.length - 1].time;
+          if (unbounded || !newestByMarket.has(key) || newest > newestByMarket.get(key)) {
+            newestByMarket.set(key, newest);
+          }
+        }
+        if (unbounded) exhaustedMarkets.delete(key);
+        else if (range?.limit && bars.length < range.limit) exhaustedMarkets.add(key);
+        return bars;
       } catch (e) {
         lastErr = e;
         await new Promise((res) => setTimeout(res, 700 * (i + 1)));
       }
     }
     throw lastErr;
+  }
+
+  subscribe(ticker, timeframe, onBar) {
+    const tf = TF_MAP[timeframe] || '1d';
+    const params = new URLSearchParams({ symbol: ticker, tf });
+    const es = new EventSource(`/api/stream?${params}`);
+    es.onmessage = (event) => {
+      try {
+        const msg = JSON.parse(event.data);
+        if (!msg?.bar) return;
+        const key = `${ticker}|${tf}`;
+        const newest = newestByMarket.get(key);
+        if (newest == null || msg.bar.time > newest) newestByMarket.set(key, msg.bar.time);
+        onBar(msg.bar);
+      } catch {
+        /* malformed frame — keep the stream open */
+      }
+    };
+    es.addEventListener('stream-error', (event) => {
+      let message = 'unknown error';
+      try { message = JSON.parse(event.data).message; } catch {}
+      console.warn('[longbridge] candlestick stream failed:', message);
+    });
+    return () => es.close();
   }
 
   async listSymbols() {
@@ -46,17 +109,51 @@ class LongbridgeProvider {
       name: 'longbridge',
       displayName: '长桥',
       supportedTimeframes: Object.keys(TF_MAP),
-      capabilities: { enumerate: true, stream: false, symbolInfo: false },
+      capabilities: { enumerate: true, stream: true, symbolInfo: false },
     };
   }
 }
 
 const PERSIST_KEY = 'vela-client-longbridge';
 const TIMEFRAME_FAVORITES = ['1', '5', '15', '60', '240', 'D', 'W', 'M'];
-// History depth (bars) the chart loads + lets Vela backfill. A restored persisted cell
-// carries NO `bars`, so it would boot at Vela's 500 default and never scroll back — seed
-// it here too, mirroring the workspace default below.
-const DEEP_BARS = 20000;
+// Indicators every chart starts with. Volume is a native study; the other is the
+// manifest name served by /api/indicators.json.
+const DEFAULT_STUDIES = { native: 'volume', manifest: 'Smart Money Concepts' };
+// Bump the version to re-apply the defaults to workspaces saved before this change.
+const DEFAULTS_FLAG = 'host.defaultIndicators';
+const DEFAULTS_VERSION = 2;
+// The catalogue title differs from the name the script declares; a ledger entry must
+// carry the declared one.
+const LEGACY_STUDY_NAMES = ['Smart Money Concepts (SMC)'];
+
+function seedDefaultStudies(doc) {
+  const ext = doc.ext && typeof doc.ext === 'object' && !Array.isArray(doc.ext) ? doc.ext : {};
+  if (ext[DEFAULTS_FLAG] === DEFAULTS_VERSION) return doc;
+  if (Array.isArray(doc.charts)) {
+    for (const chart of doc.charts) {
+      if (!chart || typeof chart !== 'object') continue;
+      const current = chart.indicators;
+      const natives = Array.isArray(current?.natives) ? [...current.natives] : [];
+      const manifest = Array.isArray(current?.manifest)
+        ? current.manifest.filter((e) => !LEGACY_STUDY_NAMES.includes(typeof e === 'string' ? e : e?.name))
+        : [];
+      const typeOf = (e) => (typeof e === 'string' ? e : e?.type);
+      const nameOf = (e) => (typeof e === 'string' ? e : e?.name);
+      if (!natives.some((e) => typeOf(e) === DEFAULT_STUDIES.native)) natives.push(DEFAULT_STUDIES.native);
+      if (!manifest.some((e) => nameOf(e) === DEFAULT_STUDIES.manifest)) manifest.push(DEFAULT_STUDIES.manifest);
+      chart.indicators = { manifest, natives };
+    }
+  }
+  doc.ext = { ...ext, [DEFAULTS_FLAG]: DEFAULTS_VERSION };
+  return doc;
+}
+
+async function loadIndicators() {
+  const res = await fetch('/api/indicators.json');
+  if (!res.ok) throw new Error(`indicators: HTTP ${res.status}`);
+  const list = await res.json();
+  return list.map((e) => (e.name === DEFAULT_STUDIES.manifest ? { ...e, enabled: true } : e));
+}
 // Display timezone for the axis / bottom bar (IANA). The persisted workspace doc
 // carries its own `timezone`, so we force it here too.
 const TIMEZONE = 'America/New_York';
@@ -70,7 +167,11 @@ const storage = {
     let raw = null;
     try { raw = localStorage.getItem(key); } catch { return null; }
     if (key !== PERSIST_KEY) return raw;
-    if (!raw) return JSON.stringify({ version: 1, layout: '1', timezone: TIMEZONE, timeframeFavorites: TIMEFRAME_FAVORITES });
+    if (!raw) {
+      return JSON.stringify(seedDefaultStudies({
+        version: 1, layout: '1', timezone: TIMEZONE, timeframeFavorites: TIMEFRAME_FAVORITES,
+      }));
+    }
     try {
       const doc = JSON.parse(raw);
       doc.timezone = TIMEZONE;
@@ -79,10 +180,11 @@ const storage = {
       }
       if (Array.isArray(doc.charts)) {
         for (const c of doc.charts) {
-          if (typeof c.bars !== 'number' || c.bars <= 0) c.bars = DEEP_BARS;
+          // Every boot starts from the small window; scrolling grows it on demand.
+          c.bars = INITIAL_BARS;
         }
       }
-      return JSON.stringify(doc);
+      return JSON.stringify(seedDefaultStudies(doc));
     } catch {
       return raw;
     }
@@ -103,12 +205,13 @@ registerRendererDefaults({ attribution: false });
 const ws = new VelaWorkspace('#app', {
   layout: false,
   theme: 'dark',
-  symbol: 'longbridge:AAPL.US',
-  timeframe: 'D',
-  bars: DEEP_BARS,
+  symbol: 'longbridge:SPY.US',
+  timeframe: '5',
+  bars: INITIAL_BARS,
+  live: true,
   providers: { longbridge: () => new LongbridgeProvider() },
-  engines: { pine: () => new PineEngine() },
-  indicators: '/api/indicators.json',
+  engines: { pine: () => new PineWorkerEngine() },
+  indicators: loadIndicators,
   timezone: TIMEZONE,
   persist: PERSIST_KEY,
   storage,
@@ -116,6 +219,129 @@ const ws = new VelaWorkspace('#app', {
 
 // The persisted doc's own `timezone` wins on boot, so force the display zone here too.
 ws.setTimezone(TIMEZONE);
+
+// Lazy history: extending the depth prepends older bars and keeps the viewport put.
+// A page loads when the left edge reaches the loaded history or when zooming out makes
+// the visible window wider than everything loaded. Drag/zoom gestures also re-check on
+// their own, because a drag at the pan limit emits no viewport change.
+const slidingInstalled = new WeakSet();
+const slideStyle = document.createElement('style');
+slideStyle.textContent = `
+.vslide-pill { position: absolute; left: 12px; top: 54px; z-index: 30; display: flex; align-items: center;
+  gap: 8px; padding: 6px 10px; border-radius: 6px; background: rgba(30, 34, 45, .92);
+  border: 1px solid rgba(255, 255, 255, .1); color: #d1d4dc; font: 12px/1.2 system-ui, sans-serif;
+  pointer-events: none; }
+.vslide-pill[hidden] { display: none !important; }
+.vslide-spin { width: 12px; height: 12px; border: 2px solid rgba(255, 255, 255, .25);
+  border-top-color: #fff; border-radius: 50%; animation: vslide-spin .8s linear infinite; }
+@keyframes vslide-spin { to { transform: rotate(360deg); } }
+`;
+document.head.appendChild(slideStyle);
+
+function installSliding(cell) {
+  if (slidingInstalled.has(cell)) return;
+  slidingInstalled.add(cell);
+  const chart = cell.chart;
+  let extending = false;
+  let lastAt = 0;
+  let guard = null;
+  // Boot builds the initial frame through several viewport updates; only history the
+  // user deliberately pans into may extend the window.
+  let userActive = false;
+  let dragging = false;
+  let gestureTimer = null;
+
+  const pill = document.createElement('div');
+  pill.className = 'vslide-pill';
+  pill.hidden = true;
+  pill.innerHTML = '<span class="vslide-spin"></span><span class="vslide-text"></span>';
+  cell.host.appendChild(pill);
+  const setPill = (text) => {
+    if (text == null) {
+      pill.hidden = true;
+      return;
+    }
+    pill.querySelector('.vslide-text').textContent = text;
+    pill.hidden = false;
+  };
+  let shownAt = 0;
+  let finishing = false;
+  const finish = () => {
+    if (finishing) return;
+    finishing = true;
+    if (guard) {
+      clearTimeout(guard);
+      guard = null;
+    }
+    // Keep a short minimum so an instant (cached) page still reads as an action.
+    const wait = Math.max(0, 500 - (Date.now() - shownAt));
+    setTimeout(() => {
+      extending = false;
+      finishing = false;
+      setPill(null);
+    }, wait);
+  };
+
+  chart.on('history:progress', ({ loaded, target }) => {
+    if (extending && loaded < target) setPill(`加载更早数据 ${loaded}/${target}`);
+  });
+  chart.on('history:complete', () => {
+    if (extending) finish();
+  });
+
+  const maybeExtend = () => {
+    if (!userActive || extending) return;
+    const range = chart.getVisibleRange();
+    if (!range) return;
+    const { from, to } = range;
+    const market = chart.market;
+    const tf = TF_MAP[market.timeframe] || '1d';
+    const interval = TF_MS[tf] || 300_000;
+    const key = `${(market.symbol ?? '').split(':').pop()}|${tf}`;
+    const oldest = oldestByMarket.get(key);
+    const newest = newestByMarket.get(key);
+    const depth = market.bars ?? INITIAL_BARS;
+    if (oldest == null || exhaustedMarkets.has(key)) return;
+    if (depth >= MAX_BARS) return;
+    // Two triggers: the left edge reached the oldest loaded bar, OR zooming out made
+    // the visible window as wide as everything loaded (the view needs more history
+    // even though the user never panned all the way to the left edge).
+    const atEdge = from <= oldest + 100 * interval;
+    const loadedSpan = newest != null ? newest - oldest : 0;
+    const zoomedPast = loadedSpan > 0 && to - from >= loadedSpan * 0.95;
+    if (!atEdge && !zoomedPast) return;
+    if (Date.now() - lastAt < 800) return;
+    extending = true;
+    lastAt = Date.now();
+    shownAt = Date.now();
+    setPill('加载更早数据…');
+    guard = setTimeout(finish, 30_000);
+    chart
+      .setMarket({ bars: Math.min(depth + SLIDE_BARS, MAX_BARS) })
+      .catch(finish);
+  };
+
+  // A drag at the pan limit emits no viewport change, so the gesture itself has to
+  // ask for the next page instead of waiting for the view to move.
+  const scheduleExtend = () => {
+    if (gestureTimer) clearTimeout(gestureTimer);
+    gestureTimer = setTimeout(() => {
+      gestureTimer = null;
+      maybeExtend();
+    }, 100);
+  };
+  cell.host.addEventListener('wheel', () => { userActive = true; scheduleExtend(); }, { capture: true, passive: true });
+  cell.host.addEventListener('pointerdown', () => { userActive = true; dragging = true; }, { capture: true });
+  cell.host.addEventListener('pointermove', () => { if (dragging) scheduleExtend(); }, { capture: true, passive: true });
+  cell.host.addEventListener('pointerup', () => { dragging = false; scheduleExtend(); }, { capture: true });
+  window.addEventListener('pointerup', () => { dragging = false; }, true);
+  chart.on('viewport:changed', () => maybeExtend());
+}
+for (const cell of ws.cells()) installSliding(cell);
+ws.on('cell:created', ({ id }) => {
+  const cell = ws.cell(id);
+  if (cell) installSliding(cell);
+});
 
 // Vela's built-in timeframe/style dropdowns live in the topbar but their menu + a
 // hover tooltip share one trigger, which is fragile (a box pops where the menu opens

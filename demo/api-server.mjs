@@ -15,6 +15,7 @@ const DB_FILE = path.join(CACHE_DIR, 'bars.sqlite');
 process.env.LONGPORT_HTTP_URL ||= 'https://openapi.longportapp.com';
 process.env.LONGPORT_QUOTE_WS_URL ||= 'wss://openapi-quote.longportapp.com/v2';
 process.env.LONGPORT_TRADE_WS_URL ||= 'wss://openapi-trade.longportapp.com/v2';
+process.env.LONGPORT_PUSH_CANDLESTICK_MODE ||= 'realtime';
 
 const { Config, QuoteContext, Period, AdjustType, TradeSessions, NaiveDate, NaiveDatetime, Time, Market } =
   await import('longport');
@@ -155,9 +156,59 @@ function getCtx() {
       process.env.LONGPORT_APP_SECRET,
       process.env.LONGPORT_ACCESS_TOKEN,
     );
-    ctxPromise = QuoteContext.new(config);
+    const ctx = QuoteContext.new(config);
+    bindCandlestickPush(ctx);
+    ctxPromise = ctx;
   }
   return ctxPromise;
+}
+
+// ---------------- realtime candlestick push (SSE) ----------------
+// The SDK pushes through one socket owned by the QuoteContext, so subscriptions are
+// reference-counted per (symbol, timeframe) and fanned out to every connected client.
+const PERIOD_TF = new Map(Object.entries(TF).map(([tf, period]) => [period, tf]));
+const streams = new Map(); // `${symbol}|${tf}` -> { symbol, tf, period, clients:Set, subscribed }
+let pushBound = false;
+
+function sendFrame(client, payload) {
+  if (client.destroyed || client.writableEnded) return;
+  try {
+    client.write(payload);
+  } catch {
+    /* the client disconnected between the check and the write */
+  }
+}
+
+function bindCandlestickPush(ctx) {
+  if (pushBound) return;
+  pushBound = true;
+  ctx.setOnCandlestick((err, event) => {
+    try {
+      if (err) {
+        console.warn('[push] candlestick error:', err.message);
+        return;
+      }
+      const tf = PERIOD_TF.get(event.data.period);
+      if (!tf) return;
+      const entry = streams.get(`${event.symbol}|${tf}`);
+      if (!entry) return;
+      const bar = toBar(event.data.candlestick);
+      const payload = `data: ${JSON.stringify({ symbol: event.symbol, tf, confirmed: event.data.isConfirmed, bar })}\n\n`;
+      for (const client of entry.clients) sendFrame(client, payload);
+      // Only the closed bar is worth persisting; the forming candle is pushed many times
+      // per second and the history endpoint answers it anyway.
+      if (event.data.isConfirmed) cachePut(event.symbol, tf, [bar], {});
+    } catch (e) {
+      console.warn('[push] frame failed:', e.message);
+    }
+  });
+}
+
+async function subscribeStream(entry) {
+  if (entry.subscribed) return;
+  const ctx = await getCtx();
+  await ctx.subscribeCandlesticks(entry.symbol, entry.period, TradeSessions.Intraday);
+  entry.subscribed = true;
 }
 
 async function withRetry(fn, tries = 3) {
@@ -392,6 +443,48 @@ async function usSymbols() {
 const server = http.createServer(async (req, res) => {
   const u = new URL(req.url, 'http://localhost');
   try {
+    if (u.pathname === '/api/stream') {
+      const symbol = u.searchParams.get('symbol') || '';
+      const tf = u.searchParams.get('tf') || '';
+      if (!symbol || TF[tf] === undefined) return send(res, 400, JSON.stringify({ error: 'bad symbol or tf' }));
+      res.writeHead(200, {
+        'content-type': 'text/event-stream; charset=utf-8',
+        'cache-control': 'no-cache, no-transform',
+        connection: 'keep-alive',
+        'access-control-allow-origin': '*',
+      });
+      res.on('error', () => {}); // a client dropping mid-frame must not take the service down
+      sendFrame(res, ': connected\n\n');
+      const key = `${symbol}|${tf}`;
+      let entry = streams.get(key);
+      if (!entry) {
+        entry = { symbol, tf, period: TF[tf], clients: new Set(), subscribed: false };
+        streams.set(key, entry);
+      }
+      entry.clients.add(res);
+      const heartbeat = setInterval(() => sendFrame(res, ': ping\n\n'), 15_000);
+      subscribeStream(entry).catch((e) => {
+        console.warn(`[push] subscribe failed ${symbol} ${tf}:`, e.message);
+        sendFrame(res, `event: stream-error\ndata: ${JSON.stringify({ message: e.message })}\n\n`);
+      });
+      req.on('close', () => {
+        clearInterval(heartbeat);
+        entry.clients.delete(res);
+        if (entry.clients.size > 0) return;
+        streams.delete(key);
+        if (!entry.subscribed) return;
+        void (async () => {
+          try {
+            const ctx = await getCtx();
+            await ctx.unsubscribeCandlesticks(entry.symbol, entry.period);
+          } catch {
+            /* the socket is already gone */
+          }
+        })();
+      });
+      return;
+    }
+
     if (u.pathname === '/api/bars') {
       const symbol = u.searchParams.get('symbol') || 'AAPL.US';
       const tf = u.searchParams.get('tf') || '1d';

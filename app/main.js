@@ -57,6 +57,7 @@ function startServer() {
   serverProc = spawn(nodeBin, [API_SERVER], {
     env: { ...process.env },
     stdio: ['ignore', 'pipe', 'pipe'],
+    windowsHide: true,
   });
   serverProc.stdout.on('data', (d) => process.stdout.write('[api] ' + d));
   serverProc.stderr.on('data', (d) => process.stderr.write('[api] ' + d));
