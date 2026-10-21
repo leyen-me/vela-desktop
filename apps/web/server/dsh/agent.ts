@@ -1,52 +1,21 @@
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { DeepSeekHarness, type HarnessSession } from '@deepseek-ai/dsh-sdk-client';
 import { logger } from '../logger.ts';
-import { buildAgentPrompt, loadAgentConfig } from '../agent.ts';
-import {
-  assertDshNode,
-  DSH_ENABLED,
-  DSH_HOME,
-  DSH_INIT_TIMEOUT_MS,
-  DSH_MODEL,
-  DSH_PROVIDER,
-  DSH_REASONING_EFFORT,
-  DSH_SESSION_IDLE_MS,
-  DSH_TURN_TIMEOUT_MS,
-  DSH_WORKSPACE,
-  ensureDshDirs,
-} from './config.ts';
+import { LIVE_PERSONA, buildAgentPrompt, loadAgentConfig } from '../agent.ts';
+import { DSH_ENABLED, DSH_HOME, DSH_MODEL, DSH_REASONING_EFFORT, DSH_TURN_TIMEOUT_MS, ensureDshDirs } from './config.ts';
 import { removePatch, writePatch, type McpServerPatch } from './patch.ts';
-import { mapNotification, type AgentStreamEvent, type MapState } from './events.ts';
+import { DshRuntime } from './runtime.ts';
+import type { DshNotificationEvent } from './notify.ts';
 
-type HarnessOptions = NonNullable<ConstructorParameters<typeof DeepSeekHarness>[0]>;
+export type AgentStreamEvent =
+  | { type: 'reasoning'; delta: string }
+  | { type: 'content'; delta: string }
+  | { type: 'tool'; name: string; ok: boolean; message?: string }
+  | { type: 'done' }
+  | { type: 'error'; message: string };
 
-let harness: DeepSeekHarness | null = null;
+let runtime: DshRuntime | null = null;
 let patchPath: string | null = null;
-const sessions = new Map<string, HarnessSession>();
-const queues = new Map<string, Promise<unknown>>();
-const activeKeys = new Set<string>();
-const lastUsed = new Map<string, number>();
-let evictTimer: NodeJS.Timeout | null = null;
-
-function startSessionEviction(): void {
-  if (evictTimer) return;
-  evictTimer = setInterval(() => {
-    const cutoff = Date.now() - DSH_SESSION_IDLE_MS;
-    for (const [key, usedAt] of lastUsed) {
-      if (usedAt > cutoff || activeKeys.has(key)) continue;
-      sessions.delete(key);
-      lastUsed.delete(key);
-      queues.delete(key);
-      logger.info('[dsh] session evicted after idle timeout', { key });
-    }
-    if (sessions.size === 0 && evictTimer) {
-      clearInterval(evictTimer);
-      evictTimer = null;
-    }
-  }, Math.min(60_000, DSH_SESSION_IDLE_MS));
-  evictTimer.unref();
-}
 
 function mcpServers(): McpServerPatch[] {
   return [
@@ -62,69 +31,29 @@ function mcpServers(): McpServerPatch[] {
   ];
 }
 
-function getHarness(): DeepSeekHarness {
-  if (harness) return harness;
-  assertDshNode();
+function getRuntime(): DshRuntime {
+  if (runtime) return runtime;
   ensureDshDirs();
-  patchPath = writePatch('live.patch.yml', mcpServers());
-  const options: HarnessOptions = {
-    profile: 'sdk',
-    patches: [patchPath],
+  patchPath = writePatch('live.patch.yml', mcpServers(), { personaPrefix: LIVE_PERSONA });
+  runtime = new DshRuntime({
+    patchFile: patchPath,
     dshHome: DSH_HOME,
-    cwd: DSH_WORKSPACE,
-    processCwd: DSH_WORKSPACE,
-    initializeTimeoutMs: DSH_INIT_TIMEOUT_MS,
     requestTimeoutMs: DSH_TURN_TIMEOUT_MS,
-    provider: DSH_PROVIDER,
-    model: DSH_MODEL,
-  };
-  options.reasoningEffort = DSH_REASONING_EFFORT as NonNullable<HarnessOptions['reasoningEffort']>;
-  const configured = loadAgentConfig();
-  if (configured.key) options.env = { ...process.env, DEEPSEEK_API_KEY: configured.key };
-  harness = new DeepSeekHarness(options);
-  return harness;
+  });
+  return runtime;
 }
 
 function sessionIdFor(key: string): string {
   return `session-${createHash('sha256').update(`vela-live:${key}`).digest('hex').slice(0, 32)}`;
 }
 
-async function getSession(key: string): Promise<HarnessSession> {
-  const existing = sessions.get(key);
-  if (existing) return existing;
-  const runtime = getHarness();
-  const id = sessionIdFor(key);
-  let session: HarnessSession | null = null;
-  let lastError: unknown = null;
-  for (let attempt = 0; attempt < 2 && !session; attempt += 1) {
-    try {
-      session = await runtime.resumeSession(id);
-    } catch (error) {
-      lastError = error;
-      // A previous runtime may still hold the session's write handle during a
-      // restart; give it a moment before giving up on the persisted history.
-      if (attempt === 0) await new Promise((resolve) => setTimeout(resolve, 1500));
-    }
+function adaptEvent(event: DshNotificationEvent): AgentStreamEvent | null {
+  if (event.type === 'reasoning') return { type: 'reasoning', delta: event.text };
+  if (event.type === 'content') return { type: 'content', delta: event.text };
+  if (event.type === 'tool_result') {
+    return { type: 'tool', name: event.name, ok: event.ok, message: event.text.slice(0, 500) || undefined };
   }
-  if (!session) {
-    logger.warn('[dsh] resume failed; starting a fresh session', {
-      id,
-      message: lastError instanceof Error ? lastError.message : String(lastError),
-    });
-    session = runtime.session();
-  }
-  sessions.set(key, session);
-  return session;
-}
-
-function enqueue<T>(key: string, task: () => Promise<T>): Promise<T> {
-  const previous = queues.get(key) ?? Promise.resolve();
-  const next = previous.then(task, task);
-  queues.set(
-    key,
-    next.catch(() => undefined),
-  );
-  return next;
+  return null;
 }
 
 export type AnalysisBody = {
@@ -166,7 +95,10 @@ function imageBlock(image: InlineImage) {
   return { type: 'image' as const, data: image.data, mimeType: mime };
 }
 
-export async function streamAnalysis(body: AnalysisBody, emit: (event: AgentStreamEvent) => void): Promise<void> {
+export async function streamAnalysis(
+  body: AnalysisBody,
+  emit: (event: AgentStreamEvent) => void,
+): Promise<void> {
   const agent = loadAgentConfig();
   if (!agent.key)
     throw new Error('未检测到 DEEPSEEK_API_KEY，请设置环境变量后重启应用（或在 data/agent.json 中配置 apiKey）');
@@ -176,29 +108,18 @@ export async function streamAnalysis(body: AnalysisBody, emit: (event: AgentStre
   const text = userText ? `${prompt}\n\n本轮用户消息：\n${userText}` : prompt;
   const input = images.length > 0 ? [{ type: 'text' as const, text }, ...images.map(imageBlock)] : text;
   const key = `${String(body.symbol ?? '')}|${String(body.timeframe ?? '')}`;
-  const state: MapState = { seen: new Set(), calls: new Map() };
 
-  await enqueue(key, async () => {
-    activeKeys.add(key);
-    try {
-      const session = await getSession(key);
-      const result = await session.run(input, {
-        onNotification: (notification) => {
-          for (const event of mapNotification(notification, state)) {
-            if (event.type === 'tool' && !event.ok) {
-              logger.warn('[dsh] tool failed', { name: event.name, message: event.message });
-            }
-            emit(event);
-          }
-        },
-      });
-      if (!result.finalResponse.trim()) logger.warn('[dsh] analysis finished without an assistant message');
-    } finally {
-      activeKeys.delete(key);
-      lastUsed.set(key, Date.now());
-      startSessionEviction();
-    }
-  });
+  const result = await getRuntime().run(
+    key,
+    sessionIdFor(key),
+    input,
+    (event) => {
+      const mapped = adaptEvent(event);
+      if (mapped) emit(mapped);
+    },
+    { resume: true },
+  );
+  if (!result.finalResponse.trim()) logger.warn('[dsh] analysis finished without an assistant message');
   emit({ type: 'done' });
 }
 
@@ -215,18 +136,9 @@ export function agentStatus() {
 }
 
 export async function shutdownDsh(): Promise<void> {
-  const current = harness;
-  harness = null;
-  sessions.clear();
-  queues.clear();
-  activeKeys.clear();
-  lastUsed.clear();
-  if (evictTimer) {
-    clearInterval(evictTimer);
-    evictTimer = null;
-  }
+  const current = runtime;
+  runtime = null;
   if (patchPath) removePatch(patchPath);
   patchPath = null;
-  if (current)
-    await current.close().catch((error) => logger.warn('[dsh] close failed', { message: (error as Error).message }));
+  if (current) await current.close();
 }

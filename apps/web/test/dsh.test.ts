@@ -1,18 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mapNotification, type MapState } from '../server/dsh/events.ts';
+import { createNotificationMapper } from '../server/dsh/notify.ts';
 import { buildPatch } from '../server/dsh/patch.ts';
-
-function state(): MapState {
-  return { seen: new Set(), calls: new Map() };
-}
 
 function sessionEvent(event: Record<string, unknown>) {
   return { method: 'session.event', params: { sessionId: 'session-test', event } };
 }
 
 test('assistant messages map reasoning and answer text once', () => {
-  const seen = state();
+  const map = createNotificationMapper();
   const notification = sessionEvent({
     type: 'assistant/message',
     data: {
@@ -27,21 +23,21 @@ test('assistant messages map reasoning and answer text once', () => {
     },
   });
 
-  assert.deepEqual(mapNotification(notification, seen), [
-    { type: 'reasoning', delta: 'thinking' },
-    { type: 'content', delta: 'answer' },
+  assert.deepEqual(map(notification), [
+    { type: 'reasoning', text: 'thinking' },
+    { type: 'content', text: 'answer' },
   ]);
-  assert.deepEqual(mapNotification(notification, seen), []);
+  assert.deepEqual(map(notification), []);
 });
 
 test('tool results resolve the call name and surface failures', () => {
-  const seen = state();
-  mapNotification(
-    sessionEvent({ type: 'tool/call', data: { callId: 'call-1', name: 'mcp__trading__market_bars', arguments: '{}' } }),
-    seen,
+  const map = createNotificationMapper();
+  assert.deepEqual(
+    map(sessionEvent({ type: 'tool/call', data: { callId: 'call-1', name: 'mcp__trading__market_bars', arguments: '{}' } })),
+    [{ type: 'tool_call', id: 'call-1', name: 'mcp__trading__market_bars', args: {} }],
   );
 
-  const success = mapNotification(
+  const success = map(
     sessionEvent({
       type: 'tool/result',
       data: {
@@ -52,20 +48,20 @@ test('tool results resolve the call name and surface failures', () => {
         },
       },
     }),
-    seen,
   );
   assert.deepEqual(success, [
-    { type: 'tool', name: 'mcp__trading__market_bars', ok: true, message: '{"count":1}' },
+    { type: 'tool_result', id: 'call-1', name: 'mcp__trading__market_bars', ok: true, text: '{"count":1}', value: { count: 1 } },
   ]);
 
-  const failure = mapNotification(
+  const failure = map(
     sessionEvent({
       type: 'tool/result',
       data: { message: { toolCallId: 'call-1', isError: true, content: [{ type: 'text', text: 'nope' }] } },
     }),
-    seen,
   );
-  assert.deepEqual(failure, [{ type: 'tool', name: 'mcp__trading__market_bars', ok: false, message: 'nope' }]);
+  assert.deepEqual(failure, [
+    { type: 'tool_result', id: 'call-1', name: 'mcp__trading__market_bars', ok: false, text: 'nope', value: 'nope' },
+  ]);
 });
 
 test('generated patches disable host tools and mount MCP servers', () => {
