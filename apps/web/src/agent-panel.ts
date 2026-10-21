@@ -50,6 +50,11 @@ export function mountAgentPanel(ctx: any, body: HTMLElement) {
   font-size: 12px; user-select: none; }
 .vagent-think-body { padding: 0 8px 7px; color: var(--vela-fg-muted, #8a8f9c); font-size: 12px;
   line-height: 1.45; white-space: pre-wrap; max-height: 240px; overflow-y: auto; }
+.vagent-tools { display: flex; flex-direction: column; gap: 3px; margin-bottom: 6px; }
+.vagent-tool { display: flex; align-items: center; gap: 5px; font-size: 11px;
+  color: var(--vela-fg-muted, #8a8f9c); }
+.vagent-tool[data-ok='0'] { color: #e57373; }
+.vagent-tool-name { color: var(--vela-fg, #d1d4dc); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .vagent-answer { white-space: pre-wrap; }
 .vagent-answer[data-streaming='1']::after { content: '▍'; margin-left: 1px; animation: vagent-caret 1s steps(2) infinite; }
 @keyframes vagent-caret { 50% { opacity: 0; } }
@@ -263,10 +268,12 @@ export function mountAgentPanel(ctx: any, body: HTMLElement) {
         const thinkBody = document.createElement('div');
         thinkBody.className = 'vagent-think-body';
         details.append(summary, thinkBody);
+        const toolList = document.createElement('div');
+        toolList.className = 'vagent-tools';
         const answerEl = document.createElement('div');
         answerEl.className = 'vagent-answer';
         answerEl.dataset.streaming = '1';
-        node.append(details, answerEl);
+        node.append(details, toolList, answerEl);
         turn.appendChild(node);
         msgsEl.scrollTop = msgsEl.scrollHeight;
 
@@ -293,6 +300,21 @@ export function mountAgentPanel(ctx: any, body: HTMLElement) {
           if (parsed.type === 'error') throw new Error(parsed.message || 'agent error');
           if (parsed.type === 'system') {
             setSystem(parsed.content, parsed.meta);
+            return;
+          }
+          if (parsed.type === 'tool') {
+            const line = document.createElement('div');
+            line.className = 'vagent-tool';
+            line.dataset.ok = parsed.ok === false ? '0' : '1';
+            const icon = document.createElement('span');
+            icon.textContent = parsed.ok === false ? '✗' : '✓';
+            const name = document.createElement('span');
+            name.className = 'vagent-tool-name';
+            name.textContent = String(parsed.name ?? 'tool').replace(/^mcp__[^_]+__/, '');
+            line.append(icon, name);
+            if (typeof parsed.message === 'string' && parsed.message) line.title = parsed.message.slice(0, 1000);
+            toolList.appendChild(line);
+            msgsEl.scrollTop = msgsEl.scrollHeight;
             return;
           }
           if (parsed.type === 'reasoning' && parsed.delta) {

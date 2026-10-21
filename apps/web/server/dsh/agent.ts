@@ -11,6 +11,7 @@ import {
   DSH_MODEL,
   DSH_PROVIDER,
   DSH_REASONING_EFFORT,
+  DSH_SESSION_IDLE_MS,
   DSH_TURN_TIMEOUT_MS,
   DSH_WORKSPACE,
   ensureDshDirs,
@@ -24,6 +25,28 @@ let harness: DeepSeekHarness | null = null;
 let patchPath: string | null = null;
 const sessions = new Map<string, HarnessSession>();
 const queues = new Map<string, Promise<unknown>>();
+const activeKeys = new Set<string>();
+const lastUsed = new Map<string, number>();
+let evictTimer: NodeJS.Timeout | null = null;
+
+function startSessionEviction(): void {
+  if (evictTimer) return;
+  evictTimer = setInterval(() => {
+    const cutoff = Date.now() - DSH_SESSION_IDLE_MS;
+    for (const [key, usedAt] of lastUsed) {
+      if (usedAt > cutoff || activeKeys.has(key)) continue;
+      sessions.delete(key);
+      lastUsed.delete(key);
+      queues.delete(key);
+      logger.info('[dsh] session evicted after idle timeout', { key });
+    }
+    if (sessions.size === 0 && evictTimer) {
+      clearInterval(evictTimer);
+      evictTimer = null;
+    }
+  }, Math.min(60_000, DSH_SESSION_IDLE_MS));
+  evictTimer.unref();
+}
 
 function mcpServers(): McpServerPatch[] {
   return [
@@ -141,18 +164,25 @@ export async function streamAnalysis(body: AnalysisBody, emit: (event: AgentStre
   const state: MapState = { seen: new Set(), calls: new Map() };
 
   await enqueue(key, async () => {
-    const session = await getSession(key);
-    const result = await session.run(input, {
-      onNotification: (notification) => {
-        for (const event of mapNotification(notification, state)) {
-          if (event.type === 'tool' && !event.ok) {
-            logger.warn('[dsh] tool failed', { name: event.name, message: event.message });
+    activeKeys.add(key);
+    try {
+      const session = await getSession(key);
+      const result = await session.run(input, {
+        onNotification: (notification) => {
+          for (const event of mapNotification(notification, state)) {
+            if (event.type === 'tool' && !event.ok) {
+              logger.warn('[dsh] tool failed', { name: event.name, message: event.message });
+            }
+            emit(event);
           }
-          emit(event);
-        }
-      },
-    });
-    if (!result.finalResponse.trim()) logger.warn('[dsh] analysis finished without an assistant message');
+        },
+      });
+      if (!result.finalResponse.trim()) logger.warn('[dsh] analysis finished without an assistant message');
+    } finally {
+      activeKeys.delete(key);
+      lastUsed.set(key, Date.now());
+      startSessionEviction();
+    }
   });
   emit({ type: 'done' });
 }
@@ -174,6 +204,12 @@ export async function shutdownDsh(): Promise<void> {
   harness = null;
   sessions.clear();
   queues.clear();
+  activeKeys.clear();
+  lastUsed.clear();
+  if (evictTimer) {
+    clearInterval(evictTimer);
+    evictTimer = null;
+  }
   if (patchPath) removePatch(patchPath);
   patchPath = null;
   if (current)

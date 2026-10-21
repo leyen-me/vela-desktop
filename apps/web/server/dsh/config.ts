@@ -16,6 +16,7 @@ export const DSH_REASONING_EFFORT = process.env.DSH_REASONING_EFFORT || 'low';
 export const DSH_INIT_TIMEOUT_MS = Number(process.env.DSH_INIT_TIMEOUT_MS) || 60_000;
 export const DSH_TURN_TIMEOUT_MS = Number(process.env.DSH_TURN_TIMEOUT_MS) || 180_000;
 export const DSH_BACKTEST_TIMEOUT_MS = Number(process.env.DSH_BACKTEST_TIMEOUT_MS) || 240_000;
+export const DSH_SESSION_IDLE_MS = Number(process.env.DSH_SESSION_IDLE_MS) || 30 * 60_000;
 
 export const DSH_ENABLED = process.env.DSH_ENABLED !== 'false';
 
