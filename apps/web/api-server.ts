@@ -62,11 +62,12 @@ import {
 } from '@vela/trading-core';
 
 type StreamEntry = { symbol: string; tf: string; period: unknown; clients: Set<ServerResponse>; subscribed: boolean };
-type RunState = { runId: string; paused: boolean; stopped: boolean };
+type RunState = { runId: string; paused: boolean; stopped: boolean; cancelled: boolean };
 type BacktestRun = {
   pause: () => void;
   resume: () => void;
   stop: () => void;
+  cancel: () => void;
   state: () => RunState;
   controlToken: string;
   agent: DshBacktestAgent;
@@ -329,9 +330,10 @@ const server = http.createServer(async (req, res) => {
       const runId = requireString(body.runId, 'runId', { maxLength: 64 });
       const run = backtestRuns.get(runId);
       if (!run) throw notFound('run not found or already finished');
-      const action = oneOf(body.action, ['pause', 'resume', 'stop'], 'action');
+      const action = oneOf(body.action, ['pause', 'resume', 'stop', 'cancel'], 'action');
       if (action === 'pause') run.pause();
       else if (action === 'resume') run.resume();
+      else if (action === 'cancel') run.cancel();
       else run.stop();
       return send(res, 200, JSON.stringify({ ok: true, ...run.state() }));
     }
@@ -370,6 +372,7 @@ const server = http.createServer(async (req, res) => {
       res.on('close', () => abort.abort());
       const runId = randomUUID();
       const pauseState: { paused: boolean; waiters: Array<() => void> } = { paused: false, waiters: [] };
+      let cancelled = false;
       const waitIfPaused = (): Promise<void> => {
         if (!pauseState.paused) return Promise.resolve();
         return new Promise<void>((resolve) => {
@@ -419,8 +422,19 @@ const server = http.createServer(async (req, res) => {
           for (const release of waiters) release();
           emit({ type: 'control', action: 'stop' });
         },
+        cancel() {
+          if (cancelled) return;
+          cancelled = true;
+          stopAbort.abort();
+          const waiters = pauseState.waiters.splice(0);
+          for (const release of waiters) release();
+          // Cancelling must not wait for the in-flight model turn: close the
+          // runtime so the pending decide() rejects immediately.
+          void agentRuntime.close();
+          emit({ type: 'control', action: 'cancel' });
+        },
         state() {
-          return { runId, paused: pauseState.paused, stopped: stopAbort.signal.aborted };
+          return { runId, paused: pauseState.paused, stopped: stopAbort.signal.aborted, cancelled };
         },
       };
       backtestRuns.set(runId, runControl);
@@ -476,6 +490,11 @@ const server = http.createServer(async (req, res) => {
           stopSignal: stopAbort.signal,
           waitIfPaused,
         });
+        if (cancelled) {
+          logger.info(`[backtest] cancelled ${runId}`);
+          emit({ type: 'cancelled' });
+          return;
+        }
         logger.info(`[backtest] done ${runId}${report.stopped ? ' (stopped)' : ''} entries=${report.metrics.entriesUsed} pnl=${report.metrics.netPnl.toFixed(2)}`);
         emit({
           type: 'done',
@@ -495,7 +514,10 @@ const server = http.createServer(async (req, res) => {
         });
         res.end();
       } catch (e) {
-        if (!abort.signal.aborted) {
+        if (cancelled) {
+          logger.info(`[backtest] cancelled ${runId}`);
+          emit({ type: 'cancelled' });
+        } else if (!abort.signal.aborted) {
           logger.warn(`[backtest] failed ${runId}:`, (e as Error).message);
           emit({ type: 'error', message: (e as Error).message });
         }

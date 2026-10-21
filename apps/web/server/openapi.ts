@@ -212,7 +212,7 @@ export const openapi = {
     },
     '/backtest/control': {
       post: {
-        summary: 'Pause, resume or stop a running backtest',
+        summary: 'Pause, resume, stop or cancel a running backtest',
         requestBody: {
           required: true,
           content: json({
@@ -220,7 +220,7 @@ export const openapi = {
             required: ['runId', 'action'],
             properties: {
               runId: { type: 'string' },
-              action: { type: 'string', enum: ['pause', 'resume', 'stop'] },
+              action: { type: 'string', enum: ['pause', 'resume', 'stop', 'cancel'] },
             },
           }),
         },

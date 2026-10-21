@@ -13,7 +13,7 @@ type RunEvent = {
     entryQuota?: { limit: number; used: number; reserved: number; available: number };
     position?: { qty: number } | null;
     runId?: string;
-    action?: 'pause' | 'resume' | 'stop';
+    action?: 'pause' | 'resume' | 'stop' | 'cancel';
     report?: {
         metrics: Record<string, number>;
         session: { date: string; isEarlyClose: boolean };
@@ -159,6 +159,7 @@ export function registerBacktestPanel(): void {
                   <button data-k="plan" class="secondary" type="button">检查时段</button>
                   <button data-k="pause" class="secondary" type="button" hidden disabled>暂停</button>
                   <button data-k="stop" class="secondary" type="button" hidden>停止</button>
+                  <button data-k="cancel" class="secondary" type="button" hidden>取消回测</button>
                 </div>
               </div>
               <div class="vbt-body">
@@ -179,6 +180,7 @@ export function registerBacktestPanel(): void {
             const planButton = get<HTMLButtonElement>('plan');
             const pauseButton = get<HTMLButtonElement>('pause');
             const stopButton = get<HTMLButtonElement>('stop');
+            const cancelButton = get<HTMLButtonElement>('cancel');
             const copyButton = get<HTMLButtonElement>('copy');
             const summary = get<HTMLDivElement>('summary');
             const equity = get<HTMLDivElement>('equity');
@@ -366,6 +368,8 @@ export function registerBacktestPanel(): void {
                     pauseButton.disabled = true;
                     stopButton.textContent = '停止';
                 }
+                cancelButton.textContent = next ? '取消回测' : '退出回测';
+                cancelButton.hidden = !next && !replayPlan;
             };
 
             let replayPlan: { open: number; close: number } | null = null;
@@ -390,6 +394,8 @@ export function registerBacktestPanel(): void {
                     if (!state.active || state.nextTime == null || state.nextTime >= replayPlan.close) break;
                     if (!chart.replay.step()) break;
                 }
+                cancelButton.hidden = false;
+                cancelButton.textContent = '退出回测';
             };
             let aiMarkerIds: string[] = [];
             const clearTradeMarkers = () => {
@@ -518,6 +524,10 @@ export function registerBacktestPanel(): void {
                     return;
                 }
                 if (event.type === 'control' && event.action) {
+                    if (event.action === 'cancel') {
+                        appendLog('正在取消回测…');
+                        return;
+                    }
                     if (event.action === 'stop') {
                         stopButton.disabled = true;
                         stopButton.textContent = '停止中…';
@@ -569,6 +579,14 @@ export function registerBacktestPanel(): void {
                     if (!event.report.stopped) revealSessionEnd();
                     addTradeMarkers(event.report);
                     onDone(event.report);
+                    return;
+                }
+                if (event.type === 'cancelled') {
+                    stopReplay();
+                    clearTradeMarkers();
+                    setBusy(false);
+                    cancelButton.hidden = true;
+                    appendLog('回测已取消，图表已恢复实时模式。');
                     return;
                 }
                 if (event.type === 'error') {
@@ -680,6 +698,21 @@ export function registerBacktestPanel(): void {
                 } finally {
                     pauseButton.disabled = false;
                 }
+            });
+            cancelButton.addEventListener('click', () => {
+                const runId = currentRunId;
+                if (runId) {
+                    void api.post('/backtest/control', { runId, action: 'cancel' }).catch(() => {
+                        /* the stream is being aborted anyway */
+                    });
+                }
+                abort?.abort();
+                abort = null;
+                stopReplay();
+                clearTradeMarkers();
+                setBusy(false);
+                cancelButton.hidden = true;
+                appendLog('已取消回测，图表已恢复实时模式。');
             });
             stopButton.addEventListener('click', async () => {
                 if (!currentRunId) {
