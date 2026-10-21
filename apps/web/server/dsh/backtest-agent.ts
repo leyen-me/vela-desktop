@@ -13,11 +13,11 @@ import { loadAgentConfig } from '../agent.ts';
 import { logger } from '../logger.ts';
 import {
   assertDshNode,
+  DSH_BACKTEST_REASONING_EFFORT,
   DSH_BACKTEST_TIMEOUT_MS,
   DSH_INIT_TIMEOUT_MS,
   DSH_MODEL,
   DSH_PROVIDER,
-  DSH_REASONING_EFFORT,
   DSH_ROOT,
   DSH_WORKSPACE,
   ensureDshDirs,
@@ -185,7 +185,7 @@ export class DshBacktestAgent implements BacktestAgent {
       provider: DSH_PROVIDER,
       model: DSH_MODEL,
     };
-    options.reasoningEffort = DSH_REASONING_EFFORT as NonNullable<HarnessOptions['reasoningEffort']>;
+    options.reasoningEffort = DSH_BACKTEST_REASONING_EFFORT as NonNullable<HarnessOptions['reasoningEffort']>;
     const configured = loadAgentConfig();
     if (configured.key) options.env = { ...process.env, DEEPSEEK_API_KEY: configured.key };
     this.harness = new DeepSeekHarness(options);

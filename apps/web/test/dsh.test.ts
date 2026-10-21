@@ -88,8 +88,10 @@ test('generated patches disable host tools and mount MCP servers', () => {
   assert.doesNotMatch(patch, /id: tool-bash\n {2}disabled: false/);
 });
 
-test('generated patches honour an empty server list', () => {
+test('generated patches always pin sampling temperature', () => {
   const patch = buildPatch([]);
   assert.match(patch, /disabled: true/);
-  assert.doesNotMatch(patch, /- insert:/);
+  assert.match(patch, /- insert:/);
+  assert.match(patch, /id: "vela-sampling"/);
+  assert.match(patch, /temperature: 0/);
 });

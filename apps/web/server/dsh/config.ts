@@ -13,10 +13,14 @@ export const DSH_PATCH_DIR = path.join(DSH_ROOT, 'patches');
 export const DSH_PROVIDER = process.env.DSH_PROVIDER || 'deepseek-official';
 export const DSH_MODEL = process.env.DSH_MODEL || process.env.DEEPSEEK_MODEL || 'deepseek-v4-flash';
 export const DSH_REASONING_EFFORT = process.env.DSH_REASONING_EFFORT || 'low';
+export const DSH_BACKTEST_REASONING_EFFORT = process.env.DSH_BACKTEST_REASONING_EFFORT || DSH_REASONING_EFFORT;
 export const DSH_INIT_TIMEOUT_MS = Number(process.env.DSH_INIT_TIMEOUT_MS) || 60_000;
 export const DSH_TURN_TIMEOUT_MS = Number(process.env.DSH_TURN_TIMEOUT_MS) || 180_000;
 export const DSH_BACKTEST_TIMEOUT_MS = Number(process.env.DSH_BACKTEST_TIMEOUT_MS) || 240_000;
 export const DSH_SESSION_IDLE_MS = Number(process.env.DSH_SESSION_IDLE_MS) || 30 * 60_000;
+export const DSH_TEMPERATURE = Number.isFinite(Number(process.env.DSH_TEMPERATURE))
+  ? Number(process.env.DSH_TEMPERATURE)
+  : 0;
 
 export const DSH_ENABLED = process.env.DSH_ENABLED !== 'false';
 
