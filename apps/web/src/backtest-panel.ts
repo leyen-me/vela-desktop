@@ -92,6 +92,10 @@ function addStyle(): () => void {
 .vbt-context { margin:0 12px 8px; padding:8px 10px; border:1px solid var(--vela-border,#2a2e39); border-radius:8px;
   background:rgba(255,255,255,.025); color:var(--vela-fg-muted,#8a8f9c); font-size:11px; line-height:1.55; }
 .vbt-context b { color:var(--vela-fg,#d1d4dc); font-weight:600; }
+.vbt-status { margin-top:6px; color:var(--vela-fg-muted,#8a8f9c); font-size:11px; display:flex; align-items:center; gap:6px; }
+.vbt-status[hidden] { display:none; }
+.vbt-status[data-busy='1']::before { content:''; width:6px; height:6px; border-radius:50%; background:#f0b90b; animation:vbt-pulse 1.2s ease-in-out infinite; }
+@keyframes vbt-pulse { 50% { opacity:.3; } }
 .vbt-sys { margin-top:6px; border-top:1px solid rgba(255,255,255,.06); padding-top:5px; }
 .vbt-sys[hidden] { display:none; }
 .vbt-sys summary { cursor:pointer; color:var(--vela-fg-muted,#8a8f9c); font-size:10px; list-style:none; }
@@ -100,11 +104,14 @@ function addStyle(): () => void {
 .vbt-sys[open] summary::before { content:'▾ '; }
 .vbt-sys pre { margin:5px 0 0; max-height:220px; overflow:auto; white-space:pre-wrap; word-break:break-word;
   font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:10px; line-height:1.5; color:var(--vela-fg-muted,#8a8f9c); }
+.vbt-log:empty::before { content:'等待回测开始'; margin:auto; color:var(--vela-fg-muted,#8a8f9c); font-size:11px; }
+.vbt-errors { display:flex; flex-direction:column; gap:4px; border:1px solid var(--vela-border,#2a2e39); border-radius:6px; padding:6px 8px; }
+.vbt-errors .vbt-note { text-align:left; }
 .vbt-log { border:1px solid var(--vela-border,#2a2e39); border-radius:8px; padding:10px; max-height:420px; overflow:auto;
   display:flex; flex-direction:column; gap:12px; font-size:11px; line-height:1.55; color:var(--vela-fg-muted,#8a8f9c);
   user-select:text; cursor:text; }
 .vbt-note { white-space:pre-wrap; padding:0 4px; text-align:center; font-size:10.5px; color:var(--vela-fg-muted,#8a8f9c); }
-.vbt-log:empty::before { content:'暂无决策记录'; margin:auto; color:var(--vela-fg-muted,#8a8f9c); font-size:11px; }
+
 .vbt-turn { display:flex; flex-direction:column; gap:8px; }
 .vbt-msg { max-width:90%; padding:8px 11px; border-radius:12px; font-size:12px; line-height:1.55; }
 .vbt-msg.user { align-self:flex-end; background:linear-gradient(135deg, rgba(41,98,255,.28), rgba(41,98,255,.14));
@@ -197,12 +204,16 @@ export function registerBacktestPanel(): void {
               <div class="vbt-body">
                 <div class="vbt-context">
                   <div data-k="context">选择交易日并开始回测。</div>
+                  <div class="vbt-status" data-k="status" hidden></div>
                   <details class="vbt-sys" data-k="syswrap" hidden><summary>系统提示词</summary><pre data-k="sys"></pre></details>
                 </div>
                 <div data-k="summary"></div>
                 <div data-k="equity"></div>
-                <div class="vbt-loghead"><span>运行日志</span><button data-k="copy" type="button">复制日志</button></div>
-                <div class="vbt-log" data-k="log"></div>
+                <div class="vbt-log" data-k="chat"></div>
+                <div data-k="logwrap" hidden>
+                  <div class="vbt-loghead"><span>运行日志</span><button data-k="copy" type="button">复制日志</button></div>
+                  <div class="vbt-errors" data-k="log"></div>
+                </div>
                 <div data-k="trades"></div>
               </div>`;
             body.appendChild(root);
@@ -219,6 +230,9 @@ export function registerBacktestPanel(): void {
             const cancelButton = get<HTMLButtonElement>('cancel');
             const copyButton = get<HTMLButtonElement>('copy');
             const contextEl = get<HTMLDivElement>('context');
+            const statusEl = get<HTMLDivElement>('status');
+            const chatEl = get<HTMLDivElement>('chat');
+            const logWrap = get<HTMLDivElement>('logwrap');
             const sysWrap = get<HTMLDetailsElement>('syswrap');
             const sysEl = get<HTMLPreElement>('sys');
             const summary = get<HTMLDivElement>('summary');
@@ -272,13 +286,20 @@ export function registerBacktestPanel(): void {
                 syncFromChart(chart);
             };
 
+            const setStatus = (text?: string, spinning = false) => {
+                const value = (text ?? '').trim();
+                statusEl.textContent = value;
+                statusEl.dataset.busy = spinning ? '1' : '0';
+                statusEl.hidden = value.length === 0;
+            };
             const appendLog = (html: string) => {
+                logWrap.hidden = false;
                 const row = document.createElement('div');
                 row.className = 'vbt-note';
                 row.innerHTML = html;
                 log.appendChild(row);
                 while (log.childElementCount > 260) log.firstElementChild?.remove();
-                log.scrollTop = log.scrollHeight;
+                chatEl.scrollTop = chatEl.scrollHeight;
             };
 
             type AgentTurn = {
@@ -333,7 +354,7 @@ export function registerBacktestPanel(): void {
                     closedBars: event.bars,
                 }, null, 2);
                 const root = turn.querySelector('.vbt-msg.agent') as HTMLDivElement;
-                log.appendChild(turn);
+                chatEl.appendChild(turn);
                 currentTurn = {
                     root,
                     content: root.querySelector('.vbt-content') as HTMLDivElement,
@@ -344,10 +365,10 @@ export function registerBacktestPanel(): void {
                     toolCount: 0,
                     toolErrors: 0,
                 };
-                log.scrollTop = log.scrollHeight;
+                chatEl.scrollTop = chatEl.scrollHeight;
             };
             const scrollLog = () => {
-                log.scrollTop = log.scrollHeight;
+                chatEl.scrollTop = chatEl.scrollHeight;
             };
             const appendReasoning = (delta: string) => {
                 if (!currentTurn || !delta) return;
@@ -430,9 +451,12 @@ export function registerBacktestPanel(): void {
                 summary.innerHTML = '';
                 equity.innerHTML = '';
                 trades.innerHTML = '';
+                chatEl.innerHTML = '';
                 log.innerHTML = '';
+                logWrap.hidden = true;
                 setContext('选择交易日并开始回测。');
                 setSystemPrompt('');
+                setStatus('');
                 currentTurn = null;
             };
             const setBusy = (next: boolean) => {
@@ -554,8 +578,7 @@ export function registerBacktestPanel(): void {
                     const plan = data.plan;
                     setContext(`<b>${escapeHtml(currentSymbol)}</b> · ${escapeHtml(data.date)} · ${escapeHtml(data.timeframe)} · ${etClock(plan.open)}–${etClock(plan.close)} ET · 决策 ${plan.decisionTimes.length} 次 · bar ${data.sessionBars} 根${data.isEarlyClose ? ' · 半日市' : ''}`);
                     setSystemPrompt(data.systemPrompt);
-                    appendLog(`<b>${escapeHtml(data.date)}</b> ${escapeHtml(data.timeframe)} · ${etClock(plan.open)}–${etClock(plan.close)} ET`);
-                    appendLog(`强平 ${etClock(plan.flattenAt)} ET · 决策 ${plan.decisionTimes.length} 次 · 当日 bar ${data.sessionBars} 根 · 预热 ${data.warmupBars} 根${data.isEarlyClose ? ' · 半日市' : ''}`);
+                    setStatus(`强平 ${etClock(plan.flattenAt)} ET · 预热 ${data.warmupBars} 根`);
                 } catch (error) {
                     appendLog(`<span class="vbt-down">${escapeHtml(error instanceof Error ? error.message : String(error))}</span>`);
                 } finally {
@@ -608,29 +631,29 @@ export function registerBacktestPanel(): void {
                 }
                 if (event.type === 'control' && event.action) {
                     if (event.action === 'cancel') {
-                        appendLog('正在取消回测…');
+                        setStatus('正在取消回测…', true);
                         return;
                     }
                     if (event.action === 'stop') {
                         stopButton.disabled = true;
                         stopButton.textContent = '停止中…';
                         pauseButton.disabled = true;
-                        appendLog('正在停止，等待当前决策结束并生成部分结果…');
+                        setStatus('正在停止，等待当前决策结束…', true);
                         return;
                     }
                     paused = event.action === 'pause';
                     pauseButton.textContent = paused ? '继续' : '暂停';
-                    appendLog(paused ? '已暂停；当前决策完成后停止推进。' : '已继续。');
+                    setStatus(paused ? '已暂停；当前决策完成后停止推进。' : '回测中…', !paused);
                     return;
                 }
                 if (event.type === 'session') {
                     if (event.phase === 'loading' && event.plan) {
-                        appendLog(`加载 ${etClock(event.plan.open)}–${etClock(event.plan.close)} ET 的行情…`);
+                        setStatus('加载行情…', true);
                     } else if (event.phase === 'ready' && event.plan) {
                         const plan = event.plan;
                         setContext(`<b>${escapeHtml(currentSymbol)}</b> · ${escapeHtml(date.value)} · ${escapeHtml(currentTimeframe)} · ${etClock(plan.open)}–${etClock(plan.close)} ET · 决策 ${plan.decisionTimes.length} 次 · bar ${event.bars ?? 0} 根${plan.isEarlyClose ? ' · 半日市' : ''}`);
                         setSystemPrompt(event.systemPrompt);
-                        appendLog(`时段就绪 · 决策 ${plan.decisionTimes.length} 次 · bar ${event.bars ?? 0} 根${plan.isEarlyClose ? ' · 半日市' : ''}`);
+                        setStatus('回测中…', true);
                     }
                     return;
                 }
@@ -672,7 +695,7 @@ export function registerBacktestPanel(): void {
                     clearTradeMarkers();
                     setBusy(false);
                     cancelButton.hidden = true;
-                    appendLog('回测已取消，图表已恢复实时模式。');
+                    setStatus('已取消回测，图表已恢复实时模式。');
                     return;
                 }
                 if (event.type === 'error') {
@@ -693,13 +716,13 @@ export function registerBacktestPanel(): void {
                     const plan = sessionData.plan;
                     const chart = getChart();
                     if (!chart) throw new Error('没有可回放的图表');
-                    appendLog('准备图表回放…');
+                    setStatus('准备图表回放…', true);
                     await chart.replay.start({ from: plan.open - 1 });
                     if (!chart.replay.state.active) {
                         throw new Error('图表没有可用于回放的历史数据，请先加载该交易日的历史');
                     }
                     replayPlan = { open: plan.open, close: plan.close };
-                    appendLog(`图表已回放到 ${etClock(plan.open)} 之前，等待首根 K 线收盘。`);
+                    setStatus(`等待 ${etClock(plan.open)} 首根 K 线收盘…`, true);
 
                     const res = await fetch(`${API_BASE}/backtest/run`, {
                         method: 'POST',
@@ -749,9 +772,9 @@ export function registerBacktestPanel(): void {
                                 if (report.stopped) appendFinish('回测已停止');
                                 renderReport(report);
                                 if (report.stopped) {
-                                    appendLog(`回测已停止 · ${report.session.date} · 成交 ${report.fills.length} 笔`);
+                                    setStatus(`回测已停止 · ${report.session.date} · 成交 ${report.fills.length} 笔`);
                                 } else {
-                                    appendLog(`回测完成 · ${report.session.date} · 成交 ${report.fills.length} 笔`);
+                                    setStatus(`回测完成 · ${report.session.date} · 成交 ${report.fills.length} 笔`);
                                 }
                             });
                         }
@@ -778,7 +801,7 @@ export function registerBacktestPanel(): void {
                     const data = await api.post('/backtest/control', { runId: currentRunId, action });
                     paused = Boolean(data.paused);
                     pauseButton.textContent = paused ? '继续' : '暂停';
-                    appendLog(paused ? '暂停请求已发送；当前决策完成后停止推进。' : '已继续。');
+                    setStatus(paused ? '已暂停' : '回测中…', !paused);
                 } catch (error) {
                     appendLog(`<span class="vbt-down">${escapeHtml(error instanceof Error ? error.message : String(error))}</span>`);
                 } finally {
@@ -798,14 +821,14 @@ export function registerBacktestPanel(): void {
                 clearTradeMarkers();
                 setBusy(false);
                 cancelButton.hidden = true;
-                appendLog('已取消回测，图表已恢复实时模式。');
+                setStatus('已取消回测，图表已恢复实时模式。');
             });
             stopButton.addEventListener('click', async () => {
                 if (!currentRunId) {
                     abort?.abort();
                     stopReplay();
                     clearTradeMarkers();
-                    appendLog('已停止。');
+                    setStatus('已停止。');
                     return;
                 }
                 stopButton.disabled = true;
