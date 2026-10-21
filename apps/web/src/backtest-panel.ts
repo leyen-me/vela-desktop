@@ -361,12 +361,13 @@ export function registerBacktestPanel(): void {
                 runButton.textContent = next ? '回测中…' : '开始回测';
                 pauseButton.hidden = !next;
                 stopButton.hidden = !next;
+                stopButton.textContent = '停止';
+                stopButton.disabled = false;
+                pauseButton.textContent = '暂停';
+                pauseButton.disabled = true;
                 if (!next) {
                     paused = false;
                     currentRunId = '';
-                    pauseButton.textContent = '暂停';
-                    pauseButton.disabled = true;
-                    stopButton.textContent = '停止';
                 }
                 cancelButton.textContent = next ? '取消回测' : '退出回测';
                 cancelButton.hidden = !next && !replayPlan;
