@@ -3,8 +3,11 @@ import { registerSidePanel } from '@luxalgo/vela/widget';
 import { registerIcon, svg16 } from '@luxalgo/vela/ui';
 import { PineWorkerEngine } from '@luxalgo/vela-pinets';
 import { installIndicatorEditor } from './indicator-editor.js';
+import { registerBacktestPanel } from './backtest-panel.ts';
 
-registerIcon('agent', svg16('<circle cx="8" cy="8" r="2.5"/><path d="M8 1.5v3M8 11.5v3M1.5 8h3M11.5 8h3"/>'));
+registerIcon('agent', svg16('<path d="M6.2 1.6c.6 2.4 1.6 3.4 4 4-2.4.6-3.4 1.6-4 4-.6-2.4-1.6-3.4-4-4 2.4-.6 3.4-1.6 4-4z" fill="currentColor" fill-opacity="0.2"/><path d="M12 9.2c.4 1.6 1.1 2.3 2.7 2.7-1.6.4-2.3 1.1-2.7 2.7-.4-1.6-1.1-2.3-2.7-2.7 1.6-.4 2.3-1.1 2.7-2.7z" fill="currentColor" fill-opacity="0.2"/>'));
+registerBacktestPanel();
+
 registerSidePanel({
   id: 'agent',
   title: 'AI 日内分析',

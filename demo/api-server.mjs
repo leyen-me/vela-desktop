@@ -1,8 +1,18 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
+import {
+  buildTradingDayPlan,
+  inferSessionCloseFromBars,
+  sessionDateInZone,
+  timeframeMs,
+  runBacktest,
+  createLlmBacktestAgent,
+  createOpenAiCompatibleClient,
+} from '@vela/trading-core';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, '..');
@@ -258,6 +268,7 @@ function getCtx() {
 // reference-counted per (symbol, timeframe) and fanned out to every connected client.
 const PERIOD_TF = new Map(Object.entries(TF).map(([tf, period]) => [period, tf]));
 const streams = new Map(); // `${symbol}|${tf}` -> { symbol, tf, period, clients:Set, subscribed }
+const backtestRuns = new Map();
 let pushBound = false;
 
 function sendFrame(client, payload) {
@@ -727,6 +738,244 @@ const server = http.createServer(async (req, res) => {
           sendFrame(res, `data: ${JSON.stringify({ type: 'error', message: e.message })}\n\n`);
           res.end();
         }
+      }
+      return;
+    }
+
+    if (u.pathname === '/api/backtest/session') {
+      try {
+        const rawSymbol = u.searchParams.get('symbol') || '';
+        const symbol = rawSymbol.includes(':') ? rawSymbol.split(':').pop() : rawSymbol;
+        const date = u.searchParams.get('date') || '';
+        const timeframe = u.searchParams.get('timeframe') || '5m';
+        if (!symbol.endsWith('.US')) throw new Error('Only US symbols are supported');
+        const tfMs = timeframeMs(timeframe);
+        const base = buildTradingDayPlan({ date, timeframe });
+        if (!base.isTradingDay) throw new Error(`${date} is not a US trading day`);
+        const today = sessionDateInZone(Date.now(), 'America/New_York');
+        if (date > today) throw new Error('Backtest date is in the future');
+        if (date === today && Date.now() < base.close) throw new Error('Today\'s session is not finished yet');
+        const from = base.open - 7 * 86_400_000;
+        const { bars, hitGenesis } = await fetchWindow(symbol, timeframe, from, base.close, 10_000);
+        const coreBars = bars.map((bar) => ({
+          symbol,
+          timeframe,
+          openTime: bar.time,
+          closeTime: bar.time + tfMs,
+          open: bar.open,
+          high: bar.high,
+          low: bar.low,
+          close: bar.close,
+          volume: bar.volume ?? 0,
+        }));
+        const earlyClose = inferSessionCloseFromBars(coreBars, base);
+        const plan = earlyClose ? buildTradingDayPlan({ date, timeframe, close: earlyClose }) : base;
+        const sessionBars = coreBars.filter(
+          (bar) => bar.closeTime > plan.open && bar.closeTime <= plan.close,
+        );
+        return send(res, 200, JSON.stringify({
+          symbol,
+          date,
+          timeframe,
+          plan,
+          isEarlyClose: plan.isEarlyClose,
+          sessionBars: sessionBars.length,
+          warmupBars: coreBars.length - sessionBars.length,
+          hitGenesis,
+        }));
+      } catch (e) {
+        return send(res, 400, JSON.stringify({ error: e.message }));
+      }
+    }
+
+    if (u.pathname === '/api/backtest/control') {
+      if (req.method !== 'POST') return send(res, 405, JSON.stringify({ error: 'method not allowed' }));
+      let body;
+      try {
+        body = await readJsonBody(req, 20_000);
+      } catch (e) {
+        return send(res, 400, JSON.stringify({ error: e.message }));
+      }
+      const run = backtestRuns.get(String(body.runId || ''));
+      if (!run) return send(res, 404, JSON.stringify({ error: 'run not found or already finished' }));
+      const action = String(body.action || '');
+      if (action === 'pause') run.pause();
+      else if (action === 'resume') run.resume();
+      else if (action === 'stop') run.stop();
+      else return send(res, 400, JSON.stringify({ error: 'action must be pause, resume or stop' }));
+      return send(res, 200, JSON.stringify({ ok: true, ...run.state() }));
+    }
+
+    if (u.pathname === '/api/backtest/run') {
+      if (req.method !== 'POST') return send(res, 405, JSON.stringify({ error: 'method not allowed' }));
+      const agent = loadAgentConfig();
+      if (!agent.key) {
+        return send(res, 503, JSON.stringify({
+          error: '未检测到 DEEPSEEK_API_KEY，无法运行 AI 回测',
+        }));
+      }
+      let body;
+      try {
+        body = await readJsonBody(req, 200_000);
+      } catch (e) {
+        return send(res, 400, JSON.stringify({ error: e.message }));
+      }
+      const rawSymbol = String(body.symbol || '');
+      const symbol = rawSymbol.includes(':') ? rawSymbol.split(':').pop() : rawSymbol;
+      const date = String(body.date || '');
+      const timeframe = String(body.timeframe || '5m');
+      const positionSizePct = Number(body.positionSizePct ?? 80);
+      const maxEntriesPerDay = Number(body.maxEntriesPerDay ?? 2);
+      const allowShort = body.allowShort !== false;
+      const allowAddOn = body.allowAddOn === true;
+      const initialCapital = Number(body.initialCapital ?? 100_000);
+      const slippageBps = Number(body.slippageBps ?? 2);
+      if (!symbol.endsWith('.US')) {
+        return send(res, 400, JSON.stringify({ error: 'Only US symbols are supported' }));
+      }
+      res.writeHead(200, {
+        'content-type': 'text/event-stream; charset=utf-8',
+        'cache-control': 'no-cache, no-transform',
+        connection: 'keep-alive',
+        'access-control-allow-origin': '*',
+      });
+      const emit = (event) => sendFrame(res, `data: ${JSON.stringify(event)}\n\n`);
+      const abort = new AbortController();
+      const stopAbort = new AbortController();
+      res.on('error', () => {});
+      res.on('close', () => abort.abort());
+      const runId = randomUUID();
+      const pauseState = { paused: false, waiters: [] };
+      const waitIfPaused = () => {
+        if (!pauseState.paused) return Promise.resolve();
+        return new Promise((resolve) => {
+          const release = () => {
+            abort.signal.removeEventListener('abort', release);
+            stopAbort.signal.removeEventListener('abort', release);
+            resolve();
+          };
+          abort.signal.addEventListener('abort', release, { once: true });
+          stopAbort.signal.addEventListener('abort', release, { once: true });
+          pauseState.waiters.push(release);
+        });
+      };
+      const runControl = {
+        pause() {
+          if (pauseState.paused) return;
+          pauseState.paused = true;
+          emit({ type: 'control', action: 'pause' });
+        },
+        resume() {
+          if (!pauseState.paused) return;
+          pauseState.paused = false;
+          const waiters = pauseState.waiters.splice(0);
+          for (const release of waiters) release();
+          emit({ type: 'control', action: 'resume' });
+        },
+        stop() {
+          if (stopAbort.signal.aborted) return;
+          stopAbort.abort();
+          const waiters = pauseState.waiters.splice(0);
+          for (const release of waiters) release();
+          emit({ type: 'control', action: 'stop' });
+        },
+        state() {
+          return { runId, paused: pauseState.paused, stopped: stopAbort.signal.aborted };
+        },
+      };
+      backtestRuns.set(runId, runControl);
+      console.log(`[backtest] run ${runId} ${symbol} ${date} ${timeframe}`);
+      emit({ type: 'run', runId });
+      try {
+        const tfMs = timeframeMs(timeframe);
+        const base = buildTradingDayPlan({ date, timeframe });
+        if (!base.isTradingDay) throw new Error(`${date} is not a US trading day`);
+        const today = sessionDateInZone(Date.now(), 'America/New_York');
+        if (date > today) throw new Error('Backtest date is in the future');
+        if (date === today && Date.now() < base.close) throw new Error('Today\'s session is not finished yet');
+        emit({ type: 'session', phase: 'loading', plan: base });
+        const from = base.open - 7 * 86_400_000;
+        const { bars } = await fetchWindow(symbol, timeframe, from, base.close, 10_000);
+        const coreBars = bars.map((bar) => ({
+          symbol,
+          timeframe,
+          openTime: bar.time,
+          closeTime: bar.time + tfMs,
+          open: bar.open,
+          high: bar.high,
+          low: bar.low,
+          close: bar.close,
+          volume: bar.volume ?? 0,
+        }));
+        const earlyClose = inferSessionCloseFromBars(coreBars, base);
+        const session = earlyClose ? buildTradingDayPlan({ date, timeframe, close: earlyClose }) : base;
+        emit({ type: 'session', phase: 'ready', plan: session, bars: coreBars.length });
+        const client = createOpenAiCompatibleClient({ baseURL: agent.base, apiKey: agent.key });
+        const llmSignal = AbortSignal.any([abort.signal, stopAbort.signal]);
+        const inner = createLlmBacktestAgent({
+          client,
+          model: agent.model,
+          reasoningEffort: agent.effort,
+          signal: llmSignal,
+          onEvent: (event) => {
+            if (event.type === 'error') console.warn('[backtest] agent error:', event.message);
+            else if (event.type === 'tool_result' && !event.result.ok) {
+              console.warn('[backtest] tool rejected:', event.name, event.result.error?.code, event.result.error?.message);
+            }
+            emit({ type: 'agent', event });
+          },
+        });
+        const wrapped = {
+          async decide(input) {
+            emit({ type: 'decision', asOf: input.asOf, entryQuota: input.entryQuota, position: input.position });
+            return inner.decide(input);
+          },
+        };
+        const report = await runBacktest({
+          config: {
+            symbol,
+            date,
+            timeframe,
+            initialCapital,
+            positionSizePct,
+            maxEntriesPerDay,
+            allowShort,
+            allowAddOn,
+            slippageBps,
+          },
+          session: earlyClose ? { close: earlyClose } : {},
+          bars: coreBars,
+          agent: wrapped,
+          signal: abort.signal,
+          stopSignal: stopAbort.signal,
+          waitIfPaused,
+        });
+        console.log(`[backtest] done ${runId}${report.stopped ? ' (stopped)' : ''} entries=${report.metrics.entriesUsed} pnl=${report.metrics.netPnl.toFixed(2)}`);
+        emit({
+          type: 'done',
+          report: {
+            session: report.session,
+            metrics: report.metrics,
+            orders: report.orders,
+            fills: report.fills,
+            closedTrades: report.closedTrades,
+            equityCurve: report.equityCurve,
+            blockedOrders: report.blockedOrders,
+            decisions: report.decisions.length,
+            finalAccount: report.finalAccount,
+            stopped: report.stopped,
+            ...(report.stoppedAt != null ? { stoppedAt: report.stoppedAt } : {}),
+          },
+        });
+        res.end();
+      } catch (e) {
+        if (!abort.signal.aborted) {
+          console.warn(`[backtest] failed ${runId}:`, e.message);
+          emit({ type: 'error', message: e.message });
+        }
+        res.end();
+      } finally {
+        backtestRuns.delete(runId);
       }
       return;
     }
