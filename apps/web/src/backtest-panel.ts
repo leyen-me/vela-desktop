@@ -17,6 +17,7 @@ type RunEvent = {
     lastPrice?: number;
     limits?: Record<string, number>;
     systemPrompt?: string;
+    cancelled?: boolean;
     runId?: string;
     action?: 'pause' | 'resume' | 'stop' | 'cancel';
     report?: {
@@ -245,6 +246,7 @@ export function registerBacktestPanel(): void {
             let paused = false;
             let currentRunId = '';
             let abort: AbortController | null = null;
+            let cancellationTimer: ReturnType<typeof setTimeout> | null = null;
             let currentSymbol = '';
             let currentTimeframe = '';
             let offMarket: (() => void) | null = null;
@@ -475,6 +477,7 @@ export function registerBacktestPanel(): void {
                 }
                 cancelButton.textContent = next ? '取消回测' : '退出回测';
                 cancelButton.hidden = !next && !replayPlan;
+                cancelButton.disabled = false;
             };
 
             let replayPlan: { open: number; close: number } | null = null;
@@ -617,7 +620,7 @@ export function registerBacktestPanel(): void {
                 </table>`;
             };
 
-            const handleFrame = (payload: string, onDone: (report: NonNullable<RunEvent['report']>) => void) => {
+            const handleFrame = (payload: string, onDone: (report: NonNullable<RunEvent['report']>, cancelled: boolean) => void) => {
                 let event: RunEvent;
                 try {
                     event = JSON.parse(payload);
@@ -685,12 +688,14 @@ export function registerBacktestPanel(): void {
                     return;
                 }
                 if (event.type === 'done' && event.report) {
-                    if (!event.report.stopped) revealSessionEnd();
+                    if (!event.report.stopped && !event.cancelled) revealSessionEnd();
                     addTradeMarkers(event.report);
-                    onDone(event.report);
+                    onDone(event.report, event.cancelled === true);
                     return;
                 }
                 if (event.type === 'cancelled') {
+                    if (cancellationTimer) clearTimeout(cancellationTimer);
+                    cancellationTimer = null;
                     stopReplay();
                     clearTradeMarkers();
                     setBusy(false);
@@ -767,11 +772,14 @@ export function registerBacktestPanel(): void {
                             if (!line) continue;
                             const payload = line.slice(5).trim();
                             if (!payload) continue;
-                            handleFrame(payload, (report) => {
+                            handleFrame(payload, (report, cancelled) => {
                                 done = true;
-                                if (report.stopped) appendFinish('回测已停止');
+                                if (cancelled) appendFinish('回测已取消');
+                                else if (report.stopped) appendFinish('回测已停止');
                                 renderReport(report);
-                                if (report.stopped) {
+                                if (cancelled) {
+                                    setStatus(`回测已取消 · 部分结果 · 成交 ${report.fills.length} 笔`);
+                                } else if (report.stopped) {
                                     setStatus(`回测已停止 · ${report.session.date} · 成交 ${report.fills.length} 笔`);
                                 } else {
                                     setStatus(`回测完成 · ${report.session.date} · 成交 ${report.fills.length} 笔`);
@@ -785,6 +793,8 @@ export function registerBacktestPanel(): void {
                         appendLog(`<span class="vbt-down">${escapeHtml(error instanceof Error ? error.message : String(error))}</span>`);
                     }
                 } finally {
+                    if (cancellationTimer) clearTimeout(cancellationTimer);
+                    cancellationTimer = null;
                     if (!done) stopReplay();
                     abort = null;
                     setBusy(false);
@@ -810,18 +820,33 @@ export function registerBacktestPanel(): void {
             });
             cancelButton.addEventListener('click', () => {
                 const runId = currentRunId;
-                if (runId) {
-                    void api.post('/backtest/control', { runId, action: 'cancel' }).catch(() => {
-                        /* the stream is being aborted anyway */
-                    });
+                if (!runId) {
+                    abort?.abort();
+                    abort = null;
+                    stopReplay();
+                    clearTradeMarkers();
+                    setBusy(false);
+                    cancelButton.hidden = true;
+                    setStatus('已退出回测，图表已恢复实时模式。');
+                    return;
                 }
-                abort?.abort();
-                abort = null;
-                stopReplay();
-                clearTradeMarkers();
-                setBusy(false);
-                cancelButton.hidden = true;
-                setStatus('已取消回测，图表已恢复实时模式。');
+                // Stop the run immediately but keep the SSE open for the partial
+                // report, so the result panel survives the cancellation.
+                setStatus('正在取消回测…', true);
+                cancelButton.disabled = true;
+                void api.post('/backtest/control', { runId, action: 'cancel' }).catch(() => {
+                    /* the stream settles on its own */
+                });
+                cancellationTimer = setTimeout(() => {
+                    if (!busy) return;
+                    abort?.abort();
+                    abort = null;
+                    stopReplay();
+                    clearTradeMarkers();
+                    setBusy(false);
+                    cancelButton.hidden = true;
+                    setStatus('已取消回测，图表已恢复实时模式。');
+                }, 20_000);
             });
             stopButton.addEventListener('click', async () => {
                 if (!currentRunId) {

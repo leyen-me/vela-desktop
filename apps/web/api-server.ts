@@ -501,14 +501,12 @@ const server = http.createServer(async (req, res) => {
           stopSignal: stopAbort.signal,
           waitIfPaused,
         });
-        if (cancelled) {
-          logger.info(`[backtest] cancelled ${runId}`);
-          emit({ type: 'cancelled' });
-          return;
-        }
-        logger.info(`[backtest] done ${runId}${report.stopped ? ' (stopped)' : ''} entries=${report.metrics.entriesUsed} pnl=${report.metrics.netPnl.toFixed(2)}`);
+        logger.info(
+          `[backtest] ${cancelled ? 'cancelled' : 'done'} ${runId}${report.stopped ? ' (stopped)' : ''} entries=${report.metrics.entriesUsed} pnl=${report.metrics.netPnl.toFixed(2)}`,
+        );
         emit({
           type: 'done',
+          ...(cancelled ? { cancelled: true } : {}),
           report: {
             session: report.session,
             metrics: report.metrics,
