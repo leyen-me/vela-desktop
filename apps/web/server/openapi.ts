@@ -147,20 +147,20 @@ export const openapi = {
     },
     '/agent/status': {
       get: {
-        summary: 'LLM configuration status',
+        summary: 'dsh agent configuration status',
         responses: { 200: { description: 'Status', content: json(envelope({ type: 'object' })) } },
       },
     },
     '/agent/system': {
       get: {
-        summary: 'System prompt preview for the current chart',
+        summary: 'Chart context sent to the dsh agent',
         parameters: [symbol, timeframe],
         responses: { 200: { description: 'Prompt', content: json(envelope({ type: 'object' })) } },
       },
     },
     '/agent': {
       post: {
-        summary: 'Stream an intraday analysis (SSE)',
+        summary: 'Stream a dsh intraday analysis (SSE)',
         requestBody: {
           required: true,
           content: json({
@@ -190,7 +190,7 @@ export const openapi = {
     },
     '/backtest/run': {
       post: {
-        summary: 'Run an AI backtest (SSE)',
+        summary: 'Run a dsh-driven backtest (SSE)',
         requestBody: {
           required: true,
           content: json({

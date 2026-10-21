@@ -9,7 +9,7 @@ A local-first trading workstation built on [Vela](https://velacharts.dev) by Lux
 - **Charting** — Vela workspace with multiple panes, drawing tools and a custom indicator editor (CodeMirror + PineTS).
 - **Market data** — Longbridge quotes, lazy-loaded history and live candlestick push, cached locally in SQLite.
 - **Indicator vault** — scraped LuxAlgo Pine library (`data/pine/**`) plus user-defined indicators.
-- **AI intraday analysis** — DeepSeek-compatible LLM panel (optional API key).
+- **AI intraday analysis** — DeepSeek Harness (`dsh`) agent panel with MCP trading tools (optional API key).
 - **Backtesting** — session-aware single-day backtests with a simulated broker and LLM tool calls (`packages/trading-core`).
 - **Desktop** — Electron wrapper that starts the local API service and points the window at it.
 
@@ -21,7 +21,7 @@ apps/
   web/              Vite client + Node data/API service (api-server.ts)
     shared/         Shared API contract types
 packages/
-  trading-core/     Backtest engine, simulated broker, quota and LLM agent
+  trading-core/     Backtest engine, simulated broker, quota and agent contracts
   vela/             Vendored Vela charting library (Apache-2.0)
 data/               Scraped Pine indicator vault and local caches (cache/ is git-ignored)
 tools/              Indicator scraper and Playwright exploration scripts
@@ -29,7 +29,7 @@ tools/              Indicator scraper and Playwright exploration scripts
 
 ## Requirements
 
-- Node.js >= 22.17 (the API service uses the built-in `node:sqlite` module)
+- Node.js >= 24 (the API service uses `node:sqlite`; the dsh runtime requires >=22.19 / >=24)
 - pnpm 10 (`corepack enable`)
 
 ## Quick start
@@ -69,8 +69,9 @@ All configuration is read from environment variables; see [`.env.example`](./.en
 | `VELA_NODE` | Node binary used by the Electron shell to spawn the API service |
 | `LONGPORT_APP_KEY` / `LONGPORT_APP_SECRET` / `LONGPORT_ACCESS_TOKEN` | Longbridge OpenAPI credentials |
 | `LONGPORT_HTTP_URL` / `LONGPORT_QUOTE_WS_URL` / `LONGPORT_TRADE_WS_URL` | Longbridge endpoints (international gateway by default) |
-| `DEEPSEEK_API_KEY` | API key for the AI analysis panel |
-| `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL` | OpenAI-compatible endpoint and model |
+| `DEEPSEEK_API_KEY` | API key for the dsh agent runtime |
+| `DSH_MODEL` / `DSH_REASONING_EFFORT` | dsh model route and reasoning effort |
+| `DSH_ENABLED` | Set `false` to disable all AI endpoints |
 | `AGENT_REASONING_EFFORT` | LLM reasoning effort (`low` by default) |
 
 Never commit `.env` or `data/agent.json`; both are git-ignored.

@@ -12,7 +12,6 @@ import {
   DEFAULT_HOST,
   DEFAULT_PORT,
   MAX_AGENT_IMAGES,
-  MAX_AGENT_MESSAGES,
   MAX_BAR_LIMIT,
 } from './server/config.ts';
 import { AppError, ERROR_CODES, badRequest, methodNotAllowed, notFound } from './server/errors.ts';
@@ -20,7 +19,10 @@ import { logger } from './server/logger.ts';
 import { docsHtml, openapi } from './server/openapi.ts';
 import { paginate, readJsonBody, send, stripApiPrefix } from './server/http.ts';
 import { oneOf, parsePagination, parseInteger, requireString, resolveWithin, usSymbol } from './server/validate.ts';
-import { buildAgentPrompt, loadAgentConfig } from './server/agent.ts';
+import { buildAgentPrompt } from './server/agent.ts';
+import { agentStatus, shutdownDsh, streamAnalysis } from './server/dsh/agent.ts';
+import { DshBacktestAgent } from './server/dsh/backtest-agent.ts';
+import { DSH_MODEL, DSH_REASONING_EFFORT } from './server/dsh/config.ts';
 import {
   TF,
   agentTfLabel,
@@ -56,13 +58,19 @@ import {
   sessionDateInZone,
   timeframeMs,
   runBacktest,
-  createLlmBacktestAgent,
-  createOpenAiCompatibleClient,
+  type DecisionInput,
 } from '@vela/trading-core';
 
 type StreamEntry = { symbol: string; tf: string; period: unknown; clients: Set<ServerResponse>; subscribed: boolean };
 type RunState = { runId: string; paused: boolean; stopped: boolean };
-type BacktestRun = { pause: () => void; resume: () => void; stop: () => void; state: () => RunState };
+type BacktestRun = {
+  pause: () => void;
+  resume: () => void;
+  stop: () => void;
+  state: () => RunState;
+  controlToken: string;
+  agent: DshBacktestAgent;
+};
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, '..', '..');
@@ -184,19 +192,12 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (pathname === '/api/agent/status') {
-      const agent = loadAgentConfig();
-      return send(res, 200, JSON.stringify({
-        configured: Boolean(agent.key),
-        source: agent.source,
-        model: agent.model,
-        effort: agent.effort,
-      }));
+      return send(res, 200, JSON.stringify(agentStatus()));
     }
 
-    // The system prompt for the current chart, so the panel can show it before the
-    // first candle closes.
+    // The chart context sent with every turn, so the panel can show what the
+    // harness sees before the first candle closes.
     if (pathname === '/api/agent/system') {
-      const agent = loadAgentConfig();
       const symbol = u.searchParams.get('symbol') || '';
       const timeframe = u.searchParams.get('timeframe') || '';
       const content = await buildAgentPrompt({ symbol, timeframe, context: {} }, false);
@@ -205,31 +206,28 @@ const server = http.createServer(async (req, res) => {
         meta: {
           symbol,
           timeframe: agentTfLabel(timeframe),
-          model: agent.model,
-          effort: agent.effort,
+          model: DSH_MODEL,
+          effort: DSH_REASONING_EFFORT,
           vision: false,
           images: 0,
         },
       }));
     }
 
-    // Intraday analysis agent. The DeepSeek key never reaches the renderer: the server
-    // calls the OpenAI-compatible endpoint and relays reasoning/content deltas as SSE.
+    // Intraday analysis agent. The DeepSeek key never reaches the renderer: the
+    // server drives a dsh SDK runtime and relays its session events as SSE.
     if (pathname === '/api/agent') {
       if (req.method !== 'POST') return send(res, 405, JSON.stringify({ error: 'method not allowed' }));
-      const agent = loadAgentConfig();
-      if (!agent.key) {
+      const status = agentStatus();
+      if (!status.enabled) {
+        return send(res, 503, JSON.stringify({ error: 'DSH_ENABLED=false，AI 功能已停用' }));
+      }
+      if (!status.configured) {
         return send(res, 503, JSON.stringify({
           error: '未检测到 DEEPSEEK_API_KEY，请设置环境变量后重启应用（或在 data/agent.json 中配置 apiKey）',
         }));
       }
       const body = await readJsonBody(req, AGENT_BODY_LIMIT);
-      const messages = Array.isArray(body.messages)
-        ? body.messages
-            .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string')
-            .slice(-MAX_AGENT_MESSAGES)
-            .map((m) => ({ role: m.role, content: m.content }))
-        : [];
       const images = Array.isArray(body.images) ? body.images.filter((img) => img && img.data).slice(0, MAX_AGENT_IMAGES) : [];
       body.images = images;
       const system = await buildAgentPrompt(body, images.length > 0);
@@ -245,98 +243,39 @@ const server = http.createServer(async (req, res) => {
         meta: {
           symbol: body.symbol,
           timeframe: agentTfLabel(body.timeframe),
-          model: agent.model,
-          effort: agent.effort,
+          model: status.model,
+          effort: status.effort,
           vision: images.length > 0,
           images: images.length,
         },
       })}\n\n`);
-      const abort = new AbortController();
-      res.on('close', () => abort.abort());
       try {
-        let upstreamMessages = [{ role: 'system', content: system }, ...messages];
-        if (images.length > 0) {
-          const lastUser = [...upstreamMessages].reverse().find((m) => m.role === 'user');
-          if (lastUser) {
-            upstreamMessages = upstreamMessages.map((m) =>
-              m === lastUser
-                ? {
-                    role: 'user',
-                    content: [
-                      { type: 'text', text: m.content },
-                      ...images.map((img) => ({
-                        type: 'image_url',
-                        image_url: { url: `data:${img.mime || 'image/jpeg'};base64,${img.data}` },
-                      })),
-                    ],
-                  }
-                : m,
-            );
-          }
-        }
-        const upstream = await fetch(`${agent.base}/chat/completions`, {
-          method: 'POST',
-          headers: {
-            'content-type': 'application/json',
-            authorization: `Bearer ${agent.key}`,
-          },
-          body: JSON.stringify({
-            model: agent.model,
-            reasoning_effort: agent.effort,
-            stream: true,
-            messages: upstreamMessages,
-          }),
-          signal: abort.signal,
+        await streamAnalysis(body, (event) => {
+          sendFrame(res, `data: ${JSON.stringify(event)}\n\n`);
         });
-        if (!upstream.ok) {
-          const detail = (await upstream.text()).slice(0, 500);
-          sendFrame(res, `data: ${JSON.stringify({ type: 'error', message: `DeepSeek ${upstream.status}: ${detail}` })}\n\n`);
-          return res.end();
-        }
-        if (!upstream.body) return res.end();
-        const reader = upstream.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
-        for (;;) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
-          let cut;
-          while ((cut = buffer.indexOf('\n')) >= 0) {
-            const line = buffer.slice(0, cut).trim();
-            buffer = buffer.slice(cut + 1);
-            if (!line.startsWith('data:')) continue;
-            const data = line.slice(5).trim();
-            if (!data) continue;
-            if (data === '[DONE]') {
-              sendFrame(res, `data: ${JSON.stringify({ type: 'done' })}\n\n`);
-              return res.end();
-            }
-            let parsed;
-            try {
-              parsed = JSON.parse(data);
-            } catch {
-              continue;
-            }
-            const delta = parsed.choices?.[0]?.delta;
-            if (!delta) continue;
-            if (delta.reasoning_content) {
-              sendFrame(res, `data: ${JSON.stringify({ type: 'reasoning', delta: delta.reasoning_content })}\n\n`);
-            }
-            if (delta.content) {
-              sendFrame(res, `data: ${JSON.stringify({ type: 'content', delta: delta.content })}\n\n`);
-            }
-          }
-        }
-        sendFrame(res, `data: ${JSON.stringify({ type: 'done' })}\n\n`);
+      } catch (error) {
+        logger.warn('[agent] dsh turn failed', { message: (error as Error).message });
+        sendFrame(res, `data: ${JSON.stringify({ type: 'error', message: (error as Error).message })}\n\n`);
+      } finally {
         res.end();
-      } catch (e) {
-        if (!abort.signal.aborted) {
-          sendFrame(res, `data: ${JSON.stringify({ type: 'error', message: (e as Error).message })}\n\n`);
-          res.end();
-        }
       }
       return;
+    }
+
+    // Private back-channel used by the per-run MCP bridge. It never leaves the
+    // loopback interface and every call carries the run's one-time token.
+    const internalTool = /^\/api\/internal\/backtest\/([A-Za-z0-9-]+)\/tool$/.exec(pathname);
+    if (internalTool) {
+      if (req.method !== 'POST') throw methodNotAllowed();
+      const run = backtestRuns.get(internalTool[1]);
+      if (!run) throw notFound('run not found or already finished');
+      if (req.headers['x-backtest-token'] !== run.controlToken) {
+        throw new AppError('invalid backtest token', { status: ERROR_CODES.UNAUTHORIZED });
+      }
+      const body = await readJsonBody(req, CONTROL_BODY_LIMIT);
+      const name = requireString(body.name, 'name', { maxLength: 64 });
+      const args = body.args && typeof body.args === 'object' && !Array.isArray(body.args) ? body.args : {};
+      return send(res, 200, JSON.stringify({ result: run.agent.executeTool(name, args) }));
     }
 
     if (pathname === '/api/backtest/session') {
@@ -399,8 +338,11 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === '/api/backtest/run') {
       if (req.method !== 'POST') throw methodNotAllowed();
-      const agent = loadAgentConfig();
-      if (!agent.key) {
+      const status = agentStatus();
+      if (!status.enabled) {
+        return send(res, 503, JSON.stringify({ error: 'DSH_ENABLED=false，AI 回测已停用' }));
+      }
+      if (!status.configured) {
         return send(res, 503, JSON.stringify({
           error: '未检测到 DEEPSEEK_API_KEY，无法运行 AI 回测',
         }));
@@ -441,7 +383,23 @@ const server = http.createServer(async (req, res) => {
           pauseState.waiters.push(release);
         });
       };
-      const runControl = {
+      const controlToken = randomUUID();
+      const agentRuntime = new DshBacktestAgent({
+        runId,
+        controlToken,
+        controlUrl: `http://127.0.0.1:${PORT}/api/v1/internal/backtest`,
+        signal: AbortSignal.any([abort.signal, stopAbort.signal]),
+        onEvent: (event) => {
+          if (event.type === 'error') logger.warn('[backtest] agent error:', event.message);
+          else if (event.type === 'tool_result' && !event.result.ok) {
+            logger.warn('[backtest] tool rejected:', event.name, event.result.error?.code, event.result.error?.message);
+          }
+          emit({ type: 'agent', event });
+        },
+      });
+      const runControl: BacktestRun = {
+        controlToken,
+        agent: agentRuntime,
         pause() {
           if (pauseState.paused) return;
           pauseState.paused = true;
@@ -492,23 +450,9 @@ const server = http.createServer(async (req, res) => {
         const earlyClose = inferSessionCloseFromBars(coreBars, base);
         const session = earlyClose ? buildTradingDayPlan({ date, timeframe, close: earlyClose }) : base;
         emit({ type: 'session', phase: 'ready', plan: session, bars: coreBars.length });
-        const client = createOpenAiCompatibleClient({ baseURL: agent.base, apiKey: agent.key });
-        const llmSignal = AbortSignal.any([abort.signal, stopAbort.signal]);
-        const inner = createLlmBacktestAgent({
-          client,
-          model: agent.model,
-          reasoningEffort: agent.effort,
-          signal: llmSignal,
-          onEvent: (event) => {
-            if (event.type === 'error') logger.warn('[backtest] agent error:', event.message);
-            else if (event.type === 'tool_result' && !event.result.ok) {
-              logger.warn('[backtest] tool rejected:', event.name, event.result.error?.code, event.result.error?.message);
-            }
-            emit({ type: 'agent', event });
-          },
-        });
+        const inner = runControl.agent;
         const wrapped = {
-          async decide(input: any): Promise<any> {
+          async decide(input: DecisionInput) {
             emit({ type: 'decision', asOf: input.asOf, entryQuota: input.entryQuota, position: input.position });
             return inner.decide(input);
           },
@@ -557,6 +501,7 @@ const server = http.createServer(async (req, res) => {
         }
         res.end();
       } finally {
+        await runControl.agent.close();
         backtestRuns.delete(runId);
       }
       return;
@@ -743,15 +688,22 @@ function shutdown(signal: string): void {
   if (shuttingDown) return;
   shuttingDown = true;
   logger.info(`[api] ${signal} received, shutting down`);
-  const forceExit = setTimeout(() => process.exit(1), 5000);
+  const forceExit = setTimeout(() => process.exit(1), 10_000);
   forceExit.unref();
   server.close(() => {
-    try {
-      closeDb();
-    } catch {
-      /* already closed */
-    }
-    process.exit(0);
+    void (async () => {
+      try {
+        await shutdownDsh();
+      } catch {
+        /* harness already reaped */
+      }
+      try {
+        closeDb();
+      } catch {
+        /* already closed */
+      }
+      process.exit(0);
+    })();
   });
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'));

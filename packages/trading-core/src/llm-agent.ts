@@ -439,6 +439,15 @@ function wrapResult<T>(name: string, result: ToolResult<T>): ToolResult<T> {
     return { ...result, tool: name };
 }
 
+/** Shared by alternative agent runtimes that keep the deterministic engine but replace the chat loop. */
+export function executeBacktestTool(
+    name: string,
+    rawArgs: unknown,
+    input: DecisionInput,
+): { result: ToolResult<unknown>; finish?: string } {
+    return executeTool(name, rawArgs, input);
+}
+
 function executeTool(
     name: string,
     rawArgs: unknown,

@@ -75,4 +75,7 @@
 - **服务端分层**：`apps/web/server/` 已拆出 config/errors/logger/http/validate/db/indicators/longbridge/agent/openapi；`api-server.ts` 仅保留路由编排与请求/响应处理。SQL 仅允许出现在 `server/db.ts`。
 - **类型覆盖**：`apps/web/src`、`apps/web/server` 与 `apps/desktop` 均为 TypeScript（`strict: true`）；前后端共享契约位于 `apps/web/shared/contracts.ts`（单一事实来源），全局错误由 `error-boundary.ts` 兜底，网络请求统一走 `api.ts`。
 - **前端模块化**：`main.ts` 仅负责装配，拆分为 `provider/storage/sliding/topbar/agent-panel/backtest-panel/indicator-editor` 等单一职责模块；动态文本进入 `innerHTML` 前必须经 `html.ts` 的 `escapeHtml`。
-- **已知技术债（待后续迭代）**：`api-server.ts` 的路由编排仍较集中，可继续按领域拆分 route 模块；写接口目前依赖文件/DB 的 upsert 语义，尚未接入 `Idempotency-Key`；AI 分析与回测采用 SSE 长连接（Node 异步 I/O，不阻塞事件循环），尚未接入独立任务队列。
+- **AI 运行时（dsh）**：AI 分析与 AI 回测统一由 `@deepseek-ai/dsh` + `@deepseek-ai/dsh-sdk-client` 驱动，不再自研 tool-call 循环；Node 必须 `^22.19 || >=24`（当前要求 `>=24`），Docker 基础镜像为 `node:24-bookworm-slim`。
+- **dsh 隔离**：`apps/web/server/dsh/patch.ts` 生成 cordis patch，禁用 shell/文件/子 Agent/技能等宿主工具，只保留 MCP 工具；运行时 home、会话与生成 patch 均落在 git-ignored 的 `data/dsh/`。
+- **MCP 交易工具**：`apps/web/server/mcp/trading-mcp.ts` 提供行情工具；`apps/web/server/mcp/backtest-mcp.ts` 是每轮回测的 stdio 桥，经 `/api/v1/internal/backtest/:runId/tool` 回写到进程内 `BacktestToolHost`（loopback + 一次性 token）。
+- **已知技术债（待后续迭代）**：`api-server.ts` 的路由编排仍较集中，可继续按领域拆分 route 模块；写接口目前依赖文件/DB 的 upsert 语义，尚未接入 `Idempotency-Key`；AI 与回测采用 SSE 长连接（Node 异步 I/O，不阻塞事件循环），尚未接入独立任务队列；dsh SDK 只推送 durable step 事件，因此 UI 的 reasoning/content 按 step 而非 token 流式呈现。

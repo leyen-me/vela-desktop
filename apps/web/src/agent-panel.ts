@@ -73,7 +73,7 @@ export function mountAgentPanel(ctx: any, body: HTMLElement) {
   systemEl.className = 'vagent-system vagent-system-global';
   systemEl.open = true;
   const systemSummary = document.createElement('summary');
-  systemSummary.textContent = '系统提示词 · 加载中…';
+  systemSummary.textContent = '图表上下文 · 加载中…';
   const systemBody = document.createElement('div');
   systemBody.className = 'vagent-system-body';
   systemBody.textContent = '正在读取当前标的与当日 K 线…';
@@ -84,7 +84,7 @@ export function mountAgentPanel(ctx: any, body: HTMLElement) {
   const setSystem = (content: string, meta: any = {}) => {
     const imageState = meta.vision ? ' · 截图已附' : meta.images ? ' · 截图未附' : '';
     const effort = effortLabel(meta.effort);
-    systemSummary.textContent = `系统提示词 · ${(meta.symbol ?? '').split(':').pop()} ${meta.timeframe ?? ''} · ${meta.model ?? ''}${effort ? ` · 思考强度${effort}` : ''}${imageState}`;
+    systemSummary.textContent = `图表上下文 · ${(meta.symbol ?? '').split(':').pop()} ${meta.timeframe ?? ''} · ${meta.model ?? ''}${effort ? ` · 思考强度${effort}` : ''}${imageState}`;
     systemBody.textContent = content ?? '';
   };
 

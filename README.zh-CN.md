@@ -9,7 +9,7 @@
 - **图表** — Vela 工作区，支持多窗格、绘图工具以及基于 CodeMirror + PineTS 的自定义指标编辑器。
 - **行情数据** — 长桥报价、按需加载历史 K 线与实时推送，本地 SQLite 缓存。
 - **指标库** — 抓取的 LuxAlgo Pine 指标库（`data/pine/**`）以及用户自定义指标。
-- **AI 日内分析** — 兼容 DeepSeek 的大模型面板（API Key 可选）。
+- **AI 日内分析** — 由 DeepSeek Harness（`dsh`）驱动的 Agent 面板，通过 MCP 调用行情工具（API Key 可选）。
 - **回测** — 会话感知的单日回测，内置模拟券商与 LLM 工具调用（`packages/trading-core`）。
 - **桌面端** — Electron 自动拉起本地 API 服务并加载页面的外壳。
 
@@ -21,7 +21,7 @@ apps/
   web/              Vite 客户端 + Node 数据/API 服务（api-server.ts）
     shared/         前后端共享 API 契约类型
 packages/
-  trading-core/     回测引擎、模拟券商、配额与 LLM Agent
+  trading-core/     回测引擎、模拟券商、配额与 Agent 契约
   vela/             内置 Vela 图表库（Apache-2.0）
 data/               抓取的 Pine 指标库与本地缓存（cache/ 不纳入版本控制）
 tools/              指标抓取脚本与 Playwright 探索脚本
@@ -29,7 +29,7 @@ tools/              指标抓取脚本与 Playwright 探索脚本
 
 ## 环境要求
 
-- Node.js >= 22.17（API 服务使用内置 `node:sqlite` 模块）
+- Node.js >= 24（API 服务使用 `node:sqlite`；dsh 运行时要求 >=22.19 / >=24）
 - pnpm 10（`corepack enable`）
 
 ## 快速开始
@@ -69,8 +69,9 @@ pnpm run build:web
 | `VELA_NODE` | Electron 启动 API 服务时使用的 Node 路径 |
 | `LONGPORT_APP_KEY` / `LONGPORT_APP_SECRET` / `LONGPORT_ACCESS_TOKEN` | 长桥 OpenAPI 凭据 |
 | `LONGPORT_HTTP_URL` / `LONGPORT_QUOTE_WS_URL` / `LONGPORT_TRADE_WS_URL` | 长桥接口地址（默认国际网关） |
-| `DEEPSEEK_API_KEY` | AI 分析面板的 API Key |
-| `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL` | OpenAI 兼容接口地址与模型 |
+| `DEEPSEEK_API_KEY` | dsh Agent 运行时的 API Key |
+| `DSH_MODEL` / `DSH_REASONING_EFFORT` | dsh 模型路由与思考强度 |
+| `DSH_ENABLED` | 设为 `false` 可停用全部 AI 接口 |
 | `AGENT_REASONING_EFFORT` | LLM 推理强度（默认 `low`） |
 
 切勿提交 `.env` 或 `data/agent.json`，二者均已加入 `.gitignore`。
