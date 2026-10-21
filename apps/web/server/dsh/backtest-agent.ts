@@ -9,6 +9,7 @@ import {
   type ToolResult,
   executeBacktestTool,
 } from '@vela/trading-core';
+import { loadAgentConfig } from '../agent.ts';
 import { logger } from '../logger.ts';
 import {
   assertDshNode,
@@ -185,6 +186,8 @@ export class DshBacktestAgent implements BacktestAgent {
       model: DSH_MODEL,
     };
     options.reasoningEffort = DSH_REASONING_EFFORT as NonNullable<HarnessOptions['reasoningEffort']>;
+    const configured = loadAgentConfig();
+    if (configured.key) options.env = { ...process.env, DEEPSEEK_API_KEY: configured.key };
     this.harness = new DeepSeekHarness(options);
     return this.harness;
   }

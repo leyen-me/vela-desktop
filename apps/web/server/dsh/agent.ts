@@ -79,6 +79,8 @@ function getHarness(): DeepSeekHarness {
     model: DSH_MODEL,
   };
   options.reasoningEffort = DSH_REASONING_EFFORT as NonNullable<HarnessOptions['reasoningEffort']>;
+  const configured = loadAgentConfig();
+  if (configured.key) options.env = { ...process.env, DEEPSEEK_API_KEY: configured.key };
   harness = new DeepSeekHarness(options);
   return harness;
 }
@@ -92,11 +94,24 @@ async function getSession(key: string): Promise<HarnessSession> {
   if (existing) return existing;
   const runtime = getHarness();
   const id = sessionIdFor(key);
-  let session: HarnessSession;
-  try {
-    session = await runtime.resumeSession(id);
-  } catch {
-    session = runtime.session(id);
+  let session: HarnessSession | null = null;
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt < 2 && !session; attempt += 1) {
+    try {
+      session = await runtime.resumeSession(id);
+    } catch (error) {
+      lastError = error;
+      // A previous runtime may still hold the session's write handle during a
+      // restart; give it a moment before giving up on the persisted history.
+      if (attempt === 0) await new Promise((resolve) => setTimeout(resolve, 1500));
+    }
+  }
+  if (!session) {
+    logger.warn('[dsh] resume failed; starting a fresh session', {
+      id,
+      message: lastError instanceof Error ? lastError.message : String(lastError),
+    });
+    session = runtime.session();
   }
   sessions.set(key, session);
   return session;
