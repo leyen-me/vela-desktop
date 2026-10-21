@@ -71,7 +71,7 @@ function addStyle(): () => void {
 .vbt-field span { color:var(--vela-fg-muted,#8a8f9c); font-size:11px; }
 .vbt-field input, .vbt-field select { width:100%; box-sizing:border-box; padding:5px 7px; border-radius:5px; border:1px solid var(--vela-border,#2a2e39); background:var(--vela-bg,#131722); color:var(--vela-fg,#d1d4dc); font-size:12px; }
 .vbt-row { display:flex; gap:6px; grid-column:1 / -1; }
-.vbt-row button { flex:1; padding:7px 8px; border-radius:5px; border:0; background:#2962ff; color:#fff; font-weight:600; cursor:pointer; }
+.vbt-row button { flex:1 1 auto; padding:7px 6px; border-radius:5px; border:0; background:#2962ff; color:#fff; font-weight:600; cursor:pointer; white-space:nowrap; font-size:11px; }
 .vbt-row button:disabled { opacity:.5; cursor:default; }
 .vbt-row button.secondary { background:transparent; border:1px solid var(--vela-border,#2a2e39); color:var(--vela-fg-muted,#8a8f9c); }
 .vbt-body { flex:1; overflow:auto; padding:10px 12px 20px; }
@@ -84,14 +84,24 @@ function addStyle(): () => void {
 .vbt-loghead { display:flex; align-items:center; justify-content:space-between; margin:8px 0 4px; color:var(--vela-fg-muted,#8a8f9c); font-size:11px; }
 .vbt-loghead button { all:unset; cursor:pointer; padding:2px 6px; border-radius:4px; border:1px solid var(--vela-border,#2a2e39); color:var(--vela-fg-muted,#8a8f9c); font-size:10px; }
 .vbt-loghead button:hover { color:var(--vela-fg,#d1d4dc); }
-.vbt-log { border:1px solid var(--vela-border,#2a2e39); border-radius:6px; padding:7px 8px; max-height:320px; overflow:auto; font-size:11px; line-height:1.55; color:var(--vela-fg-muted,#8a8f9c); user-select:text; cursor:text; }
-.vbt-note { white-space:pre-wrap; padding:1px 0; }
-.vbt-turn { border-bottom:1px solid rgba(255,255,255,.06); padding:5px 0 7px; }
-.vbt-turn:last-child { border-bottom:0; }
-.vbt-turn-head { color:var(--vela-fg-muted,#8a8f9c); font-size:10px; margin-bottom:4px; }
-.vbt-content { white-space:pre-wrap; color:var(--vela-fg,#d1d4dc); font-size:12px; line-height:1.5; min-height:1px; }
+.vbt-context { margin:0 12px 8px; padding:8px 10px; border:1px solid var(--vela-border,#2a2e39); border-radius:8px;
+  background:rgba(255,255,255,.025); color:var(--vela-fg-muted,#8a8f9c); font-size:11px; line-height:1.55; }
+.vbt-context b { color:var(--vela-fg,#d1d4dc); font-weight:600; }
+.vbt-log { border:1px solid var(--vela-border,#2a2e39); border-radius:8px; padding:10px; max-height:420px; overflow:auto;
+  display:flex; flex-direction:column; gap:12px; font-size:11px; line-height:1.55; color:var(--vela-fg-muted,#8a8f9c);
+  user-select:text; cursor:text; }
+.vbt-note { white-space:pre-wrap; padding:0 4px; text-align:center; font-size:10.5px; color:var(--vela-fg-muted,#8a8f9c); }
+.vbt-log:empty::before { content:'暂无决策记录'; margin:auto; color:var(--vela-fg-muted,#8a8f9c); font-size:11px; }
+.vbt-turn { display:flex; flex-direction:column; gap:8px; }
+.vbt-msg { max-width:90%; padding:8px 11px; border-radius:12px; font-size:12px; line-height:1.55; }
+.vbt-msg.user { align-self:flex-end; background:linear-gradient(135deg, rgba(41,98,255,.28), rgba(41,98,255,.14));
+  border:1px solid rgba(41,98,255,.4); border-top-right-radius:4px; color:var(--vela-fg,#d1d4dc); }
+.vbt-msg.agent { align-self:flex-start; background:rgba(255,255,255,.045); border:1px solid rgba(255,255,255,.06);
+  border-top-left-radius:4px; color:var(--vela-fg,#d1d4dc); }
+.vbt-msg-head { color:var(--vela-fg-muted,#8a8f9c); font-size:10px; margin-bottom:3px; }
+.vbt-content { white-space:pre-wrap; color:var(--vela-fg,#d1d4dc); font-size:12px; line-height:1.55; min-height:1px; }
 .vbt-content:empty::before { content:'正在分析…'; color:var(--vela-fg-muted,#8a8f9c); }
-.vbt-details { margin-top:5px; border:1px solid var(--vela-border,#2a2e39); border-radius:5px; padding:2px 6px; }
+.vbt-details { margin-top:6px; border:1px solid var(--vela-border,#2a2e39); border-radius:6px; padding:2px 6px; background:rgba(0,0,0,.12); }
 .vbt-details summary { cursor:pointer; color:var(--vela-fg-muted,#8a8f9c); font-size:10px; padding:2px 0; }
 .vbt-detail-body { white-space:pre-wrap; color:var(--vela-fg-muted,#8a8f9c); font-size:11px; max-height:180px; overflow:auto; padding-bottom:4px; }
 .vbt-tool { white-space:pre-wrap; padding:1px 0; }
@@ -155,18 +165,21 @@ export function registerBacktestPanel(): void {
                 <label class="vbt-field"><span>每日开仓上限</span><input data-k="entries" type="number" min="0" step="1" value="2"></label>
                 <label class="vbt-field"><span>初始资金</span><input data-k="capital" type="number" min="1000" step="1000" value="100000"></label>
                 <div class="vbt-row">
-                  <button data-k="run" type="button">开始回测</button>
+                  <button data-k="run" type="button" style="flex:2">开始回测</button>
                   <button data-k="plan" class="secondary" type="button">检查时段</button>
+                </div>
+                <div class="vbt-row">
                   <button data-k="pause" class="secondary" type="button" hidden disabled>暂停</button>
                   <button data-k="stop" class="secondary" type="button" hidden>停止</button>
-                  <button data-k="cancel" class="secondary" type="button" hidden>取消回测</button>
+                  <button data-k="cancel" class="secondary" type="button" hidden>退出回测</button>
                 </div>
               </div>
               <div class="vbt-body">
+                <div class="vbt-context" data-k="context">选择交易日并开始回测。</div>
                 <div data-k="summary"></div>
                 <div data-k="equity"></div>
                 <div class="vbt-loghead"><span>运行日志</span><button data-k="copy" type="button">复制日志</button></div>
-                <div class="vbt-log" data-k="log">选择交易日，然后开始回测。</div>
+                <div class="vbt-log" data-k="log"></div>
                 <div data-k="trades"></div>
               </div>`;
             body.appendChild(root);
@@ -182,6 +195,7 @@ export function registerBacktestPanel(): void {
             const stopButton = get<HTMLButtonElement>('stop');
             const cancelButton = get<HTMLButtonElement>('cancel');
             const copyButton = get<HTMLButtonElement>('copy');
+            const contextEl = get<HTMLDivElement>('context');
             const summary = get<HTMLDivElement>('summary');
             const equity = get<HTMLDivElement>('equity');
             const log = get<HTMLDivElement>('log');
@@ -255,15 +269,22 @@ export function registerBacktestPanel(): void {
             let currentTurn: AgentTurn | null = null;
 
             const beginTurn = (asOf?: number, quota?: { available?: number }, position?: { qty?: number } | null) => {
-                const root = document.createElement('div');
-                root.className = 'vbt-turn';
-                root.innerHTML = `<div class="vbt-turn-head"></div>
-                  <div class="vbt-content"></div>
-                  <details class="vbt-details vbt-think" hidden><summary>思考过程</summary><div class="vbt-detail-body"></div></details>
-                  <details class="vbt-details vbt-tools" hidden><summary>工具调用 (0)</summary><div class="vbt-detail-body"></div></details>`;
-                const head = root.querySelector('.vbt-turn-head') as HTMLDivElement;
-                head.textContent = `${asOf ? etClock(asOf) : ''} 决策 · 可开仓 ${quota?.available ?? '?'} · 持仓 ${position?.qty ?? 0}`;
-                log.appendChild(root);
+                const turn = document.createElement('div');
+                turn.className = 'vbt-turn';
+                turn.innerHTML = `<div class="vbt-msg user">
+                    <div class="vbt-msg-head">K 线收盘</div>
+                    <div class="vbt-msg-body"></div>
+                  </div>
+                  <div class="vbt-msg agent">
+                    <div class="vbt-msg-head">AI 决策</div>
+                    <div class="vbt-content"></div>
+                    <details class="vbt-details vbt-think" hidden><summary>思考过程</summary><div class="vbt-detail-body"></div></details>
+                    <details class="vbt-details vbt-tools" hidden><summary>工具调用 (0)</summary><div class="vbt-detail-body"></div></details>
+                  </div>`;
+                const userBody = turn.querySelector('.vbt-msg.user .vbt-msg-body') as HTMLDivElement;
+                userBody.textContent = `${asOf ? etClock(asOf) : ''} 收盘 · 可开仓 ${quota?.available ?? '?'} · 持仓 ${position?.qty ?? 0}`;
+                const root = turn.querySelector('.vbt-msg.agent') as HTMLDivElement;
+                log.appendChild(turn);
                 currentTurn = {
                     root,
                     content: root.querySelector('.vbt-content') as HTMLDivElement,
@@ -348,11 +369,15 @@ export function registerBacktestPanel(): void {
                 currentTurn.content.appendChild(row);
                 scrollLog();
             };
+            const setContext = (html: string) => {
+                contextEl.innerHTML = html;
+            };
             const clear = () => {
                 summary.innerHTML = '';
                 equity.innerHTML = '';
                 trades.innerHTML = '';
                 log.innerHTML = '';
+                setContext('选择交易日并开始回测。');
                 currentTurn = null;
             };
             const setBusy = (next: boolean) => {
@@ -472,6 +497,7 @@ export function registerBacktestPanel(): void {
                 try {
                     const data = await api.get(`/backtest/session?${query()}`);
                     const plan = data.plan;
+                    setContext(`<b>${escapeHtml(currentSymbol)}</b> · ${escapeHtml(data.date)} · ${escapeHtml(data.timeframe)} · ${etClock(plan.open)}–${etClock(plan.close)} ET · 决策 ${plan.decisionTimes.length} 次 · bar ${data.sessionBars} 根${data.isEarlyClose ? ' · 半日市' : ''}`);
                     appendLog(`<b>${escapeHtml(data.date)}</b> ${escapeHtml(data.timeframe)} · ${etClock(plan.open)}–${etClock(plan.close)} ET`);
                     appendLog(`强平 ${etClock(plan.flattenAt)} ET · 决策 ${plan.decisionTimes.length} 次 · 当日 bar ${data.sessionBars} 根 · 预热 ${data.warmupBars} 根${data.isEarlyClose ? ' · 半日市' : ''}`);
                 } catch (error) {
@@ -545,7 +571,9 @@ export function registerBacktestPanel(): void {
                     if (event.phase === 'loading' && event.plan) {
                         appendLog(`加载 ${etClock(event.plan.open)}–${etClock(event.plan.close)} ET 的行情…`);
                     } else if (event.phase === 'ready' && event.plan) {
-                        appendLog(`时段就绪 · 决策 ${event.plan.decisionTimes.length} 次 · bar ${event.bars ?? 0} 根${event.plan.isEarlyClose ? ' · 半日市' : ''}`);
+                        const plan = event.plan;
+                        setContext(`<b>${escapeHtml(currentSymbol)}</b> · ${escapeHtml(date.value)} · ${escapeHtml(currentTimeframe)} · ${etClock(plan.open)}–${etClock(plan.close)} ET · 决策 ${plan.decisionTimes.length} 次 · bar ${event.bars ?? 0} 根${plan.isEarlyClose ? ' · 半日市' : ''}`);
+                        appendLog(`时段就绪 · 决策 ${plan.decisionTimes.length} 次 · bar ${event.bars ?? 0} 根${plan.isEarlyClose ? ' · 半日市' : ''}`);
                     }
                     return;
                 }
