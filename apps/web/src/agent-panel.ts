@@ -11,56 +11,64 @@ export function mountAgentPanel(ctx: any, body: HTMLElement) {
   style.textContent = `
 .vela-panel-agent .vela-panel-header { display: none !important; }
 .vela-panel-agent .vela-panel-body { padding: 0; }
-.vagent { display: flex; flex-direction: column; height: 100%; margin: 0; font-size: 13px; }
-.vagent-ctx { display: flex; align-items: baseline; gap: 8px; padding: 10px 12px;
-  border-bottom: 1px solid var(--vela-border, #2a2e39); }
-.vagent-sym { font-weight: 600; color: var(--vela-fg-bright, #fff); }
-.vagent-tf { color: var(--vela-fg-muted, #8a8f9c); }
-.vagent-last { margin-left: auto; color: var(--vela-fg-bright, #fff); font-variant-numeric: tabular-nums; }
-.vagent-config { margin: 10px 12px 0; padding: 8px 10px; border-radius: 6px; line-height: 1.5;
-  background: rgba(240, 185, 11, .12); border: 1px solid rgba(240, 185, 11, .35);
+.vagent { display: flex; flex-direction: column; height: 100%; margin: 0;
+  font-size: 13px; color: var(--vela-fg, #d1d4dc); }
+
+/* chart context pinned above the conversation */
+.vagent-system-global { flex: none; margin: 10px 12px 4px; border: 1px solid var(--vela-border, #2a2e39);
+  border-radius: 8px; background: rgba(255, 255, 255, .025); overflow: hidden; }
+.vagent-system summary { cursor: pointer; padding: 7px 10px; color: var(--vela-fg-muted, #8a8f9c);
+  font-size: 11px; user-select: none; list-style: none; }
+.vagent-system summary::-webkit-details-marker { display: none; }
+.vagent-system summary::before { content: '▸'; display: inline-block; margin-right: 6px; transition: transform .15s; }
+.vagent-system[open] summary::before { transform: rotate(90deg); }
+.vagent-system-body { padding: 0 10px 9px; color: var(--vela-fg-muted, #8a8f9c);
+  font-size: 11px; line-height: 1.55; white-space: pre-wrap; max-height: 200px; overflow-y: auto;
+  border-top: 1px solid rgba(255, 255, 255, .05); padding-top: 8px; }
+.vagent-system[open] .vagent-system-body { display: block; }
+
+.vagent-config { margin: 8px 12px 0; padding: 8px 10px; border-radius: 8px; line-height: 1.5;
+  background: rgba(240, 185, 11, .1); border: 1px solid rgba(240, 185, 11, .3);
   color: #f0b90b; font-size: 11px; white-space: pre-wrap; }
 .vagent-config[hidden] { display: none !important; }
 .vagent-config button { all: unset; cursor: pointer; margin-top: 5px; display: inline-block;
   padding: 2px 8px; border-radius: 4px; border: 1px solid rgba(240, 185, 11, .5); color: #f0b90b; }
-.vagent-msgs { flex: 1; overflow-y: auto; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
-.vagent-turn { display: flex; flex-direction: column; gap: 6px; }
-.vagent-msg { max-width: 92%; padding: 7px 9px; border-radius: 7px; line-height: 1.45; white-space: pre-wrap;
-  word-break: break-word; }
-.vagent-msg.agent { background: var(--vela-hover, rgba(255,255,255,.06)); }
-.vagent-msg.user { align-self: flex-end; background: rgba(41, 98, 255, .22); }
-.vagent-msg.system { color: var(--vela-fg-muted, #8a8f9c); font-size: 12px; padding: 0 2px; }
-.vagent-auto { display: flex; align-items: center; gap: 8px; margin: 0 12px 8px; padding: 8px 10px;
-  border-radius: 6px; background: var(--vela-hover, rgba(255,255,255,.06)); color: var(--vela-fg, #d1d4dc);
-  font-size: 12px; }
-.vagent-dot { width: 7px; height: 7px; border-radius: 50%; background: #26a69a;
-  box-shadow: 0 0 0 3px rgba(38, 166, 154, .15); flex: none; }
-.vagent-dot[data-busy='1'] { background: #f0b90b; animation: vagent-pulse 1.2s ease-in-out infinite; }
-@keyframes vagent-pulse { 50% { opacity: .35; } }
-.vagent-system { border: 1px solid var(--vela-border, #2a2e39); border-radius: 6px; margin-bottom: 6px;
-  background: rgba(41, 98, 255, .06); }
-.vagent-system-global { margin: 10px 12px 0; flex: none; }
-.vagent-system summary { cursor: pointer; padding: 5px 8px; color: var(--vela-fg-muted, #8a8f9c);
-  font-size: 12px; user-select: none; }
-.vagent-system-body { padding: 0 8px 7px; color: var(--vela-fg-muted, #8a8f9c); font-size: 11px;
-  line-height: 1.4; white-space: pre-wrap; max-height: 240px; overflow-y: auto; }
-.vagent-think { border: 1px solid var(--vela-border, #2a2e39); border-radius: 6px; margin-bottom: 6px;
-  background: rgba(255, 255, 255, .03); }
-.vagent-think summary { cursor: pointer; padding: 5px 8px; color: var(--vela-fg-muted, #8a8f9c);
-  font-size: 12px; user-select: none; }
-.vagent-think-body { padding: 0 8px 7px; color: var(--vela-fg-muted, #8a8f9c); font-size: 12px;
-  line-height: 1.45; white-space: pre-wrap; max-height: 240px; overflow-y: auto; }
-.vagent-tools { display: flex; flex-direction: column; gap: 3px; margin-bottom: 6px; }
-.vagent-tool { display: flex; align-items: center; gap: 5px; font-size: 11px;
-  color: var(--vela-fg-muted, #8a8f9c); }
-.vagent-tool[data-ok='0'] { color: #e57373; }
-.vagent-tool-name { color: var(--vela-fg, #d1d4dc); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+/* conversation: user right, assistant left */
+.vagent-msgs { flex: 1; overflow-y: auto; padding: 10px 14px 20px; display: flex;
+  flex-direction: column; gap: 14px; }
+.vagent-empty { margin: auto; max-width: 240px; text-align: center; color: var(--vela-fg-muted, #8a8f9c);
+  font-size: 12px; line-height: 1.7; }
+.vagent-turn { display: flex; flex-direction: column; gap: 7px; align-items: flex-start; }
+.vagent-msg { max-width: 88%; padding: 9px 12px; border-radius: 12px; line-height: 1.58;
+  white-space: pre-wrap; word-break: break-word; }
+.vagent-msg.agent { align-self: flex-start; background: rgba(255, 255, 255, .05);
+  border: 1px solid rgba(255, 255, 255, .06); border-top-left-radius: 4px; }
+.vagent-msg.user { align-self: flex-end; background: linear-gradient(135deg, rgba(41, 98, 255, .3), rgba(41, 98, 255, .16));
+  border: 1px solid rgba(41, 98, 255, .4); border-top-right-radius: 4px; }
+.vagent-msg.system { align-self: center; max-width: 100%; padding: 0 4px; background: none;
+  color: var(--vela-fg-muted, #8a8f9c); font-size: 11px; }
+
+/* reasoning + tool activity inside the assistant card */
+.vagent-msg.agent .vagent-think { margin: 0 0 7px; padding: 0; border: 0;
+  border-radius: 6px; background: rgba(0, 0, 0, .16); }
+.vagent-msg.agent .vagent-think summary { padding: 4px 8px; color: var(--vela-fg-muted, #8a8f9c);
+  font-size: 11px; user-select: none; }
+.vagent-msg.agent .vagent-think-body { padding: 0 8px 6px; color: var(--vela-fg-muted, #8a8f9c);
+  font-size: 11.5px; line-height: 1.5; white-space: pre-wrap; max-height: 200px; overflow-y: auto; }
+.vagent-tools { display: flex; flex-wrap: wrap; gap: 4px; margin: 0 0 7px; }
+.vagent-tool { display: inline-flex; align-items: center; gap: 4px; padding: 2px 7px;
+  border-radius: 999px; background: rgba(255, 255, 255, .05); border: 1px solid rgba(255, 255, 255, .08);
+  color: var(--vela-fg-muted, #8a8f9c); font-size: 10.5px; }
+.vagent-tool[data-ok='0'] { color: #ef5350; border-color: rgba(239, 83, 80, .35); }
+.vagent-tool-name { color: var(--vela-fg, #d1d4dc);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .vagent-answer { white-space: pre-wrap; }
+.vagent-answer:empty::before { content: '分析中…'; color: var(--vela-fg-muted, #8a8f9c); }
 .vagent-answer[data-streaming='1']::after { content: '▍'; margin-left: 1px; animation: vagent-caret 1s steps(2) infinite; }
 @keyframes vagent-caret { 50% { opacity: 0; } }
-.vagent-shot { display: block; margin-top: 6px; width: 100%; max-height: 180px; object-fit: contain;
-  border-radius: 5px; border: 1px solid var(--vela-border-strong, #363a45); background: #0b0e11; }
-.vagent-note { padding: 0 12px 8px; color: var(--vela-fg-muted, #8a8f9c); font-size: 11px; }
+.vagent-shot { display: block; margin-top: 7px; width: 100%; max-height: 160px; object-fit: contain;
+  border-radius: 6px; border: 1px solid var(--vela-border-strong, #363a45); background: #0b0e11; }
 `;
   document.head.appendChild(style);
   body.style.padding = '0';
@@ -73,10 +81,14 @@ export function mountAgentPanel(ctx: any, body: HTMLElement) {
   body.appendChild(root);
 
   const msgsEl = root.querySelector<HTMLElement>('.vagent-msgs')!;
+  const emptyEl = document.createElement('div');
+  emptyEl.className = 'vagent-empty';
+  emptyEl.textContent = '等待下一根 K 线收盘后自动分析；也可以先展开上方的图表上下文。';
+  msgsEl.appendChild(emptyEl);
   const configEl = root.querySelector<HTMLElement>('.vagent-config')!;
   const systemEl = document.createElement('details');
   systemEl.className = 'vagent-system vagent-system-global';
-  systemEl.open = true;
+  systemEl.open = false;
   const systemSummary = document.createElement('summary');
   systemSummary.textContent = '图表上下文 · 加载中…';
   const systemBody = document.createElement('div');
@@ -129,6 +141,7 @@ export function mountAgentPanel(ctx: any, body: HTMLElement) {
   void loadAgentStatus();
 
   const addMessage = (role: string, text: string) => {
+    emptyEl.remove();
     const el = document.createElement('div');
     el.className = `vagent-msg ${role}`;
     el.textContent = text;
@@ -206,6 +219,7 @@ export function mountAgentPanel(ctx: any, body: HTMLElement) {
 
     // One turn: system context first (left), then the user bar (right) with its
     // screenshot thumbnail, then the agent's reasoning/answer (left).
+    emptyEl.remove();
     const turn = document.createElement('div');
     turn.className = 'vagent-turn';
     msgsEl.appendChild(turn);
