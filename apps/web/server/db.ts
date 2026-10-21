@@ -90,7 +90,7 @@ const toBar = (row: BarRow): Bar => ({
   high: row.high ?? 0,
   low: row.low ?? 0,
   close: row.close ?? 0,
-  volume: row.volume,
+  volume: row.volume ?? undefined,
 });
 
 export function cacheGet(symbol: string, tf: string, count: number): Bar[] {

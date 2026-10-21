@@ -19,6 +19,7 @@ A local-first trading workstation built on [Vela](https://velacharts.dev) by Lux
 apps/
   desktop/          Electron main process (main.ts → dist/main.js)
   web/              Vite client + Node data/API service (api-server.ts)
+    shared/         Shared API contract types
 packages/
   trading-core/     Backtest engine, simulated broker, quota and LLM agent
   vela/             Vendored Vela charting library (Apache-2.0)
@@ -64,6 +65,7 @@ All configuration is read from environment variables; see [`.env.example`](./.en
 | Variable | Purpose |
 | --- | --- |
 | `API_PORT` | API/web server port (default `5174`) |
+| `HOST` | API bind address (default `127.0.0.1`; `0.0.0.0` in Docker) |
 | `VELA_NODE` | Node binary used by the Electron shell to spawn the API service |
 | `LONGPORT_APP_KEY` / `LONGPORT_APP_SECRET` / `LONGPORT_ACCESS_TOKEN` | Longbridge OpenAPI credentials |
 | `LONGPORT_HTTP_URL` / `LONGPORT_QUOTE_WS_URL` / `LONGPORT_TRADE_WS_URL` | Longbridge endpoints (international gateway by default) |

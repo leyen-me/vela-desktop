@@ -68,9 +68,11 @@
 - **端口约定**：API 与生产静态托管默认 `5174`（`API_PORT`）；Vite 开发服务器 `5173`，`/api` 代理至 `5174`。
 - **配置加载**：`apps/desktop/main.ts` 与 `apps/web/api-server.ts` 启动时用 `process.loadEnvFile()` 读取根目录 `.env`（缺失时忽略）；模板见 `.env.example`。`data/agent.json` 为 git-ignored 的本地密钥兜底。
 - **健康检查**：`GET /api/health` 返回 `{ status, uptime }`，供 Docker `HEALTHCHECK` 与冒烟测试使用。
+- **监听与 CORS**：API 默认只绑定 `127.0.0.1`（`HOST` 可覆盖），Docker 中设为 `0.0.0.0`；不发送通配 CORS 头，浏览器请求统一走同源或 Vite 代理。
 - **容器化**：`Dockerfile` 单阶段构建 core/vela/web/desktop，并以 `node --experimental-strip-types apps/web/api-server.ts` 运行；`docker-compose.yml` 暴露 `5174` 并持久化 `data/cache`。
 - **测试入口**：`pnpm test` 聚合 `trading-core`、`vela` 与 `apps/web` 的冒烟测试（`apps/web/test`）。
 - **API 契约**：JSON 响应统一为 `{ code, message, data, timestamp }`（0 表示成功）；路由统一 `/api/v1` 前缀，旧 `/api` 保留为别名；文档见 `/api/docs` 与 `/api/v1/openapi.json`。
-- **服务端分层**：`apps/web/server/` 已拆出 config/errors/logger/http/validate/db/openapi；`api-server.ts` 仅保留路由编排与第三方/业务服务调用。SQL 仅允许出现在 `server/db.ts`。
-- **类型覆盖**：`apps/web/src`、`apps/web/server` 与 `apps/desktop` 均为 TypeScript（`strict: true`）；全局错误由 `error-boundary.ts` 兜底，网络请求统一走 `api.ts`。
-- **已知技术债（待后续迭代）**：`api-server.ts` 的路由编排仍较集中，可继续按领域拆分 service；AI 分析/回测采用 SSE 长连接（Node 异步 I/O，不阻塞事件循环），尚未接入独立任务队列。
+- **服务端分层**：`apps/web/server/` 已拆出 config/errors/logger/http/validate/db/indicators/longbridge/agent/openapi；`api-server.ts` 仅保留路由编排与请求/响应处理。SQL 仅允许出现在 `server/db.ts`。
+- **类型覆盖**：`apps/web/src`、`apps/web/server` 与 `apps/desktop` 均为 TypeScript（`strict: true`）；前后端共享契约位于 `apps/web/shared/contracts.ts`（单一事实来源），全局错误由 `error-boundary.ts` 兜底，网络请求统一走 `api.ts`。
+- **前端模块化**：`main.ts` 仅负责装配，拆分为 `provider/storage/sliding/topbar/agent-panel/backtest-panel/indicator-editor` 等单一职责模块；动态文本进入 `innerHTML` 前必须经 `html.ts` 的 `escapeHtml`。
+- **已知技术债（待后续迭代）**：`api-server.ts` 的路由编排仍较集中，可继续按领域拆分 route 模块；写接口目前依赖文件/DB 的 upsert 语义，尚未接入 `Idempotency-Key`；AI 分析与回测采用 SSE 长连接（Node 异步 I/O，不阻塞事件循环），尚未接入独立任务队列。

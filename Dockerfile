@@ -4,7 +4,8 @@ ENV PNPM_HOME=/pnpm \
     PATH=/pnpm:$PATH \
     ELECTRON_SKIP_BINARY_DOWNLOAD=1 \
     NODE_ENV=production \
-    API_PORT=5174
+    API_PORT=5174 \
+    HOST=0.0.0.0
 
 RUN corepack enable
 
@@ -13,7 +14,11 @@ WORKDIR /app
 COPY . .
 
 RUN pnpm install --frozen-lockfile \
-    && pnpm run build
+    && pnpm run build \
+    && mkdir -p /app/data/cache \
+    && chown -R node:node /app
+
+USER node
 
 EXPOSE 5174
 

@@ -1,11 +1,11 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { JSON_TYPE, API_PREFIX, MAX_BODY_CHARS } from './config.ts';
 import { AppError, ERROR_CODES } from './errors.ts';
+import type { ApiEnvelope, Paginated } from '../shared/contracts.ts';
 
-type Envelope = { code: number; message: string; data: unknown; timestamp: number };
 type JsonBody = Record<string, any>;
 
-const isEnvelope = (value: unknown): value is Envelope =>
+const isEnvelope = (value: unknown): value is ApiEnvelope =>
   value !== null &&
   typeof value === 'object' &&
   !Array.isArray(value) &&
@@ -25,7 +25,7 @@ export function send(
     return;
   }
   if (!type.includes('application/json')) {
-    res.writeHead(status, { 'content-type': type, 'access-control-allow-origin': '*' });
+    res.writeHead(status, { 'content-type': type });
     res.end(body as string | Buffer);
     return;
   }
@@ -51,12 +51,12 @@ export function send(
     };
   }
 
-  res.writeHead(status, { 'content-type': type, 'access-control-allow-origin': '*' });
+  res.writeHead(status, { 'content-type': type });
   res.end(JSON.stringify(payload));
 }
 
 export function sendText(res: ServerResponse, status: number, body: string): void {
-  res.writeHead(status, { 'content-type': 'text/plain; charset=utf-8', 'access-control-allow-origin': '*' });
+  res.writeHead(status, { 'content-type': 'text/plain; charset=utf-8' });
   res.end(body);
 }
 
@@ -95,12 +95,7 @@ export function readJsonBody<T = JsonBody>(req: IncomingMessage, maxChars = MAX_
   });
 }
 
-export function paginate<T>(items: T[], { page, pageSize }: { page: number; pageSize: number }): {
-  items: T[];
-  page: number;
-  pageSize: number;
-  total: number;
-} {
+export function paginate<T>(items: T[], { page, pageSize }: { page: number; pageSize: number }): Paginated<T> {
   const total = items.length;
   const offset = (page - 1) * pageSize;
   return { items: items.slice(offset, offset + pageSize), page, pageSize, total };

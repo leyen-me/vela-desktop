@@ -1,6 +1,7 @@
 import path from 'node:path';
 import { DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE } from './config.ts';
 import { badRequest } from './errors.ts';
+import type { PaginationQuery } from '../shared/contracts.ts';
 
 type IntegerOptions = { min?: number; max?: number; fallback?: number };
 type PaginationOptions = { defaultPageSize?: number; maxPageSize?: number };
@@ -46,7 +47,7 @@ export function usSymbol(value: unknown, field = 'symbol'): string {
 export function parsePagination(
   searchParams: URLSearchParams,
   { defaultPageSize = DEFAULT_PAGE_SIZE, maxPageSize = MAX_PAGE_SIZE }: PaginationOptions = {},
-): { page: number; pageSize: number } {
+): PaginationQuery {
   const page = parseInteger(searchParams.get('page'), 'page', { min: 1, fallback: 1 });
   const pageSize = parseInteger(searchParams.get('pageSize'), 'pageSize', {
     min: 1,

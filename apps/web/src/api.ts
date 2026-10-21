@@ -1,7 +1,8 @@
 export const API_BASE = '/api/v1';
+import type { ApiEnvelope } from '../shared/contracts.ts';
+
 const DEFAULT_TIMEOUT_MS = 30_000;
 
-type Envelope<T> = { code: number; message: string; data: T; timestamp: number };
 export type RequestOptions = Omit<RequestInit, 'body'> & { timeout?: number; body?: BodyInit | null };
 
 export class ApiError extends Error {
@@ -33,9 +34,9 @@ export async function apiRequest<T = any>(path: string, { timeout = DEFAULT_TIME
       return res as unknown as T;
     }
 
-    let envelope: Envelope<T>;
+    let envelope: ApiEnvelope<T>;
     try {
-      envelope = (await res.json()) as Envelope<T>;
+      envelope = (await res.json()) as ApiEnvelope<T>;
     } catch {
       throw new ApiError('响应格式错误', { status: res.status });
     }

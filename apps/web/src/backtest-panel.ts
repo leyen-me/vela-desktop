@@ -1,6 +1,7 @@
 import { registerSidePanel } from '@luxalgo/vela/widget';
 import { registerIcon, svg16 } from '@luxalgo/vela/ui';
 import { API_BASE, api } from './api.ts';
+import { escapeHtml } from './html.ts';
 
 type RunEvent = {
     type: string;
@@ -464,10 +465,10 @@ export function registerBacktestPanel(): void {
                 try {
                     const data = await api.get(`/backtest/session?${query()}`);
                     const plan = data.plan;
-                    appendLog(`<b>${data.date}</b> ${data.timeframe} · ${etClock(plan.open)}–${etClock(plan.close)} ET`);
+                    appendLog(`<b>${escapeHtml(data.date)}</b> ${escapeHtml(data.timeframe)} · ${etClock(plan.open)}–${etClock(plan.close)} ET`);
                     appendLog(`强平 ${etClock(plan.flattenAt)} ET · 决策 ${plan.decisionTimes.length} 次 · 当日 bar ${data.sessionBars} 根 · 预热 ${data.warmupBars} 根${data.isEarlyClose ? ' · 半日市' : ''}`);
                 } catch (error) {
-                    appendLog(`<span class="vbt-down">${error instanceof Error ? error.message : String(error)}</span>`);
+                    appendLog(`<span class="vbt-down">${escapeHtml(error instanceof Error ? error.message : String(error))}</span>`);
                 } finally {
                     setBusy(false);
                 }
@@ -573,7 +574,7 @@ export function registerBacktestPanel(): void {
                 if (event.type === 'error') {
                     stopReplay();
                     clearTradeMarkers();
-                    appendLog(`<span class="vbt-down">${event.message ?? '回测失败'}</span>`);
+                    appendLog(`<span class="vbt-down">${escapeHtml(event.message ?? '回测失败')}</span>`);
                 }
             };
 
@@ -654,7 +655,7 @@ export function registerBacktestPanel(): void {
                     if (!done) appendLog('事件流已结束，但没有收到回测报告。');
                 } catch (error) {
                     if ((error as Error).name !== 'AbortError') {
-                        appendLog(`<span class="vbt-down">${error instanceof Error ? error.message : String(error)}</span>`);
+                        appendLog(`<span class="vbt-down">${escapeHtml(error instanceof Error ? error.message : String(error))}</span>`);
                     }
                 } finally {
                     if (!done) stopReplay();
@@ -675,7 +676,7 @@ export function registerBacktestPanel(): void {
                     pauseButton.textContent = paused ? '继续' : '暂停';
                     appendLog(paused ? '暂停请求已发送；当前决策完成后停止推进。' : '已继续。');
                 } catch (error) {
-                    appendLog(`<span class="vbt-down">${error instanceof Error ? error.message : String(error)}</span>`);
+                    appendLog(`<span class="vbt-down">${escapeHtml(error instanceof Error ? error.message : String(error))}</span>`);
                 } finally {
                     pauseButton.disabled = false;
                 }
@@ -694,7 +695,7 @@ export function registerBacktestPanel(): void {
                 try {
                     await api.post('/backtest/control', { runId: currentRunId, action: 'stop' });
                 } catch (error) {
-                    appendLog(`<span class="vbt-down">${error instanceof Error ? error.message : String(error)}</span>`);
+                    appendLog(`<span class="vbt-down">${escapeHtml(error instanceof Error ? error.message : String(error))}</span>`);
                 }
             });
             copyButton.addEventListener('click', async () => {

@@ -19,6 +19,7 @@
 apps/
   desktop/          Electron 主进程（main.ts → dist/main.js）
   web/              Vite 客户端 + Node 数据/API 服务（api-server.ts）
+    shared/         前后端共享 API 契约类型
 packages/
   trading-core/     回测引擎、模拟券商、配额与 LLM Agent
   vela/             内置 Vela 图表库（Apache-2.0）
@@ -64,6 +65,7 @@ pnpm run build:web
 | 变量 | 用途 |
 | --- | --- |
 | `API_PORT` | API/Web 服务端口（默认 `5174`） |
+| `HOST` | API 监听地址（默认 `127.0.0.1`，Docker 内为 `0.0.0.0`） |
 | `VELA_NODE` | Electron 启动 API 服务时使用的 Node 路径 |
 | `LONGPORT_APP_KEY` / `LONGPORT_APP_SECRET` / `LONGPORT_ACCESS_TOKEN` | 长桥 OpenAPI 凭据 |
 | `LONGPORT_HTTP_URL` / `LONGPORT_QUOTE_WS_URL` / `LONGPORT_TRADE_WS_URL` | 长桥接口地址（默认国际网关） |
