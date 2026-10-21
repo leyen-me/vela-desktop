@@ -467,7 +467,17 @@ const server = http.createServer(async (req, res) => {
         const inner = runControl.agent;
         const wrapped = {
           async decide(input: DecisionInput) {
-            emit({ type: 'decision', asOf: input.asOf, entryQuota: input.entryQuota, position: input.position });
+            emit({
+              type: 'decision',
+              asOf: input.asOf,
+              entryQuota: input.entryQuota,
+              position: input.position,
+              account: input.account,
+              orders: input.orders,
+              lastPrice: input.lastPrice,
+              limits: input.limits,
+              bars: input.bars.length,
+            });
             return inner.decide(input);
           },
         };

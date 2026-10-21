@@ -11,7 +11,11 @@ type RunEvent = {
     event?: Record<string, unknown>;
     asOf?: number;
     entryQuota?: { limit: number; used: number; reserved: number; available: number };
-    position?: { qty: number } | null;
+    position?: { qty: number; avgPrice?: number; unrealizedPnl?: number } | null;
+    account?: { equity: number; cash: number; buyingPower: number; realizedPnl?: number; unrealizedPnl?: number };
+    orders?: Array<Record<string, unknown>>;
+    lastPrice?: number;
+    limits?: Record<string, number>;
     runId?: string;
     action?: 'pause' | 'resume' | 'stop' | 'cancel';
     report?: {
@@ -99,6 +103,13 @@ function addStyle(): () => void {
 .vbt-msg.agent { align-self:flex-start; background:rgba(255,255,255,.045); border:1px solid rgba(255,255,255,.06);
   border-top-left-radius:4px; color:var(--vela-fg,#d1d4dc); }
 .vbt-msg-head { color:var(--vela-fg-muted,#8a8f9c); font-size:10px; margin-bottom:3px; }
+.vbt-input { margin-top:6px; border-top:1px solid rgba(255,255,255,.08); padding-top:4px; }
+.vbt-input summary { cursor:pointer; color:var(--vela-fg-muted,#8a8f9c); font-size:10px; list-style:none; }
+.vbt-input summary::-webkit-details-marker { display:none; }
+.vbt-input summary::before { content:'▸ '; }
+.vbt-input[open] summary::before { content:'▾ '; }
+.vbt-input pre { margin:4px 0 0; max-height:180px; overflow:auto; white-space:pre-wrap; word-break:break-word;
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:10px; line-height:1.45; color:var(--vela-fg-muted,#8a8f9c); }
 .vbt-content { white-space:pre-wrap; color:var(--vela-fg,#d1d4dc); font-size:12px; line-height:1.55; min-height:1px; }
 .vbt-content:empty::before { content:'正在分析…'; color:var(--vela-fg-muted,#8a8f9c); }
 .vbt-details { margin-top:6px; border:1px solid var(--vela-border,#2a2e39); border-radius:6px; padding:2px 6px; background:rgba(0,0,0,.12); }
@@ -268,12 +279,18 @@ export function registerBacktestPanel(): void {
             };
             let currentTurn: AgentTurn | null = null;
 
-            const beginTurn = (asOf?: number, quota?: { available?: number }, position?: { qty?: number } | null) => {
+            const beginTurn = (event: RunEvent) => {
+                const asOf = event.asOf;
+                const quota = event.entryQuota;
+                const position = event.position;
+                const account = event.account;
+                const orders = event.orders ?? [];
                 const turn = document.createElement('div');
                 turn.className = 'vbt-turn';
                 turn.innerHTML = `<div class="vbt-msg user">
-                    <div class="vbt-msg-head">K 线收盘</div>
+                    <div class="vbt-msg-head">K 线收盘${asOf ? ` · ${etClock(asOf)}` : ''}</div>
                     <div class="vbt-msg-body"></div>
+                    <details class="vbt-input"><summary>本轮输入</summary><pre></pre></details>
                   </div>
                   <div class="vbt-msg agent">
                     <div class="vbt-msg-head">AI 决策</div>
@@ -282,7 +299,25 @@ export function registerBacktestPanel(): void {
                     <details class="vbt-details vbt-tools" hidden><summary>工具调用 (0)</summary><div class="vbt-detail-body"></div></details>
                   </div>`;
                 const userBody = turn.querySelector('.vbt-msg.user .vbt-msg-body') as HTMLDivElement;
-                userBody.textContent = `${asOf ? etClock(asOf) : ''} 收盘 · 可开仓 ${quota?.available ?? '?'} · 持仓 ${position?.qty ?? 0}`;
+                const lines = [
+                    `价格 ${event.lastPrice ?? '?'} · 可开仓 ${quota?.available ?? '?'}/${quota?.limit ?? '?'} · 持仓 ${position?.qty ?? 0}`,
+                ];
+                if (account) {
+                    lines.push(`权益 $${money(account.equity)} · 现金 $${money(account.cash)} · 购买力 $${money(account.buyingPower)}`);
+                }
+                lines.push(`挂单 ${orders.length}`);
+                userBody.textContent = lines.join('\n');
+                const input = turn.querySelector('.vbt-msg.user .vbt-input pre') as HTMLPreElement;
+                input.textContent = JSON.stringify({
+                    asOf: asOf ? new Date(asOf).toISOString() : null,
+                    lastPrice: event.lastPrice,
+                    account,
+                    position,
+                    workingOrders: orders,
+                    entryQuota: quota,
+                    limits: event.limits,
+                    closedBars: event.bars,
+                }, null, 2);
                 const root = turn.querySelector('.vbt-msg.agent') as HTMLDivElement;
                 log.appendChild(turn);
                 currentTurn = {
@@ -579,7 +614,7 @@ export function registerBacktestPanel(): void {
                 }
                 if (event.type === 'decision') {
                     revealDecisionBar();
-                    beginTurn(event.asOf, event.entryQuota, event.position);
+                    beginTurn(event);
                     return;
                 }
                 if (event.type === 'agent' && event.event) {
