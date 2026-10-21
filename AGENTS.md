@@ -79,3 +79,14 @@
 - **dsh 隔离**：`apps/web/server/dsh/patch.ts` 生成 cordis patch，禁用 shell/文件/子 Agent/技能等宿主工具，只保留 MCP 工具；运行时 home、会话与生成 patch 均落在 git-ignored 的 `data/dsh/`。
 - **MCP 交易工具**：`apps/web/server/mcp/trading-mcp.ts` 提供行情工具；`apps/web/server/mcp/backtest-mcp.ts` 是每轮回测的 stdio 桥，经 `/api/v1/internal/backtest/:runId/tool` 回写到进程内 `BacktestToolHost`（loopback + 一次性 token）。
 - **已知技术债（待后续迭代）**：`api-server.ts` 的路由编排仍较集中，可继续按领域拆分 route 模块；写接口目前依赖文件/DB 的 upsert 语义，尚未接入 `Idempotency-Key`；AI 与回测采用 SSE 长连接（Node 异步 I/O，不阻塞事件循环），尚未接入独立任务队列；dsh SDK 只推送 durable step 事件，因此 UI 的 reasoning/content 按 step 而非 token 流式呈现。
+
+---
+
+## 五、本地开发重启约定 (Local Dev Restart)
+
+- **改完代码必须主动重启**：不要只交付源码，确保用户窗口加载的是最新产物。
+- **前端改动**：先 `pnpm run build:web`（Electron/API 托管的是 `apps/web/dist`）。
+- **桌面主进程改动**：`pnpm run build:desktop`。
+- **统一重启**：结束旧的 Electron 与 API 进程后，在后台重新执行 `pnpm run dev`（会重新构建 desktop、拉起 Electron，并由 Electron spawn 新版 API）。
+- **仅后端改动**：至少重启 API 进程；`pnpm run dev` 也可。
+- **重启后自检**：`curl http://127.0.0.1:5174/api/health` 返回 `code: 0`，并确认 Electron 进程已起来。
