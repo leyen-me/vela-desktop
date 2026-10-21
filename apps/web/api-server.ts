@@ -21,7 +21,7 @@ import { paginate, readJsonBody, send, stripApiPrefix } from './server/http.ts';
 import { oneOf, parsePagination, parseInteger, requireString, resolveWithin, usSymbol } from './server/validate.ts';
 import { buildAgentPrompt } from './server/agent.ts';
 import { agentStatus, shutdownDsh, streamAnalysis } from './server/dsh/agent.ts';
-import { DshBacktestAgent } from './server/dsh/backtest-agent.ts';
+import { DshBacktestAgent, backtestSystemPrompt } from './server/dsh/backtest-agent.ts';
 import { DSH_MODEL, DSH_REASONING_EFFORT } from './server/dsh/config.ts';
 import {
   TF,
@@ -314,6 +314,7 @@ const server = http.createServer(async (req, res) => {
           date,
           timeframe,
           plan,
+          systemPrompt: backtestSystemPrompt(symbol, plan),
           isEarlyClose: plan.isEarlyClose,
           sessionBars: sessionBars.length,
           warmupBars: coreBars.length - sessionBars.length,
@@ -463,7 +464,7 @@ const server = http.createServer(async (req, res) => {
         }));
         const earlyClose = inferSessionCloseFromBars(coreBars, base);
         const session = earlyClose ? buildTradingDayPlan({ date, timeframe, close: earlyClose }) : base;
-        emit({ type: 'session', phase: 'ready', plan: session, bars: coreBars.length });
+        emit({ type: 'session', phase: 'ready', plan: session, bars: coreBars.length, systemPrompt: backtestSystemPrompt(symbol, session) });
         const inner = runControl.agent;
         const wrapped = {
           async decide(input: DecisionInput) {

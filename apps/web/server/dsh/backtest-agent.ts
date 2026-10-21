@@ -72,12 +72,20 @@ function formatBar(bar: DecisionInput['bars'][number], timezone: string): string
   return `${clock(bar.closeTime, timezone)} O${bar.open} H${bar.high} L${bar.low} C${bar.close} V${bar.volume}`;
 }
 
-function sessionBrief(input: DecisionInput): string {
-  const plan = input.session;
+function planBrief(plan: DecisionInput['session'], symbol: string): string {
   return [
-    `标的与周期：${plan.date} ${plan.timeframe} ${input.bars[0]?.symbol ?? ''}`,
+    `标的与周期：${plan.date} ${plan.timeframe} ${symbol}`,
     `交易时段：${clock(plan.open, plan.timezone)}-${clock(plan.close, plan.timezone)}；${clock(plan.flattenAt, plan.timezone)} 起停止开仓并强制平仓。`,
   ].join('\n');
+}
+
+function sessionBrief(input: DecisionInput): string {
+  return planBrief(input.session, input.bars[0]?.symbol ?? '');
+}
+
+/** Full system prompt shown to the operator and used by the run's dsh persona. */
+export function backtestSystemPrompt(symbol: string, plan: DecisionInput['session']): string {
+  return `${BACKTEST_PERSONA}\n\n${planBrief(plan, symbol)}`;
 }
 
 function contextMessage(input: DecisionInput, first: boolean, lastAsOf: number | null): string {

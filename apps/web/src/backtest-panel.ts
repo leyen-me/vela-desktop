@@ -16,6 +16,7 @@ type RunEvent = {
     orders?: Array<Record<string, unknown>>;
     lastPrice?: number;
     limits?: Record<string, number>;
+    systemPrompt?: string;
     runId?: string;
     action?: 'pause' | 'resume' | 'stop' | 'cancel';
     report?: {
@@ -91,6 +92,14 @@ function addStyle(): () => void {
 .vbt-context { margin:0 12px 8px; padding:8px 10px; border:1px solid var(--vela-border,#2a2e39); border-radius:8px;
   background:rgba(255,255,255,.025); color:var(--vela-fg-muted,#8a8f9c); font-size:11px; line-height:1.55; }
 .vbt-context b { color:var(--vela-fg,#d1d4dc); font-weight:600; }
+.vbt-sys { margin-top:6px; border-top:1px solid rgba(255,255,255,.06); padding-top:5px; }
+.vbt-sys[hidden] { display:none; }
+.vbt-sys summary { cursor:pointer; color:var(--vela-fg-muted,#8a8f9c); font-size:10px; list-style:none; }
+.vbt-sys summary::-webkit-details-marker { display:none; }
+.vbt-sys summary::before { content:'▸ '; }
+.vbt-sys[open] summary::before { content:'▾ '; }
+.vbt-sys pre { margin:5px 0 0; max-height:220px; overflow:auto; white-space:pre-wrap; word-break:break-word;
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:10px; line-height:1.5; color:var(--vela-fg-muted,#8a8f9c); }
 .vbt-log { border:1px solid var(--vela-border,#2a2e39); border-radius:8px; padding:10px; max-height:420px; overflow:auto;
   display:flex; flex-direction:column; gap:12px; font-size:11px; line-height:1.55; color:var(--vela-fg-muted,#8a8f9c);
   user-select:text; cursor:text; }
@@ -186,7 +195,10 @@ export function registerBacktestPanel(): void {
                 </div>
               </div>
               <div class="vbt-body">
-                <div class="vbt-context" data-k="context">选择交易日并开始回测。</div>
+                <div class="vbt-context">
+                  <div data-k="context">选择交易日并开始回测。</div>
+                  <details class="vbt-sys" data-k="syswrap" hidden><summary>系统提示词</summary><pre data-k="sys"></pre></details>
+                </div>
                 <div data-k="summary"></div>
                 <div data-k="equity"></div>
                 <div class="vbt-loghead"><span>运行日志</span><button data-k="copy" type="button">复制日志</button></div>
@@ -207,6 +219,8 @@ export function registerBacktestPanel(): void {
             const cancelButton = get<HTMLButtonElement>('cancel');
             const copyButton = get<HTMLButtonElement>('copy');
             const contextEl = get<HTMLDivElement>('context');
+            const sysWrap = get<HTMLDetailsElement>('syswrap');
+            const sysEl = get<HTMLPreElement>('sys');
             const summary = get<HTMLDivElement>('summary');
             const equity = get<HTMLDivElement>('equity');
             const log = get<HTMLDivElement>('log');
@@ -407,12 +421,18 @@ export function registerBacktestPanel(): void {
             const setContext = (html: string) => {
                 contextEl.innerHTML = html;
             };
+            const setSystemPrompt = (text?: string) => {
+                const value = (text ?? '').trim();
+                sysEl.textContent = value;
+                sysWrap.hidden = value.length === 0;
+            };
             const clear = () => {
                 summary.innerHTML = '';
                 equity.innerHTML = '';
                 trades.innerHTML = '';
                 log.innerHTML = '';
                 setContext('选择交易日并开始回测。');
+                setSystemPrompt('');
                 currentTurn = null;
             };
             const setBusy = (next: boolean) => {
@@ -533,6 +553,7 @@ export function registerBacktestPanel(): void {
                     const data = await api.get(`/backtest/session?${query()}`);
                     const plan = data.plan;
                     setContext(`<b>${escapeHtml(currentSymbol)}</b> · ${escapeHtml(data.date)} · ${escapeHtml(data.timeframe)} · ${etClock(plan.open)}–${etClock(plan.close)} ET · 决策 ${plan.decisionTimes.length} 次 · bar ${data.sessionBars} 根${data.isEarlyClose ? ' · 半日市' : ''}`);
+                    setSystemPrompt(data.systemPrompt);
                     appendLog(`<b>${escapeHtml(data.date)}</b> ${escapeHtml(data.timeframe)} · ${etClock(plan.open)}–${etClock(plan.close)} ET`);
                     appendLog(`强平 ${etClock(plan.flattenAt)} ET · 决策 ${plan.decisionTimes.length} 次 · 当日 bar ${data.sessionBars} 根 · 预热 ${data.warmupBars} 根${data.isEarlyClose ? ' · 半日市' : ''}`);
                 } catch (error) {
@@ -608,6 +629,7 @@ export function registerBacktestPanel(): void {
                     } else if (event.phase === 'ready' && event.plan) {
                         const plan = event.plan;
                         setContext(`<b>${escapeHtml(currentSymbol)}</b> · ${escapeHtml(date.value)} · ${escapeHtml(currentTimeframe)} · ${etClock(plan.open)}–${etClock(plan.close)} ET · 决策 ${plan.decisionTimes.length} 次 · bar ${event.bars ?? 0} 根${plan.isEarlyClose ? ' · 半日市' : ''}`);
+                        setSystemPrompt(event.systemPrompt);
                         appendLog(`时段就绪 · 决策 ${plan.decisionTimes.length} 次 · bar ${event.bars ?? 0} 根${plan.isEarlyClose ? ' · 半日市' : ''}`);
                     }
                     return;
