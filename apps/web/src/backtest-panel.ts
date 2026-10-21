@@ -1,5 +1,6 @@
 import { registerSidePanel } from '@luxalgo/vela/widget';
 import { registerIcon, svg16 } from '@luxalgo/vela/ui';
+import { API_BASE, api } from './api.ts';
 
 type RunEvent = {
     type: string;
@@ -461,9 +462,7 @@ export function registerBacktestPanel(): void {
                 clear();
                 setBusy(true);
                 try {
-                    const res = await fetch(`/api/backtest/session?${query()}`);
-                    const data = await res.json();
-                    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+                    const data = await api.get(`/backtest/session?${query()}`);
                     const plan = data.plan;
                     appendLog(`<b>${data.date}</b> ${data.timeframe} · ${etClock(plan.open)}–${etClock(plan.close)} ET`);
                     appendLog(`强平 ${etClock(plan.flattenAt)} ET · 决策 ${plan.decisionTimes.length} 次 · 当日 bar ${data.sessionBars} 根 · 预热 ${data.warmupBars} 根${data.isEarlyClose ? ' · 半日市' : ''}`);
@@ -585,9 +584,7 @@ export function registerBacktestPanel(): void {
                 abort = new AbortController();
                 let done = false;
                 try {
-                    const sessionRes = await fetch(`/api/backtest/session?${query()}`, { signal: abort.signal });
-                    const sessionData = await sessionRes.json();
-                    if (!sessionRes.ok) throw new Error(sessionData.error || `HTTP ${sessionRes.status}`);
+                    const sessionData = await api.get(`/backtest/session?${query()}`, { signal: abort.signal });
                     const plan = sessionData.plan;
                     const chart = getChart();
                     if (!chart) throw new Error('没有可回放的图表');
@@ -599,7 +596,7 @@ export function registerBacktestPanel(): void {
                     replayPlan = { open: plan.open, close: plan.close };
                     appendLog(`图表已回放到 ${etClock(plan.open)} 之前，等待首根 K 线收盘。`);
 
-                    const res = await fetch('/api/backtest/run', {
+                    const res = await fetch(`${API_BASE}/backtest/run`, {
                         method: 'POST',
                         headers: { 'content-type': 'application/json' },
                         body: JSON.stringify({
@@ -618,7 +615,8 @@ export function registerBacktestPanel(): void {
                         let message = `HTTP ${res.status}`;
                         try {
                             const data = await res.json();
-                            if (data?.error) message = data.error;
+                            if (data?.message) message = data.message;
+                            else if (data?.error) message = data.error;
                         } catch {
                             /* not JSON */
                         }
@@ -672,13 +670,7 @@ export function registerBacktestPanel(): void {
                 const action = paused ? 'resume' : 'pause';
                 pauseButton.disabled = true;
                 try {
-                    const res = await fetch('/api/backtest/control', {
-                        method: 'POST',
-                        headers: { 'content-type': 'application/json' },
-                        body: JSON.stringify({ runId: currentRunId, action }),
-                    });
-                    const data = await res.json();
-                    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+                    const data = await api.post('/backtest/control', { runId: currentRunId, action });
                     paused = Boolean(data.paused);
                     pauseButton.textContent = paused ? '继续' : '暂停';
                     appendLog(paused ? '暂停请求已发送；当前决策完成后停止推进。' : '已继续。');
@@ -700,15 +692,7 @@ export function registerBacktestPanel(): void {
                 pauseButton.disabled = true;
                 stopButton.textContent = '停止中…';
                 try {
-                    const res = await fetch('/api/backtest/control', {
-                        method: 'POST',
-                        headers: { 'content-type': 'application/json' },
-                        body: JSON.stringify({ runId: currentRunId, action: 'stop' }),
-                    });
-                    if (!res.ok) {
-                        const data = await res.json().catch(() => ({}));
-                        throw new Error(data.error || `HTTP ${res.status}`);
-                    }
+                    await api.post('/backtest/control', { runId: currentRunId, action: 'stop' });
                 } catch (error) {
                     appendLog(`<span class="vbt-down">${error instanceof Error ? error.message : String(error)}</span>`);
                 }

@@ -8,7 +8,7 @@
 // The editor is CodeMirror 6 with a small Pine StreamLanguage — line numbers, bracket
 // matching / auto-close, auto-indent, active-line, multi-cursor, undo/redo, Ctrl+F
 // search, and the One Dark theme. Persistence is local: user scripts in
-// /api/custom-indicators, bundled vault scripts edited in place via /api/indicators/source.
+// /api/v1/custom-indicators, bundled vault scripts edited in place via /api/v1/indicators/source.
 import { basicSetup, EditorView } from 'codemirror';
 import { keymap } from '@codemirror/view';
 import { indentWithTab } from '@codemirror/commands';
@@ -17,8 +17,10 @@ import { oneDark } from '@codemirror/theme-one-dark';
 import { tags as t } from '@lezer/highlight';
 import { registerLegendAction } from '@luxalgo/vela/workspace';
 
-const CUSTOM_API = '/api/custom-indicators';
-const BUNDLED_API = '/api/indicators/source';
+import { api } from './api.ts';
+
+const CUSTOM_API = '/custom-indicators';
+const BUNDLED_API = '/indicators/source';
 
 const KEYWORDS = new Set([
   'indicator', 'strategy', 'library', 'import', 'export', 'if', 'else', 'for', 'while', 'switch',
@@ -99,7 +101,16 @@ const CSS = `
 .ci-err { color: #f23645; font-size: 13px; min-height: 16px; }
 `;
 
-export function installIndicatorEditor(ws) {
+type CustomIndicator = { id: string; name: string; script: string };
+type EditorEntry = {
+  customId?: string;
+  name?: string;
+  script?: string;
+  handleId?: string;
+  originalSource?: string;
+};
+
+export function installIndicatorEditor(ws: any) {
   let styleDone = false;
   const ensureStyle = () => {
     if (styleDone) return;
@@ -109,27 +120,27 @@ export function installIndicatorEditor(ws) {
     document.head.appendChild(s);
   };
 
-  const getCustom = async () => {
-    const r = await fetch(CUSTOM_API);
-    return r.ok ? r.json() : [];
+  const getCustom = async (): Promise<CustomIndicator[]> => {
+    const data = await api.get(`${CUSTOM_API}?pageSize=5000`);
+    return data?.items ?? [];
   };
-  const bundledNames = async () => {
-    const r = await fetch('/api/indicators');
-    return r.ok ? new Set((await r.json()).map((it) => it.name)) : new Set();
+  const bundledNames = async (): Promise<Set<string>> => {
+    const data = await api.get('/indicators?pageSize=5000');
+    return new Set<string>((data?.items ?? []).map((it: any) => it.name));
   };
-  const declaredTitle = (s) => {
+  const declaredTitle = (s?: string) => {
     const m = /(?:indicator|strategy|library)\s*\(\s*(['"])(.*?)\1/.exec(s || '');
     return m ? m[2] : undefined;
   };
-  const applyToChart = async (handleId, source) => {
+  const applyToChart = async (handleId?: string, source?: string) => {
     if (!handleId || !source) return;
     const chart = ws.cells()[0]?.chart;
-    const handle = chart?.indicators().find((h) => h.id === handleId);
+    const handle = chart?.indicators().find((h: any) => h.id === handleId);
     if (handle?.updateCode) await handle.updateCode(source).catch(() => {});
   };
 
   // entry: { customId?, name?, script?, handleId?, originalSource? }
-  function open(entry = {}) {
+  function open(entry: EditorEntry = {}) {
     ensureStyle();
     const editing = !!(entry.customId || entry.handleId || entry.name);
     const backdrop = document.createElement('div');
@@ -167,7 +178,7 @@ export function installIndicatorEditor(ws) {
     const save = document.createElement('button');
     save.className = 'ci-btn primary';
     save.textContent = '保存';
-    const setBusy = (busy) => {
+    const setBusy = (busy: boolean) => {
       save.disabled = busy;
       save.replaceChildren();
       if (busy) {
@@ -188,20 +199,17 @@ export function installIndicatorEditor(ws) {
       try {
         const title2 = declaredTitle(entry.originalSource);
         if (entry.customId) {
-          const r = await fetch(CUSTOM_API, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: entry.customId, name: n, script: src }) });
-          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          await api.post(CUSTOM_API, { id: entry.customId, name: n, script: src });
         } else if (title2 && (await bundledNames()).has(title2)) {
-          const r = await fetch(BUNDLED_API, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: title2, script: src }) });
-          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          await api.post(BUNDLED_API, { name: title2, script: src });
         } else {
-          const r = await fetch(CUSTOM_API, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: n, script: src }) });
-          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          await api.post(CUSTOM_API, { name: n, script: src });
         }
         await ws.reloadIndicators?.();
         await applyToChart(entry.handleId, src);
         viewDestroy();
-      } catch (e) {
-        err.textContent = `保存失败：${e.message}`;
+      } catch (error) {
+        err.textContent = `保存失败：${error instanceof Error ? error.message : String(error)}`;
         setBusy(false);
       }
     });
@@ -241,17 +249,17 @@ export function installIndicatorEditor(ws) {
 
   // ── library events ──
   document.addEventListener('vela-indicator-new', () => open());
-  document.addEventListener('vela-indicator-edit', async (e) => {
-    const id = e.detail?.id;
+  document.addEventListener('vela-indicator-edit', async (event: Event) => {
+    const id = (event as CustomEvent).detail?.id;
     const list = await getCustom();
     const entry = list.find((r) => r.id === id);
     if (entry) open({ customId: entry.id, name: entry.name, script: entry.script, originalSource: entry.script });
   });
-  document.addEventListener('vela-indicator-delete', async (e) => {
-    const { id, name } = e.detail || {};
+  document.addEventListener('vela-indicator-delete', async (event: Event) => {
+    const { id, name } = (event as CustomEvent).detail || {};
     if (!id) return;
     if (!window.confirm(`删除脚本「${name ?? ''}」？`)) return;
-    await fetch(`${CUSTOM_API}?id=${encodeURIComponent(id)}`, { method: 'DELETE' });
+    await api.del(`${CUSTOM_API}?id=${encodeURIComponent(id)}`);
     await ws.reloadIndicators?.();
   });
 
@@ -264,7 +272,7 @@ export function installIndicatorEditor(ws) {
     when: (ind) => ind.source !== undefined,
     async run(ctx, ind) {
       const customs = await getCustom();
-      const custom = customs.find((c) => c.script === ind.source);
+      const custom = customs.find((c) => c.script === (ind as any).source);
       open({
         customId: custom?.id,
         name: custom?.name ?? declaredTitle(ind.source) ?? ind.title,

@@ -1,9 +1,18 @@
+import './error-boundary.ts';
 import { VelaWorkspace, setLocale, registerRendererDefaults } from '@luxalgo/vela/workspace';
 import { registerSidePanel } from '@luxalgo/vela/widget';
 import { registerIcon, svg16 } from '@luxalgo/vela/ui';
 import { PineWorkerEngine } from '@luxalgo/vela-pinets';
-import { installIndicatorEditor } from './indicator-editor.js';
+import { installIndicatorEditor } from './indicator-editor.ts';
 import { registerBacktestPanel } from './backtest-panel.ts';
+import { API_BASE, api } from './api.ts';
+
+type Bar = { time: number; open: number; high: number; low: number; close: number; volume?: number };
+type BarRange = { limit?: number; from?: number | null; to?: number | null };
+type SymbolRow = { ticker: string; description?: string; type?: string; section?: string };
+type JsonObject = Record<string, any>;
+type VelaChart = any;
+type VelaCell = any;
 
 registerIcon('agent', svg16('<path d="M6.2 1.6c.6 2.4 1.6 3.4 4 4-2.4.6-3.4 1.6-4 4-.6-2.4-1.6-3.4-4-4 2.4-.6 3.4-1.6 4-4z" fill="currentColor" fill-opacity="0.2"/><path d="M12 9.2c.4 1.6 1.1 2.3 2.7 2.7-1.6.4-2.3 1.1-2.7 2.7-.4-1.6-1.1-2.3-2.7-2.7 1.6-.4 2.3-1.1 2.7-2.7z" fill="currentColor" fill-opacity="0.2"/>'));
 registerBacktestPanel();
@@ -26,7 +35,7 @@ registerSidePanel({
 const revokeObjectURL = URL.revokeObjectURL.bind(URL);
 URL.revokeObjectURL = (url) => setTimeout(() => revokeObjectURL(url), 30_000);
 
-const TF_MAP = {
+const TF_MAP: Record<string, string> = {
   '1': '1m', '5': '5m', '15': '15m', '30': '30m',
   '60': '1h', '120': '2h', '240': '4h',
   D: '1d', W: '1w', M: '1M',
@@ -34,7 +43,7 @@ const TF_MAP = {
   '1h': '1h', '2h': '2h', '4h': '4h',
   '1d': '1d', '1w': '1w', '1M': '1M',
 };
-const TF_MS = {
+const TF_MS: Record<string, number> = {
   '1m': 60_000, '5m': 300_000, '15m': 900_000, '30m': 1_800_000,
   '1h': 3_600_000, '2h': 7_200_000, '4h': 14_400_000,
   '1d': 86_400_000, '1w': 604_800_000, '1M': 2_592_000_000,
@@ -48,12 +57,12 @@ const MAX_BARS = 20_000;
 
 // Provider-side bookkeeping for the lazy history: the oldest bar delivered for each
 // market, and whether the source ran out of older data.
-const oldestByMarket = new Map();
-const newestByMarket = new Map();
-const exhaustedMarkets = new Set();
+const oldestByMarket = new Map<string, number>();
+const newestByMarket = new Map<string, number>();
+const exhaustedMarkets = new Set<string>();
 
 class LongbridgeProvider {
-  async getBars(ticker, timeframe, range) {
+  async getBars(ticker: string, timeframe: string, range?: BarRange): Promise<Bar[]> {
     const tf = TF_MAP[timeframe] || '1d';
     const params = new URLSearchParams({
       symbol: ticker,
@@ -62,22 +71,24 @@ class LongbridgeProvider {
     });
     if (range?.from != null) params.set('from', String(range.from));
     if (range?.to != null) params.set('to', String(range.to));
-    let lastErr;
+    let lastErr: unknown;
     for (let i = 0; i < 3; i++) {
       try {
-        const r = await fetch(`/api/bars?${params}`);
-        if (!r.ok) throw new Error(`longbridge ${r.status}`);
-        const bars = (await r.json()).bars;
+        const data = await api.get(`/bars?${params}`);
+        const bars = data?.bars as Bar[] | undefined;
+        if (!Array.isArray(bars)) throw new Error('invalid bars response');
         const key = `${ticker}|${tf}`;
         const unbounded = range?.from == null && range?.to == null;
         if (bars.length > 0) {
           // A full request redefines the window (symbol/timeframe switch); an older
           // window only ever pushes the left edge further back.
-          if (unbounded || !oldestByMarket.has(key) || bars[0].time < oldestByMarket.get(key)) {
+          const previousOldest = oldestByMarket.get(key);
+          if (unbounded || previousOldest == null || bars[0].time < previousOldest) {
             oldestByMarket.set(key, bars[0].time);
           }
           const newest = bars[bars.length - 1].time;
-          if (unbounded || !newestByMarket.has(key) || newest > newestByMarket.get(key)) {
+          const previousNewest = newestByMarket.get(key);
+          if (unbounded || previousNewest == null || newest > previousNewest) {
             newestByMarket.set(key, newest);
           }
         }
@@ -92,10 +103,10 @@ class LongbridgeProvider {
     throw lastErr;
   }
 
-  subscribe(ticker, timeframe, onBar) {
+  subscribe(ticker: string, timeframe: string, onBar: (bar: Bar) => void): () => void {
     const tf = TF_MAP[timeframe] || '1d';
     const params = new URLSearchParams({ symbol: ticker, tf });
-    const es = new EventSource(`/api/stream?${params}`);
+    const es = new EventSource(`${API_BASE}/stream?${params}`);
     es.onmessage = (event) => {
       try {
         const msg = JSON.parse(event.data);
@@ -122,9 +133,15 @@ class LongbridgeProvider {
   }
 
   async listSymbols() {
-    const r = await fetch('/api/symbols');
-    const rows = await r.json();
-    return rows.map((s) => ({ ticker: s.ticker, description: s.description, type: s.type, section: s.section }));
+    const rows: SymbolRow[] = [];
+    for (let page = 1; ; page += 1) {
+      const data = await api.get(`/symbols?page=${page}&pageSize=5000`);
+      rows.push(...(data?.items ?? []));
+      if (rows.length >= (data?.total ?? 0) || !data?.items?.length) break;
+    }
+    return rows.map((s) => ({
+      ticker: s.ticker, description: s.description, type: s.type, section: s.section,
+    }));
   }
 
   info() {
@@ -140,7 +157,7 @@ class LongbridgeProvider {
 const PERSIST_KEY = 'vela-client-longbridge';
 const TIMEFRAME_FAVORITES = ['1', '5', '15', '60', '240', 'D', 'W', 'M'];
 // Indicators every chart starts with. Volume is a native study; the other is the
-// manifest name served by /api/indicators.json.
+// manifest name served by /api/v1/indicators.json.
 const DEFAULT_STUDIES = { native: 'volume', manifest: 'Smart Money Concepts' };
 // Bump the version to re-apply the defaults to workspaces saved before this change.
 const DEFAULTS_FLAG = 'host.defaultIndicators';
@@ -149,7 +166,7 @@ const DEFAULTS_VERSION = 2;
 // carry the declared one.
 const LEGACY_STUDY_NAMES = ['Smart Money Concepts (SMC)'];
 
-function seedDefaultStudies(doc) {
+function seedDefaultStudies(doc: JsonObject): JsonObject {
   const ext = doc.ext && typeof doc.ext === 'object' && !Array.isArray(doc.ext) ? doc.ext : {};
   if (ext[DEFAULTS_FLAG] === DEFAULTS_VERSION) return doc;
   if (Array.isArray(doc.charts)) {
@@ -158,12 +175,12 @@ function seedDefaultStudies(doc) {
       const current = chart.indicators;
       const natives = Array.isArray(current?.natives) ? [...current.natives] : [];
       const manifest = Array.isArray(current?.manifest)
-        ? current.manifest.filter((e) => !LEGACY_STUDY_NAMES.includes(typeof e === 'string' ? e : e?.name))
+        ? current.manifest.filter((e: any) => !LEGACY_STUDY_NAMES.includes(typeof e === 'string' ? e : e?.name))
         : [];
-      const typeOf = (e) => (typeof e === 'string' ? e : e?.type);
-      const nameOf = (e) => (typeof e === 'string' ? e : e?.name);
-      if (!natives.some((e) => typeOf(e) === DEFAULT_STUDIES.native)) natives.push(DEFAULT_STUDIES.native);
-      if (!manifest.some((e) => nameOf(e) === DEFAULT_STUDIES.manifest)) manifest.push(DEFAULT_STUDIES.manifest);
+      const typeOf = (e: any) => (typeof e === 'string' ? e : e?.type);
+      const nameOf = (e: any) => (typeof e === 'string' ? e : e?.name);
+      if (!natives.some((e: any) => typeOf(e) === DEFAULT_STUDIES.native)) natives.push(DEFAULT_STUDIES.native);
+      if (!manifest.some((e: any) => nameOf(e) === DEFAULT_STUDIES.manifest)) manifest.push(DEFAULT_STUDIES.manifest);
       chart.indicators = { manifest, natives };
     }
   }
@@ -172,10 +189,9 @@ function seedDefaultStudies(doc) {
 }
 
 async function loadIndicators() {
-  const res = await fetch('/api/indicators.json');
-  if (!res.ok) throw new Error(`indicators: HTTP ${res.status}`);
-  const list = await res.json();
-  return list.map((e) => (e.name === DEFAULT_STUDIES.manifest ? { ...e, enabled: true } : e));
+  const list = await api.get('/indicators.json');
+  if (!Array.isArray(list)) throw new Error('invalid indicators manifest');
+  return list.map((e: JsonObject) => (e.name === DEFAULT_STUDIES.manifest ? { ...e, enabled: true } : e));
 }
 // Display timezone for the axis / bottom bar (IANA). The persisted workspace doc
 // carries its own `timezone`, so we force it here too.
@@ -186,7 +202,7 @@ const TIMEZONE = 'America/New_York';
 // we seed/merge it here — otherwise the topbar hides every timeframe behind the
 // dropdown menu.
 const storage = {
-  get(key) {
+  get(key: string): string | null {
     let raw = null;
     try { raw = localStorage.getItem(key); } catch { return null; }
     if (key !== PERSIST_KEY) return raw;
@@ -199,7 +215,7 @@ const storage = {
       return JSON.stringify(fresh);
     }
     try {
-      const doc = JSON.parse(raw);
+      const doc: JsonObject = JSON.parse(raw);
       doc.timezone = TIMEZONE;
       if (!Array.isArray(doc.timeframeFavorites) || doc.timeframeFavorites.length === 0) {
         doc.timeframeFavorites = TIMEFRAME_FAVORITES;
@@ -223,8 +239,8 @@ const storage = {
       return raw;
     }
   },
-  set(key, value) { try { localStorage.setItem(key, value); } catch {} },
-  remove(key) { try { localStorage.removeItem(key); } catch {} },
+  set(key: string, value: string) { try { localStorage.setItem(key, value); } catch {} },
+  remove(key: string) { try { localStorage.removeItem(key); } catch {} },
 };
 
 // Simplified-Chinese chrome. Set BEFORE the workspace is built so the very first
@@ -245,7 +261,7 @@ const ws = new VelaWorkspace('#app', {
   live: true,
   providers: { longbridge: () => new LongbridgeProvider() },
   engines: { pine: () => new PineWorkerEngine() },
-  indicators: loadIndicators,
+  indicators: loadIndicators as any,
   topbar: { right: ['actions', 'panels'] },
   timezone: TIMEZONE,
   persist: PERSIST_KEY,
@@ -273,30 +289,30 @@ slideStyle.textContent = `
 `;
 document.head.appendChild(slideStyle);
 
-function installSliding(cell) {
+function installSliding(cell: VelaCell) {
   if (slidingInstalled.has(cell)) return;
   slidingInstalled.add(cell);
   const chart = cell.chart;
   let extending = false;
   let lastAt = 0;
-  let guard = null;
+  let guard: ReturnType<typeof setTimeout> | null = null;
   // Boot builds the initial frame through several viewport updates; only history the
   // user deliberately pans into may extend the window.
   let userActive = false;
   let dragging = false;
-  let gestureTimer = null;
+  let gestureTimer: ReturnType<typeof setTimeout> | null = null;
 
   const pill = document.createElement('div');
   pill.className = 'vslide-pill';
   pill.hidden = true;
   pill.innerHTML = '<span class="vslide-spin"></span><span class="vslide-text"></span>';
   cell.host.appendChild(pill);
-  const setPill = (text) => {
+  const setPill = (text: string | null) => {
     if (text == null) {
       pill.hidden = true;
       return;
     }
-    pill.querySelector('.vslide-text').textContent = text;
+    pill.querySelector('.vslide-text')!.textContent = text;
     pill.hidden = false;
   };
   let shownAt = 0;
@@ -317,7 +333,7 @@ function installSliding(cell) {
     }, wait);
   };
 
-  chart.on('history:progress', ({ loaded, target }) => {
+  chart.on('history:progress', ({ loaded, target }: { loaded: number; target: number }) => {
     if (extending && loaded < target) setPill(`加载更早数据 ${loaded}/${target}`);
   });
   chart.on('history:complete', () => {
@@ -382,11 +398,11 @@ ws.on('cell:created', ({ id }) => {
 // hover tooltip share one trigger, which is fragile (a box pops where the menu opens
 // and vanishes when the pointer chases it). We replace just those two dropdowns with
 // our own click-only control: plain DOM, no hover handling, so it can't disappear.
-const TIMEFRAMES = [
+const TIMEFRAMES: Array<[string, string]> = [
   ['1', '1m'], ['5', '5m'], ['15', '15m'], ['30', '30m'], ['60', '1h'],
   ['120', '2h'], ['240', '4h'], ['D', '1D'], ['W', '1W'], ['M', '1M'],
 ];
-const PRICE_STYLES = [
+const PRICE_STYLES: Array<[string, string]> = [
   ['candles', 'Candles'], ['bars', 'Bars'], ['line', 'Line'],
   ['area', 'Area'], ['baseline', 'Baseline'], ['heikinashi', 'Heikin Ashi'],
 ];
@@ -411,7 +427,13 @@ const CONTROL_CSS = `
 .vct-opt[data-current] { background: var(--vela-hover-strong, rgba(255,255,255,.14)); color: var(--vela-fg-bright, #fff); }
 `;
 
-function makeDropdown({ items, getValue, onSelect }) {
+type DropdownOptions = {
+  items: Array<[string, string]>;
+  getValue: () => string;
+  onSelect: (value: string) => void;
+};
+
+function makeDropdown({ items, getValue, onSelect }: DropdownOptions) {
   const wrap = document.createElement('div');
   wrap.className = 'vct-dd';
   const btn = document.createElement('button');
@@ -429,7 +451,7 @@ function makeDropdown({ items, getValue, onSelect }) {
   panel.className = 'vct-panel';
   panel.hidden = true;
   panel.setAttribute('role', 'listbox');
-  const labelOf = (v) => (items.find(([val]) => val === v) || [, v])[1];
+  const labelOf = (v: string) => (items.find(([val]) => val === v) || [, v])[1];
   for (const [val, text] of items) {
     const opt = document.createElement('button');
     opt.type = 'button';
@@ -443,8 +465,8 @@ function makeDropdown({ items, getValue, onSelect }) {
   wrap.appendChild(btn);
 
   let open = false;
-  const onDocDown = (e) => { if (!wrap.contains(e.target) && !panel.contains(e.target)) close(); };
-  const onKey = (e) => { if (e.key === 'Escape') close(); };
+  const onDocDown = (e: PointerEvent) => { if (!wrap.contains(e.target as Node) && !panel.contains(e.target as Node)) close(); };
+  const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') close(); };
   function position() {
     const r = btn.getBoundingClientRect();
     panel.style.left = `${Math.max(4, Math.min(r.left, window.innerWidth - panel.offsetWidth - 4))}px`;
@@ -471,19 +493,19 @@ function makeDropdown({ items, getValue, onSelect }) {
   }
   btn.addEventListener('click', () => (open ? close() : show()));
 
-  let last = null;
+  let last: string | null = null;
   const sync = () => {
     const v = getValue();
     if (v === last) return;
     last = v;
     label.textContent = labelOf(v);
-    for (const opt of panel.children) opt.toggleAttribute('data-current', opt.dataset.value === v);
+    for (const opt of panel.children as HTMLCollectionOf<HTMLButtonElement>) opt.toggleAttribute('data-current', opt.dataset.value === v);
   };
   sync();
   return { el: wrap, sync, close };
 }
 
-(function installCustomTopbarControls(workspace) {
+(function installCustomTopbarControls(workspace: any) {
   const style = document.createElement('style');
   style.textContent = CONTROL_CSS;
   document.head.appendChild(style);
@@ -492,12 +514,12 @@ function makeDropdown({ items, getValue, onSelect }) {
   const tfDD = makeDropdown({
     items: TIMEFRAMES,
     getValue: () => activeCell()?.timeframe ?? 'D',
-    onSelect: (v) => activeCell()?.setTimeframe(v),
+    onSelect: (v: string) => activeCell()?.setTimeframe(v),
   });
   const styleDD = makeDropdown({
     items: PRICE_STYLES,
     getValue: () => activeCell()?.priceStyle ?? 'candles',
-    onSelect: (v) => activeCell()?.setPriceStyle(v),
+    onSelect: (v: string) => activeCell()?.setPriceStyle(v),
   });
 
   const mount = () => {
@@ -528,9 +550,9 @@ function makeDropdown({ items, getValue, onSelect }) {
 installIndicatorEditor(ws);
 
 // The agent column's UI. The backend is intentionally a thin contract so the runtime
-// can be swapped later: POST /api/agent { symbol, timeframe, messages } and answer
+// can be swapped later: POST /api/v1/agent { symbol, timeframe, messages } and answer
 // with JSON { reply } or an SSE stream of { delta } / { text } frames.
-function mountAgentPanel(ctx, body) {
+function mountAgentPanel(ctx: any, body: HTMLElement) {
   const style = document.createElement('style');
   style.textContent = `
 .vela-panel-agent .vela-panel-header { display: none !important; }
@@ -591,8 +613,8 @@ function mountAgentPanel(ctx, body) {
     <div class="vagent-msgs"></div>`;
   body.appendChild(root);
 
-  const msgsEl = root.querySelector('.vagent-msgs');
-  const configEl = root.querySelector('.vagent-config');
+  const msgsEl = root.querySelector<HTMLElement>('.vagent-msgs')!;
+  const configEl = root.querySelector<HTMLElement>('.vagent-config')!;
   const systemEl = document.createElement('details');
   systemEl.className = 'vagent-system vagent-system-global';
   systemEl.open = true;
@@ -604,28 +626,27 @@ function mountAgentPanel(ctx, body) {
   systemEl.append(systemSummary, systemBody);
   root.prepend(systemEl);
 
-  const effortLabel = (effort) => ({ low: '低', high: '高', max: '最高' }[effort] ?? effort ?? '');
-  const setSystem = (content, meta = {}) => {
+  const effortLabel = (effort?: string) => ({ low: '低', high: '高', max: '最高' } as Record<string, string>)[effort ?? ''] ?? effort ?? '';
+  const setSystem = (content: string, meta: any = {}) => {
     const imageState = meta.vision ? ' · 截图已附' : meta.images ? ' · 截图未附' : '';
     const effort = effortLabel(meta.effort);
     systemSummary.textContent = `系统提示词 · ${(meta.symbol ?? '').split(':').pop()} ${meta.timeframe ?? ''} · ${meta.model ?? ''}${effort ? ` · 思考强度${effort}` : ''}${imageState}`;
     systemBody.textContent = content ?? '';
   };
 
-  const history = [];
-  let agentConfigured = null;
+  const history: Array<{ role: string; content: string }> = [];
+  let agentConfigured: boolean | null = null;
   let configWarned = false;
   let busy = false;
-  let chart = null;
-  let offMarket = null;
-  let queued = null;
+  let chart: VelaChart | null = null;
+  let offMarket: (() => void) | null = null;
+  let queued: { text: string; bar: Bar } | null = null;
   let systemLoaded = false;
   let previewBusy = false;
 
   const loadAgentStatus = async () => {
     try {
-      const res = await fetch('/api/agent/status');
-      const data = await res.json();
+      const data = await api.get('/agent/status');
       agentConfigured = Boolean(data.configured);
       if (agentConfigured) {
         configWarned = false;
@@ -648,7 +669,7 @@ function mountAgentPanel(ctx, body) {
   };
   void loadAgentStatus();
 
-  const addMessage = (role, text) => {
+  const addMessage = (role: string, text: string) => {
     const el = document.createElement('div');
     el.className = `vagent-msg ${role}`;
     el.textContent = text;
@@ -656,7 +677,7 @@ function mountAgentPanel(ctx, body) {
     msgsEl.scrollTop = msgsEl.scrollHeight;
     return el;
   };
-  const bind = (next) => {
+  const bind = (next: VelaChart) => {
     offMarket?.();
     chart = next;
     systemLoaded = false;
@@ -685,9 +706,7 @@ function mountAgentPanel(ctx, body) {
     try {
       const market = current.market;
       const params = new URLSearchParams({ symbol: market.symbol ?? '', timeframe: market.timeframe ?? '' });
-      const res = await fetch(`/api/agent/system?${params}`);
-      if (!res.ok) return;
-      const data = await res.json();
+      const data = await api.get(`/agent/system?${params}`);
       setSystem(data.content, data.meta);
       systemLoaded = true;
     } catch {
@@ -697,15 +716,16 @@ function mountAgentPanel(ctx, body) {
     }
   }
 
-  const formatBarText = (bar) => {
+  const formatBarText = (bar: Bar) => {
     const time = new Date(bar.time).toLocaleTimeString('zh-CN', {
       timeZone: TIMEZONE, hour12: false, hour: '2-digit', minute: '2-digit',
     });
-    const tf = TF_MAP[chart?.market.timeframe] || chart?.market.timeframe || '';
+    const timeframe = chart?.market?.timeframe as string | undefined;
+    const tf = (timeframe && TF_MAP[timeframe]) || timeframe || '';
     return `${time} ${tf} 收盘\nO ${bar.open}  H ${bar.high}  L ${bar.low}  C ${bar.close}  V ${bar.volume ?? 0}`;
   };
 
-  const capture = (target) => {
+  const capture = (target: any) => {
     try {
       const canvas = target.renderer.screenshotCanvas?.();
       if (!canvas) return { images: [], preview: null };
@@ -718,7 +738,7 @@ function mountAgentPanel(ctx, body) {
     }
   };
 
-  const analyze = async (text, bar, target) => {
+  const analyze = async (text: string, bar: Bar, target: VelaChart | null) => {
     if (!target) return;
     const shot = capture(target);
     const images = shot.images;
@@ -752,9 +772,9 @@ function mountAgentPanel(ctx, body) {
       const context = {
         last: bar.close,
         visibleRange: target.getVisibleRange(),
-        indicators: target.inspect().indicators.map((item) => item.title),
+        indicators: target.inspect().indicators.map((item: any) => item.title),
       };
-      const res = await fetch('/api/agent', {
+      const res = await fetch(`${API_BASE}/agent`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
@@ -770,7 +790,8 @@ function mountAgentPanel(ctx, body) {
         let detail = `HTTP ${res.status}`;
         try {
           const payload = await res.json();
-          if (payload?.error) detail = payload.error;
+          if (payload?.message) detail = payload.message;
+          else if (payload?.error) detail = payload.error;
         } catch {
           /* not JSON */
         }
@@ -802,8 +823,8 @@ function mountAgentPanel(ctx, body) {
         let reasoning = '';
         let firstReasoning = true;
         let firstContent = true;
-        const handleFrame = (frame) => {
-          const line = frame.split('\n').find((l) => l.startsWith('data:'));
+        const handleFrame = (frame: string) => {
+          const line = frame.split('\n').find((l: string) => l.startsWith('data:'));
           if (!line) return;
           const payload = line.slice(5).trim();
           if (!payload || payload === '[DONE]') return;
@@ -863,11 +884,11 @@ function mountAgentPanel(ctx, body) {
         turn.appendChild(replyEl);
         history.push({ role: 'assistant', content: reply });
       }
-    } catch (err) {
-      for (const el of turn.querySelectorAll('.vagent-answer[data-streaming]')) delete el.dataset.streaming;
+    } catch (error) {
+      for (const el of turn.querySelectorAll<HTMLElement>('.vagent-answer[data-streaming]')) delete el.dataset.streaming;
       const errEl = document.createElement('div');
       errEl.className = 'vagent-msg system';
-      errEl.textContent = `Agent 请求失败：${err.message}`;
+      errEl.textContent = `Agent 请求失败：${error instanceof Error ? error.message : String(error)}`;
       turn.appendChild(errEl);
     } finally {
       busy = false;
@@ -879,8 +900,8 @@ function mountAgentPanel(ctx, body) {
     }
   };
 
-  const onClosedBar = (event) => {
-    const detail = event.detail;
+  const onClosedBar = (event: Event) => {
+    const detail = (event as CustomEvent).detail;
     const market = chart?.market;
     if (!detail || !market) return;
     const ticker = (market.symbol ?? '').split(':').pop();
@@ -920,4 +941,4 @@ function mountAgentPanel(ctx, body) {
   };
 }
 
-window.ws = ws;
+(window as any).ws = ws;

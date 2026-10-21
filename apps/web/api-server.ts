@@ -3,8 +3,24 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { DatabaseSync } from 'node:sqlite';
+import type { ServerResponse } from 'node:http';
+import { DEFAULT_PORT } from './server/config.ts';
+import { AppError, ERROR_CODES, badRequest, methodNotAllowed, notFound } from './server/errors.ts';
+import { logger } from './server/logger.ts';
+import { docsHtml, openapi } from './server/openapi.ts';
+import { paginate, readJsonBody, send, stripApiPrefix } from './server/http.ts';
+import { oneOf, parsePagination, parseInteger, requireString, resolveWithin, usSymbol } from './server/validate.ts';
 import {
+  cacheCount,
+  cacheCoveredFrom,
+  cacheFetchedAt,
+  cacheGet,
+  cacheGetWindow,
+  cachePut,
+  closeDb,
+} from './server/db.ts';
+import {
+  type Timeframe,
   buildTradingDayPlan,
   inferSessionCloseFromBars,
   sessionDateInZone,
@@ -14,12 +30,26 @@ import {
   createOpenAiCompatibleClient,
 } from '@vela/trading-core';
 
+type Bar = { time: number; open: number; high: number; low: number; close: number; volume?: number | null };
+type SymbolRow = { ticker: string; description?: string; type?: string; section?: string };
+type IndicatorEntry = { name: string; file: string; family: string };
+type CustomScript = { id: string; name: string; script: string; createdAt?: number; updatedAt?: number };
+type AgentConfig = { key: string; source: 'env' | 'file' | null; base: string; model: string; effort: 'low' | 'high' | 'max' };
+type AgentFile = { apiKey?: string; baseURL?: string; model?: string; reasoningEffort?: string };
+type StreamEntry = { symbol: string; tf: string; period: unknown; clients: Set<ServerResponse>; subscribed: boolean };
+type RunState = { runId: string; paused: boolean; stopped: boolean };
+type BacktestRun = { pause: () => void; resume: () => void; stop: () => void; state: () => RunState };
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const ROOT = path.join(__dirname, '..');
+const ROOT = path.join(__dirname, '..', '..');
+try {
+  process.loadEnvFile(path.join(ROOT, '.env'));
+} catch {
+  /* .env is optional */
+}
 const PINE_DIR = path.join(ROOT, 'data', 'pine');
 const DIST = path.join(__dirname, 'dist');
 const CACHE_DIR = path.join(ROOT, 'data', 'cache');
-const DB_FILE = path.join(CACHE_DIR, 'bars.sqlite');
 
 // --- Longbridge: force the international gateway ---
 process.env.LONGPORT_HTTP_URL ||= 'https://openapi.longportapp.com';
@@ -32,56 +62,58 @@ process.env.LONGPORT_PUSH_CANDLESTICK_MODE ||= 'realtime';
 //   { "apiKey": "...", "baseURL": "...", "model": "deepseek-flash", "reasoningEffort": "low" }
 // V4.1 Flash (`deepseek-flash`) is natively multimodal, so screenshots go straight into
 // the user message's `content` parts; no separate vision endpoint is needed.
-function loadAgentConfig() {
-  let file = {};
+function loadAgentConfig(): AgentConfig {
+  let file: AgentFile = {};
   try {
-    file = JSON.parse(fs.readFileSync(path.join(ROOT, 'data', 'agent.json'), 'utf8'));
+    file = JSON.parse(fs.readFileSync(path.join(ROOT, 'data', 'agent.json'), 'utf8')) as AgentFile;
   } catch {
     /* no local config */
   }
   const envKey = process.env.DEEPSEEK_API_KEY || '';
+  const effortRaw = process.env.AGENT_REASONING_EFFORT || file.reasoningEffort || 'low';
+  const effort = effortRaw === 'high' || effortRaw === 'max' ? effortRaw : 'low';
   return {
     key: envKey || file.apiKey || '',
-    source: envKey ? 'env' : file.apiKey ? 'file' : null,
+    source: envKey ? ('env' as const) : file.apiKey ? ('file' as const) : null,
     base: (process.env.DEEPSEEK_BASE_URL || file.baseURL || 'https://api.deepseek.com').replace(/\/+$/, ''),
     model: process.env.DEEPSEEK_MODEL || file.model || 'deepseek-flash',
-    effort: process.env.AGENT_REASONING_EFFORT || file.reasoningEffort || 'low',
+    effort,
   };
 }
 
-function startOfTodayMs(ms, tz) {
+function startOfTodayMs(ms: number, tz: string): number {
   const parts = new Intl.DateTimeFormat('en-CA', {
     timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
     hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
   }).formatToParts(new Date(ms));
-  const get = (type) => Number(parts.find((p) => p.type === type).value);
+  const get = (type: string) => Number(parts.find((p) => p.type === type)!.value);
   const localAsUtc = Date.UTC(get('year'), get('month') - 1, get('day'), get('hour') % 24, get('minute'), get('second'));
   const offset = localAsUtc - Math.floor(ms / 1000) * 1000;
   return Date.UTC(get('year'), get('month') - 1, get('day')) - offset;
 }
 
-function todayLabel(ms, tz) {
+function todayLabel(ms: number, tz: string): string {
   return new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(ms));
 }
 
-function clockLabel(ms, tz) {
+function clockLabel(ms: number, tz: string): string {
   return new Intl.DateTimeFormat('en-GB', { timeZone: tz, hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(ms));
 }
 
-async function todayBars(symbol, tf) {
+async function todayBars(symbol: string, tf: string): Promise<Bar[]> {
   const tz = tzForSymbol(symbol);
   const to = Date.now();
   const from = startOfTodayMs(to, tz);
   try {
     const { bars } = await fetchWindow(symbol, tf, from, to, 2000);
-    return bars.filter((bar) => bar.time >= from && bar.time <= to);
+    return bars.filter((bar: Bar) => bar.time >= from && bar.time <= to);
   } catch (e) {
-    console.warn('[agent] today bars failed:', e.message);
+    logger.warn('[agent] today bars failed:', (e as Error).message);
     return [];
   }
 }
 
-async function buildAgentPrompt(body, hasImages = false) {
+async function buildAgentPrompt(body: Record<string, any>, hasImages = false): Promise<string> {
   const symbol = typeof body.symbol === 'string' ? body.symbol : '';
   const ticker = symbol.split(':').pop();
   const timeframe = agentTfLabel(typeof body.timeframe === 'string' ? body.timeframe : '');
@@ -111,18 +143,18 @@ async function buildAgentPrompt(body, hasImages = false) {
 const { Config, QuoteContext, Period, AdjustType, TradeSessions, NaiveDate, NaiveDatetime, Time, Market } =
   await import('longport');
 
-const TF = {
+const TF: Record<string, any> = {
   '1m': Period.Min_1, '5m': Period.Min_5, '15m': Period.Min_15, '30m': Period.Min_30,
   '1h': Period.Min_60, '2h': Period.Min_120, '4h': Period.Min_240,
   '1d': Period.Day, '1w': Period.Week, '1M': Period.Month,
 };
 
 // Chart UI values ('5', '60', 'D') -> the labels the agent prompt and UI speak.
-const AGENT_TF_LABEL = {
+const AGENT_TF_LABEL: Record<string, string> = {
   '1': '1m', '5': '5m', '15': '15m', '30': '30m', '60': '1h', '120': '2h', '240': '4h',
   D: '1d', W: '1w', M: '1M',
 };
-function agentTfLabel(tf) {
+function agentTfLabel(tf: string): string {
   return AGENT_TF_LABEL[tf] || tf || 'unknown';
 }
 
@@ -132,129 +164,33 @@ const PAGE = 1000;
 const MAX_LIMIT = 50000;
 
 // Longbridge history anchors are NAIVE datetimes interpreted in the MARKET's timezone.
-const TZ_BY_SUFFIX = [
+const TZ_BY_SUFFIX: Array<[string, string]> = [
   ['.US', 'America/New_York'], ['.HK', 'Asia/Hong_Kong'],
   ['.SH', 'Asia/Shanghai'], ['.SZ', 'Asia/Shanghai'],
 ];
-function tzForSymbol(symbol) {
+function tzForSymbol(symbol: string): string {
   const hit = TZ_BY_SUFFIX.find(([s]) => symbol.endsWith(s));
   return hit ? hit[1] : 'UTC';
 }
-function toNaiveDatetime(ms, tz) {
+function toNaiveDatetime(ms: number, tz: string): any {
   const parts = new Intl.DateTimeFormat('en-US', {
     timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
     hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
   }).formatToParts(new Date(ms));
-  const g = (t) => Number(parts.find((p) => p.type === t).value);
+  const g = (t: string) => Number(parts.find((p) => p.type === t)!.value);
   return new NaiveDatetime(new NaiveDate(g('year'), g('month'), g('day')), new Time(g('hour') % 24, g('minute'), g('second')));
 }
 
-// ---------------- SQLite cache (built-in node:sqlite, WAL) ----------------
-fs.mkdirSync(CACHE_DIR, { recursive: true });
-const db = new DatabaseSync(DB_FILE);
-db.exec('PRAGMA journal_mode = WAL');
-db.exec('PRAGMA synchronous = NORMAL');
-db.exec(`CREATE TABLE IF NOT EXISTS bars (
-  symbol TEXT NOT NULL, tf TEXT NOT NULL, time INTEGER NOT NULL,
-  open REAL, high REAL, low REAL, close REAL, volume REAL,
-  PRIMARY KEY (symbol, tf, time));`);
-db.exec(`CREATE TABLE IF NOT EXISTS meta (
-  symbol TEXT NOT NULL, tf TEXT NOT NULL, fetched_at INTEGER NOT NULL,
-  PRIMARY KEY (symbol, tf));`);
-
-// Oldest open-time we have PROVEN covered by a fetch (0 = source exhausted going back).
-{
-  const cols = db.prepare('PRAGMA table_info(meta)').all().map((c) => c.name);
-  if (!cols.includes('covered_from')) db.exec('ALTER TABLE meta ADD COLUMN covered_from INTEGER');
-}
-
-const qCount = db.prepare('SELECT COUNT(*) AS n FROM bars WHERE symbol=? AND tf=?');
-const qFetchedAt = db.prepare('SELECT fetched_at, covered_from FROM meta WHERE symbol=? AND tf=?');
-const qGet = db.prepare(
-  'SELECT time,open,high,low,close,volume FROM bars WHERE symbol=? AND tf=? ORDER BY time DESC LIMIT ?',
-);
-const qGetWindow = db.prepare(
-  `SELECT time,open,high,low,close,volume FROM bars
-   WHERE symbol=? AND tf=? AND (? IS NULL OR time<=?) AND (? IS NULL OR time>=?)
-   ORDER BY time DESC LIMIT ?`,
-);
-const qPutBar = db.prepare(
-  `INSERT INTO bars (symbol,tf,time,open,high,low,close,volume) VALUES (?,?,?,?,?,?,?,?)
-   ON CONFLICT(symbol,tf,time) DO UPDATE SET open=excluded.open,high=excluded.high,
-     low=excluded.low,close=excluded.close,volume=excluded.volume`,
-);
-const qPutMeta = db.prepare('INSERT OR REPLACE INTO meta (symbol,tf,fetched_at,covered_from) VALUES (?,?,?,?)');
-const qGetCovered = db.prepare('SELECT covered_from FROM meta WHERE symbol=? AND tf=?');
-
-function cacheCount(symbol, tf) {
-  return qCount.get(symbol, tf).n;
-}
-function cacheFetchedAt(symbol, tf) {
-  const r = qFetchedAt.get(symbol, tf);
-  return r ? r.fetched_at : 0;
-}
-function cacheCoveredFrom(symbol, tf) {
-  const r = qGetCovered.get(symbol, tf);
-  return r ? r.covered_from : null;
-}
-function cacheGet(symbol, tf, count) {
-  return qGet.all(symbol, tf, count).reverse().map((r) => ({
-    time: r.time, open: r.open, high: r.high, low: r.low, close: r.close, volume: r.volume,
-  }));
-}
-// Newest `limit` cached bars inside [from, to] (either bound null = unbounded), ascending.
-function cacheGetWindow(symbol, tf, from, to, limit) {
-  return qGetWindow.all(symbol, tf, to, to, from, from, limit).reverse().map((r) => ({
-    time: r.time, open: r.open, high: r.high, low: r.low, close: r.close, volume: r.volume,
-  }));
-}
-function cachePut(symbol, tf, bars, { hitGenesis = false } = {}) {
-  // Coverage is the OLDEST open-time down to which we have a CONTIGUOUS run ending at
-  // "now" (0 = the source itself is exhausted). We only extend it for a chunk that
-  // CONNECTS to what we already had — a disjoint island (e.g. a request.security range
-  // in the distant past) must not widen the claim.
-  const prev = cacheCoveredFrom(symbol, tf);
-  const asc = [...bars].sort((a, b) => a.time - b.time);
-  let next = prev;
-  if (asc.length > 0) {
-    const newest = asc[asc.length - 1].time;
-    const tol = tfToMs(tf) * 3;
-    const connects = prev == null || prev === 0 || newest >= prev - tol;
-    if (prev === 0) next = 0;
-    else if (connects) next = hitGenesis ? 0 : prev == null ? asc[0].time : Math.min(prev, asc[0].time);
-  } else if (hitGenesis && prev == null) {
-    next = prev; // empty probe with nothing proven yet — make no coverage claim
-  }
-
-  db.exec('BEGIN');
-  try {
-    for (const b of bars) {
-      qPutBar.run(symbol, tf, b.time, b.open, b.high, b.low, b.close, b.volume ?? null);
-    }
-    qPutMeta.run(symbol, tf, Date.now(), next);
-    db.exec('COMMIT');
-  } catch (e) {
-    db.exec('ROLLBACK');
-    throw e;
-  }
-}
-
-const isIntraday = (tf) => /h$/.test(tf) || /m$/.test(tf);
-const ttlOf = (tf) => (isIntraday(tf) ? 60_000 : 30 * 60_000);
-
-const TF_MS_UNIT = { m: 60_000, h: 3_600_000, d: 86_400_000, w: 604_800_000, M: 2_592_000_000 };
-function tfToMs(tf) {
-  return parseInt(tf, 10) * (TF_MS_UNIT[tf.slice(-1)] || 60_000);
-}
+const ttlOf = (tf: string): number => (/[hm]$/.test(tf) ? 60_000 : 30 * 60_000);
 
 // ---------------- Longbridge client ----------------
-let ctxPromise = null;
-function getCtx() {
+let ctxPromise: any = null;
+function getCtx(): any {
   if (!ctxPromise) {
     const config = Config.fromApikey(
-      process.env.LONGPORT_APP_KEY,
-      process.env.LONGPORT_APP_SECRET,
-      process.env.LONGPORT_ACCESS_TOKEN,
+      process.env.LONGPORT_APP_KEY ?? '',
+      process.env.LONGPORT_APP_SECRET ?? '',
+      process.env.LONGPORT_ACCESS_TOKEN ?? '',
     );
     const ctx = QuoteContext.new(config);
     bindCandlestickPush(ctx);
@@ -266,12 +202,12 @@ function getCtx() {
 // ---------------- realtime candlestick push (SSE) ----------------
 // The SDK pushes through one socket owned by the QuoteContext, so subscriptions are
 // reference-counted per (symbol, timeframe) and fanned out to every connected client.
-const PERIOD_TF = new Map(Object.entries(TF).map(([tf, period]) => [period, tf]));
-const streams = new Map(); // `${symbol}|${tf}` -> { symbol, tf, period, clients:Set, subscribed }
-const backtestRuns = new Map();
+const PERIOD_TF = new Map<unknown, string>(Object.entries(TF).map(([tf, period]) => [period, tf]));
+const streams = new Map<string, StreamEntry>(); // `${symbol}|${tf}` -> { symbol, tf, period, clients:Set, subscribed }
+const backtestRuns = new Map<string, BacktestRun>();
 let pushBound = false;
 
-function sendFrame(client, payload) {
+function sendFrame(client: ServerResponse, payload: string): void {
   if (client.destroyed || client.writableEnded) return;
   try {
     client.write(payload);
@@ -280,13 +216,13 @@ function sendFrame(client, payload) {
   }
 }
 
-function bindCandlestickPush(ctx) {
+function bindCandlestickPush(ctx: any): void {
   if (pushBound) return;
   pushBound = true;
-  ctx.setOnCandlestick((err, event) => {
+  ctx.setOnCandlestick((err: any, event: any) => {
     try {
       if (err) {
-        console.warn('[push] candlestick error:', err.message);
+        logger.warn('[push] candlestick error:', err.message);
         return;
       }
       const tf = PERIOD_TF.get(event.data.period);
@@ -300,20 +236,20 @@ function bindCandlestickPush(ctx) {
       // per second and the history endpoint answers it anyway.
       if (event.data.isConfirmed) cachePut(event.symbol, tf, [bar], {});
     } catch (e) {
-      console.warn('[push] frame failed:', e.message);
+      logger.warn('[push] frame failed:', (e as Error).message);
     }
   });
 }
 
-async function subscribeStream(entry) {
+async function subscribeStream(entry: StreamEntry): Promise<void> {
   if (entry.subscribed) return;
   const ctx = await getCtx();
   await ctx.subscribeCandlesticks(entry.symbol, entry.period, TradeSessions.Intraday);
   entry.subscribed = true;
 }
 
-async function withRetry(fn, tries = 3) {
-  let lastErr;
+async function withRetry<T>(fn: () => Promise<T>, tries = 3): Promise<T> {
+  let lastErr: unknown;
   for (let i = 0; i < tries; i++) {
     try {
       return await fn();
@@ -326,7 +262,7 @@ async function withRetry(fn, tries = 3) {
   throw lastErr;
 }
 
-function toBar(b) {
+function toBar(b: any): Bar {
   return {
     time: Date.parse(b.timestamp),
     open: parseFloat(b.open),
@@ -343,11 +279,11 @@ function toBar(b) {
  * Returns { bars (ascending), hitGenesis } — hitGenesis=true means the source has
  * nothing older, so the caller can mark coverage as exhausted.
  */
-async function fetchWindow(symbol, tf, from, to, limit) {
+async function fetchWindow(symbol: string, tf: string, from: number | null, to: number | null, limit: number): Promise<{ bars: Bar[]; hitGenesis: boolean }> {
   const period = TF[tf];
   const tz = tzForSymbol(symbol);
   const ctx = await getCtx();
-  const byTime = new Map();
+  const byTime = new Map<number, Bar>();
   let anchor = to; // null -> latest
   let hitGenesis = false;
 
@@ -359,7 +295,7 @@ async function fetchWindow(symbol, tf, from, to, limit) {
     const anchorDt = anchor == null ? null : toNaiveDatetime(anchor, tz);
     let batch;
     try {
-      batch = await withRetry(() =>
+      batch = await withRetry<any>(() =>
         ctx.historyCandlesticksByOffset(symbol, period, AdjustType.NoAdjust, false, anchorDt, want, TradeSessions.Intraday),
       );
     } catch (e) {
@@ -367,7 +303,7 @@ async function fetchWindow(symbol, tf, from, to, limit) {
       // begin 2023-10-01) with a "limit" error. If we had already walked down to it that
       // IS the bottom (genesis); an anchor BEYOND the floor that we never reached proves
       // nothing — just return what we have.
-      const msg = String(e?.message || e);
+      const msg = String((e as Error)?.message || e);
       if (byTime.size > 0) hitGenesis = true;
       else if (!/limit|301600|301607/i.test(msg)) throw e;
       break;
@@ -377,7 +313,7 @@ async function fetchWindow(symbol, tf, from, to, limit) {
       break;
     }
     let oldestNew = Infinity; // oldest bar STRICTLY older than the anchor = real progress
-    for (const b of batch) {
+    for (const b of batch as any[]) {
       const bar = toBar(b);
       if (anchor != null && bar.time >= anchor) continue; // boundary bar / overlap
       if (bar.time < oldestNew) oldestNew = bar.time;
@@ -398,15 +334,10 @@ async function fetchWindow(symbol, tf, from, to, limit) {
 }
 
 // ---------------- helpers ----------------
-function send(res, status, body, type = 'application/json; charset=utf-8') {
-  res.writeHead(status, { 'content-type': type, 'access-control-allow-origin': '*' });
-  res.end(body);
-}
-
-let idxCache = null;
+let idxCache: IndicatorEntry[] | null = null;
 // Indicator folders → picker group labels, in display order. The picker groups the
 // catalogue by `category`, so this is both the label and the ordering.
-const FAMILY_LABELS = {
+const FAMILY_LABELS: Record<string, string> = {
   trend: '趋势',
   momentum: '动量',
   volatility: '波动率',
@@ -426,14 +357,14 @@ const FAMILY_LABELS = {
   unknown: '其他',
 };
 const FAMILY_ORDER = Object.keys(FAMILY_LABELS);
-const familyRank = (f) => {
+const familyRank = (f: string): number => {
   const i = FAMILY_ORDER.indexOf(f);
   return i < 0 ? FAMILY_ORDER.length : i;
 };
 
-function listIndicators() {
+function listIndicators(): IndicatorEntry[] {
   if (idxCache) return idxCache;
-  const out = [];
+  const out: IndicatorEntry[] = [];
   for (const fam of fs.readdirSync(PINE_DIR)) {
     const dir = path.join(PINE_DIR, fam);
     if (!fs.statSync(dir).isDirectory()) continue;
@@ -444,7 +375,7 @@ function listIndicators() {
       out.push({ name: m ? m[2] : f.replace(/\.pine$/, ''), file: `${fam}/${f}`, family: fam });
     }
   }
-  out.sort((a, b) => familyRank(a.family) - familyRank(b.family) || a.name.localeCompare(b.name));
+  out.sort((a: IndicatorEntry, b: IndicatorEntry) => familyRank(a.family) - familyRank(b.family) || a.name.localeCompare(b.name));
   idxCache = out;
   return out;
 }
@@ -452,34 +383,26 @@ function listIndicators() {
 // ---------------- user scripts (custom indicators) ----------------
 const CUSTOM_FILE = path.join(ROOT, 'data', 'custom-indicators.json');
 
-function loadCustom() {
+function loadCustom(): CustomScript[] {
   try {
     const rows = JSON.parse(fs.readFileSync(CUSTOM_FILE, 'utf8'));
-    return Array.isArray(rows) ? rows : [];
+    return Array.isArray(rows) ? (rows as CustomScript[]) : [];
   } catch {
     return [];
   }
 }
-function saveCustom(rows) {
+function saveCustom(rows: CustomScript[]): void {
   fs.mkdirSync(path.dirname(CUSTOM_FILE), { recursive: true });
   fs.writeFileSync(CUSTOM_FILE, JSON.stringify(rows, null, 2));
 }
-function slugId(name) {
+function slugId(name: string): string {
   const base = String(name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'script';
   return `${base}-${Date.now().toString(36)}`;
-}
-function readJsonBody(req, maxChars = 1_000_000) {
-  return new Promise((resolve, reject) => {
-    let body = '';
-    req.on('data', (c) => { body += c; if (body.length > maxChars) req.destroy(); });
-    req.on('end', () => { try { resolve(body ? JSON.parse(body) : {}); } catch (e) { reject(e); } });
-    req.on('error', reject);
-  });
 }
 
 // Fallback catalogue if the live Longbridge list can't be fetched. US-only: this app
 // targets Longbridge US equities.
-const SYMBOLS = [
+const SYMBOLS: Array<[string, string, string]> = [
   ['AAPL.US', 'Apple Inc.', 'stock'], ['NVDA.US', 'NVIDIA', 'stock'],
   ['MSFT.US', 'Microsoft', 'stock'], ['TSLA.US', 'Tesla', 'stock'],
   ['AMZN.US', 'Amazon', 'stock'], ['GOOGL.US', 'Alphabet', 'stock'],
@@ -489,7 +412,7 @@ const SYMBOLS = [
 
 // The landing order for the symbol picker: the three US index ETFs first, then a set
 // of popular names. `section` groups them under a header in the picker.
-const RECOMMENDED = [
+const RECOMMENDED: Array<[string, string]> = [
   ['SPY.US', '指数'], ['QQQ.US', '指数'], ['DIA.US', '指数'],
   ['AAPL.US', '热门股票'], ['NVDA.US', '热门股票'], ['MSFT.US', '热门股票'],
   ['TSLA.US', '热门股票'], ['AMZN.US', '热门股票'], ['GOOGL.US', '热门股票'],
@@ -501,12 +424,12 @@ const RECOMMENDED = [
 // disk — it changes slowly and the round trip is heavy. Lazy + refreshed once a day.
 const US_SYMBOLS_FILE = path.join(CACHE_DIR, 'us-symbols.json');
 const US_SYMBOLS_TTL = 24 * 60 * 60_000;
-let usSymbolsMem = null;
+let usSymbolsMem: SymbolRow[] | null = null;
 
-function orderUsSymbols(rows) {
+function orderUsSymbols(rows: SymbolRow[]): SymbolRow[] {
   const byTicker = new Map(rows.map((r) => [r.ticker, r]));
-  const head = [];
-  const seen = new Set();
+  const head: SymbolRow[] = [];
+  const seen = new Set<string>();
   for (const [ticker, section] of RECOMMENDED) {
     const row = byTicker.get(ticker);
     if (row) { head.push({ ...row, section }); seen.add(ticker); }
@@ -514,11 +437,11 @@ function orderUsSymbols(rows) {
   return [...head, ...rows.filter((r) => !seen.has(r.ticker))];
 }
 
-async function usSymbols() {
+async function usSymbols(): Promise<SymbolRow[]> {
   if (usSymbolsMem) return usSymbolsMem;
   try {
     if (Date.now() - fs.statSync(US_SYMBOLS_FILE).mtimeMs < US_SYMBOLS_TTL) {
-      const rows = JSON.parse(fs.readFileSync(US_SYMBOLS_FILE, 'utf8'));
+      const rows = JSON.parse(fs.readFileSync(US_SYMBOLS_FILE, 'utf8')) as SymbolRow[];
       if (Array.isArray(rows) && rows.length) {
         usSymbolsMem = orderUsSymbols(rows);
         return usSymbolsMem;
@@ -529,25 +452,41 @@ async function usSymbols() {
     const ctx = await getCtx();
     const list = await ctx.securityList(Market.US);
     const rows = list
-      .filter((s) => /^[A-Z0-9]+\.US$/.test(s.symbol)) // drop warrants/units/structured (suffixed) tickers
-      .map((s) => ({ ticker: s.symbol, description: s.nameEn || s.nameCn || '', type: 'stock' }));
+      .filter((s: any) => /^[A-Z0-9]+\.US$/.test(s.symbol)) // drop warrants/units/structured (suffixed) tickers
+      .map((s: any) => ({ ticker: s.symbol, description: s.nameEn || s.nameCn || '', type: 'stock' }));
     usSymbolsMem = orderUsSymbols(rows);
     try { fs.writeFileSync(US_SYMBOLS_FILE, JSON.stringify(usSymbolsMem)); } catch {}
     return usSymbolsMem;
   } catch (e) {
-    console.warn('securityList failed:', e.message);
+    logger.warn('securityList failed:', (e as Error).message);
     return orderUsSymbols(SYMBOLS.map(([ticker, description, type]) => ({ ticker, description, type })));
   }
 }
 
 // ---------------- server ----------------
 const server = http.createServer(async (req, res) => {
-  const u = new URL(req.url, 'http://localhost');
+  const u = new URL(req.url ?? '/', 'http://localhost');
+  const pathname = stripApiPrefix(u.pathname);
+  const startedAt = Date.now();
+  res.on('finish', () => {
+    logger.info('http', { method: req.method, path: u.pathname, status: res.statusCode, ms: Date.now() - startedAt });
+  });
   try {
-    if (u.pathname === '/api/stream') {
-      const symbol = u.searchParams.get('symbol') || '';
-      const tf = u.searchParams.get('tf') || '';
-      if (!symbol || TF[tf] === undefined) return send(res, 400, JSON.stringify({ error: 'bad symbol or tf' }));
+    if (pathname === '/api/openapi.json') {
+      return send(res, 200, JSON.stringify(openapi));
+    }
+
+    if (pathname === '/api/docs') {
+      return send(res, 200, docsHtml, 'text/html; charset=utf-8');
+    }
+
+    if (pathname === '/api/health') {
+      return send(res, 200, JSON.stringify({ status: 'ok', uptime: process.uptime() }));
+    }
+
+    if (pathname === '/api/stream') {
+      const symbol = usSymbol(u.searchParams.get('symbol'));
+      const tf = oneOf(u.searchParams.get('tf'), Object.keys(TF), 'tf');
       res.writeHead(200, {
         'content-type': 'text/event-stream; charset=utf-8',
         'cache-control': 'no-cache, no-transform',
@@ -565,7 +504,7 @@ const server = http.createServer(async (req, res) => {
       entry.clients.add(res);
       const heartbeat = setInterval(() => sendFrame(res, ': ping\n\n'), 15_000);
       subscribeStream(entry).catch((e) => {
-        console.warn(`[push] subscribe failed ${symbol} ${tf}:`, e.message);
+        logger.warn(`[push] subscribe failed ${symbol} ${tf}:`, e.message);
         sendFrame(res, `event: stream-error\ndata: ${JSON.stringify({ message: e.message })}\n\n`);
       });
       req.on('close', () => {
@@ -586,7 +525,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    if (u.pathname === '/api/agent/status') {
+    if (pathname === '/api/agent/status') {
       const agent = loadAgentConfig();
       return send(res, 200, JSON.stringify({
         configured: Boolean(agent.key),
@@ -598,7 +537,7 @@ const server = http.createServer(async (req, res) => {
 
     // The system prompt for the current chart, so the panel can show it before the
     // first candle closes.
-    if (u.pathname === '/api/agent/system') {
+    if (pathname === '/api/agent/system') {
       const agent = loadAgentConfig();
       const symbol = u.searchParams.get('symbol') || '';
       const timeframe = u.searchParams.get('timeframe') || '';
@@ -618,7 +557,7 @@ const server = http.createServer(async (req, res) => {
 
     // Intraday analysis agent. The DeepSeek key never reaches the renderer: the server
     // calls the OpenAI-compatible endpoint and relays reasoning/content deltas as SSE.
-    if (u.pathname === '/api/agent') {
+    if (pathname === '/api/agent') {
       if (req.method !== 'POST') return send(res, 405, JSON.stringify({ error: 'method not allowed' }));
       const agent = loadAgentConfig();
       if (!agent.key) {
@@ -697,6 +636,7 @@ const server = http.createServer(async (req, res) => {
           sendFrame(res, `data: ${JSON.stringify({ type: 'error', message: `DeepSeek ${upstream.status}: ${detail}` })}\n\n`);
           return res.end();
         }
+        if (!upstream.body) return res.end();
         const reader = upstream.body.getReader();
         const decoder = new TextDecoder();
         let buffer = '';
@@ -735,20 +675,19 @@ const server = http.createServer(async (req, res) => {
         res.end();
       } catch (e) {
         if (!abort.signal.aborted) {
-          sendFrame(res, `data: ${JSON.stringify({ type: 'error', message: e.message })}\n\n`);
+          sendFrame(res, `data: ${JSON.stringify({ type: 'error', message: (e as Error).message })}\n\n`);
           res.end();
         }
       }
       return;
     }
 
-    if (u.pathname === '/api/backtest/session') {
+    if (pathname === '/api/backtest/session') {
       try {
-        const rawSymbol = u.searchParams.get('symbol') || '';
-        const symbol = rawSymbol.includes(':') ? rawSymbol.split(':').pop() : rawSymbol;
-        const date = u.searchParams.get('date') || '';
-        const timeframe = u.searchParams.get('timeframe') || '5m';
-        if (!symbol.endsWith('.US')) throw new Error('Only US symbols are supported');
+        const symbol = usSymbol(u.searchParams.get('symbol'));
+        const date = requireString(u.searchParams.get('date'), 'date', { maxLength: 10 });
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw badRequest('date must be YYYY-MM-DD');
+        const timeframe = oneOf(u.searchParams.get('timeframe') || '5m', Object.keys(TF), 'timeframe') as Timeframe;
         const tfMs = timeframeMs(timeframe);
         const base = buildTradingDayPlan({ date, timeframe });
         if (!base.isTradingDay) throw new Error(`${date} is not a US trading day`);
@@ -784,71 +723,58 @@ const server = http.createServer(async (req, res) => {
           hitGenesis,
         }));
       } catch (e) {
-        return send(res, 400, JSON.stringify({ error: e.message }));
+        return send(res, 400, JSON.stringify({ error: (e as Error).message }));
       }
     }
 
-    if (u.pathname === '/api/backtest/control') {
-      if (req.method !== 'POST') return send(res, 405, JSON.stringify({ error: 'method not allowed' }));
-      let body;
-      try {
-        body = await readJsonBody(req, 20_000);
-      } catch (e) {
-        return send(res, 400, JSON.stringify({ error: e.message }));
-      }
-      const run = backtestRuns.get(String(body.runId || ''));
-      if (!run) return send(res, 404, JSON.stringify({ error: 'run not found or already finished' }));
-      const action = String(body.action || '');
+    if (pathname === '/api/backtest/control') {
+      if (req.method !== 'POST') throw methodNotAllowed();
+      const body = await readJsonBody(req, 20_000);
+      const runId = requireString(body.runId, 'runId', { maxLength: 64 });
+      const run = backtestRuns.get(runId);
+      if (!run) throw notFound('run not found or already finished');
+      const action = oneOf(body.action, ['pause', 'resume', 'stop'], 'action');
       if (action === 'pause') run.pause();
       else if (action === 'resume') run.resume();
-      else if (action === 'stop') run.stop();
-      else return send(res, 400, JSON.stringify({ error: 'action must be pause, resume or stop' }));
+      else run.stop();
       return send(res, 200, JSON.stringify({ ok: true, ...run.state() }));
     }
 
-    if (u.pathname === '/api/backtest/run') {
-      if (req.method !== 'POST') return send(res, 405, JSON.stringify({ error: 'method not allowed' }));
+    if (pathname === '/api/backtest/run') {
+      if (req.method !== 'POST') throw methodNotAllowed();
       const agent = loadAgentConfig();
       if (!agent.key) {
         return send(res, 503, JSON.stringify({
           error: '未检测到 DEEPSEEK_API_KEY，无法运行 AI 回测',
         }));
       }
-      let body;
-      try {
-        body = await readJsonBody(req, 200_000);
-      } catch (e) {
-        return send(res, 400, JSON.stringify({ error: e.message }));
-      }
-      const rawSymbol = String(body.symbol || '');
-      const symbol = rawSymbol.includes(':') ? rawSymbol.split(':').pop() : rawSymbol;
-      const date = String(body.date || '');
-      const timeframe = String(body.timeframe || '5m');
-      const positionSizePct = Number(body.positionSizePct ?? 80);
-      const maxEntriesPerDay = Number(body.maxEntriesPerDay ?? 2);
+      const body = await readJsonBody(req, 200_000);
+      const symbol = usSymbol(body.symbol);
+      const date = requireString(body.date, 'date', { maxLength: 10 });
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw badRequest('date must be YYYY-MM-DD');
+      const timeframe = oneOf(body.timeframe || '5m', Object.keys(TF), 'timeframe') as Timeframe;
+      const positionSizePct = parseInteger(body.positionSizePct, 'positionSizePct', { min: 1, max: 100, fallback: 80 });
+      const maxEntriesPerDay = parseInteger(body.maxEntriesPerDay, 'maxEntriesPerDay', { min: 1, max: 50, fallback: 2 });
       const allowShort = body.allowShort !== false;
       const allowAddOn = body.allowAddOn === true;
-      const initialCapital = Number(body.initialCapital ?? 100_000);
-      const slippageBps = Number(body.slippageBps ?? 2);
-      if (!symbol.endsWith('.US')) {
-        return send(res, 400, JSON.stringify({ error: 'Only US symbols are supported' }));
-      }
+      const initialCapital = parseInteger(body.initialCapital, 'initialCapital', { min: 1, max: 1_000_000_000, fallback: 100_000 });
+      const slippageBps = parseInteger(body.slippageBps, 'slippageBps', { min: 0, max: 1000, fallback: 2 });
       res.writeHead(200, {
         'content-type': 'text/event-stream; charset=utf-8',
         'cache-control': 'no-cache, no-transform',
         connection: 'keep-alive',
         'access-control-allow-origin': '*',
       });
-      const emit = (event) => sendFrame(res, `data: ${JSON.stringify(event)}\n\n`);
+      const emit = (event: unknown) => sendFrame(res, `data: ${JSON.stringify(event)}\n\n`);
       const abort = new AbortController();
       const stopAbort = new AbortController();
       res.on('error', () => {});
       res.on('close', () => abort.abort());
       const runId = randomUUID();
-      const pauseState = { paused: false, waiters: [] };
-      const waitIfPaused = () => {
+      const pauseState: { paused: boolean; waiters: Array<() => void> } = { paused: false, waiters: [] };
+      const waitIfPaused = (): Promise<void> => {
         if (!pauseState.paused) return Promise.resolve();
-        return new Promise((resolve) => {
+        return new Promise<void>((resolve) => {
           const release = () => {
             abort.signal.removeEventListener('abort', release);
             stopAbort.signal.removeEventListener('abort', release);
@@ -884,7 +810,7 @@ const server = http.createServer(async (req, res) => {
         },
       };
       backtestRuns.set(runId, runControl);
-      console.log(`[backtest] run ${runId} ${symbol} ${date} ${timeframe}`);
+      logger.info(`[backtest] run ${runId} ${symbol} ${date} ${timeframe}`);
       emit({ type: 'run', runId });
       try {
         const tfMs = timeframeMs(timeframe);
@@ -918,15 +844,15 @@ const server = http.createServer(async (req, res) => {
           reasoningEffort: agent.effort,
           signal: llmSignal,
           onEvent: (event) => {
-            if (event.type === 'error') console.warn('[backtest] agent error:', event.message);
+            if (event.type === 'error') logger.warn('[backtest] agent error:', event.message);
             else if (event.type === 'tool_result' && !event.result.ok) {
-              console.warn('[backtest] tool rejected:', event.name, event.result.error?.code, event.result.error?.message);
+              logger.warn('[backtest] tool rejected:', event.name, event.result.error?.code, event.result.error?.message);
             }
             emit({ type: 'agent', event });
           },
         });
         const wrapped = {
-          async decide(input) {
+          async decide(input: any): Promise<any> {
             emit({ type: 'decision', asOf: input.asOf, entryQuota: input.entryQuota, position: input.position });
             return inner.decide(input);
           },
@@ -950,7 +876,7 @@ const server = http.createServer(async (req, res) => {
           stopSignal: stopAbort.signal,
           waitIfPaused,
         });
-        console.log(`[backtest] done ${runId}${report.stopped ? ' (stopped)' : ''} entries=${report.metrics.entriesUsed} pnl=${report.metrics.netPnl.toFixed(2)}`);
+        logger.info(`[backtest] done ${runId}${report.stopped ? ' (stopped)' : ''} entries=${report.metrics.entriesUsed} pnl=${report.metrics.netPnl.toFixed(2)}`);
         emit({
           type: 'done',
           report: {
@@ -970,8 +896,8 @@ const server = http.createServer(async (req, res) => {
         res.end();
       } catch (e) {
         if (!abort.signal.aborted) {
-          console.warn(`[backtest] failed ${runId}:`, e.message);
-          emit({ type: 'error', message: e.message });
+          logger.warn(`[backtest] failed ${runId}:`, (e as Error).message);
+          emit({ type: 'error', message: (e as Error).message });
         }
         res.end();
       } finally {
@@ -980,15 +906,20 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    if (u.pathname === '/api/bars') {
-      const symbol = u.searchParams.get('symbol') || 'AAPL.US';
-      const tf = u.searchParams.get('tf') || '1d';
-      if (TF[tf] === undefined) return send(res, 400, JSON.stringify({ error: 'bad tf' }));
-
-      const from = u.searchParams.has('from') ? Number(u.searchParams.get('from')) : null;
-      const to = u.searchParams.has('to') ? Number(u.searchParams.get('to')) : null;
-      const rawCount = Number(u.searchParams.get('count') || u.searchParams.get('limit') || 500);
-      const limit = Math.max(1, Math.min(rawCount || 500, MAX_LIMIT));
+    if (pathname === '/api/bars') {
+      const symbol = usSymbol(u.searchParams.get('symbol') || 'AAPL.US');
+      const tf = oneOf(u.searchParams.get('tf') || '1d', Object.keys(TF), 'tf');
+      const from = u.searchParams.has('from')
+        ? parseInteger(u.searchParams.get('from'), 'from', { min: 0 })
+        : null;
+      const to = u.searchParams.has('to')
+        ? parseInteger(u.searchParams.get('to'), 'to', { min: 0 })
+        : null;
+      const limit = parseInteger(
+        u.searchParams.get('count') || u.searchParams.get('limit'),
+        'count',
+        { min: 1, max: MAX_LIMIT, fallback: 500 },
+      );
       const windowed = from != null || to != null;
 
       // ---- bounded window (Vela's backfill / request.security range) ----
@@ -1032,14 +963,15 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, JSON.stringify({ symbol, tf, source, bars: cacheGet(symbol, tf, limit) }));
     }
 
-    if (u.pathname === '/api/symbols') {
-      return send(res, 200, JSON.stringify(await usSymbols()));
+    if (pathname === '/api/symbols') {
+      const pagination = parsePagination(u.searchParams);
+      return send(res, 200, JSON.stringify(paginate(await usSymbols(), pagination)));
     }
 
-    if (u.pathname === '/api/indicators.json') {
+    if (pathname === '/api/indicators.json') {
       const builtins = listIndicators().map((it) => ({
         name: it.name,
-        url: `/api/indicators/raw?file=${encodeURIComponent(it.file)}`,
+        url: `/api/v1/indicators/raw?file=${encodeURIComponent(it.file)}`,
         language: 'pine',
         enabled: false,
         category: FAMILY_LABELS[it.family] ?? it.family,
@@ -1057,13 +989,15 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, JSON.stringify([...customs, ...builtins]));
     }
 
-    if (u.pathname === '/api/custom-indicators') {
-      if (req.method === 'GET') return send(res, 200, JSON.stringify(loadCustom()));
+    if (pathname === '/api/custom-indicators') {
+      if (req.method === 'GET') {
+        const pagination = parsePagination(u.searchParams);
+        return send(res, 200, JSON.stringify(paginate(loadCustom(), pagination)));
+      }
       if (req.method === 'POST') {
         const body = await readJsonBody(req);
-        const name = String(body.name || '').trim();
-        const script = String(body.script || '');
-        if (!name || !script.trim()) return send(res, 400, JSON.stringify({ error: 'name and script required' }));
+        const name = requireString(body.name, 'name', { maxLength: 80 });
+        const script = requireString(body.script, 'script', { maxLength: 200_000 });
         const rows = loadCustom();
         const existing = body.id ? rows.find((r) => r.id === body.id) : null;
         if (existing) {
@@ -1077,46 +1011,54 @@ const server = http.createServer(async (req, res) => {
         return send(res, 200, JSON.stringify(existing ?? rows[rows.length - 1]));
       }
       if (req.method === 'DELETE') {
-        const id = u.searchParams.get('id');
+        const id = requireString(u.searchParams.get('id'), 'id', { maxLength: 80 });
         saveCustom(loadCustom().filter((r) => r.id !== id));
         return send(res, 200, JSON.stringify({ ok: true }));
       }
-      return send(res, 405, JSON.stringify({ error: 'method not allowed' }));
+      throw methodNotAllowed();
     }
 
-    if (u.pathname === '/api/indicators') {
-      return send(res, 200, JSON.stringify(listIndicators()));
+    if (pathname === '/api/indicators') {
+      const pagination = parsePagination(u.searchParams);
+      return send(res, 200, JSON.stringify(paginate(listIndicators(), pagination)));
     }
 
     // Overwrite a bundled (vault) indicator's source in place — the "edit any indicator"
     // path from the chart legend. Matched by declared name.
-    if (u.pathname === '/api/indicators/source' && req.method === 'POST') {
+    if (pathname === '/api/indicators/source' && req.method === 'POST') {
       const body = await readJsonBody(req);
-      const name = String(body.name || '').trim();
-      const script = String(body.script || '');
+      const name = requireString(body.name, 'name', { maxLength: 120 });
+      const script = requireString(body.script, 'script', { maxLength: 200_000 });
       const item = listIndicators().find((it) => it.name === name);
       if (!item) return send(res, 404, JSON.stringify({ error: 'indicator not found' }));
-      const full = path.join(PINE_DIR, item.file);
-      if (!full.startsWith(PINE_DIR)) return send(res, 400, JSON.stringify({ error: 'bad path' }));
+      const full = resolveWithin(PINE_DIR, item.file);
       fs.writeFileSync(full, script);
       idxCache = null;
       return send(res, 200, JSON.stringify({ ok: true, file: item.file }));
     }
 
-    if (u.pathname === '/api/indicators/raw') {
+    if (pathname === '/api/indicators/raw') {
       const file = u.searchParams.get('file') || '';
-      const full = path.join(PINE_DIR, file);
-      if (!full.startsWith(PINE_DIR) || !fs.existsSync(full)) return send(res, 404, 'not found', 'text/plain');
+      let full;
+      try {
+        full = resolveWithin(PINE_DIR, file);
+      } catch {
+        return send(res, 404, 'not found', 'text/plain');
+      }
+      if (!fs.existsSync(full) || !fs.statSync(full).isFile()) return send(res, 404, 'not found', 'text/plain');
       return send(res, 200, fs.readFileSync(full), 'text/plain; charset=utf-8');
     }
 
+    if (u.pathname.startsWith('/api/')) throw notFound();
+
     if (fs.existsSync(DIST)) {
-      const rel = decodeURIComponent(u.pathname === '/' ? 'index.html' : u.pathname.slice(1));
+      const rel = decodeURIComponent(pathname === '/' ? 'index.html' : pathname.slice(1));
       let file = path.join(DIST, rel);
-      if (!file.startsWith(DIST) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) {
+      const relToDist = path.relative(DIST, file);
+      if (relToDist.startsWith('..') || path.isAbsolute(relToDist) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) {
         file = path.join(DIST, 'index.html');
       }
-      const MIME = {
+      const MIME: Record<string, string> = {
         '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
         '.mjs': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
         '.json': 'application/json; charset=utf-8', '.svg': 'image/svg+xml',
@@ -1125,20 +1067,43 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, fs.readFileSync(file), MIME[path.extname(file)] || 'application/octet-stream');
     }
 
-    return send(res, 404, JSON.stringify({ error: 'not found' }));
+    throw notFound();
   } catch (e) {
-    return send(res, 500, JSON.stringify({ error: e.message }));
+    const status = e instanceof AppError ? e.status : ERROR_CODES.INTERNAL_ERROR;
+    const message = e instanceof Error ? e.message : String(e);
+    const details = e instanceof AppError ? e.details : null;
+    if (status >= ERROR_CODES.INTERNAL_ERROR) logger.error('request failed', e);
+    return send(res, status, JSON.stringify({ error: message, details }));
   }
 });
 
-const PORT = process.env.API_PORT || 5174;
-server.listen(PORT, () => console.log(`api on http://localhost:${PORT}`));
+const PORT = Number(process.env.API_PORT) || DEFAULT_PORT;
+server.listen(PORT, () => logger.info(`api on http://localhost:${PORT}`));
+
+let shuttingDown = false;
+function shutdown(signal: string): void {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logger.info(`[api] ${signal} received, shutting down`);
+  const forceExit = setTimeout(() => process.exit(1), 5000);
+  forceExit.unref();
+  server.close(() => {
+    try {
+      closeDb();
+    } catch {
+      /* already closed */
+    }
+    process.exit(0);
+  });
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
 
 fetchWindow('AAPL.US', '1d', null, null, 2)
-  .then(() => console.log('longbridge warm-up ok'))
-  .catch((e) => console.warn('longbridge warm-up failed:', e.message));
+  .then(() => logger.info('longbridge warm-up ok'))
+  .catch((e) => logger.warn('longbridge warm-up failed:', e.message));
 
 // Pre-fetch the US symbol universe so the picker's first open is instant.
 usSymbols()
-  .then((rows) => console.log(`symbol universe ready: ${rows.length} US symbols`))
-  .catch((e) => console.warn('symbol universe failed:', e.message));
+  .then((rows) => logger.info(`symbol universe ready: ${rows.length} US symbols`))
+  .catch((e) => logger.warn('symbol universe failed:', e.message));
